@@ -273,7 +273,9 @@ mod tests {
     #[test]
     fn save_load_run_state() {
         let dir = tempdir().unwrap();
-        let rec = sample_record(dir.path());
+        // Explicit state_dir so parallel tests that set COORDINATOR_STATE_DIR cannot redirect us.
+        let mut rec = sample_record(dir.path());
+        rec.state_dir = Some(dir.path().join("explicit-state"));
         let mut state = RunState::idle(&rec.id);
         state.status = RunStatus::Running;
         state.phase = STUB_PHASE_ACTIVE.into();
@@ -290,7 +292,8 @@ mod tests {
     #[test]
     fn loads_legacy_run_state_without_0005_fields() {
         let dir = tempdir().unwrap();
-        let rec = sample_record(dir.path());
+        let mut rec = sample_record(dir.path());
+        rec.state_dir = Some(dir.path().join("explicit-state"));
         let path = run_state_path(&rec);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Minimal 0004-shaped JSON (no run_epoch / failure_class / etc.).
