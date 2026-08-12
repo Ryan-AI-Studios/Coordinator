@@ -274,30 +274,30 @@ fn truncate_msg(msg: &str) -> String {
 }
 
 /// `{state_dir}/outcomes`
-pub fn outcomes_dir(record: &ProjectRecord) -> PathBuf {
-    resolve_state_dir(record).join("outcomes")
+pub fn outcomes_dir(record: &ProjectRecord) -> Result<PathBuf> {
+    Ok(resolve_state_dir(record)?.join("outcomes"))
 }
 
-pub fn outcome_current_path(record: &ProjectRecord) -> PathBuf {
-    outcomes_dir(record).join("current.json")
+pub fn outcome_current_path(record: &ProjectRecord) -> Result<PathBuf> {
+    Ok(outcomes_dir(record)?.join("current.json"))
 }
 
-pub fn outcome_applied_path(record: &ProjectRecord) -> PathBuf {
-    outcomes_dir(record).join("current.applied.json")
+pub fn outcome_applied_path(record: &ProjectRecord) -> Result<PathBuf> {
+    Ok(outcomes_dir(record)?.join("current.applied.json"))
 }
 
-pub fn outcome_history_dir(record: &ProjectRecord) -> PathBuf {
-    outcomes_dir(record).join("history")
+pub fn outcome_history_dir(record: &ProjectRecord) -> Result<PathBuf> {
+    Ok(outcomes_dir(record)?.join("history"))
 }
 
 /// Reserved layout for parallel role slots (0008); documented only this track.
-pub fn outcome_roles_dir(record: &ProjectRecord) -> PathBuf {
-    outcomes_dir(record).join("roles")
+pub fn outcome_roles_dir(record: &ProjectRecord) -> Result<PathBuf> {
+    Ok(outcomes_dir(record)?.join("roles"))
 }
 
 pub fn ensure_outcomes_dir(record: &ProjectRecord) -> Result<PathBuf> {
     ensure_state_dir(record)?;
-    let dir = outcomes_dir(record);
+    let dir = outcomes_dir(record)?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -306,12 +306,12 @@ pub fn ensure_outcomes_dir(record: &ProjectRecord) -> Result<PathBuf> {
 pub fn save_current_outcome(record: &ProjectRecord, outcome: &PhaseOutcome) -> Result<()> {
     outcome.validate()?;
     ensure_outcomes_dir(record)?;
-    atomic_write_json(&outcome_current_path(record), outcome)
+    atomic_write_json(&outcome_current_path(record)?, outcome)
 }
 
 /// Load `current.json` if present. Transient IO/parse errors bubble for CLI; poll uses soft path.
 pub fn load_current_outcome(record: &ProjectRecord) -> Result<Option<PhaseOutcome>> {
-    let path = outcome_current_path(record);
+    let path = outcome_current_path(record)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -322,7 +322,7 @@ pub fn load_current_outcome(record: &ProjectRecord) -> Result<Option<PhaseOutcom
 
 /// Soft load for pollers: missing → None; share/parse errors → None (skip tick).
 pub fn try_load_current_outcome(record: &ProjectRecord) -> Option<PhaseOutcome> {
-    let path = outcome_current_path(record);
+    let path = outcome_current_path(record).ok()?;
     if !path.exists() {
         return None;
     }
@@ -454,7 +454,9 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusV
     // Consume pattern: history → applied snapshot → remove current → save state.
     best_effort_history(record, &outcome);
     let _ = ensure_outcomes_dir(record);
-    let _ = atomic_write_json(&outcome_applied_path(record), &outcome);
+    if let Ok(applied) = outcome_applied_path(record) {
+        let _ = atomic_write_json(&applied, &outcome);
+    }
     clear_active_outcome_file(record);
 
     save_run_state(record, &state)?;
@@ -463,8 +465,9 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusV
 
 /// Remove active `current.json` if present (non-fatal).
 pub fn clear_active_outcome_file(record: &ProjectRecord) {
-    let current = outcome_current_path(record);
-    if current.exists() {
+    if let Ok(current) = outcome_current_path(record)
+        && current.exists()
+    {
         let _ = std::fs::remove_file(&current);
     }
 }
@@ -501,7 +504,9 @@ fn format_failure_event(outcome: &PhaseOutcome, class: FailureClass) -> String {
 }
 
 fn best_effort_history(record: &ProjectRecord, outcome: &PhaseOutcome) {
-    let dir = outcome_history_dir(record);
+    let Ok(dir) = outcome_history_dir(record) else {
+        return;
+    };
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -529,8 +534,9 @@ pub fn poll_try_apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<O
                 || msg.contains("does not match current phase")
                 || msg.contains("does not match state run_epoch")
             {
-                let current = outcome_current_path(record);
-                if current.exists() {
+                if let Ok(current) = outcome_current_path(record)
+                    && current.exists()
+                {
                     let _ = std::fs::remove_file(&current);
                 }
                 return Ok(None);
@@ -640,7 +646,10 @@ mod tests {
             id: Uuid::new_v4().to_string(),
             path: path.to_path_buf(),
             display_name: None,
-            layout_profile: "nested".into(),
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             created_at: Utc::now(),
         }
@@ -753,8 +762,8 @@ mod tests {
         assert_eq!(view.phase, STUB_PHASE_COMPLETED);
         assert_eq!(view.next_track.as_deref(), Some("0006"));
         assert!(view.failure_class.is_none());
-        assert!(!outcome_current_path(&r).exists());
-        assert!(outcome_applied_path(&r).exists());
+        assert!(!outcome_current_path(&r).unwrap().exists());
+        assert!(outcome_applied_path(&r).unwrap().exists());
     }
 
     #[test]
@@ -871,7 +880,7 @@ mod tests {
         assert!(applied.is_none());
         let after = run::status(&r).unwrap();
         assert_eq!(before.status, after.status);
-        assert!(!outcome_current_path(&r).exists());
+        assert!(!outcome_current_path(&r).unwrap().exists());
     }
 
     #[test]
@@ -899,13 +908,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         assert!(
-            outcome_current_path(&r).ends_with(
+            outcome_current_path(&r).unwrap().ends_with(
                 std::path::Path::new(".coordinator")
                     .join("outcomes")
                     .join("current.json")
             )
         );
-        assert!(outcome_roles_dir(&r).ends_with("roles"));
+        assert!(outcome_roles_dir(&r).unwrap().ends_with("roles"));
     }
 
     #[test]
@@ -915,7 +924,7 @@ mod tests {
         let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::Cli, None, None, None);
         assert!(write_and_apply(&r, o).is_err());
         assert!(
-            !outcome_current_path(&r).exists(),
+            !outcome_current_path(&r).unwrap().exists(),
             "failed write must not leave current.json"
         );
     }
@@ -932,10 +941,10 @@ mod tests {
             None,
         );
         save_current_outcome(&r, &stale).unwrap();
-        assert!(outcome_current_path(&r).exists());
+        assert!(outcome_current_path(&r).unwrap().exists());
         run::run(&r, None).unwrap();
         assert!(
-            !outcome_current_path(&r).exists(),
+            !outcome_current_path(&r).unwrap().exists(),
             "run must clear active outcome file"
         );
         let tick = crate::watch::poll_once(&r).unwrap();

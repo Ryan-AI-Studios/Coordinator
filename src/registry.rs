@@ -1,5 +1,6 @@
 //! Machine-local Project Registry (`{COORDINATOR_HOME}/registry.json`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -7,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{CoordinatorError, Result};
+use crate::layout::{LayoutProfile, auto_detect_nested_execution};
 use crate::persist::atomic_write_json;
 
 pub const REGISTRY_VERSION: u32 = 1;
@@ -14,24 +16,53 @@ pub const REGISTRY_VERSION: u32 = 1;
 /// Stable project identifier.
 pub type ProjectId = String;
 
+/// Optional fields for `project add` / HTTP POST.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectAddOptions {
+    pub layout_profile: LayoutProfile,
+    pub execution_repo: Option<PathBuf>,
+    pub conductor_dir: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
+    pub display_name: Option<String>,
+    /// multi_sibling: name for primary map entry when `execution_repo` is set.
+    pub execution_repo_name: Option<String>,
+    pub execution_repos: BTreeMap<String, PathBuf>,
+}
+
+/// Fields mutatable via `project set` (workspace `path` is immutable this track).
+#[derive(Debug, Clone, Default)]
+pub struct ProjectSetOptions {
+    pub layout_profile: Option<LayoutProfile>,
+    pub execution_repo: Option<PathBuf>,
+    pub clear_execution_repo: bool,
+    pub conductor_dir: Option<PathBuf>,
+    pub clear_conductor_dir: bool,
+    pub state_dir: Option<PathBuf>,
+    pub clear_state_dir: bool,
+    pub display_name: Option<String>,
+    pub execution_repos: Option<BTreeMap<String, PathBuf>>,
+    pub execution_repo_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectRecord {
     pub id: ProjectId,
-    /// Absolute, dunce-normalized path (workspace root).
+    /// Absolute, dunce-normalized path (workspace root). Immutable via `project set`.
     pub path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// Stub field for 0006 Layout Profiles; default nested.
-    #[serde(default = "default_layout_profile")]
-    pub layout_profile: String,
+    #[serde(default)]
+    pub layout_profile: LayoutProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_repo: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub execution_repos: BTreeMap<String, PathBuf>,
     /// Optional per-record state dir override (absolute).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_dir: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
-}
-
-fn default_layout_profile() -> String {
-    "nested".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +87,13 @@ impl Registry {
         }
         let text = std::fs::read_to_string(path)?;
         let reg: Registry = serde_json::from_str(&text)?;
+        if reg.version != REGISTRY_VERSION {
+            return Err(CoordinatorError::Message(format!(
+                "unsupported registry schema version {}; expected {REGISTRY_VERSION} \
+                 (re-register projects or migrate the file)",
+                reg.version
+            )));
+        }
         Ok(reg)
     }
 
@@ -63,8 +101,8 @@ impl Registry {
         atomic_write_json(path, self)
     }
 
-    /// Add a project path: canonicalize, dedupe, assign id.
-    pub fn add(&mut self, path: &Path) -> Result<ProjectRecord> {
+    /// Add a project path: canonicalize, dedupe, assign id, apply layout options.
+    pub fn add(&mut self, path: &Path, opts: ProjectAddOptions) -> Result<ProjectRecord> {
         if !path.exists() {
             return Err(CoordinatorError::Message(format!(
                 "path does not exist: {}",
@@ -87,20 +125,81 @@ impl Registry {
             return Ok(existing.clone());
         }
 
-        let display_name = canonical
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned());
+        let display_name = opts.display_name.or_else(|| {
+            canonical
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+        });
+
+        let mut execution_repo = opts.execution_repo;
+        let mut execution_repos = opts.execution_repos;
+
+        // Nested auto-detect when primary not provided.
+        if execution_repo.is_none() && opts.layout_profile == LayoutProfile::Nested {
+            execution_repo = auto_detect_nested_execution(&canonical);
+        }
+
+        // multi_sibling: optional name for primary map entry
+        if let (Some(name), Some(exec)) = (&opts.execution_repo_name, &execution_repo) {
+            execution_repos
+                .entry(name.clone())
+                .or_insert_with(|| exec.clone());
+        }
 
         let record = ProjectRecord {
             id: Uuid::new_v4().to_string(),
             path: canonical,
             display_name,
-            layout_profile: default_layout_profile(),
-            state_dir: None,
+            layout_profile: opts.layout_profile,
+            conductor_dir: opts.conductor_dir,
+            execution_repo,
+            execution_repos,
+            state_dir: opts.state_dir,
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
         Ok(record)
+    }
+
+    /// Mutate path bindings / profile for an existing project (path immutable).
+    pub fn set(&mut self, id: &str, opts: ProjectSetOptions) -> Result<ProjectRecord> {
+        let idx = self
+            .projects
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| CoordinatorError::ProjectNotFound(id.to_string()))?;
+
+        let rec = &mut self.projects[idx];
+        if let Some(p) = opts.layout_profile {
+            rec.layout_profile = p;
+        }
+        if opts.clear_execution_repo {
+            rec.execution_repo = None;
+        } else if let Some(p) = opts.execution_repo {
+            rec.execution_repo = Some(p);
+        }
+        if opts.clear_conductor_dir {
+            rec.conductor_dir = None;
+        } else if let Some(p) = opts.conductor_dir {
+            rec.conductor_dir = Some(p);
+        }
+        if opts.clear_state_dir {
+            rec.state_dir = None;
+        } else if let Some(p) = opts.state_dir {
+            rec.state_dir = Some(p);
+        }
+        if let Some(n) = opts.display_name {
+            rec.display_name = Some(n);
+        }
+        if let Some(map) = opts.execution_repos {
+            rec.execution_repos = map;
+        }
+        if let (Some(name), Some(exec)) = (&opts.execution_repo_name, &rec.execution_repo) {
+            rec.execution_repos
+                .entry(name.clone())
+                .or_insert_with(|| exec.clone());
+        }
+        Ok(rec.clone())
     }
 
     pub fn list(&self) -> &[ProjectRecord] {
@@ -167,8 +266,8 @@ pub fn canonicalize_path(path: &Path) -> Result<PathBuf> {
     Ok(canon)
 }
 
-fn paths_equal(a: &Path, b: &Path) -> bool {
-    // Case-insensitive compare on Windows for registry dedupe.
+/// Case-insensitive path equality on Windows for registry dedupe / scan.
+pub fn paths_equal(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
     {
         a.to_string_lossy()
@@ -192,9 +291,10 @@ mod tests {
         let proj = tempdir().unwrap();
 
         let mut reg = Registry::default();
-        let rec = reg.add(proj.path()).unwrap();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         assert!(!rec.id.is_empty());
         assert!(rec.path.is_absolute());
+        assert_eq!(rec.layout_profile, LayoutProfile::Nested);
         reg.save(&reg_path).unwrap();
 
         let loaded = Registry::load(&reg_path).unwrap();
@@ -207,8 +307,8 @@ mod tests {
     fn dedupe_same_path() {
         let proj = tempdir().unwrap();
         let mut reg = Registry::default();
-        let a = reg.add(proj.path()).unwrap();
-        let b = reg.add(proj.path()).unwrap();
+        let a = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let b = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         assert_eq!(a.id, b.id);
         assert_eq!(reg.projects.len(), 1);
     }
@@ -217,7 +317,10 @@ mod tests {
     fn reject_missing_path() {
         let mut reg = Registry::default();
         let err = reg
-            .add(Path::new("C:\\does\\not\\exist\\coordinator-xyz"))
+            .add(
+                Path::new("C:\\does\\not\\exist\\coordinator-xyz"),
+                ProjectAddOptions::default(),
+            )
             .unwrap_err();
         assert!(matches!(err, CoordinatorError::Message(_)));
     }
@@ -226,7 +329,7 @@ mod tests {
     fn resolve_single_default() {
         let proj = tempdir().unwrap();
         let mut reg = Registry::default();
-        let rec = reg.add(proj.path()).unwrap();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         let resolved = reg.resolve_project(None).unwrap();
         assert_eq!(resolved.id, rec.id);
     }
@@ -236,8 +339,94 @@ mod tests {
         let p1 = tempdir().unwrap();
         let p2 = tempdir().unwrap();
         let mut reg = Registry::default();
-        reg.add(p1.path()).unwrap();
-        reg.add(p2.path()).unwrap();
+        reg.add(p1.path(), ProjectAddOptions::default()).unwrap();
+        reg.add(p2.path(), ProjectAddOptions::default()).unwrap();
         assert!(reg.resolve_project(None).is_err());
+    }
+
+    #[test]
+    fn reject_unsupported_version() {
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        std::fs::write(&reg_path, r#"{"version":99,"projects":[]}"#).unwrap();
+        let err = Registry::load(&reg_path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported registry schema version")
+        );
+    }
+
+    #[test]
+    fn load_minimal_old_style_registry() {
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        let proj = tempdir().unwrap();
+        let path_json = serde_json::to_string(&proj.path()).unwrap();
+        let json = format!(
+            r#"{{"version":1,"projects":[{{"id":"abc","path":{path_json},"layout_profile":"nested","created_at":"2026-01-01T00:00:00Z"}}]}}"#
+        );
+        std::fs::write(&reg_path, json).unwrap();
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].layout_profile, LayoutProfile::Nested);
+        assert!(loaded.projects[0].execution_repos.is_empty());
+        assert!(loaded.projects[0].execution_repo.is_none());
+    }
+
+    #[test]
+    fn reject_unknown_profile_string() {
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        let proj = tempdir().unwrap();
+        let path_json = serde_json::to_string(&proj.path()).unwrap();
+        let json = format!(
+            r#"{{"version":1,"projects":[{{"id":"abc","path":{path_json},"layout_profile":"flat","created_at":"2026-01-01T00:00:00Z"}}]}}"#
+        );
+        std::fs::write(&reg_path, json).unwrap();
+        assert!(Registry::load(&reg_path).is_err());
+    }
+
+    #[test]
+    fn set_profile_and_execution_map() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("ledgerful".into(), PathBuf::from(r"C:\dev\ledgerful"));
+        let updated = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    layout_profile: Some(LayoutProfile::MultiSibling),
+                    execution_repos: Some(map.clone()),
+                    execution_repo: Some(PathBuf::from(r"C:\dev\ledgerful")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.layout_profile, LayoutProfile::MultiSibling);
+        assert_eq!(updated.execution_repos, map);
+        // Round-trip save/load
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert_eq!(loaded.projects[0].execution_repos, map);
+    }
+
+    #[test]
+    fn nested_add_auto_detects_single_child() {
+        let ws = tempdir().unwrap();
+        let product = ws.path().join("ProductApp");
+        std::fs::create_dir_all(&product).unwrap();
+        std::fs::write(product.join("Cargo.toml"), "[package]\nname=\"p\"\n").unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(ws.path(), ProjectAddOptions::default()).unwrap();
+        assert!(rec.execution_repo.is_some());
+        let exec = rec.execution_repo.unwrap();
+        assert!(
+            paths_equal(&exec, &canonicalize_path(&product).unwrap())
+                || exec.ends_with("ProductApp")
+        );
     }
 }

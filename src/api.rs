@@ -1,23 +1,68 @@
 //! Shared Control Plane operations for CLI and HTTP (no divergent logic).
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::registry_path;
-use crate::error::Result;
+use crate::config::{self, registry_path, resolve_scan_roots};
+use crate::error::{CoordinatorError, Result};
+use crate::layout::{self, LayoutProfile, WorkspacePaths, nested_execution_null_hint};
 use crate::outcome::{
     self, FailureClass, OutcomeSource, OutcomeStatus, PhaseOutcome, load_current_outcome,
     parse_outcome_status, write_and_apply,
 };
-use crate::registry::{ProjectRecord, Registry};
+use crate::registry::{ProjectAddOptions, ProjectRecord, ProjectSetOptions, Registry};
 use crate::run;
+use crate::scan::{self, ScanCandidate};
 use crate::state::StatusView;
 use crate::watch;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectAddRequest {
     pub path: String,
+    #[serde(default)]
+    pub layout_profile: Option<String>,
+    #[serde(default)]
+    pub execution_repo: Option<String>,
+    #[serde(default)]
+    pub conductor_dir: Option<String>,
+    #[serde(default)]
+    pub state_dir: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub execution_repo_name: Option<String>,
+    #[serde(default)]
+    pub execution_repos: Option<BTreeMap<String, PathBuf>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSetRequest {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub layout_profile: Option<String>,
+    #[serde(default)]
+    pub execution_repo: Option<String>,
+    #[serde(default)]
+    pub conductor_dir: Option<String>,
+    #[serde(default)]
+    pub state_dir: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub execution_repos: Option<BTreeMap<String, PathBuf>>,
+    #[serde(default)]
+    pub execution_repo_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectScanRequest {
+    #[serde(default)]
+    pub roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub add: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +71,15 @@ pub struct ProjectRefBody {
     pub project: Option<String>,
     #[serde(default)]
     pub track: Option<String>,
+}
+
+/// Show response: raw record + resolved paths + optional remediation hint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectShowView {
+    pub project: ProjectRecord,
+    pub resolved: WorkspacePaths,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// POST /v1/outcome body: Phase Outcome fields + optional project selector.
@@ -64,17 +118,129 @@ fn save_registry(reg: &Registry) -> Result<()> {
     reg.save(&path)
 }
 
-/// `project add <path>`
-pub fn project_add(path: &Path) -> Result<ProjectRecord> {
+fn parse_optional_path(s: Option<String>) -> Option<PathBuf> {
+    s.filter(|p| !p.is_empty()).map(PathBuf::from)
+}
+
+fn opts_from_add_request(req: &ProjectAddRequest) -> Result<ProjectAddOptions> {
+    let layout_profile = match &req.layout_profile {
+        Some(s) => LayoutProfile::parse(s)?,
+        None => LayoutProfile::Nested,
+    };
+    Ok(ProjectAddOptions {
+        layout_profile,
+        execution_repo: parse_optional_path(req.execution_repo.clone()),
+        conductor_dir: parse_optional_path(req.conductor_dir.clone()),
+        state_dir: parse_optional_path(req.state_dir.clone()),
+        display_name: req.display_name.clone(),
+        execution_repo_name: req.execution_repo_name.clone(),
+        execution_repos: req.execution_repos.clone().unwrap_or_default(),
+    })
+}
+
+/// `project add <path>` with layout options.
+pub fn project_add(path: &Path, opts: ProjectAddOptions) -> Result<ProjectRecord> {
     let mut reg = load_registry()?;
-    let rec = reg.add(path)?;
+    let rec = reg.add(path, opts)?;
     save_registry(&reg)?;
     Ok(rec)
+}
+
+/// HTTP POST /v1/projects
+pub fn project_add_request(req: ProjectAddRequest) -> Result<ProjectRecord> {
+    let opts = opts_from_add_request(&req)?;
+    project_add(Path::new(&req.path), opts)
 }
 
 /// `project list`
 pub fn project_list() -> Result<Vec<ProjectRecord>> {
     Ok(load_registry()?.list().to_vec())
+}
+
+/// `project show` — raw + resolved + nested null hint.
+pub fn project_show(project: Option<&str>) -> Result<ProjectShowView> {
+    let reg = load_registry()?;
+    let rec = reg.resolve_project(project)?.clone();
+    let resolved = layout::resolve(&rec);
+    let hint = if rec.layout_profile == LayoutProfile::Nested && rec.execution_repo.is_none() {
+        let spec = project
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| rec.path.display().to_string());
+        Some(nested_execution_null_hint(&spec))
+    } else {
+        None
+    };
+    Ok(ProjectShowView {
+        project: rec,
+        resolved,
+        hint,
+    })
+}
+
+/// `project set` — mutate bindings; workspace path immutable.
+pub fn project_set(project: Option<&str>, opts: ProjectSetOptions) -> Result<ProjectRecord> {
+    let mut reg = load_registry()?;
+    let id = reg.resolve_project(project)?.id.clone();
+    let rec = reg.set(&id, opts)?;
+    save_registry(&reg)?;
+    Ok(rec)
+}
+
+/// HTTP PATCH-style set via body.
+pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
+    let layout_profile = match req.layout_profile {
+        Some(s) => Some(LayoutProfile::parse(&s)?),
+        None => None,
+    };
+    let opts = ProjectSetOptions {
+        layout_profile,
+        execution_repo: parse_optional_path(req.execution_repo),
+        clear_execution_repo: false,
+        conductor_dir: parse_optional_path(req.conductor_dir),
+        clear_conductor_dir: false,
+        state_dir: parse_optional_path(req.state_dir),
+        clear_state_dir: false,
+        display_name: req.display_name,
+        execution_repos: req.execution_repos,
+        execution_repo_name: req.execution_repo_name,
+    };
+    project_set(req.project.as_deref(), opts)
+}
+
+/// `project scan` — dry-run by default; `--add` registers new candidates.
+pub fn project_scan(
+    roots: &[PathBuf],
+    add: bool,
+) -> Result<(Vec<ScanCandidate>, Vec<ProjectRecord>)> {
+    let roots = resolve_scan_roots(roots)?;
+    if roots.is_empty() {
+        return Err(CoordinatorError::Message(
+            "no scan roots: pass --root <path> or set scan_roots in config.json".into(),
+        ));
+    }
+    let mut reg = load_registry()?;
+    let candidates = scan::scan_roots(&roots, &reg)?;
+    let mut added = Vec::new();
+    if add {
+        for c in &candidates {
+            if c.already_registered {
+                continue;
+            }
+            let opts = ProjectAddOptions {
+                layout_profile: c.detected_profile,
+                execution_repo: c.execution_repo_hint.clone(),
+                ..Default::default()
+            };
+            let rec = reg.add(&c.path, opts)?;
+            added.push(rec);
+        }
+        if !added.is_empty() {
+            save_registry(&reg)?;
+        }
+    }
+    // Re-scan registration flags after add for accurate response
+    let candidates = scan::scan_roots(&roots, &reg)?;
+    Ok((candidates, added))
 }
 
 /// Resolve project selector then return status view.
@@ -196,4 +362,15 @@ pub fn cmd_wait(project: Option<&str>, timeout_secs: u64) -> Result<StatusView> 
     let reg = load_registry()?;
     let rec = reg.resolve_project(project)?.clone();
     watch::wait_for_outcome(&rec, timeout_secs)
+}
+
+/// Persist a scan root into machine config (optional convenience).
+pub fn save_scan_root(root: &Path) -> Result<config::MachineConfig> {
+    let mut cfg = config::load_machine_config()?;
+    let path = root.to_path_buf();
+    if !cfg.scan_roots.iter().any(|r| r == &path) {
+        cfg.scan_roots.push(path);
+        config::save_machine_config(&cfg)?;
+    }
+    Ok(cfg)
 }

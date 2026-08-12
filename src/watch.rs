@@ -160,7 +160,10 @@ mod tests {
             id: Uuid::new_v4().to_string(),
             path: path.to_path_buf(),
             display_name: None,
-            layout_profile: "nested".into(),
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             created_at: chrono::Utc::now(),
         }
@@ -173,10 +176,10 @@ mod tests {
         run::run(&r, None).unwrap();
         let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::File, None, None, None);
         save_current_outcome(&r, &o).unwrap();
-        assert!(outcome_current_path(&r).exists());
+        assert!(outcome_current_path(&r).unwrap().exists());
         let view = poll_once(&r).unwrap().expect("should apply");
         assert_eq!(view.status, RunStatus::Idle);
-        assert!(!outcome_current_path(&r).exists());
+        assert!(!outcome_current_path(&r).unwrap().exists());
     }
 
     #[test]
@@ -197,7 +200,10 @@ mod tests {
                 id,
                 path,
                 display_name: None,
-                layout_profile: "nested".into(),
+                layout_profile: crate::layout::LayoutProfile::Nested,
+                conductor_dir: None,
+                execution_repo: None,
+                execution_repos: std::collections::BTreeMap::new(),
                 state_dir: None,
                 created_at: chrono::Utc::now(),
             };
@@ -267,7 +273,7 @@ mod tests {
         let r = rec(dir.path());
         run::run(&r, None).unwrap();
         outcome::ensure_outcomes_dir(&r).unwrap();
-        std::fs::write(outcome_current_path(&r), b"{not valid json").unwrap();
+        std::fs::write(outcome_current_path(&r).unwrap(), b"{not valid json").unwrap();
         let tick = poll_once(&r).unwrap();
         // No apply; still Running.
         assert!(

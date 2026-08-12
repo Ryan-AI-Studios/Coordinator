@@ -30,9 +30,53 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 |-------|-------------------|----------|
 | Machine home (registry) | `%LOCALAPPDATA%\coordinator\` | `COORDINATOR_HOME` |
 | Registry file | `{home}/registry.json` | — |
+| Machine config | `{home}/config.json` (`scan_roots`) | — |
 | Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
 | Active Phase Outcome | `{state_dir}/outcomes/current.json` | same state-dir rules |
 | Last applied outcome | `{state_dir}/outcomes/current.applied.json` | written on successful apply; `current.json` removed |
+
+Empty `COORDINATOR_HOME` or `COORDINATOR_STATE_DIR` is rejected.
+
+### Layout Profiles (path bindings)
+
+Each registered project has a **layout profile** that tells the Control Plane how to resolve Workspace Root, conductor dir, execution repo(s), and state dir. Session pool key for later harness tracks is **`project_id` + workspace `path`** (path is immutable via `project set`).
+
+| Profile | Workspace | Conductor (default) | Execution | Typical use |
+|---------|-----------|---------------------|-----------|-------------|
+| **`nested`** (default) | registry `path` | `{ws}/conductor` | primary `execution_repo` (or auto-detect one child product) | Orca, Coordinator itself |
+| **`multi_sibling`** | hub path | `{ws}/conductor` | named `execution_repos` map + optional primary | coordinated-style hubs |
+| **`single_root`** | registry `path` | `{ws}/conductor` | **always** workspace root on resolve | monorepo with conductor inside product |
+
+**Nested auto-detect (on add / scan):** inspect **immediate child directories only** (never the workspace root). Eligible child has `Cargo.toml` or `.git`, basename not in `{conductor, .git, .agents, docs, mock}`. Exactly one match → store as `execution_repo`; zero or many → leave null. Root-level `.git` / `Cargo.toml` alone does **not** count as nested product (that shape is `single_root`).
+
+**`single_root` inert fields:** setting `execution_repo` / `execution_repos` via add/set is allowed but **ignored on resolve** (execution is always the workspace root).
+
+**Profile flip:** changing `layout_profile` does **not** auto-clear stored path fields. `resolve` is profile-specific; `project show` prints **raw** record fields and **resolved** paths so mismatches are visible.
+
+**Scan (ADR-0026):** `project scan --root <dir>` checks the root and its **immediate children** for `conductor/conductor.md`. No deep recursion; directory junctions/symlinks are single entries (marker only, no descendant walk). Dry-run is default; `--add` registers new hits. CI/tests must pass explicit `--root` (do not rely on default `C:\dev`). Default `scan_roots` in `config.json` is `["C:\\dev"]` on Windows when that path exists, else `[]`.
+
+```powershell
+# Nested fixture
+$ws = "$env:TEMP\coord-nested"
+New-Item -ItemType Directory -Force -Path "$ws\conductor","$ws\ProductApp" | Out-Null
+Set-Content "$ws\conductor\conductor.md" "# tracks"
+Set-Content "$ws\ProductApp\Cargo.toml" "[package]`nname=`"p`"`nversion=`"0.1.0`""
+cargo run -- project add $ws --profile nested
+cargo run -- project show --project $ws
+# expect layout_profile=nested, execution_repo → ProductApp
+
+# Multi-sibling hub
+cargo run -- project add $hub --profile multi_sibling
+cargo run -- project set --project $hub --execution-repos-json '{\"app\":\"C:\\dev\\app\"}'
+
+# Scan dry-run then add
+cargo run -- project scan --root $scanRoot --dry-run
+cargo run -- project scan --root $scanRoot --add
+```
+
+When nested `execution_repo` is null, `project show` includes:
+
+`hint: coordinator project set --project <id|path> --execution-repo <path>`
 
 **Local-only:** `coordinator serve` binds **`127.0.0.1` only** (default port **7420**, avoids Impeccable live 5500/8400). Non-loopback bind is rejected.
 
@@ -75,7 +119,15 @@ CLI surface:
 
 ```text
 coordinator project add <path>
+    [--profile nested|multi_sibling|single_root]
+    [--execution-repo <path>] [--conductor-dir <path>] [--state-dir <path>]
+    [--display-name <name>] [--execution-repo-name <name>]
 coordinator project list
+coordinator project show [--project <path|id>]
+coordinator project set [--project …]
+    [--profile …] [--execution-repo …] [--conductor-dir …] [--state-dir …]
+    [--display-name …] [--execution-repos-json <json>] [--execution-repo-name …]
+coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]
 coordinator status [--project <path|id>]
 coordinator run [--project <path|id>] [--track <id>]
 coordinator pause [--project <path|id>]
@@ -88,6 +140,8 @@ coordinator outcome show [--project …]
 coordinator wait [--project …] [--timeout-secs N]
 coordinator serve [--port <u16>]   # default 7420, 127.0.0.1 only
 ```
+
+HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved).
 
 ### Phase Outcome schema v1
 

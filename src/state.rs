@@ -125,7 +125,7 @@ impl RunState {
     }
 }
 
-/// Status JSON fields (CLI + GET /v1/status). Additive optional fields from 0005.
+/// Status JSON fields (CLI + GET /v1/status). Additive layout fields from 0006.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StatusView {
     pub project_id: String,
@@ -142,10 +142,20 @@ pub struct StatusView {
     pub failure_class: Option<FailureClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_track: Option<String>,
+    /// Layout profile (nested | multi_sibling | single_root).
+    #[serde(default)]
+    pub layout_profile: crate::layout::LayoutProfile,
+    /// Resolved primary execution repo (null when nested and unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_repo: Option<PathBuf>,
+    /// Resolved conductor directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_dir: Option<PathBuf>,
 }
 
 impl StatusView {
     pub fn from_record(record: &ProjectRecord, state: &RunState) -> Self {
+        let paths = crate::layout::resolve(record);
         Self {
             project_id: record.id.clone(),
             path: record.path.clone(),
@@ -157,6 +167,9 @@ impl StatusView {
             phase_started_at: state.phase_started_at,
             failure_class: state.failure_class,
             next_track: state.next_track.clone(),
+            layout_profile: record.layout_profile,
+            execution_repo: paths.execution_repo,
+            conductor_dir: Some(paths.conductor_dir),
         }
     }
 }
@@ -168,22 +181,24 @@ impl StatusView {
 ///    avoids multi-project collisions when the env override is shared)
 /// 2. `record.state_dir` (already project-specific)
 /// 3. `{workspace_path}/.coordinator`
-pub fn resolve_state_dir(record: &ProjectRecord) -> PathBuf {
-    if let Some(over) = state_dir_override() {
-        return over.join(&record.id);
+///
+/// Empty `COORDINATOR_STATE_DIR` is an error.
+pub fn resolve_state_dir(record: &ProjectRecord) -> Result<PathBuf> {
+    if let Some(over) = state_dir_override()? {
+        return Ok(over.join(&record.id));
     }
     if let Some(ref sd) = record.state_dir {
-        return sd.clone();
+        return Ok(sd.clone());
     }
-    record.path.join(".coordinator")
+    Ok(record.path.join(".coordinator"))
 }
 
-pub fn run_state_path(record: &ProjectRecord) -> PathBuf {
-    resolve_state_dir(record).join("run-state.json")
+pub fn run_state_path(record: &ProjectRecord) -> Result<PathBuf> {
+    Ok(resolve_state_dir(record)?.join("run-state.json"))
 }
 
 pub fn load_run_state(record: &ProjectRecord) -> Result<RunState> {
-    let path = run_state_path(record);
+    let path = run_state_path(record)?;
     if !path.exists() {
         return Ok(RunState::idle(&record.id));
     }
@@ -193,13 +208,13 @@ pub fn load_run_state(record: &ProjectRecord) -> Result<RunState> {
 }
 
 pub fn save_run_state(record: &ProjectRecord, state: &RunState) -> Result<()> {
-    let path = run_state_path(record);
+    let path = run_state_path(record)?;
     atomic_write_json(&path, state)
 }
 
 /// Ensure state dir exists (creates `.coordinator` as needed).
 pub fn ensure_state_dir(record: &ProjectRecord) -> Result<PathBuf> {
-    let dir = resolve_state_dir(record);
+    let dir = resolve_state_dir(record)?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -213,7 +228,7 @@ where
     F: FnOnce() -> Result<T>,
 {
     ensure_state_dir(record)?;
-    let lock_path = resolve_state_dir(record).join(".run-state.lock");
+    let lock_path = resolve_state_dir(record)?.join(".run-state.lock");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match std::fs::create_dir(&lock_path) {
@@ -257,7 +272,10 @@ mod tests {
             id: Uuid::new_v4().to_string(),
             path: path.to_path_buf(),
             display_name: Some("test".into()),
-            layout_profile: "nested".into(),
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             created_at: Utc::now(),
         }
@@ -267,7 +285,10 @@ mod tests {
     fn default_state_dir_is_dot_coordinator() {
         let dir = tempdir().unwrap();
         let rec = sample_record(dir.path());
-        assert_eq!(resolve_state_dir(&rec), dir.path().join(".coordinator"));
+        assert_eq!(
+            resolve_state_dir(&rec).unwrap(),
+            dir.path().join(".coordinator")
+        );
     }
 
     #[test]
@@ -282,7 +303,7 @@ mod tests {
         state.last_event = "run: started stub".into();
         state.run_epoch = 1;
         save_run_state(&rec, &state).unwrap();
-        assert!(run_state_path(&rec).exists());
+        assert!(run_state_path(&rec).unwrap().exists());
         let loaded = load_run_state(&rec).unwrap();
         assert_eq!(loaded.status, RunStatus::Running);
         assert_eq!(loaded.phase, STUB_PHASE_ACTIVE);
@@ -294,7 +315,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut rec = sample_record(dir.path());
         rec.state_dir = Some(dir.path().join("explicit-state"));
-        let path = run_state_path(&rec);
+        let path = run_state_path(&rec).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Minimal 0004-shaped JSON (no run_epoch / failure_class / etc.).
         std::fs::write(
@@ -328,10 +349,10 @@ mod tests {
         unsafe {
             std::env::set_var(ENV_COORDINATOR_STATE_DIR, over.path());
         }
-        let resolved = resolve_state_dir(&rec);
+        let resolved = resolve_state_dir(&rec).unwrap();
         assert_eq!(resolved, over.path().join(&rec.id));
         assert_eq!(
-            run_state_path(&rec),
+            run_state_path(&rec).unwrap(),
             over.path().join(&rec.id).join("run-state.json")
         );
         unsafe {
@@ -354,9 +375,20 @@ mod tests {
         unsafe {
             std::env::set_var(ENV_COORDINATOR_STATE_DIR, over.path());
         }
-        assert_ne!(resolve_state_dir(&r1), resolve_state_dir(&r2));
-        assert!(resolve_state_dir(&r1).ends_with(std::path::Path::new(&r1.id)));
-        assert!(resolve_state_dir(&r2).ends_with(std::path::Path::new(&r2.id)));
+        assert_ne!(
+            resolve_state_dir(&r1).unwrap(),
+            resolve_state_dir(&r2).unwrap()
+        );
+        assert!(
+            resolve_state_dir(&r1)
+                .unwrap()
+                .ends_with(std::path::Path::new(&r1.id))
+        );
+        assert!(
+            resolve_state_dir(&r2)
+                .unwrap()
+                .ends_with(std::path::Path::new(&r2.id))
+        );
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_STATE_DIR);
         }
@@ -368,7 +400,24 @@ mod tests {
         let over = tempdir().unwrap();
         let mut rec = sample_record(proj.path());
         rec.state_dir = Some(over.path().to_path_buf());
-        assert_eq!(resolve_state_dir(&rec), over.path());
+        assert_eq!(resolve_state_dir(&rec).unwrap(), over.path());
+    }
+
+    #[test]
+    fn empty_state_dir_env_rejected() {
+        use crate::config::{ENV_COORDINATOR_STATE_DIR, test_env_lock};
+
+        let _guard = test_env_lock();
+        let proj = tempdir().unwrap();
+        let rec = sample_record(proj.path());
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_STATE_DIR, "");
+        }
+        let err = resolve_state_dir(&rec).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_STATE_DIR);
+        }
     }
 
     #[test]

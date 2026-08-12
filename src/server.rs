@@ -10,7 +10,10 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{self, OutcomeWriteBody, ProjectAddRequest, ProjectRefBody};
+use crate::api::{
+    self, OutcomeWriteBody, ProjectAddRequest, ProjectRefBody, ProjectScanRequest,
+    ProjectSetRequest,
+};
 use crate::config::{DEFAULT_SERVE_PORT, loopback_addr, require_loopback};
 use crate::error::CoordinatorError;
 
@@ -19,6 +22,8 @@ pub fn app() -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/projects", get(list_projects).post(add_project))
+        .route("/v1/projects/set", post(set_project))
+        .route("/v1/projects/scan", post(scan_projects))
         .route("/v1/status", get(get_status))
         .route("/v1/run", post(post_run))
         .route("/v1/pause", post(post_pause))
@@ -37,8 +42,24 @@ async fn list_projects() -> Result<impl IntoResponse, ApiError> {
 }
 
 async fn add_project(Json(body): Json<ProjectAddRequest>) -> Result<impl IntoResponse, ApiError> {
-    let rec = api::project_add(std::path::Path::new(&body.path))?;
+    let rec = api::project_add_request(body)?;
     Ok((StatusCode::CREATED, Json(rec)))
+}
+
+async fn set_project(Json(body): Json<ProjectSetRequest>) -> Result<impl IntoResponse, ApiError> {
+    let rec = api::project_set_request(body)?;
+    Ok(Json(rec))
+}
+
+async fn scan_projects(
+    Json(body): Json<ProjectScanRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (candidates, added) = api::project_scan(&body.roots, body.add)?;
+    Ok(Json(json!({
+        "candidates": candidates,
+        "added": added,
+        "mode": if body.add { "add" } else { "dry-run" },
+    })))
 }
 
 #[derive(Debug, Deserialize)]
