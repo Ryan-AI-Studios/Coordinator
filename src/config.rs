@@ -179,40 +179,55 @@ pub fn load_machine_config_at(path: &Path) -> Result<MachineConfig> {
         return Ok(MachineConfig::default());
     }
     let text = std::fs::read_to_string(path)?;
-    let cfg: MachineConfig = serde_json::from_str(&text)?;
+    let mut cfg: MachineConfig = serde_json::from_str(&text)?;
     if cfg.version != MACHINE_CONFIG_VERSION {
         return Err(CoordinatorError::Message(format!(
             "unsupported machine config version {}; expected {MACHINE_CONFIG_VERSION}",
             cfg.version
         )));
     }
+    cfg.scan_roots = normalize_scan_roots(&cfg.scan_roots)?;
     Ok(cfg)
 }
 
 pub fn save_machine_config(cfg: &MachineConfig) -> Result<()> {
+    let mut cfg = cfg.clone();
+    cfg.scan_roots = normalize_scan_roots(&cfg.scan_roots)?;
     let path = machine_config_path()?;
-    atomic_write_json(&path, cfg)
+    atomic_write_json(&path, &cfg)
+}
+
+/// Require absolute scan roots (canonicalize when existing).
+pub fn normalize_scan_root(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(CoordinatorError::Message(
+            "scan root must not be empty".into(),
+        ));
+    }
+    if path.is_absolute() {
+        if path.exists() {
+            return crate::registry::canonicalize_path(path);
+        }
+        return Ok(path.to_path_buf());
+    }
+    if path.exists() {
+        return crate::registry::canonicalize_path(path);
+    }
+    Err(CoordinatorError::Message(format!(
+        "scan root must be absolute (or existing): {}",
+        path.display()
+    )))
+}
+
+fn normalize_scan_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    roots.iter().map(|p| normalize_scan_root(p)).collect()
 }
 
 /// Resolve scan roots for one invocation: explicit `--root` flags win / extend;
 /// otherwise use config `scan_roots`.
 pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     if !explicit.is_empty() {
-        return explicit
-            .iter()
-            .map(|p| {
-                if p.is_absolute() {
-                    Ok(p.clone())
-                } else if p.exists() {
-                    crate::registry::canonicalize_path(p)
-                } else {
-                    Err(CoordinatorError::Message(format!(
-                        "scan root must be absolute (or existing): {}",
-                        p.display()
-                    )))
-                }
-            })
-            .collect();
+        return normalize_scan_roots(explicit);
     }
     Ok(load_machine_config()?.scan_roots)
 }
@@ -284,5 +299,21 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_STATE_DIR);
         }
+    }
+
+    #[test]
+    fn reject_relative_scan_root_in_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"version":1,"scan_roots":["relative\\scan"]}"#).unwrap();
+        let err = load_machine_config_at(&path).unwrap_err();
+        assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn normalize_scan_root_accepts_absolute() {
+        let p = PathBuf::from(r"C:\dev");
+        let n = normalize_scan_root(&p).unwrap();
+        assert!(n.is_absolute());
     }
 }

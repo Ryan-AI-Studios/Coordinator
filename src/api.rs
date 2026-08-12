@@ -367,7 +367,7 @@ pub fn cmd_wait(project: Option<&str>, timeout_secs: u64) -> Result<StatusView> 
 /// Persist a scan root into machine config (optional convenience).
 pub fn save_scan_root(root: &Path) -> Result<config::MachineConfig> {
     let mut cfg = config::load_machine_config()?;
-    let path = root.to_path_buf();
+    let path = config::normalize_scan_root(root)?;
     if !cfg.scan_roots.iter().any(|r| r == &path) {
         cfg.scan_roots.push(path);
         config::save_machine_config(&cfg)?;
