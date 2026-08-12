@@ -198,7 +198,21 @@ pub fn save_machine_config(cfg: &MachineConfig) -> Result<()> {
 /// otherwise use config `scan_roots`.
 pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     if !explicit.is_empty() {
-        return Ok(explicit.to_vec());
+        return explicit
+            .iter()
+            .map(|p| {
+                if p.is_absolute() {
+                    Ok(p.clone())
+                } else if p.exists() {
+                    crate::registry::canonicalize_path(p)
+                } else {
+                    Err(CoordinatorError::Message(format!(
+                        "scan root must be absolute (or existing): {}",
+                        p.display()
+                    )))
+                }
+            })
+            .collect();
     }
     Ok(load_machine_config()?.scan_roots)
 }

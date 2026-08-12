@@ -46,20 +46,56 @@ pub fn detect_profile_for_workspace(workspace: &Path) -> (LayoutProfile, Option<
     }
 }
 
+/// Stable absolute path for reporting **without** following reparse points when possible.
+///
+/// Prefer canonicalize only for normal directories. When the entry is a
+/// symlink/junction, keep the absolute path under the scan root so profile
+/// detection does not re-root into the junction target tree.
+fn scan_report_path(dir: &Path) -> PathBuf {
+    if is_reparse_point(dir) {
+        return absolute_no_follow(dir);
+    }
+    canonicalize_path(dir).unwrap_or_else(|_| absolute_no_follow(dir))
+}
+
+fn absolute_no_follow(dir: &Path) -> PathBuf {
+    if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(dir))
+            .unwrap_or_else(|_| dir.to_path_buf())
+    }
+}
+
+/// Best-effort: directory is a symlink (and on Windows, often a junction).
+fn is_reparse_point(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 fn consider_dir(dir: &Path, registry: &Registry, out: &mut Vec<ScanCandidate>) {
+    // Marker check uses the entry as listed. We do **not** recurse into descendants.
     if !dir.is_dir() || !has_conductor_marker(dir) {
         return;
     }
-    let path = canonicalize_path(dir).unwrap_or_else(|_| dir.to_path_buf());
-    // Dedupe by path
+    let path = scan_report_path(dir);
     if out.iter().any(|c| paths_equal(&c.path, &path)) {
         return;
     }
-    let already = registry
-        .projects
-        .iter()
-        .any(|p| paths_equal(&p.path, &path));
-    let (detected_profile, execution_repo_hint) = detect_profile_for_workspace(&path);
+    let already = registry.projects.iter().any(|p| {
+        paths_equal(&p.path, &path)
+            || canonicalize_path(dir)
+                .map(|c| paths_equal(&p.path, &c))
+                .unwrap_or(false)
+    });
+    // Reparse points: marker-only entry; do not walk target children for product hints.
+    let (detected_profile, execution_repo_hint) = if is_reparse_point(dir) {
+        (LayoutProfile::Nested, None)
+    } else {
+        detect_profile_for_workspace(dir)
+    };
     out.push(ScanCandidate {
         path,
         detected_profile,
@@ -81,7 +117,7 @@ pub fn scan_roots(roots: &[PathBuf], registry: &Registry) -> Result<Vec<ScanCand
         };
         for ent in entries.flatten() {
             let path = ent.path();
-            // Do not recurse; treat junctions/symlinks as this one directory only.
+            // Immediate children only. Reparse points are single entries (marker only).
             if path.is_dir() {
                 consider_dir(&path, registry, &mut out);
             }
@@ -172,5 +208,43 @@ mod tests {
         let (profile, exec) = detect_profile_for_workspace(dir.path());
         assert_eq!(profile, LayoutProfile::SingleRoot);
         assert_eq!(exec.as_ref().unwrap(), dir.path());
+    }
+
+    #[test]
+    fn reparse_point_is_marker_only_no_target_execution_hint() {
+        // Symlink directory: if the OS allows creating one, ensure we do not
+        // surface the target's nested product as execution_repo_hint.
+        let root = tempdir().unwrap();
+        let real = fixture_project(root.path(), "RealProj");
+        let product = real.join("ProductApp");
+        std::fs::create_dir_all(&product).unwrap();
+        std::fs::write(product.join("Cargo.toml"), "[package]\nname=\"p\"\n").unwrap();
+
+        let link = root.path().join("LinkProj");
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_dir(&real, &link).is_ok();
+        #[cfg(not(windows))]
+        let created = std::os::unix::fs::symlink(&real, &link).is_ok();
+
+        if !created {
+            // CI/agent without symlink privilege — skip without failing the suite.
+            return;
+        }
+        assert!(is_reparse_point(&link));
+        let reg = Registry::default();
+        let hits = scan_roots(&[root.path().to_path_buf()], &reg).unwrap();
+        let link_hit = hits.iter().find(|h| {
+            h.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("LinkProj"))
+        });
+        if let Some(hit) = link_hit {
+            assert!(
+                hit.execution_repo_hint.is_none(),
+                "reparse entry must not inherit target product auto-detect"
+            );
+            assert_eq!(hit.detected_profile, LayoutProfile::Nested);
+        }
     }
 }

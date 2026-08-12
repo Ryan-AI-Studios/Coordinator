@@ -131,8 +131,14 @@ impl Registry {
                 .map(|s| s.to_string_lossy().into_owned())
         });
 
-        let mut execution_repo = opts.execution_repo;
-        let mut execution_repos = opts.execution_repos;
+        let mut execution_repo = opts
+            .execution_repo
+            .map(|p| prefer_absolute_path(&p))
+            .transpose()?;
+        let mut execution_repos = BTreeMap::new();
+        for (k, v) in opts.execution_repos {
+            execution_repos.insert(k, prefer_absolute_path(&v)?);
+        }
 
         // Nested auto-detect when primary not provided.
         if execution_repo.is_none() && opts.layout_profile == LayoutProfile::Nested {
@@ -146,15 +152,24 @@ impl Registry {
                 .or_insert_with(|| exec.clone());
         }
 
+        let conductor_dir = opts
+            .conductor_dir
+            .map(|p| prefer_absolute_path(&p))
+            .transpose()?;
+        let state_dir = opts
+            .state_dir
+            .map(|p| prefer_absolute_path(&p))
+            .transpose()?;
+
         let record = ProjectRecord {
             id: Uuid::new_v4().to_string(),
             path: canonical,
             display_name,
             layout_profile: opts.layout_profile,
-            conductor_dir: opts.conductor_dir,
+            conductor_dir,
             execution_repo,
             execution_repos,
-            state_dir: opts.state_dir,
+            state_dir,
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
@@ -176,23 +191,27 @@ impl Registry {
         if opts.clear_execution_repo {
             rec.execution_repo = None;
         } else if let Some(p) = opts.execution_repo {
-            rec.execution_repo = Some(p);
+            rec.execution_repo = Some(prefer_absolute_path(&p)?);
         }
         if opts.clear_conductor_dir {
             rec.conductor_dir = None;
         } else if let Some(p) = opts.conductor_dir {
-            rec.conductor_dir = Some(p);
+            rec.conductor_dir = Some(prefer_absolute_path(&p)?);
         }
         if opts.clear_state_dir {
             rec.state_dir = None;
         } else if let Some(p) = opts.state_dir {
-            rec.state_dir = Some(p);
+            rec.state_dir = Some(prefer_absolute_path(&p)?);
         }
         if let Some(n) = opts.display_name {
             rec.display_name = Some(n);
         }
         if let Some(map) = opts.execution_repos {
-            rec.execution_repos = map;
+            let mut abs = BTreeMap::new();
+            for (k, v) in map {
+                abs.insert(k, prefer_absolute_path(&v)?);
+            }
+            rec.execution_repos = abs;
         }
         if let (Some(name), Some(exec)) = (&opts.execution_repo_name, &rec.execution_repo) {
             rec.execution_repos
@@ -264,6 +283,26 @@ pub fn canonicalize_path(path: &Path) -> Result<PathBuf> {
         CoordinatorError::Message(format!("cannot canonicalize {}: {e}", path.display()))
     })?;
     Ok(canon)
+}
+
+/// Prefer absolute path for stored bindings: canonicalize when the path exists,
+/// else require absolute (reject bare relative so cwd cannot drift later).
+pub fn prefer_absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(CoordinatorError::Message(
+            "path binding must not be empty".into(),
+        ));
+    }
+    if path.exists() {
+        return canonicalize_path(path);
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Err(CoordinatorError::Message(format!(
+        "path binding must be absolute (or an existing path): {}",
+        path.display()
+    )))
 }
 
 /// Case-insensitive path equality on Windows for registry dedupe / scan.
@@ -428,5 +467,42 @@ mod tests {
             paths_equal(&exec, &canonicalize_path(&product).unwrap())
                 || exec.ends_with("ProductApp")
         );
+    }
+
+    #[test]
+    fn set_does_not_mutate_workspace_path() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let original = rec.path.clone();
+        let updated = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    layout_profile: Some(LayoutProfile::SingleRoot),
+                    execution_repo: Some(PathBuf::from(r"C:\dev\stale")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.path, original);
+        assert_eq!(updated.layout_profile, LayoutProfile::SingleRoot);
+    }
+
+    #[test]
+    fn reject_relative_execution_repo_binding() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let err = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    execution_repo: Some(PathBuf::from("relative\\not\\absolute")),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("absolute"));
     }
 }

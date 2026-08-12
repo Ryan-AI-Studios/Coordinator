@@ -145,11 +145,11 @@ pub struct StatusView {
     /// Layout profile (nested | multi_sibling | single_root).
     #[serde(default)]
     pub layout_profile: crate::layout::LayoutProfile,
-    /// Resolved primary execution repo (null when nested and unknown).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Resolved primary execution repo (`null` when nested and unknown).
+    #[serde(default)]
     pub execution_repo: Option<PathBuf>,
     /// Resolved conductor directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub conductor_dir: Option<PathBuf>,
 }
 
@@ -418,6 +418,19 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_STATE_DIR);
         }
+    }
+
+    #[test]
+    fn status_serializes_null_execution_repo() {
+        let dir = tempdir().unwrap();
+        let rec = sample_record(dir.path());
+        let state = RunState::idle(&rec.id);
+        let view = StatusView::from_record(&rec, &state);
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json.as_object().unwrap().contains_key("execution_repo"));
+        assert!(json["execution_repo"].is_null());
+        assert!(json.as_object().unwrap().contains_key("conductor_dir"));
+        assert_eq!(json["layout_profile"], "nested");
     }
 
     #[test]
