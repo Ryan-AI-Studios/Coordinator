@@ -50,7 +50,7 @@ cargo run -- --help
 
 Ledgerful verify steps (when configured) must match these real cargo commands.
 
-Control Plane entrypoints (track 0004): `project add|list`, `run|status|pause|resume|stop`, `serve` (127.0.0.1:7420). See product README for env overrides (`COORDINATOR_HOME`, `COORDINATOR_STATE_DIR`).
+Control Plane entrypoints: `project add|list`, `run|status|pause|resume|stop`, `outcome write|show`, `wait`, `serve` (127.0.0.1:7420). Phase Outcome tests: `cargo test outcome`. Env overrides: `COORDINATOR_HOME`, `COORDINATOR_STATE_DIR`, `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`, `COORDINATOR_OUTCOME_POLL_MS`. See product README for the Phase Outcome contract.
 
 ## Code style
 

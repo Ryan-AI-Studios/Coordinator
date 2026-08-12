@@ -22,12 +22,20 @@ pub enum CoordinatorError {
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// `coordinator wait` budget expired without an applied outcome (exit 2).
+    #[error("wait budget expired without an applied outcome")]
+    WaitBudgetExpired,
 }
 
 impl CoordinatorError {
     /// Suggested process exit code (non-zero on failure).
+    ///
+    /// Note: `wait` exit **2** means budget expired (not "failure outcome"). Scripts that
+    /// care about success-only must inspect `status` / `failure_class` after exit 0.
     pub fn exit_code(&self) -> i32 {
         match self {
+            Self::WaitBudgetExpired => 2,
             Self::InvalidTransition { .. } => 2,
             Self::ProjectNotFound(_) => 3,
             Self::NonLoopbackBind(_) => 4,
@@ -38,6 +46,7 @@ impl CoordinatorError {
     /// HTTP status for API responses.
     pub fn http_status(&self) -> u16 {
         match self {
+            Self::WaitBudgetExpired => 408,
             Self::InvalidTransition { .. } => 409,
             Self::ProjectNotFound(_) => 404,
             Self::NonLoopbackBind(_) => 400,

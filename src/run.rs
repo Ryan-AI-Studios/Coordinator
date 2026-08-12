@@ -1,43 +1,60 @@
 //! Stub-phase run state machine (ADR-0024 stop/pause).
 //!
-//! A project left in `Running` with phase `stub:active` does **not** advance
-//! or time out in track 0004 — timeouts/outcome watch are **0005+**.
+//! Phase completion and timeouts are driven by the Phase Outcome apply path
+//! ([`crate::outcome`]) and poll/wait ([`crate::watch`]) — track 0005.
 
 use crate::error::{CoordinatorError, Result};
+use crate::outcome::clear_active_outcome_file;
 use crate::registry::ProjectRecord;
 use crate::state::{
-    RunState, RunStatus, STOP_LAST_EVENT, STUB_PHASE_ACTIVE, STUB_PHASE_STOPPED, StatusView,
-    ensure_state_dir, load_run_state, save_run_state,
+    RunState, RunStatus, STOP_LAST_EVENT, STUB_PHASE_ACTIVE, STUB_PHASE_COMPLETED,
+    STUB_PHASE_FAILED, STUB_PHASE_STOPPED, StatusView, ensure_state_dir, load_run_state,
+    save_run_state, with_run_state_lock,
 };
 
 /// Apply `run`: Idle/Stopped → Running.
+///
+/// If `--track` is omitted, prior `track_id` is **retained** (0004 absorb / 0005 docs).
 pub fn run(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusView> {
-    ensure_state_dir(record)?;
-    let mut state = load_run_state(record)?;
-    match state.status {
-        RunStatus::Idle | RunStatus::Stopped => {
-            state.status = RunStatus::Running;
-            state.phase = STUB_PHASE_ACTIVE.into();
-            if track_id.is_some() {
-                state.track_id = track_id;
+    with_run_state_lock(record, || {
+        ensure_state_dir(record)?;
+        let mut state = load_run_state(record)?;
+        match state.status {
+            RunStatus::Idle | RunStatus::Stopped => {
+                state.status = RunStatus::Running;
+                state.phase = STUB_PHASE_ACTIVE.into();
+                if track_id.is_some() {
+                    state.track_id = track_id;
+                }
+                // Fresh run epoch + phase clock; invalidate prior consume markers.
+                state.run_epoch = state.run_epoch.saturating_add(1);
+                state.phase_started_at = Some(chrono::Utc::now());
+                state.total_paused_ms = 0;
+                state.pause_started_at = None;
+                state.failure_class = None;
+                state.last_applied_outcome_hash = None;
+                state.last_event = "run: started stub".into();
+                state.updated_at = chrono::Utc::now();
+                // Drop any leftover active outcome so a prior Idle/Stopped write cannot
+                // complete this new run (stale defense when run_epoch is omitted).
+                clear_active_outcome_file(record);
+                save_run_state(record, &state)?;
+                Ok(StatusView::from_record(record, &state))
             }
-            state.last_event = "run: started stub".into();
-            state.updated_at = chrono::Utc::now();
-            save_run_state(record, &state)?;
-            Ok(StatusView::from_record(record, &state))
+            other => Err(CoordinatorError::InvalidTransition {
+                action: "run",
+                from: other.to_string(),
+            }),
         }
-        other => Err(CoordinatorError::InvalidTransition {
-            action: "run",
-            from: other.to_string(),
-        }),
-    }
+    })
 }
 
-/// Apply `pause`: Running → Paused.
+/// Apply `pause`: Running → Paused (timeout budget freezes).
 pub fn pause(record: &ProjectRecord) -> Result<StatusView> {
     transition(record, "pause", |state| match state.status {
         RunStatus::Running => {
             state.status = RunStatus::Paused;
+            state.pause_started_at = Some(chrono::Utc::now());
             state.last_event = "pause: hold stub".into();
             Ok(())
         }
@@ -48,12 +65,34 @@ pub fn pause(record: &ProjectRecord) -> Result<StatusView> {
     })
 }
 
-/// Apply `resume`: Paused → Running.
+/// Apply `resume`: Paused → Running (accumulate paused duration for timeout freeze).
+///
+/// If the phase already completed/failed while held, release to Idle instead of
+/// re-entering `Running` without a phase clock (would hang forever under autonomy).
 pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
     transition(record, "resume", |state| match state.status {
         RunStatus::Paused => {
+            if state.phase == STUB_PHASE_COMPLETED || state.phase == STUB_PHASE_FAILED {
+                state.status = RunStatus::Idle;
+                state.pause_started_at = None;
+                state.phase_started_at = None;
+                state.last_event = "resume: release hold after phase outcome".into();
+                return Ok(());
+            }
+            let now = chrono::Utc::now();
+            if let Some(pstart) = state.pause_started_at.take() {
+                let delta = (now - pstart).num_milliseconds().max(0) as u64;
+                state.total_paused_ms = state.total_paused_ms.saturating_add(delta);
+            }
             state.status = RunStatus::Running;
-            state.phase = STUB_PHASE_ACTIVE.into();
+            if state.phase.is_empty() {
+                state.phase = STUB_PHASE_ACTIVE.into();
+            }
+            // Ensure timeout clock exists if it was cleared unexpectedly.
+            if state.phase_started_at.is_none() {
+                state.phase_started_at = Some(now);
+                state.total_paused_ms = 0;
+            }
             state.last_event = "resume: continue stub".into();
             Ok(())
         }
@@ -66,31 +105,35 @@ pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
 
 /// Apply `stop`: Running/Paused → Stopped; already Stopped = successful no-op.
 pub fn stop(record: &ProjectRecord) -> Result<StatusView> {
-    ensure_state_dir(record)?;
-    let mut state = load_run_state(record)?;
-    match state.status {
-        RunStatus::Running | RunStatus::Paused => {
-            state.status = RunStatus::Stopped;
-            state.phase = STUB_PHASE_STOPPED.into();
-            state.last_event = STOP_LAST_EVENT.into();
-            state.updated_at = chrono::Utc::now();
-            save_run_state(record, &state)?;
-            Ok(StatusView::from_record(record, &state))
-        }
-        RunStatus::Stopped => {
-            // Idempotent re-stop: successful no-op (ADR / DoD-2).
-            if state.last_event != STOP_LAST_EVENT {
+    with_run_state_lock(record, || {
+        ensure_state_dir(record)?;
+        let mut state = load_run_state(record)?;
+        match state.status {
+            RunStatus::Running | RunStatus::Paused => {
+                state.status = RunStatus::Stopped;
+                state.phase = STUB_PHASE_STOPPED.into();
                 state.last_event = STOP_LAST_EVENT.into();
+                state.phase_started_at = None;
+                state.pause_started_at = None;
                 state.updated_at = chrono::Utc::now();
                 save_run_state(record, &state)?;
+                Ok(StatusView::from_record(record, &state))
             }
-            Ok(StatusView::from_record(record, &state))
+            RunStatus::Stopped => {
+                // Idempotent re-stop: successful no-op (ADR / DoD-2).
+                if state.last_event != STOP_LAST_EVENT {
+                    state.last_event = STOP_LAST_EVENT.into();
+                    state.updated_at = chrono::Utc::now();
+                    save_run_state(record, &state)?;
+                }
+                Ok(StatusView::from_record(record, &state))
+            }
+            other => Err(CoordinatorError::InvalidTransition {
+                action: "stop",
+                from: other.to_string(),
+            }),
         }
-        other => Err(CoordinatorError::InvalidTransition {
-            action: "stop",
-            from: other.to_string(),
-        }),
-    }
+    })
 }
 
 /// Read status without mutation.
@@ -103,12 +146,14 @@ fn transition<F>(record: &ProjectRecord, _action: &str, f: F) -> Result<StatusVi
 where
     F: FnOnce(&mut RunState) -> Result<()>,
 {
-    ensure_state_dir(record)?;
-    let mut state = load_run_state(record)?;
-    f(&mut state)?;
-    state.updated_at = chrono::Utc::now();
-    save_run_state(record, &state)?;
-    Ok(StatusView::from_record(record, &state))
+    with_run_state_lock(record, || {
+        ensure_state_dir(record)?;
+        let mut state = load_run_state(record)?;
+        f(&mut state)?;
+        state.updated_at = chrono::Utc::now();
+        save_run_state(record, &state)?;
+        Ok(StatusView::from_record(record, &state))
+    })
 }
 
 #[cfg(test)]

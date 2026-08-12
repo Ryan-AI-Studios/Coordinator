@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{self, ProjectAddRequest, ProjectRefBody};
+use crate::api::{self, OutcomeWriteBody, ProjectAddRequest, ProjectRefBody};
 use crate::config::{DEFAULT_SERVE_PORT, loopback_addr, require_loopback};
 use crate::error::CoordinatorError;
 
@@ -24,6 +24,7 @@ pub fn app() -> Router {
         .route("/v1/pause", post(post_pause))
         .route("/v1/resume", post(post_resume))
         .route("/v1/stop", post(post_stop))
+        .route("/v1/outcome", get(get_outcome).post(post_outcome))
 }
 
 async fn health() -> impl IntoResponse {
@@ -80,7 +81,23 @@ async fn post_stop(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse
     Ok(Json(view))
 }
 
-/// Serve on loopback only.
+async fn post_outcome(Json(body): Json<OutcomeWriteBody>) -> Result<impl IntoResponse, ApiError> {
+    let view = api::cmd_outcome_post(body)?;
+    Ok(Json(view))
+}
+
+async fn get_outcome(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
+    match api::cmd_outcome_show(q.project.as_deref())? {
+        Some(o) => Ok(Json(json!(o)).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no current outcome file" })),
+        )
+            .into_response()),
+    }
+}
+
+/// Serve on loopback only; background task polls outcomes + timeouts.
 pub async fn serve(port: u16) -> Result<(), CoordinatorError> {
     require_loopback(crate::config::LOOPBACK)?;
     let addr = loopback_addr(port);
@@ -88,11 +105,20 @@ pub async fn serve(port: u16) -> Result<(), CoordinatorError> {
         .await
         .map_err(|e| CoordinatorError::Message(format!("bind {addr}: {e}")))?;
     eprintln!("coordinator serve listening on http://{addr}");
-    axum::serve(listener, app())
-        .with_graceful_shutdown(shutdown_signal())
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let poll_handle = tokio::spawn(crate::watch::serve_poll_loop(shutdown_rx));
+
+    let result = axum::serve(listener, app())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        })
         .await
-        .map_err(|e| CoordinatorError::Message(format!("server error: {e}")))?;
-    Ok(())
+        .map_err(|e| CoordinatorError::Message(format!("server error: {e}")));
+
+    let _ = poll_handle.await;
+    result
 }
 
 /// Explicit bind with IP validation (for tests / future config).
@@ -156,16 +182,10 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ENV_COORDINATOR_HOME;
+    use crate::config::{ENV_COORDINATOR_HOME, test_env_lock};
     use http_body_util::BodyExt;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
     use tower::ServiceExt;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[tokio::test]
     async fn health_ok() {
@@ -188,10 +208,10 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn projects_add_and_status() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = test_env_lock();
         let home = tempdir().unwrap();
         let proj = tempdir().unwrap();
-        // SAFETY: serialized by env_lock; restored before guard drop.
+        // SAFETY: serialized by test_env_lock; restored before guard drop.
         unsafe {
             std::env::set_var(ENV_COORDINATOR_HOME, home.path());
         }
@@ -230,6 +250,73 @@ mod tests {
         assert!(v.get("path").is_some());
         assert!(v.get("phase").is_some());
         assert!(v.get("last_event").is_some());
+        assert!(v.get("run_epoch").is_some());
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn post_outcome_success() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+
+        let body = serde_json::to_vec(&json!({ "path": proj.path().to_string_lossy() })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let run_body = serde_json::to_vec(&json!({})).unwrap();
+        let _ = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(run_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let outcome_body = serde_json::to_vec(&json!({
+            "phase": "stub:active",
+            "status": "success",
+            "source": "http",
+            "message": "via api"
+        }))
+        .unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/outcome")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(outcome_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "Idle");
+        assert_eq!(v["phase"], "stub:completed");
 
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);

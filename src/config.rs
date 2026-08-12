@@ -18,6 +18,37 @@ pub const ENV_COORDINATOR_HOME: &str = "COORDINATOR_HOME";
 /// When set, each project uses `{COORDINATOR_STATE_DIR}/{project_id}/run-state.json`.
 pub const ENV_COORDINATOR_STATE_DIR: &str = "COORDINATOR_STATE_DIR";
 
+/// Env: stub phase wall budget in seconds (default 300). Timeout → failure_class=timeout.
+pub const ENV_STUB_PHASE_TIMEOUT_SECS: &str = "COORDINATOR_STUB_PHASE_TIMEOUT_SECS";
+
+/// Env: outcome file poll interval in milliseconds (default 500).
+pub const ENV_OUTCOME_POLL_MS: &str = "COORDINATOR_OUTCOME_POLL_MS";
+
+/// Default stub phase budget (seconds) for `stub:active`.
+pub const DEFAULT_STUB_PHASE_TIMEOUT_SECS: u64 = 300;
+
+/// Default poll interval for outcome wait / serve (milliseconds).
+pub const DEFAULT_OUTCOME_POLL_MS: u64 = 500;
+
+/// Resolve stub phase timeout duration.
+pub fn stub_phase_timeout() -> std::time::Duration {
+    let secs = std::env::var(ENV_STUB_PHASE_TIMEOUT_SECS)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STUB_PHASE_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Resolve outcome poll interval.
+pub fn outcome_poll_interval() -> std::time::Duration {
+    let ms = std::env::var(ENV_OUTCOME_POLL_MS)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_OUTCOME_POLL_MS)
+        .max(1);
+    std::time::Duration::from_millis(ms)
+}
+
 /// Resolve machine home: `COORDINATOR_HOME` or `%LOCALAPPDATA%\coordinator` (Windows)
 /// / `~/.local/share/coordinator` (other).
 pub fn machine_home() -> Result<PathBuf> {
@@ -84,6 +115,19 @@ pub fn require_loopback(ip: IpAddr) -> Result<()> {
 /// Optional global state-dir override from env.
 pub fn state_dir_override() -> Option<PathBuf> {
     std::env::var_os(ENV_COORDINATOR_STATE_DIR).map(PathBuf::from)
+}
+
+/// Process-wide lock for tests that mutate env vars affecting paths/timeouts.
+///
+/// All tests that set `COORDINATOR_HOME`, `COORDINATOR_STATE_DIR`,
+/// `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`, or `COORDINATOR_OUTCOME_POLL_MS` must
+/// hold this (survives poison so one failure does not cascade).
+#[cfg(test)]
+pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let m = LOCK.get_or_init(|| Mutex::new(()));
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
