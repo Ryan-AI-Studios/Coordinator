@@ -14,13 +14,13 @@ https://github.com/Ryan-AI-Studios/Coordinator
 
 ```powershell
 cd C:\dev\coordinator\coordinator   # or your clone root
-cargo fmt
+cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo run
 ```
 
-CI (GitHub Actions) runs `fmt --check`, `clippy -D warnings`, and `test` on `windows-latest`.
+Same gate as CI and ledgerful verify: `fmt --check`, `clippy -D warnings`, and `test` on `windows-latest`.
 
 ## Tools (product cwd only)
 
