@@ -13,7 +13,7 @@ use crate::persist::atomic_write_json;
 use crate::registry::ProjectRecord;
 use crate::state::{
     RunState, RunStatus, STUB_PHASE_COMPLETED, STUB_PHASE_FAILED, StatusView, ensure_state_dir,
-    load_run_state, resolve_state_dir, save_run_state,
+    load_run_state, resolve_state_dir, save_run_state, with_run_state_lock,
 };
 
 /// Cap for free-text message when copied into `last_event`.
@@ -342,11 +342,13 @@ fn apply_lock() -> &'static Mutex<()> {
 /// Single entry for mutating run-state from a Phase Outcome.
 ///
 /// CLI / HTTP / file poll / timeout synthesizer must call this (not hand-roll transitions).
+/// Serializes with a process mutex **and** a cross-process state-dir lock so concurrent
+/// CLI vs `serve` first-commit-wins (no last-writer-wins on run-state).
 pub fn apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView> {
     let _guard = apply_lock()
         .lock()
         .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
-    apply_locked(record, outcome)
+    with_run_state_lock(record, || apply_locked(record, outcome))
 }
 
 fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView> {

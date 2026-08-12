@@ -204,6 +204,46 @@ pub fn ensure_state_dir(record: &ProjectRecord) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Cross-process exclusive lock for run-state mutation (mkdir is atomic).
+///
+/// Held across load → decide → save so concurrent CLI vs serve first-commit-wins.
+/// Stale locks older than 60s are broken (process crash recovery).
+pub fn with_run_state_lock<T, F>(record: &ProjectRecord, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    ensure_state_dir(record)?;
+    let lock_path = resolve_state_dir(record).join(".run-state.lock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match std::fs::create_dir(&lock_path) {
+            Ok(()) => {
+                let result = f();
+                let _ = std::fs::remove_dir(&lock_path);
+                return result;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Break stale lock if older than 60s.
+                if let Ok(meta) = std::fs::metadata(&lock_path)
+                    && let Ok(modified) = meta.modified()
+                    && let Ok(age) = std::time::SystemTime::now().duration_since(modified)
+                    && age > std::time::Duration::from_secs(60)
+                {
+                    let _ = std::fs::remove_dir(&lock_path);
+                    continue;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(crate::error::CoordinatorError::Message(
+                        "timed out waiting for run-state lock".into(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
