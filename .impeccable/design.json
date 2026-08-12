@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-12T00:00:00.000Z",
+  "title": "Design System: Coordinator",
+  "extensions": {
+    "colorMeta": {
+      "bg": { "role": "neutral", "displayName": "Console Paper", "canonical": "#0f1419" },
+      "panel": { "role": "neutral", "displayName": "Panel", "canonical": "#1a222c" },
+      "panel-2": { "role": "neutral", "displayName": "Panel Raised", "canonical": "#232d3a" },
+      "ink": { "role": "neutral", "displayName": "Console Ink", "canonical": "#e8eef4" },
+      "muted": { "role": "neutral", "displayName": "Muted", "canonical": "#9aabbc" },
+      "line": { "role": "neutral", "displayName": "Line", "canonical": "#2f3b4a" },
+      "accent": { "role": "primary", "displayName": "Attention Signal", "canonical": "#e8a04a" },
+      "ok": { "role": "secondary", "displayName": "OK", "canonical": "#3dba7a" },
+      "bad": { "role": "secondary", "displayName": "Bad", "canonical": "#e05a5a" },
+      "info": { "role": "secondary", "displayName": "Info", "canonical": "#5b9fd4" }
+    },
+    "typographyMeta": {
+      "title": { "displayName": "Title", "purpose": "Surface and project names." },
+      "body": { "displayName": "Body", "purpose": "Operator guidance and notes." },
+      "label": { "displayName": "Label", "purpose": "Field labels and table headers." },
+      "mono": { "displayName": "Mono", "purpose": "IDs, paths, harness names, stats." }
+    },
+    "shadows": [],
+    "motion": [],
+    "breakpoints": [
+      { "name": "narrow", "value": "980px" }
+    ],
+    "cssVariables": {
+      "--bg": "#0f1419",
+      "--panel": "#1a222c",
+      "--panel-2": "#232d3a",
+      "--ink": "#e8eef4",
+      "--muted": "#9aabbc",
+      "--line": "#2f3b4a",
+      "--accent": "#e8a04a",
+      "--ok": "#3dba7a",
+      "--bad": "#e05a5a",
+      "--info": "#5b9fd4",
+      "--mono": "\"Cascadia Mono\", \"Consolas\", \"Courier New\", monospace",
+      "--sans": "\"Segoe UI\", system-ui, sans-serif"
+    }
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Pause / Resume / primary operator action.",
+      "html": "<button class=\"ds-btn-primary\" type=\"button\">Pause</button>",
+      "css": ".ds-btn-primary { font: inherit; border: 1px solid color-mix(in srgb, #e8a04a 45%, #2f3b4a); background: #232d3a; color: #ffe3b5; padding: 0.4rem 0.85rem; border-radius: 6px; } .ds-btn-primary:focus-visible { outline: 2px solid #5b9fd4; outline-offset: 2px; }"
+    },
+    {
+      "name": "Danger Button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "Stop — abort phase, no merge, sessions left for attach.",
+      "html": "<button class=\"ds-btn-danger\" type=\"button\">Stop</button>",
+      "css": ".ds-btn-danger { font: inherit; border: 1px solid color-mix(in srgb, #e05a5a 50%, #2f3b4a); background: #232d3a; color: #ffc9c9; padding: 0.4rem 0.85rem; border-radius: 6px; } .ds-btn-danger:focus-visible { outline: 2px solid #5b9fd4; outline-offset: 2px; }"
+    },
+    {
+      "name": "Project Card",
+      "kind": "card",
+      "refersTo": "project-card",
+      "description": "Per-project status board unit.",
+      "html": "<article class=\"ds-project\"><h2>Coordinator</h2><p class=\"ds-path\">C:\\\\dev\\\\coordinator\\\\coordinator</p></article>",
+      "css": ".ds-project { background: #1a222c; border: 1px solid #2f3b4a; border-radius: 10px; padding: 0.9rem 1rem 1rem; color: #e8eef4; font-family: \"Segoe UI\", system-ui, sans-serif; } .ds-project h2 { margin: 0; font-size: 0.95rem; font-weight: 600; } .ds-path { margin: 0.25rem 0 0; font-family: \"Cascadia Mono\", Consolas, monospace; font-size: 0.72rem; color: #8b9aab; }"
+    },
+    {
+      "name": "Status Pill",
+      "kind": "chip",
+      "refersTo": "status-pill",
+      "description": "Running / attention / failed / paused / idle micro-label.",
+      "html": "<span class=\"ds-pill ds-pill-running\">running</span>",
+      "css": ".ds-pill { font-size: 0.68rem; font-weight: 600; padding: 0.18rem 0.5rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.04em; font-family: \"Segoe UI\", system-ui, sans-serif; } .ds-pill-running { background: color-mix(in srgb, #3dba7a 22%, transparent); color: #9df0c0; }"
+    },
+    {
+      "name": "Failure Artifact",
+      "kind": "custom",
+      "refersTo": "failure-artifact",
+      "description": "Hard-fail path, class, merge block, toast note.",
+      "html": "<div class=\"ds-artifact\"><h3>Failure Artifact</h3><p class=\"ds-v\">.coordinator/FAILURE.md</p></div>",
+      "css": ".ds-artifact { border: 1px solid color-mix(in srgb, #e05a5a 45%, #2f3b4a); border-radius: 10px; background: color-mix(in srgb, #e05a5a 8%, #232d3a); padding: 0.55rem 0.7rem; color: #f0c0c0; font-family: \"Segoe UI\", system-ui, sans-serif; } .ds-artifact h3 { margin: 0 0 0.35rem; font-size: 0.78rem; color: #ffb0b0; } .ds-v { margin: 0; font-family: \"Cascadia Mono\", Consolas, monospace; font-size: 0.72rem; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Local Ops Console",
+    "overview": "Coordinator’s Status Surface is an Operate product: dense enough for concurrent harness phases, calm enough for hours-long autonomous runs. Cool industrial neutrals with a scarce attention accent; flat tonal layering; Windows-native sans + Cascadia Mono.",
+    "keyCharacteristics": [
+      "Operate-mode dashboard grammar (scan, act, recover)",
+      "Cool neutral base with a single decisive accent",
+      "Monospace for IDs/paths; humanist sans for chrome",
+      "Anti-SaaS-template posture"
+    ],
+    "rules": [
+      { "name": "The One Alarm Rule", "body": "Accent color is for state that requires operator attention or a primary action—not section decoration.", "section": "colors" },
+      { "name": "The No Purple Gradient Rule", "body": "Reject default AI-dashboard purple-to-blue gradients and glassmorphism glow stacks.", "section": "colors" },
+      { "name": "The Scan Hierarchy Rule", "body": "Status tables and phase lists must remain readable at a glance.", "section": "typography" },
+      { "name": "The Status Board Rule", "body": "Default view answers track, phase, harness roles, failure without hunting nested cards.", "section": "layout" },
+      { "name": "The Flat Console Rule", "body": "Do not nest cards inside cards; use spacing, separators, and row selection.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do design for operator scan paths: track → phase → harness → failure class.",
+      "Do keep Stop/Pause and hard-failure presentation unmistakable.",
+      "Do leave room for monospaced IDs without breaking layout.",
+      "Do map new UI colors to live :root variables."
+    ],
+    "donts": [
+      "Don't use generic AI SaaS template aesthetics.",
+      "Don't invent cloud multi-tenant ops framing.",
+      "Don't bury Stop/Pause or failure state.",
+      "Don't reintroduce seed placeholders for fixed tokens."
+    ]
+  }
+}

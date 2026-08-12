@@ -49,7 +49,7 @@ Same-machine Windows session orchestrator with hybrid Completion Signals and a b
 ## Evidence on Hand
 
 - Product intent: planning tree `SHARED-UNDERSTANDING.md` and ADRs 0001–0028 (outside this git repo)
-- Product code today: Rust binary stub + CI; no Status Surface UI yet (mockup is track 0003)
+- Product code today: Rust binary stub + CI; Status Surface **mock** under `mock/status-surface.html` (track 0003); no live Control Plane yet
 - Design skills: project-scope Impeccable under `.agents/skills/impeccable/`
 
 ## Product Principles
