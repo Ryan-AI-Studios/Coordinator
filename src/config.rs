@@ -320,7 +320,10 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&parent).unwrap();
         let rel = PathBuf::from(&name);
-        assert!(rel.exists(), "fixture relative dir should exist after chdir");
+        assert!(
+            rel.exists(),
+            "fixture relative dir should exist after chdir"
+        );
         let err = normalize_scan_root(&rel).unwrap_err();
         assert!(err.to_string().contains("absolute"));
         std::env::set_current_dir(prev).unwrap();
