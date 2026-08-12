@@ -17,6 +17,9 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "process", "io-util"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.8.1"
+
 [dev-dependencies]
 http-body-util = "0.1.5"
 tempfile = "3.27.0"

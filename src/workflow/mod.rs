@@ -166,6 +166,7 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
                 auto_start(state, &id);
                 crate::outcome::clear_active_outcome_file(record);
                 crate::workflow::drive::clear_plan_review_artifacts(record);
+                crate::notify::clear_artifact(record);
             } else {
                 state.status = RunStatus::Idle;
                 state.last_event = format!("workflow: invalid next_track {id}");
@@ -580,6 +581,24 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
         }
+    }
+
+    #[test]
+    fn compact_skip_includes_adapter_error() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, None, WorkflowDriver::Adapter).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_COMPACT.into();
+        save_run_state(&r, &state).unwrap();
+        let view = tick(&r).unwrap().expect("compact");
+        assert!(
+            view.last_event.contains("compact: skipped —"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(view.failure_class.is_none());
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
     }
 
     #[test]

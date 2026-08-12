@@ -343,19 +343,44 @@ fn apply_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Commit returned by [`apply_locked`]. Notify is fired **after** both apply
+/// locks drop so WinRT toast COM cannot stall concurrent applies.
+struct ApplyCommit {
+    view: StatusView,
+    notify: Option<crate::notify::NotifyEvent>,
+}
+
 /// Single entry for mutating run-state from a Phase Outcome.
 ///
 /// CLI / HTTP / file poll / timeout synthesizer must call this (not hand-roll transitions).
 /// Serializes with a process mutex **and** a cross-process state-dir lock so concurrent
 /// CLI vs `serve` first-commit-wins (no last-writer-wins on run-state).
+///
+/// Hard-failure notify runs **after** both locks drop (track 0009).
 pub fn apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView> {
-    let _guard = apply_lock()
-        .lock()
-        .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
-    with_run_state_lock(record, || apply_locked(record, outcome))
+    let commit = {
+        let _guard = apply_lock()
+            .lock()
+            .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
+        with_run_state_lock(record, || apply_locked(record, outcome))?
+    };
+    fire_pending_notify(record, commit.notify);
+    Ok(refresh_failure_artifact(record, commit.view))
 }
 
-fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView> {
+fn fire_pending_notify(record: &ProjectRecord, pending: Option<crate::notify::NotifyEvent>) {
+    if let Some(event) = pending {
+        crate::notify::on_hard_failure(record, &event);
+    }
+}
+
+/// Artifact is written after apply locks drop; refresh the path on the returned view.
+fn refresh_failure_artifact(record: &ProjectRecord, mut view: StatusView) -> StatusView {
+    view.failure_artifact = crate::notify::artifact::existing_path(record);
+    view
+}
+
+fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCommit> {
     outcome.validate()?;
     ensure_state_dir(record)?;
     let hash = outcome_content_hash(&outcome)?;
@@ -363,7 +388,10 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusV
 
     // Idempotent re-apply of the same content.
     if base.last_applied_outcome_hash.as_deref() == Some(hash.as_str()) {
-        return Ok(StatusView::from_record(record, &base));
+        return Ok(ApplyCommit {
+            view: StatusView::from_record(record, &base),
+            notify: None,
+        });
     }
 
     // Optional stronger epoch check when the writer set it.
@@ -457,7 +485,10 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusV
     if fresh.last_applied_outcome_hash.as_deref() == Some(hash.as_str()) {
         // Peer already applied identical content.
         clear_active_outcome_file(record);
-        return Ok(StatusView::from_record(record, &fresh));
+        return Ok(ApplyCommit {
+            view: StatusView::from_record(record, &fresh),
+            notify: None,
+        });
     }
     if fresh.run_epoch != base.run_epoch
         || fresh.status != base.status
@@ -478,7 +509,29 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusV
     clear_active_outcome_file(record);
 
     save_run_state(record, &state)?;
-    Ok(StatusView::from_record(record, &state))
+
+    let notify = match outcome.status {
+        OutcomeStatus::Failure => outcome.failure_class.map(|class| {
+            let artifact_path = crate::notify::artifact::path(record)
+                .unwrap_or_else(|_| record.path.join(".coordinator").join("FAILURE.md"));
+            crate::notify::NotifyEvent {
+                project_id: record.id.clone(),
+                track_id: state.track_id.clone(),
+                phase: state.phase.clone(),
+                failure_class: class,
+                message: outcome.message.clone(),
+                last_event: state.last_event.clone(),
+                artifact_path,
+                written_at: outcome.written_at,
+                run_epoch: state.run_epoch,
+            }
+        }),
+        OutcomeStatus::Success => None,
+    };
+    Ok(ApplyCommit {
+        view: StatusView::from_record(record, &state),
+        notify,
+    })
 }
 
 /// Remove active `current.json` if present (non-fatal).
@@ -584,50 +637,59 @@ pub fn write_and_apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<
 /// Decision and commit share one lock so a concurrent `pause` cannot lose to a
 /// stale pre-lock timeout snapshot. Returns `Ok(None)` when not timed out.
 pub fn try_timeout_under_lock(record: &ProjectRecord) -> Result<Option<StatusView>> {
-    let _guard = apply_lock()
-        .lock()
-        .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
-    with_run_state_lock(record, || {
-        let state = load_run_state(record)?;
-        if state.status != RunStatus::Running {
-            return Ok(None);
-        }
-        let Some(_started) = state.phase_started_at else {
-            return Ok(None);
-        };
-        let budget = crate::workflow::timeout_for_phase(&state.phase);
-        let elapsed = state.effective_running_elapsed(Utc::now());
-        if elapsed < budget {
-            return Ok(None);
-        }
-        if state.phase == crate::workflow::graph::PHASE_COMPACT {
-            let outcome = PhaseOutcome::success(
+    let commit = {
+        let _guard = apply_lock()
+            .lock()
+            .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
+        with_run_state_lock(record, || {
+            let state = load_run_state(record)?;
+            if state.status != RunStatus::Running {
+                return Ok(None);
+            }
+            let Some(_started) = state.phase_started_at else {
+                return Ok(None);
+            };
+            let budget = crate::workflow::timeout_for_phase(&state.phase);
+            let elapsed = state.effective_running_elapsed(Utc::now());
+            if elapsed < budget {
+                return Ok(None);
+            }
+            if state.phase == crate::workflow::graph::PHASE_COMPACT {
+                let outcome = PhaseOutcome::success(
+                    state.phase.clone(),
+                    OutcomeSource::Timeout,
+                    Some("compact: skipped".into()),
+                    None,
+                    Some(state.run_epoch),
+                );
+                let _ = save_current_outcome(record, &outcome);
+                return apply_locked(record, outcome).map(Some);
+            }
+            if state.phase == crate::workflow::graph::PHASE_PLAN_REVIEW
+                && let Ok(Some(outcome)) =
+                    crate::workflow::drive::timeout_plan_review_outcome(record, &state)
+            {
+                let _ = save_current_outcome(record, &outcome);
+                return apply_locked(record, outcome).map(Some);
+            }
+            let outcome = PhaseOutcome::failure(
                 state.phase.clone(),
+                FailureClass::Timeout,
                 OutcomeSource::Timeout,
-                Some("compact: skipped".into()),
-                None,
+                Some("phase budget exceeded".into()),
                 Some(state.run_epoch),
             );
             let _ = save_current_outcome(record, &outcome);
-            return apply_locked(record, outcome).map(Some);
+            apply_locked(record, outcome).map(Some)
+        })?
+    };
+    match commit {
+        Some(c) => {
+            fire_pending_notify(record, c.notify);
+            Ok(Some(refresh_failure_artifact(record, c.view)))
         }
-        if state.phase == crate::workflow::graph::PHASE_PLAN_REVIEW
-            && let Ok(Some(outcome)) =
-                crate::workflow::drive::timeout_plan_review_outcome(record, &state)
-        {
-            let _ = save_current_outcome(record, &outcome);
-            return apply_locked(record, outcome).map(Some);
-        }
-        let outcome = PhaseOutcome::failure(
-            state.phase.clone(),
-            FailureClass::Timeout,
-            OutcomeSource::Timeout,
-            Some("phase budget exceeded".into()),
-            Some(state.run_epoch),
-        );
-        let _ = save_current_outcome(record, &outcome);
-        apply_locked(record, outcome).map(Some)
-    })
+        None => Ok(None),
+    }
 }
 
 /// Synthesize a timeout failure for the current phase and apply it.

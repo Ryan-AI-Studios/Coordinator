@@ -38,6 +38,7 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 | Role outcomes (plan-review) | `{state_dir}/outcomes/roles/{slug}.json` | parallel reviewer slots (`agy`, `opencode`) |
 | Review files | `{state_dir}/reviews/{slug}-review.md` | always; copied to track dir when resolvable |
 | Review Bundle | `{workspace}/AI-review.md` | assembled after plan-review join; track copy when present |
+| Failure Artifact | `{state_dir}/FAILURE.md` | written on hard failure (not operator stop/pause); cleared on fresh `run` |
 
 Empty `COORDINATOR_HOME` or `COORDINATOR_STATE_DIR` is rejected.
 
@@ -112,7 +113,21 @@ Status JSON includes additive `workflow` `{ id, driver, pending_roles }`.
 
 **`next_track`:** Planner writes `metadata.next_track`. On `advance` success: valid track dir → auto-start at `plan`; null/empty → Idle (`workflow: backlog clear`); unknown id → Idle (does not fail the completed track). Pause holds auto-start until resume.
 
-**Compact:** capability-gated; timeout/failure **skips** (not a hard gate).
+**Compact:** capability-gated; timeout/failure **skips** (not a hard gate). Adapter errors surface as `compact: skipped — {reason}` (still no Failure Artifact).
+
+### Failure Artifact + toast
+
+Hard failure (apply `status=failure`, including timeout synthesis and adapter fail) writes `{state_dir}/FAILURE.md` and best-effort shows a Windows toast. **Operator `stop` / `pause` do not notify** (stop is not a Failure Class). Toast errors never fail apply.
+
+| Item | Behavior |
+|------|----------|
+| Artifact | Atomic markdown: project/track/phase/class/epoch + fenced `last_event` / message + `recommended_action` (advisory — no auto-retry) |
+| Toast | `tauri-winrt-notification` 0.8.1, PowerShell AUMID (no installer). Title `Coordinator: {class}`. Disabled with `COORDINATOR_NOTIFY=off` |
+| Adapters | `NotifyAdapter` trait: Artifact + Toast + Log + Hermes stub. Hermes v1.x POSTs `NotifyEvent` JSON to a configured local inbound webhook — **not this crate** |
+| Surfaces | `coordinator failure show` prints the markdown; `GET /v1/failure` returns `{path, body}` or **404** |
+| Status | Additive `failure_artifact` path (`null` when the file is absent). Existing `failure_class` / `run_epoch` / `phase_started_at` / `next_track` are also on status JSON |
+
+`COORDINATOR_NOTIFY=off` is the CI / headless default path. `cargo test` never requires a visible toast (recording adapter).
 
 Skip slots (`cross-model-review`, `ci-wait`) synthesize success with `last_event` `skip: deferred to 0011` / `0010`.
 
@@ -210,6 +225,7 @@ coordinator outcome write --phase <id> --status success|failure
     [--failure-class <enum>] [--message <text>] [--project …]
     [--next-track <id>] [--source cli]
 coordinator outcome show [--project …]
+coordinator failure show [--project …]
 coordinator wait [--project …] [--timeout-secs N]
 coordinator harness grok start [--project …]
 coordinator harness grok prompt --text <…> | --file <path> [--project …]
@@ -219,7 +235,7 @@ coordinator harness grok shutdown [--project …]
 coordinator serve [--port <u16>]   # default 7420, 127.0.0.1 only
 ```
 
-HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver`), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), and optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists.
+HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver`), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), `failure_artifact` (path or `null`), and optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists.
 
 ### Phase Outcome schema v1
 
@@ -346,4 +362,4 @@ This is a **visual contract**, not product orchestration. Real start/resume is C
 
 ## Status
 
-Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool).
+Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool), **0008** (canonical workflow runner), **0009** (stop/pause + Failure Artifact + toast).

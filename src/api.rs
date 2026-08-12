@@ -364,6 +364,13 @@ pub fn cmd_outcome_show(project: Option<&str>) -> Result<Option<PhaseOutcome>> {
     load_current_outcome(rec)
 }
 
+/// Show `{state_dir}/FAILURE.md` if present (CLI / GET /v1/failure).
+pub fn cmd_failure_show(project: Option<&str>) -> Result<Option<crate::notify::FailureShow>> {
+    let reg = load_registry()?;
+    let rec = reg.resolve_project(project)?;
+    crate::notify::artifact::read(rec)
+}
+
 /// Block until outcome applied or wait budget expires.
 pub fn cmd_wait(project: Option<&str>, timeout_secs: u64) -> Result<StatusView> {
     let reg = load_registry()?;

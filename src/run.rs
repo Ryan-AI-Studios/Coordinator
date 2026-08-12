@@ -51,6 +51,7 @@ pub fn run_with_driver(
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);
                 crate::workflow::drive::clear_plan_review_artifacts(record);
+                crate::notify::clear_artifact(record);
                 save_run_state(record, &state)?;
                 Ok(StatusView::from_record(record, &state))
             }
@@ -88,6 +89,7 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.last_event = "run: started stub".into();
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);
+                crate::notify::clear_artifact(record);
                 save_run_state(record, &state)?;
                 Ok(StatusView::from_record(record, &state))
             }

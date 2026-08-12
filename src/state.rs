@@ -173,6 +173,9 @@ pub struct StatusView {
     /// Additive workflow object (`id`, `driver`, `pending_roles`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowView>,
+    /// Path to `{state_dir}/FAILURE.md` when present; `null` when absent.
+    #[serde(default)]
+    pub failure_artifact: Option<PathBuf>,
 }
 
 /// Status JSON `workflow` object (0008).
@@ -208,6 +211,7 @@ impl StatusView {
                 driver: state.driver.as_str().to_string(),
                 pending_roles: state.pending_roles.clone(),
             }),
+            failure_artifact: crate::notify::artifact::existing_path(record),
         }
     }
 }
@@ -469,6 +473,8 @@ mod tests {
         assert!(json["execution_repo"].is_null());
         assert!(json.as_object().unwrap().contains_key("conductor_dir"));
         assert_eq!(json["layout_profile"], "nested");
+        assert!(json.as_object().unwrap().contains_key("failure_artifact"));
+        assert!(json["failure_artifact"].is_null());
     }
 
     #[test]

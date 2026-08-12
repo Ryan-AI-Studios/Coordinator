@@ -30,6 +30,7 @@ pub fn app() -> Router {
         .route("/v1/resume", post(post_resume))
         .route("/v1/stop", post(post_stop))
         .route("/v1/outcome", get(get_outcome).post(post_outcome))
+        .route("/v1/failure", get(get_failure))
         .route("/v1/harness/grok/start", post(post_grok_start))
         .route("/v1/harness/grok/prompt", post(post_grok_prompt))
         .route("/v1/harness/grok/compact", post(post_grok_compact))
@@ -141,6 +142,17 @@ async fn post_grok_shutdown(
 ) -> Result<impl IntoResponse, ApiError> {
     let view = api::cmd_harness_grok_shutdown(body.project.as_deref()).await?;
     Ok(Json(view))
+}
+
+async fn get_failure(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
+    match api::cmd_failure_show(q.project.as_deref())? {
+        Some(v) => Ok(Json(v).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no failure artifact" })),
+        )
+            .into_response()),
+    }
 }
 
 async fn get_outcome(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
@@ -430,6 +442,101 @@ mod tests {
         assert!(v.get("layout_profile").is_some());
         assert!(v.as_object().unwrap().contains_key("execution_repo"));
         assert!(v.as_object().unwrap().contains_key("conductor_dir"));
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn get_failure_404_then_200() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+
+        let body = serde_json::to_vec(&json!({ "path": proj.path().to_string_lossy() })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let missing = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/failure")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let _ = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let fail_body = serde_json::to_vec(&json!({
+            "phase": "plan",
+            "status": "failure",
+            "failure_class": "timeout",
+            "source": "http",
+            "message": "budget"
+        }))
+        .unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/outcome")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(fail_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let shown = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/failure")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shown.status(), StatusCode::OK);
+        let bytes = shown.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["path"].as_str().unwrap_or("").ends_with("FAILURE.md"));
+        assert!(
+            v["body"]
+                .as_str()
+                .unwrap_or("")
+                .contains("failure_class: timeout")
+        );
 
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);

@@ -290,7 +290,8 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 ///
 /// All tests that set `COORDINATOR_HOME`, `COORDINATOR_STATE_DIR`,
 /// `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`, `COORDINATOR_PHASE_TIMEOUT_SECS`,
-/// `COORDINATOR_WORKFLOW_DRIVER`, or `COORDINATOR_OUTCOME_POLL_MS` must
+/// `COORDINATOR_WORKFLOW_DRIVER`, `COORDINATOR_OUTCOME_POLL_MS`, or
+/// `COORDINATOR_NOTIFY` must
 /// hold this (survives poison so one failure does not cascade).
 #[cfg(test)]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

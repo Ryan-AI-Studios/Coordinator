@@ -88,21 +88,52 @@ fn drive_compact(
     record: &ProjectRecord,
     state: &RunState,
 ) -> Result<Option<crate::state::StatusView>> {
-    let mut msg = "compact: skipped".to_string();
-    if state.driver == WorkflowDriver::Adapter
-        && let Ok(true) = try_compact(record)
-    {
-        msg = "compact: ok".into();
-    }
+    let msg = compact_message(record, state.driver);
     synth_success(record, state, Some(msg), OutcomeSource::Test)
 }
 
-fn try_compact(record: &ProjectRecord) -> Result<bool> {
+const COMPACT_REASON_CAP: usize = 200;
+
+fn compact_message(record: &ProjectRecord, driver: WorkflowDriver) -> String {
+    if driver != WorkflowDriver::Adapter {
+        return "compact: skipped".into();
+    }
+    match try_compact(record) {
+        CompactAttempt::Ok => "compact: ok".into(),
+        CompactAttempt::Skipped(None) => "compact: skipped".into(),
+        CompactAttempt::Skipped(Some(reason)) => {
+            format!("compact: skipped — {}", truncate_reason(&reason))
+        }
+    }
+}
+
+enum CompactAttempt {
+    Ok,
+    Skipped(Option<String>),
+}
+
+fn try_compact(record: &ProjectRecord) -> CompactAttempt {
     let selector = record.path.to_string_lossy().to_string();
     match block_on_async(crate::harness::compact(Some(&selector))) {
-        Ok(view) => Ok(view.skipped != Some(true) && view.error.is_none()),
-        Err(_) => Ok(false),
+        Ok(view) => {
+            if let Some(err) = view.error {
+                CompactAttempt::Skipped(Some(err))
+            } else if view.skipped == Some(true) {
+                CompactAttempt::Skipped(None)
+            } else {
+                CompactAttempt::Ok
+            }
+        }
+        Err(e) => CompactAttempt::Skipped(Some(e.to_string())),
     }
+}
+
+fn truncate_reason(msg: &str) -> String {
+    if msg.chars().count() <= COMPACT_REASON_CAP {
+        return msg.to_string();
+    }
+    let t: String = msg.chars().take(COMPACT_REASON_CAP).collect();
+    format!("{t}…")
 }
 
 fn drive_adapter(
