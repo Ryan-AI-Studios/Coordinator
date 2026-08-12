@@ -1,7 +1,7 @@
 //! Stub-phase run state machine (ADR-0024 stop/pause).
 //!
-//! A project left in `Running` with phase `stub:active` does **not** advance
-//! or time out in track 0004 — timeouts/outcome watch are **0005+**.
+//! Phase completion and timeouts are driven by the Phase Outcome apply path
+//! ([`crate::outcome`]) and poll/wait ([`crate::watch`]) — track 0005.
 
 use crate::error::{CoordinatorError, Result};
 use crate::registry::ProjectRecord;
@@ -11,6 +11,8 @@ use crate::state::{
 };
 
 /// Apply `run`: Idle/Stopped → Running.
+///
+/// If `--track` is omitted, prior `track_id` is **retained** (0004 absorb / 0005 docs).
 pub fn run(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusView> {
     ensure_state_dir(record)?;
     let mut state = load_run_state(record)?;
@@ -21,6 +23,13 @@ pub fn run(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusVie
             if track_id.is_some() {
                 state.track_id = track_id;
             }
+            // Fresh run epoch + phase clock; invalidate prior consume markers.
+            state.run_epoch = state.run_epoch.saturating_add(1);
+            state.phase_started_at = Some(chrono::Utc::now());
+            state.total_paused_ms = 0;
+            state.pause_started_at = None;
+            state.failure_class = None;
+            state.last_applied_outcome_hash = None;
             state.last_event = "run: started stub".into();
             state.updated_at = chrono::Utc::now();
             save_run_state(record, &state)?;
@@ -33,11 +42,12 @@ pub fn run(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusVie
     }
 }
 
-/// Apply `pause`: Running → Paused.
+/// Apply `pause`: Running → Paused (timeout budget freezes).
 pub fn pause(record: &ProjectRecord) -> Result<StatusView> {
     transition(record, "pause", |state| match state.status {
         RunStatus::Running => {
             state.status = RunStatus::Paused;
+            state.pause_started_at = Some(chrono::Utc::now());
             state.last_event = "pause: hold stub".into();
             Ok(())
         }
@@ -48,12 +58,21 @@ pub fn pause(record: &ProjectRecord) -> Result<StatusView> {
     })
 }
 
-/// Apply `resume`: Paused → Running.
+/// Apply `resume`: Paused → Running (accumulate paused duration for timeout freeze).
 pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
     transition(record, "resume", |state| match state.status {
         RunStatus::Paused => {
+            let now = chrono::Utc::now();
+            if let Some(pstart) = state.pause_started_at.take() {
+                let delta = (now - pstart).num_milliseconds().max(0) as u64;
+                state.total_paused_ms = state.total_paused_ms.saturating_add(delta);
+            }
             state.status = RunStatus::Running;
-            state.phase = STUB_PHASE_ACTIVE.into();
+            // Keep phase as-is when already advanced (e.g. success-while-paused);
+            // for active stub, ensure active phase string for outcome match.
+            if state.phase.is_empty() {
+                state.phase = STUB_PHASE_ACTIVE.into();
+            }
             state.last_event = "resume: continue stub".into();
             Ok(())
         }
@@ -73,6 +92,8 @@ pub fn stop(record: &ProjectRecord) -> Result<StatusView> {
             state.status = RunStatus::Stopped;
             state.phase = STUB_PHASE_STOPPED.into();
             state.last_event = STOP_LAST_EVENT.into();
+            state.phase_started_at = None;
+            state.pause_started_at = None;
             state.updated_at = chrono::Utc::now();
             save_run_state(record, &state)?;
             Ok(StatusView::from_record(record, &state))

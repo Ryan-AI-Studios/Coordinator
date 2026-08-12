@@ -24,17 +24,23 @@ Same gate as CI and ledgerful verify: `fmt --check`, `clippy -D warnings`, and `
 
 ## Control Plane (local CLI + HTTP)
 
-Minimal local Control Plane: machine **Project Registry**, per-project **run state**, **Stop / Pause / Resume** state machine (stub phases), and a **localhost-only** JSON API.
+Minimal local Control Plane: machine **Project Registry**, per-project **run state**, **Stop / Pause / Resume**, **Phase Outcome File** completion signals, and a **localhost-only** JSON API.
 
 | Store | Default (Windows) | Override |
 |-------|-------------------|----------|
 | Machine home (registry) | `%LOCALAPPDATA%\coordinator\` | `COORDINATOR_HOME` |
 | Registry file | `{home}/registry.json` | — |
 | Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
+| Active Phase Outcome | `{state_dir}/outcomes/current.json` | same state-dir rules |
+| Last applied outcome | `{state_dir}/outcomes/current.applied.json` | written on successful apply; `current.json` removed |
 
 **Local-only:** `coordinator serve` binds **`127.0.0.1` only** (default port **7420**, avoids Impeccable live 5500/8400). Non-loopback bind is rejected.
 
-**Stub phases:** a project left in `Running` with phase `stub:active` does **not** auto-advance or time out. Heartbeats / Phase Outcomes → later tracks (**0005+**).
+**Completion contract (hybrid):** the **Phase Outcome File** is the portable done-signal (schema `version: 1`). Hooks, adapters, CLI, and HTTP may write it; **ConPTY / chat pattern-match is not the contract**. Writers must use **temp + replace** (or `coordinator outcome write` / `POST /v1/outcome`) so pollers never read torn JSON.
+
+**Stub phase timeout:** while `Running`, phase `stub:active` has a wall budget (default **300s**, env `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`). Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path. Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
+
+**`run` without `--track`:** retains the prior `track_id` (intentional). Clearing track is a workflow concern for later tracks.
 
 ```powershell
 # Smoke (temp home + fake project)
@@ -45,17 +51,24 @@ New-Item -ItemType Directory -Force -Path $proj | Out-Null
 
 cargo run -- project add $proj
 cargo run -- project list
+cargo run -- run --project $proj --track 0005
+cargo run -- status --project $proj
+cargo run -- outcome write --project $proj --phase stub:active --status success
+cargo run -- status --project $proj
+# expect Idle / stub:completed
+
+# timeout smoke
+$env:COORDINATOR_STUB_PHASE_TIMEOUT_SECS = "2"
 cargo run -- run --project $proj
+cargo run -- wait --project $proj --timeout-secs 10
 cargo run -- status --project $proj
-cargo run -- pause --project $proj
-cargo run -- resume --project $proj
-cargo run -- stop --project $proj
-cargo run -- status --project $proj
+# expect Stopped / failure_class timeout
 
 # HTTP (separate terminal)
 cargo run -- serve --port 7420
 # Invoke-RestMethod http://127.0.0.1:7420/health
 # Invoke-RestMethod http://127.0.0.1:7420/v1/status
+# POST http://127.0.0.1:7420/v1/outcome  body = Phase Outcome JSON
 ```
 
 CLI surface:
@@ -68,10 +81,82 @@ coordinator run [--project <path|id>] [--track <id>]
 coordinator pause [--project <path|id>]
 coordinator resume [--project <path|id>]
 coordinator stop [--project <path|id>]
+coordinator outcome write --phase <id> --status success|failure
+    [--failure-class <enum>] [--message <text>] [--project …]
+    [--next-track <id>] [--source cli]
+coordinator outcome show [--project …]
+coordinator wait [--project …] [--timeout-secs N]
 coordinator serve [--port <u16>]   # default 7420, 127.0.0.1 only
 ```
 
-Stop aborts advancement with **no merge**; `last_event` records sessions-for-attach deferred (real harness attach → **0007+**).
+### Phase Outcome schema v1
+
+```json
+{
+  "version": 1,
+  "phase": "stub:active",
+  "status": "success",
+  "failure_class": null,
+  "message": "optional human/agent note",
+  "written_at": "2026-08-12T12:00:00Z",
+  "source": "cli",
+  "metadata": {
+    "next_track": null,
+    "role": null
+  }
+}
+```
+
+| Field | Rules |
+|-------|--------|
+| `version` | Must be `1` |
+| `phase` | Non-empty; must match current run-state phase to apply |
+| `status` | `success` \| `failure` |
+| `failure_class` | Required when `failure`; must be null on `success`. Values: `permission`, `model_exhaustion`, `difficulty`, `harness_crash`, `timeout`, `ci_failed` |
+| `source` | `file` \| `http` \| `cli` \| `timeout` \| `test` |
+| `metadata.next_track` | Optional; copied to status on success |
+| `metadata.role` | Free-form this release (parallel roles later) |
+| `run_epoch` | Optional; when present must match run-state epoch |
+
+**Apply (single path):** Running+success → Idle / `stub:completed`; Paused+success → stay Paused / `stub:completed`; failure → Stopped / `stub:failed` + class. Idle/Stopped and phase mismatch reject for CLI/HTTP. After apply: history best-effort → `current.applied.json` → remove `current.json` → hash on run-state.
+
+### `wait` exit codes
+
+| Code | Meaning |
+|------|---------|
+| **0** | An outcome was **applied** (success **or** failure, including synthesized timeout) |
+| **2** | Wait budget (`--timeout-secs`) expired **without** an applied outcome |
+| **1** (or other) | Invalid args, unknown project, or other control-plane error |
+
+Scripts that want “success only” must inspect `status` / `failure_class` after exit 0 (e.g. `coordinator status`).
+
+Stop aborts advancement with **no merge**; `last_event` records sessions-for-attach deferred (real harness attach → **0007+**). After Stopped, further outcomes are ignored until a new `run`.
+
+### Illustrative hook writers (docs only)
+
+Hooks may drop `outcomes/current.json` with atomic replace. Event names drift across harness versions — treat the following as **illustrative**, not a shipped adapter:
+
+**Claude Code** (event name verified 2026-08: `Stop` when the model finishes a turn):
+
+```powershell
+# Illustrative: after a Stop hook decides the phase is done
+$state = Join-Path $env:COORDINATOR_PROJECT ".coordinator\outcomes"
+New-Item -ItemType Directory -Force -Path $state | Out-Null
+$tmp = Join-Path $state "current.json.tmp"
+$dst = Join-Path $state "current.json"
+@{
+  version = 1
+  phase = "stub:active"
+  status = "success"
+  failure_class = $null
+  message = "hook Stop"
+  written_at = (Get-Date).ToUniversalTime().ToString("o")
+  source = "file"
+} | ConvertTo-Json | Set-Content -Path $tmp -Encoding utf8
+Move-Item -Force $tmp $dst
+```
+
+**Grok / other CLI hooks:** same file contract; prefer `source=file`. Full Grok Session adapter → **0007**.
 
 ## Tools (product cwd only)
 
@@ -129,4 +214,4 @@ This is a **visual contract**, not product orchestration. Real start/resume is C
 
 ## Status
 
-Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton: CLI + localhost API + registry + stop/pause stubs).
+Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout).

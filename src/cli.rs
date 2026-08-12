@@ -1,4 +1,4 @@
-//! Clap CLI surface (frozen command names from track 0004).
+//! Clap CLI surface (tracks 0004–0005).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -55,6 +55,19 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Phase Outcome File writers / inspectors
+    Outcome {
+        #[command(subcommand)]
+        action: OutcomeCommands,
+    },
+    /// Block until a Phase Outcome is applied (or wait budget expires)
+    Wait {
+        #[arg(long)]
+        project: Option<String>,
+        /// Max seconds to wait for an applied outcome (default 3600)
+        #[arg(long, default_value_t = 3600)]
+        timeout_secs: u64,
+    },
     /// Serve localhost HTTP API (127.0.0.1 only)
     Serve {
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
@@ -68,6 +81,34 @@ pub enum ProjectCommands {
     Add { path: PathBuf },
     /// List registered projects
     List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OutcomeCommands {
+    /// Write a Phase Outcome and apply it (single apply path)
+    Write {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        phase: String,
+        /// success | failure
+        #[arg(long)]
+        status: String,
+        #[arg(long = "failure-class")]
+        failure_class: Option<String>,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long = "next-track")]
+        next_track: Option<String>,
+        /// file | http | cli | timeout | test (default cli)
+        #[arg(long, default_value = "cli")]
+        source: String,
+    },
+    /// Print current.json if present
+    Show {
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 /// Parse args and dispatch; returns process exit code.
@@ -112,6 +153,41 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
         }
         Commands::Stop { project } => {
             let view = api::cmd_stop(project.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&view)?);
+        }
+        Commands::Outcome { action } => match action {
+            OutcomeCommands::Write {
+                project,
+                phase,
+                status,
+                failure_class,
+                message,
+                next_track,
+                source,
+            } => {
+                let view = api::cmd_outcome_write(
+                    project.as_deref(),
+                    phase,
+                    &status,
+                    failure_class.as_deref(),
+                    message,
+                    next_track,
+                    Some(&source),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&view)?);
+            }
+            OutcomeCommands::Show { project } => match api::cmd_outcome_show(project.as_deref())? {
+                Some(o) => println!("{}", serde_json::to_string_pretty(&o)?),
+                None => {
+                    println!("null");
+                }
+            },
+        },
+        Commands::Wait {
+            project,
+            timeout_secs,
+        } => {
+            let view = api::cmd_wait(project.as_deref(), timeout_secs)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Serve { port } => {
