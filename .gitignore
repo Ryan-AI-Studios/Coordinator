@@ -34,3 +34,8 @@ Thumbs.db
 .idea/
 .vscode/
 !.vscode/extensions.json
+
+
+# Added by cargo
+
+/target

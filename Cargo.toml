@@ -1,0 +1,9 @@
+[package]
+name = "coordinator"
+version = "0.1.0"
+edition = "2024"
+description = "Same-machine Windows orchestrator for multi-harness conductor-track workflows"
+repository = "https://github.com/Ryan-AI-Studios/Coordinator"
+readme = "README.md"
+
+[dependencies]

@@ -37,15 +37,17 @@ ledgerful change-context --json
 
 Prefer `ledgerful … --json` when parsing. See `.agents/skills/ledgerful` and `ai-brains`.
 
-## Build / test (after crate exists)
+## Build / test
 
 ```powershell
+cd C:\dev\coordinator\coordinator
 cargo fmt
+cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Wire ledgerful `required_verifications` to commands that actually exist in this repo.
+Ledgerful verify steps (when configured) must match these real cargo commands.
 
 ## Code style
 
@@ -64,7 +66,8 @@ Wire ledgerful `required_verifications` to commands that actually exist in this 
 
 ## PR discipline
 
-- Feature branch → PR → CI green → squash-merge  
+- Feature branch → PR → CI green → squash-merge (default for later tracks)  
+- Bootstrap track **0001** allowed direct push to `main` per track plan  
 - Do not busy-poll CI  
 - Do not force-push shared history without owner confirmation  
 
