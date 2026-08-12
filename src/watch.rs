@@ -5,9 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::config::{
-    ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, outcome_poll_interval, stub_phase_timeout,
-};
+use crate::config::{ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, outcome_poll_interval};
 use crate::error::{CoordinatorError, Result};
 use crate::outcome::{self, try_load_current_outcome};
 use crate::registry::ProjectRecord;
@@ -41,18 +39,23 @@ pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
         }
     }
 
-    // 2) Timeout while Running only (budget frozen while Paused).
-    let state = load_run_state(record)?;
-    if state.status == RunStatus::Running
-        && let Some(started) = state.phase_started_at
-    {
-        let budget = stub_phase_timeout();
-        let elapsed = state.effective_running_elapsed(chrono::Utc::now());
-        if elapsed >= budget {
-            let view = outcome::apply_timeout(record, &state)?;
-            return Ok(Some(view));
+    // 2) Timeout while Running only — decide+apply under the same run-state lock
+    // so a concurrent pause cannot lose to a stale pre-lock snapshot.
+    match outcome::try_timeout_under_lock(record) {
+        Ok(Some(view)) => return Ok(Some(view)),
+        Ok(None) => {}
+        // Race lost to another apply (e.g. late success): not a poll crash; retry next tick.
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("apply race")
+                || msg.contains("cannot apply outcome while status is")
+                || msg.contains("timeout outcome rejected")
+            {
+                // skip
+            } else {
+                return Err(e);
+            }
         }
-        let _ = started; // used via effective_running_elapsed
     }
 
     Ok(None)

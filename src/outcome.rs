@@ -382,6 +382,13 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusV
         RunStatus::Running | RunStatus::Paused => {}
     }
 
+    // Timeout may only fire while Running (budget frozen while Paused).
+    if outcome.source == OutcomeSource::Timeout && base.status != RunStatus::Running {
+        return Err(CoordinatorError::Message(
+            "timeout outcome rejected: status is not Running".into(),
+        ));
+    }
+
     if outcome.phase != base.phase {
         return Err(CoordinatorError::Message(format!(
             "outcome phase '{}' does not match current phase '{}'",
@@ -548,8 +555,49 @@ pub fn write_and_apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<
     }
 }
 
+/// Evaluate stub phase budget and apply a timeout **under the run-state lock**.
+///
+/// Decision and commit share one lock so a concurrent `pause` cannot lose to a
+/// stale pre-lock timeout snapshot. Returns `Ok(None)` when not timed out.
+pub fn try_timeout_under_lock(record: &ProjectRecord) -> Result<Option<StatusView>> {
+    let _guard = apply_lock()
+        .lock()
+        .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
+    with_run_state_lock(record, || {
+        let state = load_run_state(record)?;
+        if state.status != RunStatus::Running {
+            return Ok(None);
+        }
+        let Some(_started) = state.phase_started_at else {
+            return Ok(None);
+        };
+        let budget = crate::config::stub_phase_timeout();
+        let elapsed = state.effective_running_elapsed(Utc::now());
+        if elapsed < budget {
+            return Ok(None);
+        }
+        let outcome = PhaseOutcome::failure(
+            state.phase.clone(),
+            FailureClass::Timeout,
+            OutcomeSource::Timeout,
+            Some("stub phase budget exceeded".into()),
+            Some(state.run_epoch),
+        );
+        let _ = save_current_outcome(record, &outcome);
+        // Already holding locks — call apply_locked directly.
+        apply_locked(record, outcome).map(Some)
+    })
+}
+
 /// Synthesize a timeout failure for the current phase and apply it.
+///
+/// Prefer [`try_timeout_under_lock`] from pollers (atomic decide+apply).
 pub fn apply_timeout(record: &ProjectRecord, state: &RunState) -> Result<StatusView> {
+    if state.status != RunStatus::Running {
+        return Err(CoordinatorError::Message(
+            "timeout apply requires status Running (budget frozen while Paused)".into(),
+        ));
+    }
     let outcome = PhaseOutcome::failure(
         state.phase.clone(),
         FailureClass::Timeout,
@@ -557,7 +605,6 @@ pub fn apply_timeout(record: &ProjectRecord, state: &RunState) -> Result<StatusV
         Some("stub phase budget exceeded".into()),
         Some(state.run_epoch),
     );
-    // Persist synthesized outcome for observability, then apply.
     let _ = save_current_outcome(record, &outcome);
     apply(record, outcome)
 }
