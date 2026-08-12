@@ -15,10 +15,14 @@ use super::graph::{
 use super::prompts;
 use super::{WorkflowDriver, mark_driven};
 
-/// Idempotent drive step. No-op when Paused / Stopped / Idle or not a canonical phase.
+/// Idempotent drive step. No-op when Stopped / Idle / leftover stub.
+///
+/// `ci-wait` is the one phase that still ticks while **Paused** (finish current wait).
 pub fn tick(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> {
     let state = load_run_state(record)?;
-    if state.status != RunStatus::Running {
+    let ci_wait_while_paused =
+        state.status == RunStatus::Paused && state.phase == super::graph::PHASE_CI_WAIT;
+    if state.status != RunStatus::Running && !ci_wait_while_paused {
         return Ok(None);
     }
     if !is_canonical(&state.phase) {
@@ -27,6 +31,9 @@ pub fn tick(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
 
     if is_skip_phase(&state.phase) {
         return synth_skip(record, &state);
+    }
+    if state.phase == super::graph::PHASE_CI_WAIT {
+        return crate::ci::drive(record, &state);
     }
     if state.phase == PHASE_COMPACT {
         return drive_compact(record, &state);
@@ -228,6 +235,7 @@ fn write_stub_reviews(record: &ProjectRecord, state: &RunState) -> Result<()> {
                 "agy" => super::graph::ROLE_REVIEWER_AGY.into(),
                 _ => super::graph::ROLE_REVIEWER_OPENCODE.into(),
             }),
+            ..Default::default()
         });
         crate::persist::atomic_write_json(&roles_dir.join(format!("{slug}.json")), &outcome)?;
     }

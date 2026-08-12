@@ -47,6 +47,7 @@ pub fn run_with_driver(
                 state.failure_class = None;
                 state.next_track = None;
                 state.last_applied_outcome_hash = None;
+                state.ci = None;
                 state.last_event = format!("run: started {WORKFLOW_ID}");
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);
@@ -232,6 +233,7 @@ mod tests {
             execution_repo: None,
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
+            auto_merge: true,
             created_at: Utc::now(),
         }
     }

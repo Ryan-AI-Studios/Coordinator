@@ -70,15 +70,25 @@ pub fn resolve_driver(explicit: Option<&str>) -> Result<WorkflowDriver> {
 
 /// Apply-table hook: canonical success → successor (stay Running/Paused) or advance.
 pub fn on_success(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseOutcome) {
-    if let Some(ref meta) = outcome.metadata
-        && let Some(ref next) = meta.next_track
-    {
-        let t = next.trim();
-        state.next_track = if t.is_empty() {
-            None
-        } else {
-            Some(t.to_string())
-        };
+    if let Some(ref meta) = outcome.metadata {
+        if let Some(ref next) = meta.next_track {
+            let t = next.trim();
+            state.next_track = if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            };
+        }
+        if meta.pr_number.is_some() || meta.pr_url.is_some() {
+            let mut ci = state.ci.take().unwrap_or_default();
+            if meta.pr_number.is_some() {
+                ci.pr_number = meta.pr_number;
+            }
+            if meta.pr_url.is_some() {
+                ci.pr_url = meta.pr_url.clone();
+            }
+            state.ci = Some(ci);
+        }
     }
     state.failure_class = None;
     state.last_driven_phase = None;
@@ -101,7 +111,10 @@ pub fn on_success(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseO
             state.pending_roles.clear();
         }
         if let Some(ref m) = outcome.message {
-            if m.starts_with("skip:") || m.starts_with("compact:") || m.starts_with("plan-review:")
+            if m.starts_with("skip:")
+                || m.starts_with("compact:")
+                || m.starts_with("plan-review:")
+                || m.starts_with("ci-wait:")
             {
                 state.last_event = m.clone();
             } else {
@@ -188,6 +201,7 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.last_driven_phase = None;
     state.failure_class = None;
     state.last_applied_outcome_hash = None;
+    state.ci = None;
     reset_phase_clock(state);
     state.last_event = format!("workflow: auto-start {track_id}");
 }
@@ -229,6 +243,7 @@ mod tests {
             execution_repo: None,
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
+            auto_merge: true,
             created_at: chrono::Utc::now(),
         }
     }
@@ -316,8 +331,13 @@ mod tests {
         run_with_driver(&r, None, WorkflowDriver::Stub).unwrap();
         let after_xmodel = walk_until(&r, |v| v.last_event.contains("0011"));
         assert!(after_xmodel.last_event.contains("skip: deferred to 0011"));
-        let after_ci = walk_until(&r, |v| v.last_event.contains("0010"));
-        assert!(after_ci.last_event.contains("skip: deferred to 0010"));
+        let after_ci = walk_until(&r, |v| v.last_event.contains("ci-wait: stub"));
+        assert!(
+            after_ci.last_event.contains("ci-wait: stub (no gh)"),
+            "last_event={}",
+            after_ci.last_event
+        );
+        assert!(!after_ci.last_event.contains("skip: deferred to 0010"));
     }
 
     #[test]
@@ -509,6 +529,7 @@ mod tests {
         agy.metadata = Some(crate::outcome::OutcomeMetadata {
             next_track: None,
             role: Some(graph::ROLE_REVIEWER_AGY.into()),
+            ..Default::default()
         });
         crate::persist::atomic_write_json(&roles.join("agy.json"), &agy).unwrap();
         let oc = PhaseOutcome::failure(
