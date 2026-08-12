@@ -3,6 +3,9 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# Accidental local Control Plane state under a registered project path
+.coordinator/
+
 # Local tool / agent state (never ship)
 .ledgerful/
 .env

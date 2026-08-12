@@ -45,9 +45,12 @@ cargo fmt
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo run -- --help
 ```
 
 Ledgerful verify steps (when configured) must match these real cargo commands.
+
+Control Plane entrypoints (track 0004): `project add|list`, `run|status|pause|resume|stop`, `serve` (127.0.0.1:7420). See product README for env overrides (`COORDINATOR_HOME`, `COORDINATOR_STATE_DIR`).
 
 ## Code style
 
