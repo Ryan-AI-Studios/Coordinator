@@ -1,22 +1,7 @@
-//! Coordinator — product binary (bootstrap stub).
-//!
-//! Control-plane behavior arrives in later tracks; this crate only needs to
-//! build, format, clippy-clean, and test.
+//! Coordinator binary — local Control Plane CLI entrypoint.
 
-fn main() {
-    println!("{}", product_name());
-}
+use std::process::ExitCode;
 
-fn product_name() -> &'static str {
-    "coordinator"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn product_name_is_coordinator() {
-        assert_eq!(product_name(), "coordinator");
-    }
+fn main() -> ExitCode {
+    coordinator::cli::run()
 }

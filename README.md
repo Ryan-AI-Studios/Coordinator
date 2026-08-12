@@ -17,10 +17,61 @@ cd C:\dev\coordinator\coordinator   # or your clone root
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo run
+cargo run -- --help
 ```
 
 Same gate as CI and ledgerful verify: `fmt --check`, `clippy -D warnings`, and `test` on `windows-latest`.
+
+## Control Plane (local CLI + HTTP)
+
+Minimal local Control Plane: machine **Project Registry**, per-project **run state**, **Stop / Pause / Resume** state machine (stub phases), and a **localhost-only** JSON API.
+
+| Store | Default (Windows) | Override |
+|-------|-------------------|----------|
+| Machine home (registry) | `%LOCALAPPDATA%\coordinator\` | `COORDINATOR_HOME` |
+| Registry file | `{home}/registry.json` | — |
+| Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
+
+**Local-only:** `coordinator serve` binds **`127.0.0.1` only** (default port **7420**, avoids Impeccable live 5500/8400). Non-loopback bind is rejected.
+
+**Stub phases:** a project left in `Running` with phase `stub:active` does **not** auto-advance or time out. Heartbeats / Phase Outcomes → later tracks (**0005+**).
+
+```powershell
+# Smoke (temp home + fake project)
+$env:COORDINATOR_HOME = "$env:TEMP\coordinator-cp-smoke"
+New-Item -ItemType Directory -Force -Path $env:COORDINATOR_HOME | Out-Null
+$proj = Join-Path $env:TEMP "coordinator-fake-project"
+New-Item -ItemType Directory -Force -Path $proj | Out-Null
+
+cargo run -- project add $proj
+cargo run -- project list
+cargo run -- run --project $proj
+cargo run -- status --project $proj
+cargo run -- pause --project $proj
+cargo run -- resume --project $proj
+cargo run -- stop --project $proj
+cargo run -- status --project $proj
+
+# HTTP (separate terminal)
+cargo run -- serve --port 7420
+# Invoke-RestMethod http://127.0.0.1:7420/health
+# Invoke-RestMethod http://127.0.0.1:7420/v1/status
+```
+
+CLI surface:
+
+```text
+coordinator project add <path>
+coordinator project list
+coordinator status [--project <path|id>]
+coordinator run [--project <path|id>] [--track <id>]
+coordinator pause [--project <path|id>]
+coordinator resume [--project <path|id>]
+coordinator stop [--project <path|id>]
+coordinator serve [--port <u16>]   # default 7420, 127.0.0.1 only
+```
+
+Stop aborts advancement with **no merge**; `last_event` records sessions-for-attach deferred (real harness attach → **0007+**).
 
 ## Tools (product cwd only)
 
@@ -78,4 +129,4 @@ This is a **visual contract**, not product orchestration. Real start/resume is C
 
 ## Status
 
-Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map). Control plane lands in **0004+**.
+Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton: CLI + localhost API + registry + stop/pause stubs).
