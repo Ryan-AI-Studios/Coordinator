@@ -30,10 +30,14 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 |-------|-------------------|----------|
 | Machine home (registry) | `%LOCALAPPDATA%\coordinator\` | `COORDINATOR_HOME` |
 | Registry file | `{home}/registry.json` | — |
-| Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`) | — |
+| Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`, `phase_timeouts_secs`) | — |
 | Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
 | Active Phase Outcome | `{state_dir}/outcomes/current.json` | same state-dir rules |
 | Last applied outcome | `{state_dir}/outcomes/current.applied.json` | written on successful apply; `current.json` removed |
+| Outcome history | `{state_dir}/outcomes/history/` | best-effort snapshots after apply |
+| Role outcomes (plan-review) | `{state_dir}/outcomes/roles/{slug}.json` | parallel reviewer slots (`agy`, `opencode`) |
+| Review files | `{state_dir}/reviews/{slug}-review.md` | always; copied to track dir when resolvable |
+| Review Bundle | `{workspace}/AI-review.md` | assembled after plan-review join; track copy when present |
 
 Empty `COORDINATOR_HOME` or `COORDINATOR_STATE_DIR` is rejected.
 
@@ -82,9 +86,35 @@ When nested `execution_repo` is null, `project show` includes:
 
 **Completion contract (hybrid):** the **Phase Outcome File** is the portable done-signal (schema `version: 1`). Hooks, adapters, CLI, and HTTP may write it; **ConPTY / chat pattern-match is not the contract**. Writers must use **temp + replace** (or `coordinator outcome write` / `POST /v1/outcome`) so pollers never read torn JSON.
 
-**Stub phase timeout:** while `Running`, phase `stub:active` has a wall budget (default **300s**, env `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`). Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path. Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
+**Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Override per key via machine `config.json` `phase_timeouts_secs`. Uniform test override: `COORDINATOR_PHASE_TIMEOUT_SECS`. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
 
-**`run` without `--track`:** retains the prior `track_id` (intentional). Clearing track is a workflow concern for later tracks.
+**`run` without `--track`:** retains the prior `track_id` (intentional). Fresh `run` **clears** `next_track` (stale Planner handoff).
+
+### Canonical workflow (`canonical_v1`)
+
+`coordinator run` starts **`plan`**, not `stub:active`. Phase Outcome apply advances the graph (status stays **Running** until `advance` completes).
+
+```
+plan → plan-review (agy + opencode join) → fold → implement
+  → cross-model-review (skip → 0011) → ci-wait (skip → 0010)
+  → compact → advance
+```
+
+| Driver | CLI / env | Behavior |
+|--------|-----------|----------|
+| `adapter` | default | Inject Grok prompt once per phase for plan/fold/implement/advance. Missing `grok` **fails** that phase. |
+| `file_wait` | `--driver file_wait` | No inject; poll `current.json` / `outcomes/roles/*.json`. |
+| `stub` | `--driver stub` or `COORDINATOR_WORKFLOW_DRIVER=stub` | Synthesize success each tick so CI can walk the full graph. |
+
+Status JSON includes additive `workflow` `{ id, driver, pending_roles }`.
+
+**Plan-review:** two role files + review markdown; Coordinator assembles `{workspace}/AI-review.md`. One reviewer may degrade; **both** missing/fail → Stopped. Line endings normalized to `\n`.
+
+**`next_track`:** Planner writes `metadata.next_track`. On `advance` success: valid track dir → auto-start at `plan`; null/empty → Idle (`workflow: backlog clear`); unknown id → Idle (does not fail the completed track). Pause holds auto-start until resume.
+
+**Compact:** capability-gated; timeout/failure **skips** (not a hard gate).
+
+Skip slots (`cross-model-review`, `ci-wait`) synthesize success with `last_event` `skip: deferred to 0011` / `0010`.
 
 ### Grok harness adapter (ACP)
 
@@ -118,9 +148,13 @@ Default `role_bindings` in `config.json`:
 ```json
 {
   "planner": { "harness": "grok", "command": "grok", "model": null },
-  "implementor": { "harness": "grok", "command": "grok", "model": null }
+  "implementor": { "harness": "grok", "command": "grok", "model": null },
+  "plan_reviewer_agy": { "harness": "antigravity", "command": "agy", "model": null },
+  "plan_reviewer_opencode": { "harness": "opencode", "command": "opencode", "model": null }
 }
 ```
+
+Saved configs that only have `planner` + `implementor` gain the reviewer keys on load.
 
 ```powershell
 # Smoke (temp home + fake project)
@@ -131,18 +165,21 @@ New-Item -ItemType Directory -Force -Path $proj | Out-Null
 
 cargo run -- project add $proj
 cargo run -- project list
-cargo run -- run --project $proj --track 0005
+cargo run -- run --project $proj --track 0005 --driver stub
 cargo run -- status --project $proj
-cargo run -- outcome write --project $proj --phase stub:active --status success
+# expect Running / plan / workflow.driver=stub
+cargo run -- wait --project $proj --timeout-secs 30
 cargo run -- status --project $proj
-# expect Idle / stub:completed
+# expect Idle (backlog clear) — stub walks the full graph
 
-# timeout smoke
-$env:COORDINATOR_STUB_PHASE_TIMEOUT_SECS = "2"
-cargo run -- run --project $proj
-cargo run -- wait --project $proj --timeout-secs 10
+# file-wait single phase
+cargo run -- run --project $proj --track 0005 --driver file_wait
+cargo run -- outcome write --project $proj --phase plan --status success
 cargo run -- status --project $proj
-# expect Stopped / failure_class timeout
+# expect Running / plan-review
+
+# leftover stub timeout (tests / old state): COORDINATOR_STUB_PHASE_TIMEOUT_SECS
+# canonical uniform override for tests: COORDINATOR_PHASE_TIMEOUT_SECS
 
 # HTTP (separate terminal)
 cargo run -- serve --port 7420
@@ -165,7 +202,7 @@ coordinator project set [--project …]
     [--display-name …] [--execution-repos-json <json>] [--execution-repo-name …]
 coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]
 coordinator status [--project <path|id>]
-coordinator run [--project <path|id>] [--track <id>]
+coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait|stub]
 coordinator pause [--project <path|id>]
 coordinator resume [--project <path|id>]
 coordinator stop [--project <path|id>]
@@ -182,14 +219,14 @@ coordinator harness grok shutdown [--project …]
 coordinator serve [--port <u16>]   # default 7420, 127.0.0.1 only
 ```
 
-HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes, and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved) and optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists.
+HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver`), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), and optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists.
 
 ### Phase Outcome schema v1
 
 ```json
 {
   "version": 1,
-  "phase": "stub:active",
+  "phase": "plan",
   "status": "success",
   "failure_class": null,
   "message": "optional human/agent note",
@@ -210,10 +247,10 @@ HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v
 | `failure_class` | Required when `failure`; must be null on `success`. Values: `permission`, `model_exhaustion`, `difficulty`, `harness_crash`, `timeout`, `ci_failed` |
 | `source` | `file` \| `http` \| `cli` \| `timeout` \| `test` \| `adapter` |
 | `metadata.next_track` | Optional; copied to status on success |
-| `metadata.role` | Free-form this release (parallel roles later) |
+| `metadata.role` | `planner` / `implementor` / `plan_reviewer_agy` / `plan_reviewer_opencode`; unknown ignored |
 | `run_epoch` | Optional; when present must match run-state epoch |
 
-**Apply (single path):** Running+success → Idle / `stub:completed`; Paused+success → stay Paused / `stub:completed`; failure → Stopped / `stub:failed` + class. Idle/Stopped and phase mismatch reject for CLI/HTTP. After apply: history best-effort → `current.applied.json` → remove `current.json` → hash on run-state.
+**Apply (single path):** leftover `stub:*` success → Idle / `stub:completed` (Paused stays Paused). Canonical success → **successor phase, stay Running** (Paused stays Paused). Canonical failure → Stopped and **keeps the failed phase id**. Operator `stop` still sets `stub:stopped`. Idle/Stopped and phase mismatch reject for CLI/HTTP. After apply: history best-effort → `current.applied.json` → remove `current.json` → hash on run-state.
 
 ### `wait` exit codes
 
@@ -241,7 +278,7 @@ $tmp = Join-Path $state "current.json.tmp"
 $dst = Join-Path $state "current.json"
 @{
   version = 1
-  phase = "stub:active"
+  phase = "plan"
   status = "success"
   failure_class = $null
   message = "hook Stop"

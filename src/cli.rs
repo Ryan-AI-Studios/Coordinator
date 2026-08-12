@@ -36,19 +36,22 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Start (or re-start) a stub run
+    /// Start (or re-start) the canonical workflow at `plan`
     Run {
         #[arg(long)]
         project: Option<String>,
         #[arg(long)]
         track: Option<String>,
+        /// adapter | file_wait | stub (default adapter, or COORDINATOR_WORKFLOW_DRIVER)
+        #[arg(long)]
+        driver: Option<String>,
     },
-    /// Pause a running stub
+    /// Pause a running workflow
     Pause {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Resume a paused stub
+    /// Resume a paused workflow
     Resume {
         #[arg(long)]
         project: Option<String>,
@@ -327,8 +330,12 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             let view = api::status(project.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
-        Commands::Run { project, track } => {
-            let view = api::cmd_run(project.as_deref(), track)?;
+        Commands::Run {
+            project,
+            track,
+            driver,
+        } => {
+            let view = api::cmd_run(project.as_deref(), track, driver.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Pause { project } => {
@@ -445,6 +452,16 @@ fn read_prompt_text(
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn run_has_driver_flag() {
+        let cmd = Cli::command();
+        let run = cmd.find_subcommand("run").expect("run");
+        assert!(
+            run.get_arguments().any(|a| a.get_id() == "driver"),
+            "run --driver"
+        );
+    }
 
     #[test]
     fn harness_grok_commands_in_help() {

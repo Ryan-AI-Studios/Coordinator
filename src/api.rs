@@ -71,6 +71,8 @@ pub struct ProjectRefBody {
     pub project: Option<String>,
     #[serde(default)]
     pub track: Option<String>,
+    #[serde(default)]
+    pub driver: Option<String>,
 }
 
 /// Show response: raw record + resolved paths + optional remediation hint.
@@ -260,10 +262,15 @@ pub fn status_all() -> Result<Vec<StatusView>> {
     Ok(out)
 }
 
-pub fn cmd_run(project: Option<&str>, track: Option<String>) -> Result<StatusView> {
+pub fn cmd_run(
+    project: Option<&str>,
+    track: Option<String>,
+    driver: Option<&str>,
+) -> Result<StatusView> {
     let reg = load_registry()?;
     let rec = reg.resolve_project(project)?.clone();
-    run::run(&rec, track)
+    let driver = crate::workflow::resolve_driver(driver)?;
+    run::run_with_driver(&rec, track, driver)
 }
 
 pub fn cmd_pause(project: Option<&str>) -> Result<StatusView> {

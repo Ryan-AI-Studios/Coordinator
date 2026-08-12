@@ -38,6 +38,8 @@ mod tests {
         assert_eq!(b["implementor"].harness, "grok");
         assert_eq!(b["planner"].command, "grok");
         assert!(b["planner"].model.is_none());
-        assert!(!b.contains_key("antigravity"));
+        assert_eq!(b["plan_reviewer_agy"].harness, "antigravity");
+        assert_eq!(b["plan_reviewer_agy"].command, "agy");
+        assert_eq!(b["plan_reviewer_opencode"].harness, "opencode");
     }
 }

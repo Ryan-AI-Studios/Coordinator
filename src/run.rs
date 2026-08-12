@@ -1,7 +1,7 @@
-//! Stub-phase run state machine (ADR-0024 stop/pause).
+//! Run state machine (ADR-0024 stop/pause; 0008 canonical DAG).
 //!
 //! Phase completion and timeouts are driven by the Phase Outcome apply path
-//! ([`crate::outcome`]) and poll/wait ([`crate::watch`]) — track 0005.
+//! ([`crate::outcome`]) and poll/wait ([`crate::watch`]).
 
 use crate::error::{CoordinatorError, Result};
 use crate::outcome::clear_active_outcome_file;
@@ -11,11 +11,60 @@ use crate::state::{
     STUB_PHASE_FAILED, STUB_PHASE_STOPPED, StatusView, ensure_state_dir, load_run_state,
     save_run_state, with_run_state_lock,
 };
+use crate::workflow::{self, WORKFLOW_ID, WorkflowDriver};
 
-/// Apply `run`: Idle/Stopped → Running.
+/// Apply `run`: Idle/Stopped → Running at `plan` (`canonical_v1`).
 ///
-/// If `--track` is omitted, prior `track_id` is **retained** (0004 absorb / 0005 docs).
+/// If `--track` is omitted, prior `track_id` is **retained**. `next_track` is cleared.
 pub fn run(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusView> {
+    run_with_driver(record, track_id, workflow::resolve_driver(None)?)
+}
+
+/// Start the canonical workflow with an explicit driver.
+pub fn run_with_driver(
+    record: &ProjectRecord,
+    track_id: Option<String>,
+    driver: WorkflowDriver,
+) -> Result<StatusView> {
+    with_run_state_lock(record, || {
+        ensure_state_dir(record)?;
+        let mut state = load_run_state(record)?;
+        match state.status {
+            RunStatus::Idle | RunStatus::Stopped => {
+                state.status = RunStatus::Running;
+                state.phase = workflow::graph::PHASE_PLAN.into();
+                state.workflow = Some(WORKFLOW_ID.into());
+                state.driver = driver;
+                state.pending_roles.clear();
+                state.last_driven_phase = None;
+                if track_id.is_some() {
+                    state.track_id = track_id;
+                }
+                state.run_epoch = state.run_epoch.saturating_add(1);
+                state.phase_started_at = Some(chrono::Utc::now());
+                state.total_paused_ms = 0;
+                state.pause_started_at = None;
+                state.failure_class = None;
+                state.next_track = None;
+                state.last_applied_outcome_hash = None;
+                state.last_event = format!("run: started {WORKFLOW_ID}");
+                state.updated_at = chrono::Utc::now();
+                clear_active_outcome_file(record);
+                crate::workflow::drive::clear_plan_review_artifacts(record);
+                save_run_state(record, &state)?;
+                Ok(StatusView::from_record(record, &state))
+            }
+            other => Err(CoordinatorError::InvalidTransition {
+                action: "run",
+                from: other.to_string(),
+            }),
+        }
+    })
+}
+
+/// Test-only leftover stub entry (does not go through public `run`).
+#[cfg(test)]
+pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusView> {
     with_run_state_lock(record, || {
         ensure_state_dir(record)?;
         let mut state = load_run_state(record)?;
@@ -23,10 +72,13 @@ pub fn run(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusVie
             RunStatus::Idle | RunStatus::Stopped => {
                 state.status = RunStatus::Running;
                 state.phase = STUB_PHASE_ACTIVE.into();
+                state.workflow = None;
+                state.driver = WorkflowDriver::Stub;
+                state.pending_roles.clear();
+                state.last_driven_phase = None;
                 if track_id.is_some() {
                     state.track_id = track_id;
                 }
-                // Fresh run epoch + phase clock; invalidate prior consume markers.
                 state.run_epoch = state.run_epoch.saturating_add(1);
                 state.phase_started_at = Some(chrono::Utc::now());
                 state.total_paused_ms = 0;
@@ -35,8 +87,6 @@ pub fn run(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusVie
                 state.last_applied_outcome_hash = None;
                 state.last_event = "run: started stub".into();
                 state.updated_at = chrono::Utc::now();
-                // Drop any leftover active outcome so a prior Idle/Stopped write cannot
-                // complete this new run (stale defense when run_epoch is omitted).
                 clear_active_outcome_file(record);
                 save_run_state(record, &state)?;
                 Ok(StatusView::from_record(record, &state))
@@ -55,7 +105,7 @@ pub fn pause(record: &ProjectRecord) -> Result<StatusView> {
         RunStatus::Running => {
             state.status = RunStatus::Paused;
             state.pause_started_at = Some(chrono::Utc::now());
-            state.last_event = "pause: hold stub".into();
+            state.last_event = "pause: hold".into();
             Ok(())
         }
         other => Err(CoordinatorError::InvalidTransition {
@@ -79,6 +129,12 @@ pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
                 state.last_event = "resume: release hold after phase outcome".into();
                 return Ok(());
             }
+            if state.phase == workflow::graph::PHASE_ADVANCE
+                && state.last_driven_phase.as_deref() == Some(workflow::graph::PHASE_ADVANCE)
+            {
+                crate::workflow::apply_advance_on_resume(record, state);
+                return Ok(());
+            }
             let now = chrono::Utc::now();
             if let Some(pstart) = state.pause_started_at.take() {
                 let delta = (now - pstart).num_milliseconds().max(0) as u64;
@@ -93,7 +149,7 @@ pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
                 state.phase_started_at = Some(now);
                 state.total_paused_ms = 0;
             }
-            state.last_event = "resume: continue stub".into();
+            state.last_event = "resume: continue".into();
             Ok(())
         }
         other => Err(CoordinatorError::InvalidTransition {
@@ -185,7 +241,7 @@ mod tests {
 
         let s = run(&r, Some("0004".into())).unwrap();
         assert_eq!(s.status, RunStatus::Running);
-        assert_eq!(s.phase, STUB_PHASE_ACTIVE);
+        assert_eq!(s.phase, crate::workflow::graph::PHASE_PLAN);
         assert_eq!(s.track_id.as_deref(), Some("0004"));
         assert!(s.last_event.contains("run:"));
 
