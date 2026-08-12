@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Coordinator — Status Surface (4 projects)</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a222c;
+      --panel-2: #232d3a;
+      --ink: #e8eef4;
+      --muted: #8b9aab;
+      --line: #2f3b4a;
+      --accent: #e8a04a;
+      --ok: #3dba7a;
+      --bad: #e05a5a;
+      --info: #5b9fd4;
+      --mono: "Cascadia Mono", "Consolas", "Courier New", monospace;
+      --sans: "Segoe UI", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--ink);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.85rem 1.25rem;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    header .sub {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-top: 0.2rem;
+    }
+    .header-meta {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .stat {
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      color: var(--muted);
+      padding: 0.35rem 0.6rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+    }
+    .stat strong { color: var(--ink); font-weight: 600; }
+    .controls { display: flex; gap: 0.5rem; }
+    button {
+      font: inherit;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--ink);
+      padding: 0.4rem 0.85rem;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button.danger {
+      border-color: color-mix(in srgb, var(--bad) 50%, var(--line));
+      color: #ffc9c9;
+    }
+    button.primary {
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+      color: #ffe3b5;
+    }
+    button.ghost { color: var(--muted); }
+
+    .toolbar {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1.25rem 0;
+      flex-wrap: wrap;
+    }
+    .toolbar p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.82rem;
+      max-width: 48rem;
+      line-height: 1.4;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1rem;
+      padding: 1rem 1.25rem 2rem;
+    }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+    }
+
+    .project {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.9rem 1rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      min-height: 100%;
+    }
+    .project.attention {
+      border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+    }
+    .project.failed {
+      border-color: color-mix(in srgb, var(--bad) 55%, var(--line));
+    }
+    .project-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.75rem;
+      align-items: flex-start;
+    }
+    .project-head h2 {
+      margin: 0;
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    .project-path {
+      margin: 0.25rem 0 0;
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      color: var(--muted);
+      word-break: break-all;
+    }
+    .project-actions {
+      display: flex;
+      gap: 0.35rem;
+      flex-shrink: 0;
+    }
+    .project-actions button {
+      padding: 0.28rem 0.55rem;
+      font-size: 0.75rem;
+    }
+
+    .kv {
+      display: grid;
+      gap: 0.4rem;
+    }
+    .kv .row {
+      display: grid;
+      grid-template-columns: 5.5rem 1fr auto;
+      gap: 0.5rem;
+      align-items: center;
+      padding: 0.45rem 0.55rem;
+      background: var(--panel-2);
+      border-radius: 7px;
+    }
+    .label { color: var(--muted); font-size: 0.74rem; }
+    .value { font-family: var(--mono); font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .pill {
+      font-size: 0.68rem;
+      font-weight: 600;
+      padding: 0.18rem 0.5rem;
+      border-radius: 999px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+    .pill.running { background: color-mix(in srgb, var(--ok) 22%, transparent); color: #9df0c0; }
+    .pill.attention { background: color-mix(in srgb, var(--accent) 22%, transparent); color: #ffd79a; }
+    .pill.failed { background: color-mix(in srgb, var(--bad) 22%, transparent); color: #ffb0b0; }
+    .pill.paused { background: color-mix(in srgb, var(--info) 22%, transparent); color: #b7d9f5; }
+    .pill.idle { background: color-mix(in srgb, var(--muted) 18%, transparent); color: #c5d0dc; }
+
+    .sessions {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.78rem;
+    }
+    .sessions th, .sessions td {
+      text-align: left;
+      padding: 0.4rem 0.25rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .sessions th {
+      color: var(--muted);
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+    .sessions td.mono { font-family: var(--mono); font-size: 0.74rem; }
+
+    .note {
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.4;
+      margin: 0;
+      padding: 0.55rem 0.65rem;
+      background: var(--panel-2);
+      border-radius: 7px;
+      border-left: 3px solid var(--line);
+    }
+    .note.warn {
+      border-left-color: var(--accent);
+      color: #e8d4b0;
+    }
+    .note.err {
+      border-left-color: var(--bad);
+      color: #f0c0c0;
+    }
+
+    footer {
+      padding: 0 1.25rem 1.5rem;
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.45;
+    }
+    footer code {
+      font-family: var(--mono);
+      font-size: 0.74rem;
+      color: #c9d6e4;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Coordinator · Status Surface</h1>
+      <div class="sub">Four concurrent projects — multi-project session pools (demo)</div>
+    </div>
+    <div class="header-meta">
+      <span class="stat">Projects <strong>4</strong></span>
+      <span class="stat">Running <strong>3</strong></span>
+      <span class="stat">Attention <strong>1</strong></span>
+      <div class="controls">
+        <button type="button" class="ghost">Add project</button>
+        <button type="button" class="primary">Pause all</button>
+        <button type="button" class="danger">Stop selected</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <p>
+      Coordinator keeps a <strong>session pool per project</strong>. After a reboot, the Control Plane
+      reloads project registry + machine state under each workspace’s <code>.coordinator/</code>
+      (or configured paths), then you <strong>resume</strong> a track/run — harnesses re-attach rather
+      than starting from zero when possible.
+    </p>
+  </div>
+
+  <main id="projects">
+    <!-- Project 1 -->
+    <article class="project" data-project="coordinator">
+      <div class="project-head">
+        <div>
+          <h2>Coordinator</h2>
+          <p class="project-path">C:\dev\coordinator\coordinator</p>
+        </div>
+        <div class="project-actions">
+          <button type="button" class="primary">Pause</button>
+          <button type="button" class="danger">Stop</button>
+        </div>
+      </div>
+      <div class="kv">
+        <div class="row">
+          <span class="label">Track</span>
+          <span class="value">0003-StatusSurfaceMockup</span>
+          <span class="pill running">running</span>
+        </div>
+        <div class="row">
+          <span class="label">Phase</span>
+          <span class="value">implement</span>
+          <span class="pill attention">gate</span>
+        </div>
+        <div class="row">
+          <span class="label">Next</span>
+          <span class="value">token-idle CI wait</span>
+          <span class="pill running">queued</span>
+        </div>
+        <div class="row">
+          <span class="label">Layout</span>
+          <span class="value">nested</span>
+          <span class="pill idle">profile</span>
+        </div>
+      </div>
+      <table class="sessions">
+        <thead>
+          <tr><th>Role</th><th>Harness</th><th>State</th><th>Idle</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Implementor</td>
+            <td class="mono">grok</td>
+            <td><span class="pill running">active</span></td>
+            <td class="mono">8s</td>
+          </tr>
+          <tr>
+            <td>Cross-model</td>
+            <td class="mono">codex</td>
+            <td><span class="pill attention">waiting</span></td>
+            <td class="mono">—</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note">No hard failure. Review gate pending clean cross-model pass.</p>
+    </article>
+
+    <!-- Project 2 -->
+    <article class="project attention" data-project="orca">
+      <div class="project-head">
+        <div>
+          <h2>Orca</h2>
+          <p class="project-path">C:\dev\Orca\OrcaSlicer-ZR</p>
+        </div>
+        <div class="project-actions">
+          <button type="button" class="primary">Resume</button>
+          <button type="button" class="danger">Stop</button>
+        </div>
+      </div>
+      <div class="kv">
+        <div class="row">
+          <span class="label">Track</span>
+          <span class="value">0142-ProfileCache</span>
+          <span class="pill attention">paused</span>
+        </div>
+        <div class="row">
+          <span class="label">Phase</span>
+          <span class="value">implement (held)</span>
+          <span class="pill paused">pause</span>
+        </div>
+        <div class="row">
+          <span class="label">Next</span>
+          <span class="value">finish phase → hold next</span>
+          <span class="pill attention">held</span>
+        </div>
+        <div class="row">
+          <span class="label">Layout</span>
+          <span class="value">nested (dogfood)</span>
+          <span class="pill idle">profile</span>
+        </div>
+      </div>
+      <table class="sessions">
+        <thead>
+          <tr><th>Role</th><th>Harness</th><th>State</th><th>Idle</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Implementor</td>
+            <td class="mono">grok</td>
+            <td><span class="pill paused">paused</span></td>
+            <td class="mono">12m</td>
+          </tr>
+          <tr>
+            <td>Plan review</td>
+            <td class="mono">agy</td>
+            <td><span class="pill idle">idle</span></td>
+            <td class="mono">40m</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note warn">Paused after current phase by operator. Sessions left for attach — Resume continues pipeline.</p>
+    </article>
+
+    <!-- Project 3 -->
+    <article class="project" data-project="ledgerful">
+      <div class="project-head">
+        <div>
+          <h2>Ledgerful</h2>
+          <p class="project-path">C:\dev\ledgerful</p>
+        </div>
+        <div class="project-actions">
+          <button type="button" class="primary">Pause</button>
+          <button type="button" class="danger">Stop</button>
+        </div>
+      </div>
+      <div class="kv">
+        <div class="row">
+          <span class="label">Track</span>
+          <span class="value">T241-VerifySteps</span>
+          <span class="pill running">running</span>
+        </div>
+        <div class="row">
+          <span class="label">Phase</span>
+          <span class="value">token-idle CI</span>
+          <span class="pill running">watching</span>
+        </div>
+        <div class="row">
+          <span class="label">Next</span>
+          <span class="value">auto squash-merge</span>
+          <span class="pill idle">pending</span>
+        </div>
+        <div class="row">
+          <span class="label">Layout</span>
+          <span class="value">multi-sibling hub</span>
+          <span class="pill idle">profile</span>
+        </div>
+      </div>
+      <table class="sessions">
+        <thead>
+          <tr><th>Role</th><th>Harness</th><th>State</th><th>Idle</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Implementor</td>
+            <td class="mono">grok</td>
+            <td><span class="pill idle">compacted</span></td>
+            <td class="mono">—</td>
+          </tr>
+          <tr>
+            <td>CI watch</td>
+            <td class="mono">(control plane)</td>
+            <td><span class="pill running">active</span></td>
+            <td class="mono">0s</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note">CI outside model sessions — no token burn. Interval adapted (~3 min checks).</p>
+    </article>
+
+    <!-- Project 4 -->
+    <article class="project failed" data-project="ai-brains">
+      <div class="project-head">
+        <div>
+          <h2>AI-Brains</h2>
+          <p class="project-path">C:\dev\AI-Brains</p>
+        </div>
+        <div class="project-actions">
+          <button type="button" class="primary">Retry</button>
+          <button type="button" class="danger">Stop</button>
+        </div>
+      </div>
+      <div class="kv">
+        <div class="row">
+          <span class="label">Track</span>
+          <span class="value">T198-ProjectEnv</span>
+          <span class="pill failed">failed</span>
+        </div>
+        <div class="row">
+          <span class="label">Phase</span>
+          <span class="value">cross-model review</span>
+          <span class="pill failed">hard-stop</span>
+        </div>
+        <div class="row">
+          <span class="label">Class</span>
+          <span class="value">model_exhaustion</span>
+          <span class="pill failed">quota</span>
+        </div>
+        <div class="row">
+          <span class="label">Layout</span>
+          <span class="value">single-root</span>
+          <span class="pill idle">profile</span>
+        </div>
+      </div>
+      <table class="sessions">
+        <thead>
+          <tr><th>Role</th><th>Harness</th><th>State</th><th>Idle</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Cross-model</td>
+            <td class="mono">codex→claude</td>
+            <td><span class="pill failed">exhausted</span></td>
+            <td class="mono">—</td>
+          </tr>
+          <tr>
+            <td>Implementor</td>
+            <td class="mono">grok</td>
+            <td><span class="pill idle">held</span></td>
+            <td class="mono">6m</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note err">Failure Artifact written · Windows toast sent. No merge. Sessions left for attach after quota recovery.</p>
+    </article>
+  </main>
+
+  <footer>
+    <strong>Start / resume after reboot (this demo + live):</strong>
+    <code>pwsh scripts/start-impeccable-live.ps1</code>
+    then open <code>http://127.0.0.1:5500/mock/status-surface.html</code>.
+    Product-level resume (real Control Plane) is track <strong>0004+</strong> — project registry + state under
+    <code>.coordinator/</code>, not this mock.
+  </footer>
+<!-- impeccable-live-start -->
+<script src="http://localhost:8400/live.js?token=6181fa4b-c475-41ce-bb00-f77f5615ed4d"></script>
+<!-- impeccable-live-end -->
+</body>
+</html>

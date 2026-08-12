@@ -52,6 +52,25 @@ npx --yes impeccable check
 
 Re-run install/init here if the Status Surface UI subtree moves (ADR-0028). Do **not** use global-only install as the design SoT.
 
+## Status Surface demo (pre-0003)
+
+Early **stack-agnostic** HTML shell for operator multi-project layout (not wired to a Control Plane). Starting point for track **0003**.
+
+| Path | Role |
+|------|------|
+| [`mock/status-surface.html`](./mock/status-surface.html) | Demo UI: **4 concurrent projects**, pause / CI-wait / hard-fail states |
+| [`scripts/start-impeccable-live.ps1`](./scripts/start-impeccable-live.ps1) | After reboot: start static page + Impeccable live inject |
+| [`.impeccable/live/config.json`](./.impeccable/live/config.json) | Live inject target (`mock/status-surface.html`) |
+
+```powershell
+cd C:\dev\coordinator\coordinator
+pwsh .\scripts\start-impeccable-live.ps1
+# opens http://127.0.0.1:5500/mock/status-surface.html
+# optional (agent session): node .agents/skills/impeccable/scripts/live-poll.mjs
+```
+
+This is a **layout demo**, not product orchestration. Real start/resume of projects is Control Plane work (**0004+**).
+
 ## Status
 
-Tracks **0001** (crate + CI) and **0002** (Impeccable + design context). Control plane, adapters, and Status Surface mockup land in later tracks.
+Tracks **0001** (crate + CI) and **0002** (Impeccable + design context). Demo mock under `mock/` feeds **0003**; control plane lands in **0004+**.

@@ -1,0 +1,6 @@
+{
+  "files": ["mock/status-surface.html"],
+  "insertBefore": "</body>",
+  "commentSyntax": "html",
+  "cspChecked": true
+}
