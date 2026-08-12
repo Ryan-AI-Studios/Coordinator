@@ -1,5 +1,6 @@
-//! Clap CLI surface (tracks 0004–0005).
+//! Clap CLI surface (tracks 0004–0006).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -8,6 +9,8 @@ use clap::{Parser, Subcommand};
 use crate::api;
 use crate::config::DEFAULT_SERVE_PORT;
 use crate::error::CoordinatorError;
+use crate::layout::LayoutProfile;
+use crate::registry::{ProjectAddOptions, ProjectSetOptions};
 use crate::server;
 
 #[derive(Debug, Parser)]
@@ -78,9 +81,65 @@ pub enum Commands {
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommands {
     /// Register a project path
-    Add { path: PathBuf },
-    /// List registered projects
+    Add {
+        path: PathBuf,
+        /// nested | multi_sibling | single_root (default nested)
+        #[arg(long = "profile", default_value = "nested")]
+        profile: String,
+        #[arg(long = "execution-repo")]
+        execution_repo: Option<PathBuf>,
+        #[arg(long = "conductor-dir")]
+        conductor_dir: Option<PathBuf>,
+        #[arg(long = "state-dir")]
+        state_dir: Option<PathBuf>,
+        #[arg(long = "display-name")]
+        display_name: Option<String>,
+        /// multi_sibling: name for primary map entry when --execution-repo set
+        #[arg(long = "execution-repo-name")]
+        execution_repo_name: Option<String>,
+    },
+    /// List registered projects (JSON; includes profile + execution summary)
     List,
+    /// Show raw record + resolved layout paths
+    Show {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Update profile / path bindings (workspace path is immutable)
+    Set {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long = "profile")]
+        profile: Option<String>,
+        #[arg(long = "execution-repo")]
+        execution_repo: Option<PathBuf>,
+        #[arg(long = "conductor-dir")]
+        conductor_dir: Option<PathBuf>,
+        #[arg(long = "state-dir")]
+        state_dir: Option<PathBuf>,
+        #[arg(long = "display-name")]
+        display_name: Option<String>,
+        /// JSON object map name → path for multi_sibling
+        #[arg(long = "execution-repos-json")]
+        execution_repos_json: Option<String>,
+        #[arg(long = "execution-repo-name")]
+        execution_repo_name: Option<String>,
+    },
+    /// Scan roots for conductor/conductor.md markers
+    Scan {
+        /// One-shot root (repeatable). When omitted, uses config.json scan_roots.
+        #[arg(long = "root")]
+        roots: Vec<PathBuf>,
+        /// Register new candidates (default is dry-run list only)
+        #[arg(long)]
+        add: bool,
+        /// Explicit dry-run (default when --add absent)
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+        /// Persist --root into machine config.json scan_roots
+        #[arg(long = "save-root", default_value_t = false)]
+        save_root: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -126,13 +185,89 @@ pub fn run() -> ExitCode {
 fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
     match cli.command {
         Commands::Project { action } => match action {
-            ProjectCommands::Add { path } => {
-                let rec = api::project_add(&path)?;
+            ProjectCommands::Add {
+                path,
+                profile,
+                execution_repo,
+                conductor_dir,
+                state_dir,
+                display_name,
+                execution_repo_name,
+            } => {
+                let layout_profile = LayoutProfile::parse(&profile)?;
+                let opts = ProjectAddOptions {
+                    layout_profile,
+                    execution_repo,
+                    conductor_dir,
+                    state_dir,
+                    display_name,
+                    execution_repo_name,
+                    execution_repos: BTreeMap::new(),
+                };
+                let rec = api::project_add(&path, opts)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
             }
             ProjectCommands::List => {
                 let list = api::project_list()?;
                 println!("{}", serde_json::to_string_pretty(&list)?);
+            }
+            ProjectCommands::Show { project } => {
+                let view = api::project_show(project.as_deref())?;
+                println!("{}", serde_json::to_string_pretty(&view)?);
+            }
+            ProjectCommands::Set {
+                project,
+                profile,
+                execution_repo,
+                conductor_dir,
+                state_dir,
+                display_name,
+                execution_repos_json,
+                execution_repo_name,
+            } => {
+                let layout_profile = match profile {
+                    Some(s) => Some(LayoutProfile::parse(&s)?),
+                    None => None,
+                };
+                let execution_repos = match execution_repos_json {
+                    Some(j) => Some(serde_json::from_str::<BTreeMap<String, PathBuf>>(&j)?),
+                    None => None,
+                };
+                let opts = ProjectSetOptions {
+                    layout_profile,
+                    execution_repo,
+                    clear_execution_repo: false,
+                    conductor_dir,
+                    clear_conductor_dir: false,
+                    state_dir,
+                    clear_state_dir: false,
+                    display_name,
+                    execution_repos,
+                    execution_repo_name,
+                };
+                let rec = api::project_set(project.as_deref(), opts)?;
+                println!("{}", serde_json::to_string_pretty(&rec)?);
+            }
+            ProjectCommands::Scan {
+                roots,
+                add,
+                dry_run,
+                save_root,
+            } => {
+                if save_root {
+                    for r in &roots {
+                        api::save_scan_root(r)?;
+                    }
+                }
+                // Dry-run is default when --add is absent. --dry-run forces list-only.
+                let do_add = add && !dry_run;
+                let (candidates, added) = api::project_scan(&roots, do_add)?;
+                let out = serde_json::json!({
+                    "candidates": candidates,
+                    "added": added,
+                    "mode": if do_add { "add" } else { "dry-run" },
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
             }
         },
         Commands::Status { project } => {

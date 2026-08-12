@@ -10,7 +10,10 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{self, OutcomeWriteBody, ProjectAddRequest, ProjectRefBody};
+use crate::api::{
+    self, OutcomeWriteBody, ProjectAddRequest, ProjectRefBody, ProjectScanRequest,
+    ProjectSetRequest,
+};
 use crate::config::{DEFAULT_SERVE_PORT, loopback_addr, require_loopback};
 use crate::error::CoordinatorError;
 
@@ -19,6 +22,8 @@ pub fn app() -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/projects", get(list_projects).post(add_project))
+        .route("/v1/projects/set", post(set_project))
+        .route("/v1/projects/scan", post(scan_projects))
         .route("/v1/status", get(get_status))
         .route("/v1/run", post(post_run))
         .route("/v1/pause", post(post_pause))
@@ -37,8 +42,24 @@ async fn list_projects() -> Result<impl IntoResponse, ApiError> {
 }
 
 async fn add_project(Json(body): Json<ProjectAddRequest>) -> Result<impl IntoResponse, ApiError> {
-    let rec = api::project_add(std::path::Path::new(&body.path))?;
+    let rec = api::project_add_request(body)?;
     Ok((StatusCode::CREATED, Json(rec)))
+}
+
+async fn set_project(Json(body): Json<ProjectSetRequest>) -> Result<impl IntoResponse, ApiError> {
+    let rec = api::project_set_request(body)?;
+    Ok(Json(rec))
+}
+
+async fn scan_projects(
+    Json(body): Json<ProjectScanRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (candidates, added) = api::project_scan(&body.roots, body.add)?;
+    Ok(Json(json!({
+        "candidates": candidates,
+        "added": added,
+        "mode": if body.add { "add" } else { "dry-run" },
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +272,128 @@ mod tests {
         assert!(v.get("phase").is_some());
         assert!(v.get("last_event").is_some());
         assert!(v.get("run_epoch").is_some());
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn projects_set_and_scan() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let scan_root = tempdir().unwrap();
+        let proj = scan_root.path().join("ScanMe");
+        std::fs::create_dir_all(proj.join("conductor")).unwrap();
+        std::fs::write(proj.join("conductor").join("conductor.md"), "# t\n").unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+
+        // Dry-run scan
+        let body = serde_json::to_vec(&json!({
+            "roots": [scan_root.path().to_string_lossy()],
+            "add": false
+        }))
+        .unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/scan")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mode"], "dry-run");
+        assert_eq!(v["candidates"].as_array().unwrap().len(), 1);
+
+        // Add via scan
+        let body = serde_json::to_vec(&json!({
+            "roots": [scan_root.path().to_string_lossy()],
+            "add": true
+        }))
+        .unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/scan")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["added"].as_array().unwrap().len(), 1);
+
+        // Second add is idempotent (no duplicate)
+        let body = serde_json::to_vec(&json!({
+            "roots": [scan_root.path().to_string_lossy()],
+            "add": true
+        }))
+        .unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/scan")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["added"].as_array().unwrap().len(), 0);
+        assert!(v["candidates"][0]["already_registered"].as_bool().unwrap());
+
+        // Set profile
+        let body = serde_json::to_vec(&json!({
+            "layout_profile": "single_root"
+        }))
+        .unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/set")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["layout_profile"], "single_root");
+
+        // Status always includes execution_repo key (may be string or null)
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("layout_profile").is_some());
+        assert!(v.as_object().unwrap().contains_key("execution_repo"));
+        assert!(v.as_object().unwrap().contains_key("conductor_dir"));
 
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);

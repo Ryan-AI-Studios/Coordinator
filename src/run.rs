@@ -169,7 +169,10 @@ mod tests {
             id: Uuid::new_v4().to_string(),
             path: path.to_path_buf(),
             display_name: None,
-            layout_profile: "nested".into(),
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             created_at: Utc::now(),
         }
