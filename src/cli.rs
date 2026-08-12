@@ -76,6 +76,59 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
     },
+    /// Drive a harness session (Grok ACP this track)
+    Harness {
+        #[command(subcommand)]
+        action: HarnessCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HarnessCommands {
+    /// Grok Build ACP adapter
+    Grok {
+        #[command(subcommand)]
+        action: GrokCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GrokCommands {
+    /// Start (or reuse) a long-lived Grok ACP session
+    Start {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Inject a prompt; applies Phase Outcome when the run is Running
+    Prompt {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Inject `/compact` (skip if capability is false)
+    Compact {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Show Grok session summary
+    Status {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Kill the Grok ACP child (explicit teardown)
+    Shutdown {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Internal detached holder (not for operators)
+    #[command(hide = true)]
+    Hold {
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -159,7 +212,7 @@ pub enum OutcomeCommands {
         message: Option<String>,
         #[arg(long = "next-track")]
         next_track: Option<String>,
-        /// file | http | cli | timeout | test (default cli)
+        /// file | http | cli | timeout | test | adapter (default cli)
         #[arg(long, default_value = "cli")]
         source: String,
     },
@@ -326,11 +379,83 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Serve { port } => {
-            let rt = tokio::runtime::Runtime::new().map_err(|e| {
-                CoordinatorError::Message(format!("failed to start async runtime: {e}"))
-            })?;
-            rt.block_on(server::serve(port))?;
+            block_on(server::serve(port))?;
         }
+        Commands::Harness { action } => match action {
+            HarnessCommands::Grok { action } => match action {
+                GrokCommands::Start { project } => {
+                    let view = block_on(api::cmd_harness_grok_start(project.as_deref(), false))?;
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                }
+                GrokCommands::Prompt {
+                    project,
+                    text,
+                    file,
+                } => {
+                    let body = read_prompt_text(text, file)?;
+                    let view = block_on(api::cmd_harness_grok_prompt(project.as_deref(), body))?;
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                }
+                GrokCommands::Compact { project } => {
+                    let view = block_on(api::cmd_harness_grok_compact(project.as_deref()))?;
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                }
+                GrokCommands::Status { project } => {
+                    let view = block_on(api::cmd_harness_grok_status(project.as_deref()))?;
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                }
+                GrokCommands::Shutdown { project } => {
+                    let view = block_on(api::cmd_harness_grok_shutdown(project.as_deref()))?;
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                }
+                GrokCommands::Hold { project } => {
+                    block_on(api::cmd_harness_grok_hold(project.as_deref()))?;
+                }
+            },
+        },
     }
     Ok(())
+}
+
+fn block_on<T>(
+    fut: impl std::future::Future<Output = Result<T, CoordinatorError>>,
+) -> Result<T, CoordinatorError> {
+    tokio::runtime::Runtime::new()
+        .map_err(|e| CoordinatorError::Message(format!("failed to start async runtime: {e}")))?
+        .block_on(fut)
+}
+
+fn read_prompt_text(
+    text: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<String, CoordinatorError> {
+    match (text, file) {
+        (Some(t), None) => Ok(t),
+        (None, Some(p)) => std::fs::read_to_string(p).map_err(CoordinatorError::from),
+        (Some(_), Some(_)) => Err(CoordinatorError::Message(
+            "pass only one of --text or --file".into(),
+        )),
+        (None, None) => Err(CoordinatorError::Message(
+            "harness grok prompt requires --text or --file".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn harness_grok_commands_in_help() {
+        let cmd = Cli::command();
+        let harness = cmd.find_subcommand("harness").expect("harness");
+        let grok = harness.find_subcommand("grok").expect("grok");
+        for expected in ["start", "prompt", "compact", "status", "shutdown"] {
+            assert!(
+                grok.find_subcommand(expected).is_some(),
+                "missing {expected}"
+            );
+        }
+    }
 }

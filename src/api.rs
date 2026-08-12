@@ -364,6 +364,73 @@ pub fn cmd_wait(project: Option<&str>, timeout_secs: u64) -> Result<StatusView> 
     watch::wait_for_outcome(&rec, timeout_secs)
 }
 
+/// POST /v1/harness/grok/prompt body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessPromptBody {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+pub async fn cmd_harness_grok_start(
+    project: Option<&str>,
+    in_process: bool,
+) -> Result<crate::harness::GrokHarnessStatus> {
+    crate::harness::start(project, in_process).await
+}
+
+pub async fn cmd_harness_grok_prompt(
+    project: Option<&str>,
+    text: String,
+) -> Result<crate::harness::HarnessPromptView> {
+    crate::harness::prompt(project, text).await
+}
+
+pub async fn cmd_harness_grok_prompt_body(
+    body: HarnessPromptBody,
+) -> Result<crate::harness::HarnessPromptView> {
+    let text = match (body.text, body.file) {
+        (Some(t), None) => t,
+        (None, Some(p)) => std::fs::read_to_string(p)?,
+        (Some(_), Some(_)) => {
+            return Err(CoordinatorError::Message(
+                "pass only one of text or file".into(),
+            ));
+        }
+        (None, None) => {
+            return Err(CoordinatorError::Message(
+                "prompt requires text or file".into(),
+            ));
+        }
+    };
+    crate::harness::prompt(body.project.as_deref(), text).await
+}
+
+pub async fn cmd_harness_grok_compact(
+    project: Option<&str>,
+) -> Result<crate::harness::HarnessPromptView> {
+    crate::harness::compact(project).await
+}
+
+pub async fn cmd_harness_grok_status(
+    project: Option<&str>,
+) -> Result<crate::harness::GrokHarnessStatus> {
+    crate::harness::grok_status(project).await
+}
+
+pub async fn cmd_harness_grok_shutdown(
+    project: Option<&str>,
+) -> Result<crate::harness::GrokHarnessStatus> {
+    crate::harness::shutdown(project).await
+}
+
+pub async fn cmd_harness_grok_hold(project: Option<&str>) -> Result<()> {
+    crate::harness::hold(project).await
+}
+
 /// Persist a scan root into machine config (optional convenience).
 pub fn save_scan_root(root: &Path) -> Result<config::MachineConfig> {
     let mut cfg = config::load_machine_config()?;

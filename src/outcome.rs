@@ -108,6 +108,8 @@ pub enum OutcomeSource {
     Cli,
     Timeout,
     Test,
+    /// Harness adapter (e.g. Grok ACP) wrote the outcome.
+    Adapter,
 }
 
 impl OutcomeSource {
@@ -118,6 +120,7 @@ impl OutcomeSource {
             Self::Cli => "cli",
             Self::Timeout => "timeout",
             Self::Test => "test",
+            Self::Adapter => "adapter",
         }
     }
 
@@ -128,6 +131,7 @@ impl OutcomeSource {
             "cli" => Ok(Self::Cli),
             "timeout" => Ok(Self::Timeout),
             "test" => Ok(Self::Test),
+            "adapter" => Ok(Self::Adapter),
             other => Err(CoordinatorError::Message(format!(
                 "unknown outcome source: {other}"
             ))),
@@ -653,6 +657,21 @@ mod tests {
             state_dir: None,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn adapter_source_round_trip() {
+        let o = PhaseOutcome::success("stub:active", OutcomeSource::Adapter, None, None, None);
+        o.validate().unwrap();
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(json.contains("\"adapter\""));
+        let o2: PhaseOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(o2.source, OutcomeSource::Adapter);
+        assert_eq!(
+            OutcomeSource::parse("adapter").unwrap(),
+            OutcomeSource::Adapter
+        );
+        assert_eq!(OutcomeSource::Adapter.as_str(), "adapter");
     }
 
     #[test]

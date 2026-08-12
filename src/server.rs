@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::{
-    self, OutcomeWriteBody, ProjectAddRequest, ProjectRefBody, ProjectScanRequest,
-    ProjectSetRequest,
+    self, HarnessPromptBody, OutcomeWriteBody, ProjectAddRequest, ProjectRefBody,
+    ProjectScanRequest, ProjectSetRequest,
 };
 use crate::config::{DEFAULT_SERVE_PORT, loopback_addr, require_loopback};
 use crate::error::CoordinatorError;
@@ -30,6 +30,11 @@ pub fn app() -> Router {
         .route("/v1/resume", post(post_resume))
         .route("/v1/stop", post(post_stop))
         .route("/v1/outcome", get(get_outcome).post(post_outcome))
+        .route("/v1/harness/grok/start", post(post_grok_start))
+        .route("/v1/harness/grok/prompt", post(post_grok_prompt))
+        .route("/v1/harness/grok/compact", post(post_grok_compact))
+        .route("/v1/harness/grok/status", get(get_grok_status))
+        .route("/v1/harness/grok/shutdown", post(post_grok_shutdown))
 }
 
 async fn health() -> impl IntoResponse {
@@ -104,6 +109,37 @@ async fn post_stop(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse
 
 async fn post_outcome(Json(body): Json<OutcomeWriteBody>) -> Result<impl IntoResponse, ApiError> {
     let view = api::cmd_outcome_post(body)?;
+    Ok(Json(view))
+}
+
+async fn post_grok_start(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
+    let view = api::cmd_harness_grok_start(body.project.as_deref(), true).await?;
+    Ok(Json(view))
+}
+
+async fn post_grok_prompt(
+    Json(body): Json<HarnessPromptBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = api::cmd_harness_grok_prompt_body(body).await?;
+    Ok(Json(view))
+}
+
+async fn post_grok_compact(
+    Json(body): Json<ProjectRefBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = api::cmd_harness_grok_compact(body.project.as_deref()).await?;
+    Ok(Json(view))
+}
+
+async fn get_grok_status(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
+    let view = api::cmd_harness_grok_status(q.project.as_deref()).await?;
+    Ok(Json(view))
+}
+
+async fn post_grok_shutdown(
+    Json(body): Json<ProjectRefBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = api::cmd_harness_grok_shutdown(body.project.as_deref()).await?;
     Ok(Json(view))
 }
 
@@ -460,6 +496,166 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["status"], "Idle");
         assert_eq!(v["phase"], "stub:completed");
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn harness_start_missing_binary_is_400() {
+        use crate::harness::ENV_GROK_BIN;
+
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_GROK_BIN, r"C:\this\does\not\exist-grok.exe");
+        }
+
+        let body = serde_json::to_vec(&json!({ "path": proj.path().to_string_lossy() })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let start_body = serde_json::to_vec(&json!({})).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/harness/grok/start")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(start_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("not found"),
+            "error={}",
+            v["error"]
+        );
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var(ENV_GROK_BIN);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn harness_prompt_and_status_via_http() {
+        use crate::harness::grok::{
+            GrokSession, mock_handshake_ok, rpc_result, session_update_chunk,
+        };
+        use crate::harness::pool::insert_test_session;
+        use std::time::Duration;
+
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+
+        let body = serde_json::to_vec(&json!({ "path": proj.path().to_string_lossy() })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let rec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let project_id = rec["id"].as_str().unwrap().to_string();
+
+        let run_body = serde_json::to_vec(&json!({})).unwrap();
+        let _ = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(run_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut lines = mock_handshake_ok("sess-http");
+        lines.push(session_update_chunk("pong"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let session =
+            GrokSession::start_mock(proj.path().to_path_buf(), lines, Duration::from_secs(2))
+                .await
+                .unwrap();
+        insert_test_session(project_id.clone(), session).await;
+
+        let prompt_body = serde_json::to_vec(&json!({ "text": "hi" })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/harness/grok/prompt")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(prompt_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["text"], "pong");
+        assert_eq!(v["applied"], true);
+
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("harness").is_some());
+        assert_eq!(v["harness"]["grok"]["session_id"], "sess-http");
+
+        let _ = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/harness/grok/shutdown")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);

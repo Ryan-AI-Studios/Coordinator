@@ -40,7 +40,7 @@ impl std::fmt::Display for RunStatus {
 }
 
 /// ADR-0024 stop note (persisted in run-state / status JSON).
-pub const STOP_LAST_EVENT: &str = "stopped: no merge; sessions-for-attach deferred to 0007+";
+pub const STOP_LAST_EVENT: &str = "stopped: no merge; sessions left for attach";
 
 /// Default stub phase while Running/Paused.
 pub const STUB_PHASE_ACTIVE: &str = "stub:active";
@@ -151,6 +151,9 @@ pub struct StatusView {
     /// Resolved conductor directory.
     #[serde(default)]
     pub conductor_dir: Option<PathBuf>,
+    /// Additive harness summary (`harness.grok`) when a session exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<crate::harness::HarnessStatusBundle>,
 }
 
 impl StatusView {
@@ -170,6 +173,7 @@ impl StatusView {
             layout_profile: record.layout_profile,
             execution_repo: paths.execution_repo,
             conductor_dir: Some(paths.conductor_dir),
+            harness: crate::harness::status_bundle_sync(record),
         }
     }
 }
