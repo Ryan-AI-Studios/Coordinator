@@ -27,6 +27,8 @@ pub struct ProjectAddOptions {
     /// multi_sibling: name for primary map entry when `execution_repo` is set.
     pub execution_repo_name: Option<String>,
     pub execution_repos: BTreeMap<String, PathBuf>,
+    /// Omit = default true (ADR-0019).
+    pub auto_merge: Option<bool>,
 }
 
 /// Fields mutatable via `project set` (workspace `path` is immutable this track).
@@ -42,6 +44,8 @@ pub struct ProjectSetOptions {
     pub display_name: Option<String>,
     pub execution_repos: Option<BTreeMap<String, PathBuf>>,
     pub execution_repo_name: Option<String>,
+    /// Omit = leave unchanged.
+    pub auto_merge: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,7 +66,14 @@ pub struct ProjectRecord {
     /// Optional per-record state dir override (absolute).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_dir: Option<PathBuf>,
+    /// Squash-merge when CI is green (ADR-0019). Missing field on old records = on.
+    #[serde(default = "default_true")]
+    pub auto_merge: bool,
     pub created_at: DateTime<Utc>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,6 +181,7 @@ impl Registry {
             execution_repo,
             execution_repos,
             state_dir,
+            auto_merge: opts.auto_merge.unwrap_or(true),
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
@@ -217,6 +229,9 @@ impl Registry {
             rec.execution_repos
                 .entry(name.clone())
                 .or_insert_with(|| exec.clone());
+        }
+        if let Some(v) = opts.auto_merge {
+            rec.auto_merge = v;
         }
         Ok(rec.clone())
     }
@@ -410,6 +425,33 @@ mod tests {
         assert_eq!(loaded.projects[0].layout_profile, LayoutProfile::Nested);
         assert!(loaded.projects[0].execution_repos.is_empty());
         assert!(loaded.projects[0].execution_repo.is_none());
+        assert!(
+            loaded.projects[0].auto_merge,
+            "missing auto_merge on old registry JSON defaults true"
+        );
+    }
+
+    #[test]
+    fn set_auto_merge_false_round_trip() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        assert!(rec.auto_merge);
+        let updated = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    auto_merge: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!updated.auto_merge);
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert!(!loaded.projects[0].auto_merge);
     }
 
     #[test]

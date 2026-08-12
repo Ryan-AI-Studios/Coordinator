@@ -13,6 +13,14 @@ use crate::layout::LayoutProfile;
 use crate::registry::{ProjectAddOptions, ProjectSetOptions};
 use crate::server;
 
+fn parse_auto_merge(s: &str) -> std::result::Result<bool, String> {
+    match s.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("expected true|false, got {other}")),
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "coordinator",
@@ -158,6 +166,9 @@ pub enum ProjectCommands {
         /// multi_sibling: name for primary map entry when --execution-repo set
         #[arg(long = "execution-repo-name")]
         execution_repo_name: Option<String>,
+        /// true | false (omit = default on)
+        #[arg(long = "auto-merge", value_parser = parse_auto_merge)]
+        auto_merge: Option<bool>,
     },
     /// List registered projects (JSON; includes profile + execution summary)
     List,
@@ -185,6 +196,9 @@ pub enum ProjectCommands {
         execution_repos_json: Option<String>,
         #[arg(long = "execution-repo-name")]
         execution_repo_name: Option<String>,
+        /// true | false (omit = leave unchanged)
+        #[arg(long = "auto-merge", value_parser = parse_auto_merge)]
+        auto_merge: Option<bool>,
     },
     /// Scan roots for conductor/conductor.md markers
     Scan {
@@ -263,6 +277,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 state_dir,
                 display_name,
                 execution_repo_name,
+                auto_merge,
             } => {
                 let layout_profile = LayoutProfile::parse(&profile)?;
                 let opts = ProjectAddOptions {
@@ -273,6 +288,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     display_name,
                     execution_repo_name,
                     execution_repos: BTreeMap::new(),
+                    auto_merge,
                 };
                 let rec = api::project_add(&path, opts)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
@@ -294,6 +310,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 display_name,
                 execution_repos_json,
                 execution_repo_name,
+                auto_merge,
             } => {
                 let layout_profile = match profile {
                     Some(s) => Some(LayoutProfile::parse(&s)?),
@@ -314,6 +331,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     display_name,
                     execution_repos,
                     execution_repo_name,
+                    auto_merge,
                 };
                 let rec = api::project_set(project.as_deref(), opts)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);

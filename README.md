@@ -97,17 +97,17 @@ When nested `execution_repo` is null, `project show` includes:
 
 ```
 plan → plan-review (agy + opencode join) → fold → implement
-  → cross-model-review (skip → 0011) → ci-wait (skip → 0010)
+  → cross-model-review (skip → 0011) → ci-wait (token-idle gh poll)
   → compact → advance
 ```
 
 | Driver | CLI / env | Behavior |
 |--------|-----------|----------|
-| `adapter` | default | Inject Grok prompt once per phase for plan/fold/implement/advance. Missing `grok` **fails** that phase. |
+| `adapter` | default | Inject Grok prompt once per phase for plan/fold/implement/advance. **`ci-wait` never injects** (token-idle `gh` poll). Missing `grok` **fails** Grok-bound phases. |
 | `file_wait` | `--driver file_wait` | No inject; poll `current.json` / `outcomes/roles/*.json`. |
 | `stub` | `--driver stub` or `COORDINATOR_WORKFLOW_DRIVER=stub` | Synthesize success each tick so CI can walk the full graph. |
 
-Status JSON includes additive `workflow` `{ id, driver, pending_roles }`.
+Status JSON includes additive `workflow` `{ id, driver, pending_roles }` and additive `ci` (`pr`, `pr_url`, `head_sha`, `last_summary`, `interval_ms`, `auto_merge`, `merge`) — `null` when phase is not `ci-wait` and no watch state is persisted. Existing additive fields include `failure_class`, `next_track`, `phase_started_at`, `run_epoch`, `failure_artifact`.
 
 **Plan-review:** two role files + review markdown; Coordinator assembles `{workspace}/AI-review.md`. One reviewer may degrade; **both** missing/fail → Stopped. Line endings normalized to `\n`.
 
@@ -129,7 +129,26 @@ Hard failure (apply `status=failure`, including timeout synthesis and adapter fa
 
 `COORDINATOR_NOTIFY=off` is the CI / headless default path. `cargo test` never requires a visible toast (recording adapter).
 
-Skip slots (`cross-model-review`, `ci-wait`) synthesize success with `last_event` `skip: deferred to 0011` / `0010`.
+The remaining skip slot is **`cross-model-review` only** (`last_event` `skip: deferred to 0011`). `ci-wait` is a real phase (track 0010).
+
+### Token-idle CI wait + auto squash-merge
+
+After implement (and the 0011 skip), Coordinator watches CI **outside** any model Session (ADR-0011). The serve/`wait` loop already wakes ~every 500ms; `ci-wait` does **not** sleep and does **not** spawn `gh` on every wake.
+
+| Item | Behavior |
+|------|----------|
+| Tool | `gh` CLI from the **execution repo** cwd (`COORDINATOR_GH_BIN` or `gh` / `gh.exe`). Env: `GH_PROMPT_DISABLED=1`, `NO_COLOR=1`. No `octocrab`, no webhooks, no `gh pr checks --watch` |
+| Target | Persisted `RunState.ci` → implement `metadata.pr_number`/`pr_url` → `gh pr view` → `gh pr list --head` → default-branch `HEAD` sha (`gh run list`). Feature branch with no PR stays pending (`ci-wait: waiting for PR`) until the 3600s phase timeout |
+| Checks | `gh pr checks {n} --json bucket,name,state` (all checks, **not** `--required`). Draft PR stays pending (`ci-wait: waiting (draft PR)`). Already `MERGED` is green. Any `fail`/`cancel` → `ci_failed`. Empty check list is green |
+| Default branch | `gh run list --commit {sha}`. Empty runs for &lt; 2 min stay pending; then treat as “no CI configured” (green, **no merge**) |
+| Interval | 15s (0–2 min) → 30s (2–10 min) → 60s (≥10 min), cap 120s. Reset to 15s when the check/run set changes. Tests: `COORDINATOR_CI_POLL_MS` is a **fixed** interval |
+| Merge | Green PR + Project `auto_merge=true` (default) → `gh pr merge {n} --squash`. **No** `--admin`, **no** `--delete-branch`. `auto_merge=false` succeeds with `ci-wait: green; merge skipped (auto_merge=false)`. Operator `stop` never merges. Pause **finishes** `ci-wait` (the one phase that ticks while Paused) then stays Paused at `compact` |
+| Fail | `failure_class=ci_failed` → Stopped + Failure Artifact + toast. No auto-retry of the workflow |
+| Process cap | Each `gh`/`git` spawn: 30s then kill (transient, `ci-wait: gh timed out`) |
+
+`project add` / `project set` accept `--auto-merge true|false` (omit = default on / leave unchanged). HTTP `POST /v1/projects` and `/v1/projects/set` take optional `auto_merge`. Old `registry.json` records without the field load as **true**.
+
+Default `cargo test` uses a scripted `CiBackend` and never needs `gh` auth. Optional live smoke: `$env:COORDINATOR_GH_LIVE='1'; cargo test ci_live -- --ignored --nocapture`.
 
 ### Grok harness adapter (ACP)
 
@@ -210,11 +229,13 @@ coordinator project add <path>
     [--profile nested|multi_sibling|single_root]
     [--execution-repo <path>] [--conductor-dir <path>] [--state-dir <path>]
     [--display-name <name>] [--execution-repo-name <name>]
+    [--auto-merge true|false]
 coordinator project list
 coordinator project show [--project <path|id>]
 coordinator project set [--project …]
     [--profile …] [--execution-repo …] [--conductor-dir …] [--state-dir …]
     [--display-name …] [--execution-repos-json <json>] [--execution-repo-name …]
+    [--auto-merge true|false]
 coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]
 coordinator status [--project <path|id>]
 coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait|stub]
@@ -235,7 +256,7 @@ coordinator harness grok shutdown [--project …]
 coordinator serve [--port <u16>]   # default 7420, 127.0.0.1 only
 ```
 
-HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver`), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), `failure_artifact` (path or `null`), and optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists.
+HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver`), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), `ci` (watch object or `null`), `failure_artifact` (path or `null`), and optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists.
 
 ### Phase Outcome schema v1
 
@@ -250,7 +271,9 @@ HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v
   "source": "cli",
   "metadata": {
     "next_track": null,
-    "role": null
+    "role": null,
+    "pr_number": null,
+    "pr_url": null
   }
 }
 ```
@@ -264,6 +287,7 @@ HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v
 | `source` | `file` \| `http` \| `cli` \| `timeout` \| `test` \| `adapter` |
 | `metadata.next_track` | Optional; copied to status on success |
 | `metadata.role` | `planner` / `implementor` / `plan_reviewer_agy` / `plan_reviewer_opencode`; unknown ignored |
+| `metadata.pr_number` / `pr_url` | Optional implement hint; copied onto `RunState.ci` when present |
 | `run_epoch` | Optional; when present must match run-state epoch |
 
 **Apply (single path):** leftover `stub:*` success → Idle / `stub:completed` (Paused stays Paused). Canonical success → **successor phase, stay Running** (Paused stays Paused). Canonical failure → Stopped and **keeps the failed phase id**. Operator `stop` still sets `stub:stopped`. Idle/Stopped and phase mismatch reject for CLI/HTTP. After apply: history best-effort → `current.applied.json` → remove `current.json` → hash on run-state.
@@ -362,4 +386,4 @@ This is a **visual contract**, not product orchestration. Real start/resume is C
 
 ## Status
 
-Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool), **0008** (canonical workflow runner), **0009** (stop/pause + Failure Artifact + toast).
+Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool), **0008** (canonical workflow runner), **0009** (stop/pause + Failure Artifact + toast), **0010** (token-idle `ci-wait` + auto squash-merge).

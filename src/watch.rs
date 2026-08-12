@@ -17,7 +17,8 @@ use crate::state::{RunStatus, StatusView, load_run_state};
 /// Returns `Some(view)` when an outcome was applied this tick; `None` otherwise.
 /// Never panics on unreadable/partial JSON (skips file apply for this tick).
 pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
-    // 0) Drive the canonical graph (inject / stub / skip / join). No-op when Paused.
+    // 0) Drive the canonical graph (inject / stub / skip / join).
+    //    `ci-wait` still ticks while Paused (finish current wait).
     match crate::workflow::tick(record) {
         Ok(Some(view)) => return Ok(Some(view)),
         Ok(None) => {}
@@ -196,6 +197,7 @@ mod tests {
             execution_repo: None,
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
+            auto_merge: true,
             created_at: chrono::Utc::now(),
         }
     }
@@ -236,6 +238,7 @@ mod tests {
                 execution_repo: None,
                 execution_repos: std::collections::BTreeMap::new(),
                 state_dir: None,
+                auto_merge: true,
                 created_at: chrono::Utc::now(),
             };
             let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::File, None, None, None);

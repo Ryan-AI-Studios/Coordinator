@@ -1095,6 +1095,7 @@ mod tests {
             execution_repo: None,
             execution_repos: Default::default(),
             state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
             created_at: chrono::Utc::now(),
         };
         let stale = PersistedGrokHandle {
@@ -1149,6 +1150,7 @@ mod tests {
             execution_repo: None,
             execution_repos: Default::default(),
             state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(&rec, None, crate::workflow::WorkflowDriver::FileWait).unwrap();
@@ -1172,6 +1174,7 @@ mod tests {
             execution_repo: None,
             execution_repos: Default::default(),
             state_dir: None,
+            auto_merge: true,
             created_at: chrono::Utc::now(),
         };
         let p = persist_path(&rec).unwrap();
@@ -1192,6 +1195,7 @@ mod tests {
             execution_repo: Some(exec.clone()),
             execution_repos: Default::default(),
             state_dir: None,
+            auto_merge: true,
             created_at: chrono::Utc::now(),
         };
         assert_eq!(grok_cwd(&rec), exec);

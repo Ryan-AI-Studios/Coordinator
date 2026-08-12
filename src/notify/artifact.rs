@@ -134,6 +134,7 @@ mod tests {
             execution_repo: None,
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
+            auto_merge: true,
             created_at: Utc::now(),
         }
     }

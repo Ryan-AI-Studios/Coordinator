@@ -35,6 +35,8 @@ pub struct ProjectAddRequest {
     pub execution_repo_name: Option<String>,
     #[serde(default)]
     pub execution_repos: Option<BTreeMap<String, PathBuf>>,
+    #[serde(default)]
+    pub auto_merge: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +57,8 @@ pub struct ProjectSetRequest {
     pub execution_repos: Option<BTreeMap<String, PathBuf>>,
     #[serde(default)]
     pub execution_repo_name: Option<String>,
+    #[serde(default)]
+    pub auto_merge: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +141,7 @@ fn opts_from_add_request(req: &ProjectAddRequest) -> Result<ProjectAddOptions> {
         display_name: req.display_name.clone(),
         execution_repo_name: req.execution_repo_name.clone(),
         execution_repos: req.execution_repos.clone().unwrap_or_default(),
+        auto_merge: req.auto_merge,
     })
 }
 
@@ -205,6 +210,7 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         display_name: req.display_name,
         execution_repos: req.execution_repos,
         execution_repo_name: req.execution_repo_name,
+        auto_merge: req.auto_merge,
     };
     project_set(req.project.as_deref(), opts)
 }
@@ -322,7 +328,7 @@ pub fn cmd_outcome_write(
         source,
         metadata: next_track.map(|t| outcome::OutcomeMetadata {
             next_track: Some(t),
-            role: None,
+            ..Default::default()
         }),
         run_epoch: None,
     };

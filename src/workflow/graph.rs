@@ -56,13 +56,12 @@ pub fn successor(phase: &str) -> Option<&'static str> {
 }
 
 pub fn is_skip_phase(phase: &str) -> bool {
-    matches!(phase, PHASE_CROSS_MODEL | PHASE_CI_WAIT)
+    matches!(phase, PHASE_CROSS_MODEL)
 }
 
 pub fn skip_deferred_track(phase: &str) -> Option<&'static str> {
     match phase {
         PHASE_CROSS_MODEL => Some("0011"),
-        PHASE_CI_WAIT => Some("0010"),
         _ => None,
     }
 }
@@ -143,13 +142,14 @@ mod tests {
     }
 
     #[test]
-    fn skip_slots_are_0010_and_0011() {
+    fn skip_slot_is_0011_only() {
         assert!(is_skip_phase(PHASE_CROSS_MODEL));
-        assert!(is_skip_phase(PHASE_CI_WAIT));
+        assert!(!is_skip_phase(PHASE_CI_WAIT));
         assert_eq!(skip_deferred_track(PHASE_CROSS_MODEL), Some("0011"));
-        assert_eq!(skip_deferred_track(PHASE_CI_WAIT), Some("0010"));
+        assert_eq!(skip_deferred_track(PHASE_CI_WAIT), None);
         assert!(!is_skip_phase(PHASE_PLAN));
         assert!(!is_skip_phase(PHASE_COMPACT));
+        assert!(!is_grok_bound(PHASE_CI_WAIT));
     }
 
     #[test]

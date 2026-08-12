@@ -28,6 +28,15 @@ pub const ENV_STUB_PHASE_TIMEOUT_SECS: &str = "COORDINATOR_STUB_PHASE_TIMEOUT_SE
 /// Env: outcome file poll interval in milliseconds (default 500).
 pub const ENV_OUTCOME_POLL_MS: &str = "COORDINATOR_OUTCOME_POLL_MS";
 
+/// Env: override `gh` binary (absolute path). Default `gh` / `gh.exe` on PATH.
+pub const ENV_COORDINATOR_GH_BIN: &str = "COORDINATOR_GH_BIN";
+
+/// Env: fixed `ci-wait` poll interval in milliseconds (tests). Unset → adaptive 15/30/60s.
+pub const ENV_COORDINATOR_CI_POLL_MS: &str = "COORDINATOR_CI_POLL_MS";
+
+/// Env: set to `1` to enable ignored live `gh` smoke tests.
+pub const ENV_COORDINATOR_GH_LIVE: &str = "COORDINATOR_GH_LIVE";
+
 /// Default stub phase budget (seconds) for `stub:active`.
 pub const DEFAULT_STUB_PHASE_TIMEOUT_SECS: u64 = 300;
 

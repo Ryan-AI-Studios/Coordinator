@@ -153,6 +153,11 @@ pub struct OutcomeMetadata {
     /// Recognized: planner, implementor, plan_reviewer_agy, plan_reviewer_opencode. Unknown ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Implement-phase hint for `ci-wait` target resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
 }
 
 /// Phase Outcome File schema v1.
@@ -217,7 +222,7 @@ impl PhaseOutcome {
     ) -> Self {
         let metadata = next_track.map(|t| OutcomeMetadata {
             next_track: Some(t),
-            role: None,
+            ..Default::default()
         });
         Self {
             version: OUTCOME_VERSION,
@@ -759,6 +764,7 @@ mod tests {
             execution_repo: None,
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
+            auto_merge: true,
             created_at: Utc::now(),
         }
     }

@@ -100,6 +100,33 @@ pub struct RunState {
     /// Tick inject-once marker (`run_epoch` + phase).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_driven_phase: Option<String>,
+    /// Token-idle CI watch (0010). Cleared on fresh `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<CiWatchState>,
+}
+
+/// Persisted `ci-wait` watcher (additive; old run-state.json loads as None).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiWatchState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_poll_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_summary: Option<String>,
+    /// `"done"` | `"skipped"` | `"queued"`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<String>,
+    /// Fingerprint of last check/run set (interval reset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_key: Option<String>,
+    /// Interval to wait before the next spawn (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_interval_ms: Option<u64>,
 }
 
 impl RunState {
@@ -122,6 +149,7 @@ impl RunState {
             driver: crate::workflow::WorkflowDriver::default(),
             pending_roles: Vec::new(),
             last_driven_phase: None,
+            ci: None,
         }
     }
 
@@ -176,6 +204,26 @@ pub struct StatusView {
     /// Path to `{state_dir}/FAILURE.md` when present; `null` when absent.
     #[serde(default)]
     pub failure_artifact: Option<PathBuf>,
+    /// Token-idle CI watch; `null` when phase ≠ `ci-wait` and no persisted state.
+    #[serde(default)]
+    pub ci: Option<CiStatusView>,
+}
+
+/// Status JSON `ci` object (0010).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiStatusView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_summary: Option<String>,
+    pub interval_ms: u64,
+    pub auto_merge: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<String>,
 }
 
 /// Status JSON `workflow` object (0008).
@@ -212,8 +260,39 @@ impl StatusView {
                 pending_roles: state.pending_roles.clone(),
             }),
             failure_artifact: crate::notify::artifact::existing_path(record),
+            ci: ci_status_view(record, state),
         }
     }
+}
+
+fn ci_status_view(record: &ProjectRecord, state: &RunState) -> Option<CiStatusView> {
+    if state.phase != crate::workflow::graph::PHASE_CI_WAIT && state.ci.is_none() {
+        return None;
+    }
+    let interval_ms = state
+        .ci
+        .as_ref()
+        .and_then(|c| c.next_interval_ms)
+        .unwrap_or_else(crate::ci::initial_interval_ms);
+    let (pr, pr_url, head_sha, last_summary, merge) = match state.ci.as_ref() {
+        Some(c) => (
+            c.pr_number,
+            c.pr_url.clone(),
+            c.head_sha.clone(),
+            c.last_summary.clone(),
+            c.merge.clone(),
+        ),
+        None => (None, None, None, None, None),
+    };
+    Some(CiStatusView {
+        pr,
+        pr_url,
+        head_sha,
+        last_summary,
+        interval_ms,
+        auto_merge: record.auto_merge,
+        merge,
+    })
 }
 
 /// Resolve state directory for a project.
@@ -319,6 +398,7 @@ mod tests {
             execution_repo: None,
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
+            auto_merge: true,
             created_at: Utc::now(),
         }
     }
@@ -475,6 +555,8 @@ mod tests {
         assert_eq!(json["layout_profile"], "nested");
         assert!(json.as_object().unwrap().contains_key("failure_artifact"));
         assert!(json["failure_artifact"].is_null());
+        assert!(json.as_object().unwrap().contains_key("ci"));
+        assert!(json["ci"].is_null());
     }
 
     #[test]

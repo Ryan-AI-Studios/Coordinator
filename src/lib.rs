@@ -4,8 +4,10 @@
 //! complete phases without chat vibes (track **0005**). Grok ACP adapter +
 //! project-keyed session pool: track **0007**. Canonical workflow runner: track **0008**.
 //! Failure Artifact + toast + Notify Adapter: track **0009**.
+//! Token-idle CI wait + auto squash-merge: track **0010**.
 
 pub mod api;
+pub mod ci;
 pub mod cli;
 pub mod config;
 pub mod error;
