@@ -197,26 +197,26 @@ pub fn save_machine_config(cfg: &MachineConfig) -> Result<()> {
     atomic_write_json(&path, &cfg)
 }
 
-/// Require absolute scan roots (canonicalize when existing).
+/// Require **absolute** scan roots (schema contract). Canonicalize when the path exists.
+///
+/// Relative paths are always rejected — even if they exist under the current cwd —
+/// so persisted `scan_roots` never depend on process working directory.
 pub fn normalize_scan_root(path: &Path) -> Result<PathBuf> {
     if path.as_os_str().is_empty() {
         return Err(CoordinatorError::Message(
             "scan root must not be empty".into(),
         ));
     }
-    if path.is_absolute() {
-        if path.exists() {
-            return crate::registry::canonicalize_path(path);
-        }
-        return Ok(path.to_path_buf());
+    if !path.is_absolute() {
+        return Err(CoordinatorError::Message(format!(
+            "scan root must be absolute: {}",
+            path.display()
+        )));
     }
     if path.exists() {
         return crate::registry::canonicalize_path(path);
     }
-    Err(CoordinatorError::Message(format!(
-        "scan root must be absolute (or existing): {}",
-        path.display()
-    )))
+    Ok(path.to_path_buf())
 }
 
 fn normalize_scan_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -308,6 +308,22 @@ mod tests {
         std::fs::write(&path, r#"{"version":1,"scan_roots":["relative\\scan"]}"#).unwrap();
         let err = load_machine_config_at(&path).unwrap_err();
         assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn reject_existing_relative_scan_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env_lock();
+        let abs = dir.path().to_path_buf();
+        let name = abs.file_name().unwrap().to_os_string();
+        let parent = abs.parent().unwrap().to_path_buf();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&parent).unwrap();
+        let rel = PathBuf::from(&name);
+        assert!(rel.exists(), "fixture relative dir should exist after chdir");
+        let err = normalize_scan_root(&rel).unwrap_err();
+        assert!(err.to_string().contains("absolute"));
+        std::env::set_current_dir(prev).unwrap();
     }
 
     #[test]
