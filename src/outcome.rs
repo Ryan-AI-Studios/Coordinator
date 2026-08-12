@@ -353,40 +353,41 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusV
     outcome.validate()?;
     ensure_state_dir(record)?;
     let hash = outcome_content_hash(&outcome)?;
-    let mut state = load_run_state(record)?;
+    let base = load_run_state(record)?;
 
     // Idempotent re-apply of the same content.
-    if state.last_applied_outcome_hash.as_deref() == Some(hash.as_str()) {
-        return Ok(StatusView::from_record(record, &state));
+    if base.last_applied_outcome_hash.as_deref() == Some(hash.as_str()) {
+        return Ok(StatusView::from_record(record, &base));
     }
 
     // Optional stronger epoch check when the writer set it.
     if let Some(epoch) = outcome.run_epoch
-        && epoch != state.run_epoch
+        && epoch != base.run_epoch
     {
         return Err(CoordinatorError::Message(format!(
             "outcome run_epoch {epoch} does not match state run_epoch {}",
-            state.run_epoch
+            base.run_epoch
         )));
     }
 
-    match state.status {
+    match base.status {
         RunStatus::Idle | RunStatus::Stopped => {
             return Err(CoordinatorError::Message(format!(
                 "cannot apply outcome while status is {}",
-                state.status
+                base.status
             )));
         }
         RunStatus::Running | RunStatus::Paused => {}
     }
 
-    if outcome.phase != state.phase {
+    if outcome.phase != base.phase {
         return Err(CoordinatorError::Message(format!(
             "outcome phase '{}' does not match current phase '{}'",
-            outcome.phase, state.phase
+            outcome.phase, base.phase
         )));
     }
 
+    let mut state = base.clone();
     match outcome.status {
         OutcomeStatus::Success => {
             state.phase = STUB_PHASE_COMPLETED.into();
@@ -418,22 +419,45 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusV
     }
 
     state.updated_at = Utc::now();
-    state.last_applied_outcome_hash = Some(hash);
+    state.last_applied_outcome_hash = Some(hash.clone());
     // Phase clock no longer active after apply.
     state.phase_started_at = None;
     state.pause_started_at = None;
+
+    // Cross-process fail-closed: re-load and require base snapshot still current
+    // (first valid commit wins; concurrent CLI vs serve last-writer-wins is rejected).
+    let fresh = load_run_state(record)?;
+    if fresh.last_applied_outcome_hash.as_deref() == Some(hash.as_str()) {
+        // Peer already applied identical content.
+        clear_active_outcome_file(record);
+        return Ok(StatusView::from_record(record, &fresh));
+    }
+    if fresh.run_epoch != base.run_epoch
+        || fresh.status != base.status
+        || fresh.phase != base.phase
+        || fresh.last_applied_outcome_hash != base.last_applied_outcome_hash
+    {
+        return Err(CoordinatorError::Message(
+            "apply race: run-state changed before commit; retry after status check".into(),
+        ));
+    }
 
     // Consume pattern: history → applied snapshot → remove current → save state.
     best_effort_history(record, &outcome);
     let _ = ensure_outcomes_dir(record);
     let _ = atomic_write_json(&outcome_applied_path(record), &outcome);
+    clear_active_outcome_file(record);
+
+    save_run_state(record, &state)?;
+    Ok(StatusView::from_record(record, &state))
+}
+
+/// Remove active `current.json` if present (non-fatal).
+pub fn clear_active_outcome_file(record: &ProjectRecord) {
     let current = outcome_current_path(record);
     if current.exists() {
         let _ = std::fs::remove_file(&current);
     }
-
-    save_run_state(record, &state)?;
-    Ok(StatusView::from_record(record, &state))
 }
 
 fn format_success_event(outcome: &PhaseOutcome, paused: bool) -> String {
@@ -508,10 +532,18 @@ pub fn poll_try_apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<O
 }
 
 /// Write + apply from CLI/HTTP builders (drops `current.json` then applies).
+///
+/// If apply rejects, the active file is removed so a later `run` cannot replay it.
 pub fn write_and_apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView> {
     outcome.validate()?;
     save_current_outcome(record, &outcome)?;
-    apply(record, outcome)
+    match apply(record, outcome) {
+        Ok(view) => Ok(view),
+        Err(e) => {
+            clear_active_outcome_file(record);
+            Err(e)
+        }
+    }
 }
 
 /// Synthesize a timeout failure for the current phase and apply it.
@@ -825,5 +857,56 @@ mod tests {
             )
         );
         assert!(outcome_roles_dir(&r).ends_with("roles"));
+    }
+
+    #[test]
+    fn write_while_idle_does_not_leave_replayable_file() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::Cli, None, None, None);
+        assert!(write_and_apply(&r, o).is_err());
+        assert!(
+            !outcome_current_path(&r).exists(),
+            "failed write must not leave current.json"
+        );
+    }
+
+    #[test]
+    fn new_run_clears_stale_current_json() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let stale = PhaseOutcome::success(
+            STUB_PHASE_ACTIVE,
+            OutcomeSource::File,
+            Some("stale from prior".into()),
+            None,
+            None,
+        );
+        save_current_outcome(&r, &stale).unwrap();
+        assert!(outcome_current_path(&r).exists());
+        run::run(&r, None).unwrap();
+        assert!(
+            !outcome_current_path(&r).exists(),
+            "run must clear active outcome file"
+        );
+        let tick = crate::watch::poll_once(&r).unwrap();
+        assert!(tick.is_none());
+        let s = run::status(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        assert_eq!(s.phase, STUB_PHASE_ACTIVE);
+    }
+
+    #[test]
+    fn resume_after_paused_success_goes_idle() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run::run(&r, None).unwrap();
+        run::pause(&r).unwrap();
+        let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::Cli, None, None, None);
+        apply(&r, o).unwrap();
+        let s = run::resume(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Idle);
+        assert_eq!(s.phase, STUB_PHASE_COMPLETED);
+        assert!(s.last_event.contains("release hold"));
     }
 }

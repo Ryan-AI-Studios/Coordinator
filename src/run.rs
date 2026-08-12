@@ -4,10 +4,12 @@
 //! ([`crate::outcome`]) and poll/wait ([`crate::watch`]) — track 0005.
 
 use crate::error::{CoordinatorError, Result};
+use crate::outcome::clear_active_outcome_file;
 use crate::registry::ProjectRecord;
 use crate::state::{
-    RunState, RunStatus, STOP_LAST_EVENT, STUB_PHASE_ACTIVE, STUB_PHASE_STOPPED, StatusView,
-    ensure_state_dir, load_run_state, save_run_state,
+    RunState, RunStatus, STOP_LAST_EVENT, STUB_PHASE_ACTIVE, STUB_PHASE_COMPLETED,
+    STUB_PHASE_FAILED, STUB_PHASE_STOPPED, StatusView, ensure_state_dir, load_run_state,
+    save_run_state,
 };
 
 /// Apply `run`: Idle/Stopped → Running.
@@ -32,6 +34,9 @@ pub fn run(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusVie
             state.last_applied_outcome_hash = None;
             state.last_event = "run: started stub".into();
             state.updated_at = chrono::Utc::now();
+            // Drop any leftover active outcome so a prior Idle/Stopped write cannot
+            // complete this new run (stale defense when run_epoch is omitted).
+            clear_active_outcome_file(record);
             save_run_state(record, &state)?;
             Ok(StatusView::from_record(record, &state))
         }
@@ -59,19 +64,32 @@ pub fn pause(record: &ProjectRecord) -> Result<StatusView> {
 }
 
 /// Apply `resume`: Paused → Running (accumulate paused duration for timeout freeze).
+///
+/// If the phase already completed/failed while held, release to Idle instead of
+/// re-entering `Running` without a phase clock (would hang forever under autonomy).
 pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
     transition(record, "resume", |state| match state.status {
         RunStatus::Paused => {
+            if state.phase == STUB_PHASE_COMPLETED || state.phase == STUB_PHASE_FAILED {
+                state.status = RunStatus::Idle;
+                state.pause_started_at = None;
+                state.phase_started_at = None;
+                state.last_event = "resume: release hold after phase outcome".into();
+                return Ok(());
+            }
             let now = chrono::Utc::now();
             if let Some(pstart) = state.pause_started_at.take() {
                 let delta = (now - pstart).num_milliseconds().max(0) as u64;
                 state.total_paused_ms = state.total_paused_ms.saturating_add(delta);
             }
             state.status = RunStatus::Running;
-            // Keep phase as-is when already advanced (e.g. success-while-paused);
-            // for active stub, ensure active phase string for outcome match.
             if state.phase.is_empty() {
                 state.phase = STUB_PHASE_ACTIVE.into();
+            }
+            // Ensure timeout clock exists if it was cleared unexpectedly.
+            if state.phase_started_at.is_none() {
+                state.phase_started_at = Some(now);
+                state.total_paused_ms = 0;
             }
             state.last_event = "resume: continue stub".into();
             Ok(())
