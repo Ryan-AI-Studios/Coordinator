@@ -56,7 +56,7 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Stop a run (no merge; sessions-for-attach deferred)
+    /// Stop a run (no merge; sessions left for attach; not a failure)
     Stop {
         #[arg(long)]
         project: Option<String>,
@@ -65,6 +65,11 @@ pub enum Commands {
     Outcome {
         #[command(subcommand)]
         action: OutcomeCommands,
+    },
+    /// Failure Artifact inspectors
+    Failure {
+        #[command(subcommand)]
+        action: FailureCommands,
     },
     /// Block until a Phase Outcome is applied (or wait budget expires)
     Wait {
@@ -226,6 +231,15 @@ pub enum OutcomeCommands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum FailureCommands {
+    /// Print `{state_dir}/FAILURE.md` if present
+    Show {
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
 /// Parse args and dispatch; returns process exit code.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
@@ -378,6 +392,14 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 }
             },
         },
+        Commands::Failure { action } => match action {
+            FailureCommands::Show { project } => match api::cmd_failure_show(project.as_deref())? {
+                Some(v) => print!("{}", v.body),
+                None => {
+                    return Err(CoordinatorError::Message("no failure artifact".into()));
+                }
+            },
+        },
         Commands::Wait {
             project,
             timeout_secs,
@@ -461,6 +483,13 @@ mod tests {
             run.get_arguments().any(|a| a.get_id() == "driver"),
             "run --driver"
         );
+    }
+
+    #[test]
+    fn failure_show_in_help() {
+        let cmd = Cli::command();
+        let failure = cmd.find_subcommand("failure").expect("failure");
+        assert!(failure.find_subcommand("show").is_some());
     }
 
     #[test]
