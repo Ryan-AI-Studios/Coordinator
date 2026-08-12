@@ -237,7 +237,14 @@ fn resolve_record(project: Option<&str>) -> Result<ProjectRecord> {
 }
 
 fn prompt_timeout() -> Duration {
-    crate::config::stub_phase_timeout()
+    crate::workflow::timeout_for_phase(crate::workflow::graph::PHASE_PLAN)
+}
+
+fn prompt_timeout_for(record: &ProjectRecord) -> Duration {
+    match load_run_state(record) {
+        Ok(s) => crate::workflow::timeout_for_phase(&s.phase),
+        Err(_) => prompt_timeout(),
+    }
 }
 
 fn refuse_if_paused(record: &ProjectRecord) -> Result<()> {
@@ -319,7 +326,7 @@ async fn apply_turn(
 
 async fn spawn_in_process(record: &ProjectRecord) -> Result<GrokHarnessStatus> {
     let cwd = grok_cwd(record);
-    let session = GrokSession::start(cwd, prompt_timeout()).await?;
+    let session = GrokSession::start(cwd, prompt_timeout_for(record)).await?;
     write_session_persist(record, &session, None);
     let status = GrokHarnessStatus {
         alive: true,
@@ -448,7 +455,7 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
         Err(e) => return Err(e),
     };
     let cwd = grok_cwd(&rec);
-    let mut session = match GrokSession::start(cwd, prompt_timeout()).await {
+    let mut session = match GrokSession::start(cwd, prompt_timeout_for(&rec)).await {
         Ok(s) => s,
         Err(e) => {
             let handle = PersistedGrokHandle {
@@ -555,7 +562,9 @@ async fn handle_hold_conn(
                 false,
             ),
             Ok(()) => {
-                let turn = session.inject_prompt(&text, prompt_timeout()).await;
+                let turn = session
+                    .inject_prompt(&text, prompt_timeout_for(record))
+                    .await;
                 let view = apply_turn(record, turn, session_status(session)).await?;
                 (view_to_hold(view), false)
             }
@@ -577,7 +586,7 @@ async fn handle_hold_conn(
                     false,
                 )
             } else {
-                match session.compact(prompt_timeout()).await {
+                match session.compact(prompt_timeout_for(record)).await {
                     Ok(pr) => (
                         HoldResponse {
                             ok: true,
@@ -716,7 +725,7 @@ pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPrompt
                 "no Grok session; run `coordinator harness grok start` first".into(),
             )
         })?;
-        session.inject_prompt(&text, prompt_timeout()).await
+        session.inject_prompt(&text, prompt_timeout_for(&rec)).await
     };
     let harness = current_status(&rec).await;
     apply_turn(&rec, turn, harness).await
@@ -752,7 +761,7 @@ pub async fn compact(project: Option<&str>) -> Result<HarnessPromptView> {
         });
     }
     // Compact is not a phase-completion signal (ADR-0021 skip-not-fail).
-    match session.compact(prompt_timeout()).await {
+    match session.compact(prompt_timeout_for(&rec)).await {
         Ok(pr) => Ok(HarnessPromptView {
             text: Some(pr.text),
             stop_reason: pr.stop_reason,
@@ -873,7 +882,7 @@ mod tests {
         let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
 
-        run::run(&rec, None).unwrap();
+        crate::run::run_stub(&rec, None).unwrap();
 
         let mut lines = mock_handshake_ok("sess-pool");
         lines.push(session_update_chunk("ok"));
@@ -900,7 +909,7 @@ mod tests {
         );
 
         // New run + session still in pool after stop (do not kill).
-        run::run(&rec, None).unwrap();
+        crate::run::run_stub(&rec, None).unwrap();
         let mut lines = mock_handshake_ok("sess-alive");
         lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
         let session = GrokSession::start_mock(
@@ -939,7 +948,7 @@ mod tests {
         let mut reg = Registry::default();
         let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
-        run::run(&rec, None).unwrap();
+        crate::run::run_stub(&rec, None).unwrap();
         run::pause(&rec).unwrap();
 
         let session = GrokSession::start_mock(
@@ -1012,7 +1021,7 @@ mod tests {
         let mut reg = Registry::default();
         let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
-        run::run(&rec, None).unwrap();
+        crate::run::run_stub(&rec, None).unwrap();
 
         let mut lines = mock_handshake_ok("sess-cmp");
         lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
@@ -1048,7 +1057,7 @@ mod tests {
         let mut reg = Registry::default();
         let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
-        run::run(&rec, None).unwrap();
+        crate::run::run_stub(&rec, None).unwrap();
 
         let mut lines = mock_handshake_ok("sess-fail");
         lines.push(crate::harness::grok::rpc_error(4, "broken pipe"));
@@ -1113,7 +1122,6 @@ mod tests {
             load_persist(&rec).unwrap().is_none(),
             "retry must drop the prior failure record"
         );
-
         let ready = PersistedGrokHandle {
             version: 1,
             project_id: rec.id.clone(),
@@ -1127,6 +1135,29 @@ mod tests {
             error: None,
         };
         assert_eq!(interpret_persist_after_spawn(&ready), PersistWait::Ready);
+    }
+
+    #[test]
+    fn prompt_timeout_uses_current_phase_budget() {
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: "p".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            created_at: chrono::Utc::now(),
+        };
+        crate::run::run_with_driver(&rec, None, crate::workflow::WorkflowDriver::FileWait).unwrap();
+        let t = prompt_timeout_for(&rec);
+        assert_eq!(
+            t,
+            crate::workflow::timeout_for_phase(crate::workflow::graph::PHASE_PLAN)
+        );
+        assert_ne!(t, Duration::from_secs(300));
     }
 
     #[test]

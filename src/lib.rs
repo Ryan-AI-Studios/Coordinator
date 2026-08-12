@@ -1,8 +1,8 @@
 //! Coordinator Control Plane library (CLI + localhost API share these ops).
 //!
 //! Phase Outcome File (schema v1) is the portable done-contract; apply + wait/timeout
-//! complete stub phases without chat vibes (track **0005**). Grok ACP adapter +
-//! project-keyed session pool: track **0007**.
+//! complete phases without chat vibes (track **0005**). Grok ACP adapter +
+//! project-keyed session pool: track **0007**. Canonical workflow runner: track **0008**.
 
 pub mod api;
 pub mod cli;
@@ -18,5 +18,6 @@ pub mod scan;
 pub mod server;
 pub mod state;
 pub mod watch;
+pub mod workflow;
 
 pub use error::{CoordinatorError, Result};

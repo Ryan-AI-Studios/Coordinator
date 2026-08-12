@@ -51,7 +51,7 @@ pub const STUB_PHASE_IDLE: &str = "stub:idle";
 /// Phase after operator Stop (not outcome failure).
 pub const STUB_PHASE_STOPPED: &str = "stub:stopped";
 
-/// Phase after successful outcome apply (single stub; multi-phase → 0008).
+/// Phase after successful outcome apply (single stub leftover).
 pub const STUB_PHASE_COMPLETED: &str = "stub:completed";
 
 /// Phase after failure outcome apply (including timeout).
@@ -88,6 +88,18 @@ pub struct RunState {
     /// Content hash of last successfully applied outcome (consume marker).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_applied_outcome_hash: Option<String>,
+    /// `"canonical_v1"` when started by public `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// Driver chosen at `run` (serde default `adapter`).
+    #[serde(default)]
+    pub driver: crate::workflow::WorkflowDriver,
+    /// Slugs still open in `plan-review`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_roles: Vec<String>,
+    /// Tick inject-once marker (`run_epoch` + phase).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_driven_phase: Option<String>,
 }
 
 impl RunState {
@@ -106,6 +118,10 @@ impl RunState {
             failure_class: None,
             next_track: None,
             last_applied_outcome_hash: None,
+            workflow: None,
+            driver: crate::workflow::WorkflowDriver::default(),
+            pending_roles: Vec::new(),
+            last_driven_phase: None,
         }
     }
 
@@ -154,6 +170,19 @@ pub struct StatusView {
     /// Additive harness summary (`harness.grok`) when a session exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<crate::harness::HarnessStatusBundle>,
+    /// Additive workflow object (`id`, `driver`, `pending_roles`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowView>,
+}
+
+/// Status JSON `workflow` object (0008).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub driver: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_roles: Vec<String>,
 }
 
 impl StatusView {
@@ -174,6 +203,11 @@ impl StatusView {
             execution_repo: paths.execution_repo,
             conductor_dir: Some(paths.conductor_dir),
             harness: crate::harness::status_bundle_sync(record),
+            workflow: Some(WorkflowView {
+                id: state.workflow.clone(),
+                driver: state.driver.as_str().to_string(),
+                pending_roles: state.pending_roles.clone(),
+            }),
         }
     }
 }

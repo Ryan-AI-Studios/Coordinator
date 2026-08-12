@@ -88,7 +88,7 @@ async fn get_status(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, A
 }
 
 async fn post_run(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_run(body.project.as_deref(), body.track)?;
+    let view = api::cmd_run(body.project.as_deref(), body.track, body.driver.as_deref())?;
     Ok(Json(view))
 }
 
@@ -474,7 +474,7 @@ mod tests {
             .unwrap();
 
         let outcome_body = serde_json::to_vec(&json!({
-            "phase": "stub:active",
+            "phase": "plan",
             "status": "success",
             "source": "http",
             "message": "via api"
@@ -494,8 +494,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["status"], "Idle");
-        assert_eq!(v["phase"], "stub:completed");
+        assert_eq!(v["status"], "Running");
+        assert_eq!(v["phase"], "plan-review");
 
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);

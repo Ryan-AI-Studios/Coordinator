@@ -143,7 +143,7 @@ pub struct RoleBinding {
     pub model: Option<String>,
 }
 
-/// Default Planner + Implementor → Grok (other roles omitted this track).
+/// Default Planner + Implementor → Grok; plan reviewers → agy / opencode.
 pub fn default_role_bindings() -> BTreeMap<String, RoleBinding> {
     let grok = RoleBinding {
         harness: "grok".into(),
@@ -153,6 +153,22 @@ pub fn default_role_bindings() -> BTreeMap<String, RoleBinding> {
     let mut map = BTreeMap::new();
     map.insert("planner".into(), grok.clone());
     map.insert("implementor".into(), grok);
+    map.insert(
+        "plan_reviewer_agy".into(),
+        RoleBinding {
+            harness: "antigravity".into(),
+            command: "agy".into(),
+            model: None,
+        },
+    );
+    map.insert(
+        "plan_reviewer_opencode".into(),
+        RoleBinding {
+            harness: "opencode".into(),
+            command: "opencode".into(),
+            model: None,
+        },
+    );
     map
 }
 
@@ -164,6 +180,9 @@ pub struct MachineConfig {
     pub scan_roots: Vec<PathBuf>,
     #[serde(default = "default_role_bindings")]
     pub role_bindings: BTreeMap<String, RoleBinding>,
+    /// Optional per-phase timeout overrides (seconds). Missing keys use table defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phase_timeouts_secs: BTreeMap<String, u64>,
 }
 
 impl Default for MachineConfig {
@@ -172,6 +191,7 @@ impl Default for MachineConfig {
             version: MACHINE_CONFIG_VERSION,
             scan_roots: default_scan_roots(),
             role_bindings: default_role_bindings(),
+            phase_timeouts_secs: BTreeMap::new(),
         }
     }
 }
@@ -213,7 +233,15 @@ pub fn load_machine_config_at(path: &Path) -> Result<MachineConfig> {
         )));
     }
     cfg.scan_roots = normalize_scan_roots(&cfg.scan_roots)?;
+    merge_missing_role_bindings(&mut cfg);
     Ok(cfg)
+}
+
+/// Serde `default` on the whole map does not insert keys missing from a saved file.
+fn merge_missing_role_bindings(cfg: &mut MachineConfig) {
+    for (k, v) in default_role_bindings() {
+        cfg.role_bindings.entry(k).or_insert(v);
+    }
 }
 
 pub fn save_machine_config(cfg: &MachineConfig) -> Result<()> {
@@ -261,7 +289,8 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// Process-wide lock for tests that mutate env vars affecting paths/timeouts.
 ///
 /// All tests that set `COORDINATOR_HOME`, `COORDINATOR_STATE_DIR`,
-/// `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`, or `COORDINATOR_OUTCOME_POLL_MS` must
+/// `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`, `COORDINATOR_PHASE_TIMEOUT_SECS`,
+/// `COORDINATOR_WORKFLOW_DRIVER`, or `COORDINATOR_OUTCOME_POLL_MS` must
 /// hold this (survives poison so one failure does not cascade).
 #[cfg(test)]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -301,6 +330,7 @@ mod tests {
             version: MACHINE_CONFIG_VERSION,
             scan_roots: vec![PathBuf::from(r"C:\dev")],
             role_bindings: default_role_bindings(),
+            phase_timeouts_secs: BTreeMap::new(),
         };
         atomic_write_json(&path, &cfg).unwrap();
         let loaded = load_machine_config_at(&path).unwrap();
@@ -372,5 +402,35 @@ mod tests {
         assert_eq!(loaded.role_bindings["planner"].harness, "grok");
         assert_eq!(loaded.role_bindings["implementor"].command, "grok");
         assert!(loaded.role_bindings["planner"].model.is_none());
+        assert_eq!(loaded.role_bindings["plan_reviewer_agy"].command, "agy");
+        assert_eq!(
+            loaded.role_bindings["plan_reviewer_opencode"].harness,
+            "opencode"
+        );
+    }
+
+    #[test]
+    fn merge_missing_reviewer_keys_on_partial_saved_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "scan_roots": [],
+                "role_bindings": {
+                    "planner": { "harness": "grok", "command": "grok" },
+                    "implementor": { "harness": "grok", "command": "grok" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let loaded = load_machine_config_at(&path).unwrap();
+        assert_eq!(loaded.role_bindings["planner"].command, "grok");
+        assert_eq!(loaded.role_bindings["plan_reviewer_agy"].command, "agy");
+        assert_eq!(
+            loaded.role_bindings["plan_reviewer_opencode"].command,
+            "opencode"
+        );
     }
 }

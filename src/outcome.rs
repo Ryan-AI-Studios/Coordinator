@@ -150,7 +150,7 @@ impl std::fmt::Display for OutcomeSource {
 pub struct OutcomeMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_track: Option<String>,
-    /// Free-form this track; 0008 may tighten recognized roles.
+    /// Recognized: planner, implementor, plan_reviewer_agy, plan_reviewer_opencode. Unknown ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
 }
@@ -401,41 +401,55 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusV
     }
 
     let mut state = base.clone();
+    let canonical = crate::workflow::is_canonical(&outcome.phase);
     match outcome.status {
         OutcomeStatus::Success => {
-            state.phase = STUB_PHASE_COMPLETED.into();
-            state.failure_class = None;
-            if let Some(ref meta) = outcome.metadata
-                && let Some(ref next) = meta.next_track
-            {
-                state.next_track = Some(next.clone());
-            }
-            match state.status {
-                RunStatus::Running => {
-                    state.status = RunStatus::Idle;
-                    state.last_event = format_success_event(&outcome, false);
+            if canonical {
+                crate::workflow::on_success(record, &mut state, &outcome);
+            } else {
+                state.phase = STUB_PHASE_COMPLETED.into();
+                state.failure_class = None;
+                if let Some(ref meta) = outcome.metadata
+                    && let Some(ref next) = meta.next_track
+                {
+                    let t = next.trim();
+                    state.next_track = if t.is_empty() {
+                        None
+                    } else {
+                        Some(t.to_string())
+                    };
                 }
-                RunStatus::Paused => {
-                    // Finished current phase while held (ADR-0024).
-                    state.last_event = format_success_event(&outcome, true);
+                match state.status {
+                    RunStatus::Running => {
+                        state.status = RunStatus::Idle;
+                        state.last_event = format_success_event(&outcome, false);
+                    }
+                    RunStatus::Paused => {
+                        // Finished current phase while held (ADR-0024).
+                        state.last_event = format_success_event(&outcome, true);
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
+                // Phase clock no longer active after leftover stub apply.
+                state.phase_started_at = None;
+                state.pause_started_at = None;
             }
         }
         OutcomeStatus::Failure => {
             let class = outcome.failure_class.expect("validated");
             state.status = RunStatus::Stopped;
-            state.phase = STUB_PHASE_FAILED.into();
+            if !canonical {
+                state.phase = STUB_PHASE_FAILED.into();
+            }
             state.failure_class = Some(class);
             state.last_event = format_failure_event(&outcome, class);
+            state.phase_started_at = None;
+            state.pause_started_at = None;
         }
     }
 
     state.updated_at = Utc::now();
     state.last_applied_outcome_hash = Some(hash.clone());
-    // Phase clock no longer active after apply.
-    state.phase_started_at = None;
-    state.pause_started_at = None;
 
     // Cross-process fail-closed: re-load and require base snapshot still current
     // (first valid commit wins; concurrent CLI vs serve last-writer-wins is rejected).
@@ -581,20 +595,37 @@ pub fn try_timeout_under_lock(record: &ProjectRecord) -> Result<Option<StatusVie
         let Some(_started) = state.phase_started_at else {
             return Ok(None);
         };
-        let budget = crate::config::stub_phase_timeout();
+        let budget = crate::workflow::timeout_for_phase(&state.phase);
         let elapsed = state.effective_running_elapsed(Utc::now());
         if elapsed < budget {
             return Ok(None);
+        }
+        if state.phase == crate::workflow::graph::PHASE_COMPACT {
+            let outcome = PhaseOutcome::success(
+                state.phase.clone(),
+                OutcomeSource::Timeout,
+                Some("compact: skipped".into()),
+                None,
+                Some(state.run_epoch),
+            );
+            let _ = save_current_outcome(record, &outcome);
+            return apply_locked(record, outcome).map(Some);
+        }
+        if state.phase == crate::workflow::graph::PHASE_PLAN_REVIEW
+            && let Ok(Some(outcome)) =
+                crate::workflow::drive::timeout_plan_review_outcome(record, &state)
+        {
+            let _ = save_current_outcome(record, &outcome);
+            return apply_locked(record, outcome).map(Some);
         }
         let outcome = PhaseOutcome::failure(
             state.phase.clone(),
             FailureClass::Timeout,
             OutcomeSource::Timeout,
-            Some("stub phase budget exceeded".into()),
+            Some("phase budget exceeded".into()),
             Some(state.run_epoch),
         );
         let _ = save_current_outcome(record, &outcome);
-        // Already holding locks — call apply_locked directly.
         apply_locked(record, outcome).map(Some)
     })
 }
@@ -608,11 +639,22 @@ pub fn apply_timeout(record: &ProjectRecord, state: &RunState) -> Result<StatusV
             "timeout apply requires status Running (budget frozen while Paused)".into(),
         ));
     }
+    if state.phase == crate::workflow::graph::PHASE_COMPACT {
+        let outcome = PhaseOutcome::success(
+            state.phase.clone(),
+            OutcomeSource::Timeout,
+            Some("compact: skipped".into()),
+            None,
+            Some(state.run_epoch),
+        );
+        let _ = save_current_outcome(record, &outcome);
+        return apply(record, outcome);
+    }
     let outcome = PhaseOutcome::failure(
         state.phase.clone(),
         FailureClass::Timeout,
         OutcomeSource::Timeout,
-        Some("stub phase budget exceeded".into()),
+        Some("phase budget exceeded".into()),
         Some(state.run_epoch),
     );
     let _ = save_current_outcome(record, &outcome);
@@ -640,7 +682,7 @@ pub fn is_outcomes_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run;
+    use crate::run::{self, run_stub};
     use crate::state::STUB_PHASE_ACTIVE;
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -768,7 +810,7 @@ mod tests {
     fn apply_success_running_to_idle() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, Some("0005".into())).unwrap();
+        run_stub(&r, Some("0005".into())).unwrap();
         let o = PhaseOutcome::success(
             STUB_PHASE_ACTIVE,
             OutcomeSource::Cli,
@@ -789,7 +831,7 @@ mod tests {
     fn apply_success_paused_stays_paused() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, None).unwrap();
+        run_stub(&r, None).unwrap();
         run::pause(&r).unwrap();
         let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::File, None, None, None);
         let view = apply(&r, o).unwrap();
@@ -802,7 +844,7 @@ mod tests {
     fn apply_failure_stops_with_class() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, None).unwrap();
+        run_stub(&r, None).unwrap();
         let o = PhaseOutcome::failure(
             STUB_PHASE_ACTIVE,
             FailureClass::Permission,
@@ -821,7 +863,7 @@ mod tests {
         for class in FailureClass::ALL {
             let dir = tempdir().unwrap();
             let r = rec(dir.path());
-            run::run(&r, None).unwrap();
+            run_stub(&r, None).unwrap();
             let o =
                 PhaseOutcome::failure(STUB_PHASE_ACTIVE, class, OutcomeSource::Test, None, None);
             let view = apply(&r, o).unwrap();
@@ -843,7 +885,7 @@ mod tests {
     fn reject_apply_after_stop() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, None).unwrap();
+        run_stub(&r, None).unwrap();
         run::stop(&r).unwrap();
         let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::Cli, None, None, None);
         assert!(apply(&r, o).is_err());
@@ -853,7 +895,7 @@ mod tests {
     fn reject_phase_mismatch() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, None).unwrap();
+        run_stub(&r, None).unwrap();
         let o = PhaseOutcome::success("other:phase", OutcomeSource::Cli, None, None, None);
         assert!(apply(&r, o).is_err());
     }
@@ -862,7 +904,7 @@ mod tests {
     fn reapply_same_hash_is_noop() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, None).unwrap();
+        run_stub(&r, None).unwrap();
         let o = PhaseOutcome::success(
             STUB_PHASE_ACTIVE,
             OutcomeSource::Cli,
@@ -882,7 +924,7 @@ mod tests {
     fn leftover_current_after_idle_poll_consumes_without_transition() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, None).unwrap();
+        run_stub(&r, None).unwrap();
         let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::Cli, None, None, None);
         apply(&r, o).unwrap();
         // Drop a stale success file while Idle (different content so hash differs).
@@ -906,7 +948,7 @@ mod tests {
     fn run_epoch_mismatch_rejects() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, None).unwrap();
+        run_stub(&r, None).unwrap();
         let mut o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::Cli, None, None, None);
         o.run_epoch = Some(999);
         assert!(apply(&r, o).is_err());
@@ -916,9 +958,9 @@ mod tests {
     fn track_id_retained_on_run_without_track() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, Some("0005".into())).unwrap();
+        run_stub(&r, Some("0005".into())).unwrap();
         run::stop(&r).unwrap();
-        let s = run::run(&r, None).unwrap();
+        let s = run_stub(&r, None).unwrap();
         assert_eq!(s.track_id.as_deref(), Some("0005"));
     }
 
@@ -961,7 +1003,7 @@ mod tests {
         );
         save_current_outcome(&r, &stale).unwrap();
         assert!(outcome_current_path(&r).unwrap().exists());
-        run::run(&r, None).unwrap();
+        run_stub(&r, None).unwrap();
         assert!(
             !outcome_current_path(&r).unwrap().exists(),
             "run must clear active outcome file"
@@ -977,7 +1019,7 @@ mod tests {
     fn resume_after_paused_success_goes_idle() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
-        run::run(&r, None).unwrap();
+        run_stub(&r, None).unwrap();
         run::pause(&r).unwrap();
         let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::Cli, None, None, None);
         apply(&r, o).unwrap();
