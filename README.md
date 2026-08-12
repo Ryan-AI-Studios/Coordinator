@@ -30,7 +30,7 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 |-------|-------------------|----------|
 | Machine home (registry) | `%LOCALAPPDATA%\coordinator\` | `COORDINATOR_HOME` |
 | Registry file | `{home}/registry.json` | — |
-| Machine config | `{home}/config.json` (`scan_roots`) | — |
+| Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`) | — |
 | Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
 | Active Phase Outcome | `{state_dir}/outcomes/current.json` | same state-dir rules |
 | Last applied outcome | `{state_dir}/outcomes/current.applied.json` | written on successful apply; `current.json` removed |
@@ -86,6 +86,42 @@ When nested `execution_repo` is null, `project show` includes:
 
 **`run` without `--track`:** retains the prior `track_id` (intentional). Clearing track is a workflow concern for later tracks.
 
+### Grok harness adapter (ACP)
+
+Long-lived **Grok Build** sessions use `grok agent stdio` (JSON-RPC 2.0, line-delimited). This is the primary drive surface (ADR-0001). Headless `grok -p` is not the pool model. Completion is still the **Phase Outcome File** (`source: "adapter"` when the adapter writes it). ConPTY scraping is not the contract.
+
+| Item | Behavior |
+|------|----------|
+| Spawn | `grok agent stdio` — `initialize` → `authenticate` (`methodId`, `_meta.headless`) → `session/new` `{ cwd, mcpServers: [] }` |
+| Cwd | Layout-resolved `execution_repo` if set, else `workspace_root` |
+| Prompt | `session/prompt` with `sessionId` + content-block array; `session/update` chunks collected |
+| Compact | Inject `/compact` via `session/prompt` (not a separate RPC). If unsupported: `supports_compact=false` and skip (ADR-0021), do not fail the run |
+| Auth | Operator `grok login` (`cached_token`) or `XAI_API_KEY` (`xai.api_key`). Coordinator does **not** own OAuth |
+| Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` kills the child |
+| Pause | New injects are refused while Paused; the child stays up |
+| Pool | One Grok ACP session per `project_id`. CLI `start` detaches a localhost holder so later `prompt`/`compact` can reuse it. `serve` keeps the session in-process |
+| Persist | `{state_dir}/harness-grok.json` (session id / pid / control addr) — not a transcript |
+
+Optional project hooks (`Stop`, `SessionEnd`, `PreCompact`, `PostCompact`) may also write `outcomes/current.json` (`source: file`). Project hooks need a one-time `grok` `/hooks-trust`. The adapter-written outcome is the automation path.
+
+Live tests are **not** required for CI:
+
+```powershell
+$env:COORDINATOR_GROK_LIVE = "1"
+cargo test grok_live -- --ignored --nocapture
+```
+
+`COORDINATOR_GROK_BIN` overrides the `grok` executable (absolute path). Default resolution walks `PATH` + Windows `PATHEXT` using the `implementor`/`planner` role binding `command` (no `which` crate).
+
+Default `role_bindings` in `config.json`:
+
+```json
+{
+  "planner": { "harness": "grok", "command": "grok", "model": null },
+  "implementor": { "harness": "grok", "command": "grok", "model": null }
+}
+```
+
 ```powershell
 # Smoke (temp home + fake project)
 $env:COORDINATOR_HOME = "$env:TEMP\coordinator-cp-smoke"
@@ -138,10 +174,15 @@ coordinator outcome write --phase <id> --status success|failure
     [--next-track <id>] [--source cli]
 coordinator outcome show [--project …]
 coordinator wait [--project …] [--timeout-secs N]
+coordinator harness grok start [--project …]
+coordinator harness grok prompt --text <…> | --file <path> [--project …]
+coordinator harness grok compact [--project …]
+coordinator harness grok status [--project …]
+coordinator harness grok shutdown [--project …]
 coordinator serve [--port <u16>]   # default 7420, 127.0.0.1 only
 ```
 
-HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved).
+HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes, and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved) and optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists.
 
 ### Phase Outcome schema v1
 
@@ -167,7 +208,7 @@ HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v
 | `phase` | Non-empty; must match current run-state phase to apply |
 | `status` | `success` \| `failure` |
 | `failure_class` | Required when `failure`; must be null on `success`. Values: `permission`, `model_exhaustion`, `difficulty`, `harness_crash`, `timeout`, `ci_failed` |
-| `source` | `file` \| `http` \| `cli` \| `timeout` \| `test` |
+| `source` | `file` \| `http` \| `cli` \| `timeout` \| `test` \| `adapter` |
 | `metadata.next_track` | Optional; copied to status on success |
 | `metadata.role` | Free-form this release (parallel roles later) |
 | `run_epoch` | Optional; when present must match run-state epoch |
@@ -184,7 +225,7 @@ HTTP: `POST/GET /v1/projects` (layout fields), `POST /v1/projects/set`, `POST /v
 
 Scripts that want “success only” must inspect `status` / `failure_class` after exit 0 (e.g. `coordinator status`).
 
-Stop aborts advancement with **no merge**; `last_event` records sessions-for-attach deferred (real harness attach → **0007+**). After Stopped, further outcomes are ignored until a new `run`.
+Stop aborts advancement with **no merge**; `last_event` records **sessions left for attach**. After Stopped, further outcomes are ignored until a new `run`. `harness grok shutdown` is the explicit teardown.
 
 ### Illustrative hook writers (docs only)
 
@@ -210,7 +251,7 @@ $dst = Join-Path $state "current.json"
 Move-Item -Force $tmp $dst
 ```
 
-**Grok / other CLI hooks:** same file contract; prefer `source=file`. Full Grok Session adapter → **0007**.
+**Grok / other CLI hooks:** same file contract; prefer `source=file` for hooks. The Grok ACP adapter writes `source=adapter` after a successful (or failed) prompt when a phase is Running. Hooks need `/hooks-trust` if used.
 
 ## Tools (product cwd only)
 
@@ -268,4 +309,4 @@ This is a **visual contract**, not product orchestration. Real start/resume is C
 
 ## Status
 
-Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout).
+Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool).
