@@ -146,20 +146,14 @@ pub fn status_after_wait(record: &ProjectRecord) -> Result<StatusView> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS};
+    use crate::config::{ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, test_env_lock};
     use crate::outcome::{
         FailureClass, OutcomeSource, PhaseOutcome, outcome_current_path, save_current_outcome,
         write_and_apply,
     };
     use crate::state::STUB_PHASE_ACTIVE;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
     use uuid::Uuid;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn rec(path: &std::path::Path) -> ProjectRecord {
         ProjectRecord {
@@ -187,7 +181,7 @@ mod tests {
 
     #[test]
     fn wait_sees_file_drop() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = test_env_lock();
         unsafe {
             std::env::set_var(ENV_OUTCOME_POLL_MS, "50");
         }
@@ -221,7 +215,7 @@ mod tests {
 
     #[test]
     fn short_budget_produces_timeout() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = test_env_lock();
         unsafe {
             std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "1");
             std::env::set_var(ENV_OUTCOME_POLL_MS, "50");
@@ -240,7 +234,7 @@ mod tests {
 
     #[test]
     fn pause_freezes_timeout() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = test_env_lock();
         unsafe {
             std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "1");
             std::env::set_var(ENV_OUTCOME_POLL_MS, "50");
@@ -288,7 +282,7 @@ mod tests {
 
     #[test]
     fn wait_budget_expires_without_apply() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = test_env_lock();
         // Huge stub budget so timeout synthesizer does not fire; wait itself expires.
         unsafe {
             std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "3600");

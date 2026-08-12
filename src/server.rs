@@ -182,16 +182,10 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ENV_COORDINATOR_HOME;
+    use crate::config::{ENV_COORDINATOR_HOME, test_env_lock};
     use http_body_util::BodyExt;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
     use tower::ServiceExt;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[tokio::test]
     async fn health_ok() {
@@ -214,10 +208,10 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn projects_add_and_status() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = test_env_lock();
         let home = tempdir().unwrap();
         let proj = tempdir().unwrap();
-        // SAFETY: serialized by env_lock; restored before guard drop.
+        // SAFETY: serialized by test_env_lock; restored before guard drop.
         unsafe {
             std::env::set_var(ENV_COORDINATOR_HOME, home.path());
         }
@@ -266,7 +260,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn post_outcome_success() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = test_env_lock();
         let home = tempdir().unwrap();
         let proj = tempdir().unwrap();
         unsafe {

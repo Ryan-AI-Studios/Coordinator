@@ -316,17 +316,15 @@ mod tests {
 
     #[test]
     fn state_dir_env_override() {
-        use crate::config::ENV_COORDINATOR_STATE_DIR;
-        use std::sync::{Mutex, OnceLock};
+        use crate::config::{ENV_COORDINATOR_STATE_DIR, test_env_lock};
 
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = test_env_lock();
 
         let proj = tempdir().unwrap();
         let over = tempdir().unwrap();
         let rec = sample_record(proj.path());
 
-        // SAFETY: serialized by LOCK; restored before drop.
+        // SAFETY: serialized by test_env_lock; restored before drop.
         unsafe {
             std::env::set_var(ENV_COORDINATOR_STATE_DIR, over.path());
         }
@@ -343,11 +341,9 @@ mod tests {
 
     #[test]
     fn state_dir_env_keys_by_project_id() {
-        use crate::config::ENV_COORDINATOR_STATE_DIR;
-        use std::sync::{Mutex, OnceLock};
+        use crate::config::{ENV_COORDINATOR_STATE_DIR, test_env_lock};
 
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = test_env_lock();
 
         let over = tempdir().unwrap();
         let p1 = tempdir().unwrap();

@@ -117,6 +117,19 @@ pub fn state_dir_override() -> Option<PathBuf> {
     std::env::var_os(ENV_COORDINATOR_STATE_DIR).map(PathBuf::from)
 }
 
+/// Process-wide lock for tests that mutate env vars affecting paths/timeouts.
+///
+/// All tests that set `COORDINATOR_HOME`, `COORDINATOR_STATE_DIR`,
+/// `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`, or `COORDINATOR_OUTCOME_POLL_MS` must
+/// hold this (survives poison so one failure does not cascade).
+#[cfg(test)]
+pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let m = LOCK.get_or_init(|| Mutex::new(()));
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
