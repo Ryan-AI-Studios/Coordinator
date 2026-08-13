@@ -92,6 +92,11 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
     },
+    /// Open the Local Ops Console (Status Surface). Requires `--features ui`.
+    Ui {
+        #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
+        port: u16,
+    },
     /// Drive a harness session (Grok ACP this track)
     Harness {
         #[command(subcommand)]
@@ -428,6 +433,9 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
         Commands::Serve { port } => {
             block_on(server::serve(port))?;
         }
+        Commands::Ui { port } => {
+            crate::ui::run_cli(port)?;
+        }
         Commands::Harness { action } => match action {
             HarnessCommands::Grok { action } => match action {
                 GrokCommands::Start { project } => {
@@ -508,6 +516,16 @@ mod tests {
         let cmd = Cli::command();
         let failure = cmd.find_subcommand("failure").expect("failure");
         assert!(failure.find_subcommand("show").is_some());
+    }
+
+    #[test]
+    fn ui_subcommand_in_help() {
+        let cmd = Cli::command();
+        let ui = cmd.find_subcommand("ui").expect("ui");
+        assert!(
+            ui.get_arguments().any(|a| a.get_id() == "port"),
+            "ui --port"
+        );
     }
 
     #[test]

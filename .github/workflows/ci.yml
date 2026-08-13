@@ -15,7 +15,7 @@ jobs:
   check:
     name: fmt clippy test
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -32,3 +32,6 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+      - name: cargo test --features ui
+        run: cargo test --features ui

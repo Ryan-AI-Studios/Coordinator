@@ -17,7 +17,9 @@ cd C:\dev\coordinator\coordinator   # or your clone root
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo test --features ui
 cargo run -- --help
+cargo run --features ui -- ui
 ```
 
 Same gate as CI and ledgerful verify: `fmt --check`, `clippy -D warnings`, and `test` on `windows-latest`.
@@ -408,9 +410,28 @@ npx --yes impeccable check
 
 Re-run install/init here if the Status Surface UI subtree moves (ADR-0028). Do **not** use global-only install as the design SoT.
 
+## Status Surface (track 0014)
+
+Live **Dioxus Desktop** window (WebView2) bound to in-process Control Plane `api::*`. CLI remains the automation entry.
+
+```powershell
+# Requires Microsoft Edge WebView2 Evergreen:
+# https://developer.microsoft.com/microsoft-edge/webview2/
+cargo run --features ui -- ui
+# optional: cargo run --features ui -- ui --port 7420
+```
+
+- Feature `ui` is **not** default (keeps `cargo test` / CI default path off the Dioxus compile). CI also runs `cargo test --features ui` (compiles the window crate; does **not** launch WebView2).
+- If WebView2 is missing, `coordinator ui` prints an Evergreen install hint and exits non-zero (no panic, no LAN/browser fallback).
+- Bind stays `127.0.0.1` only. If `:7420` is already taken by `coordinator serve`, the window skips owned serve and still uses in-process `api::*`.
+- Pause all / Stop selected / Resume match ADR-0024. Stop copy includes **sessions left for attach**. Stop never writes `FAILURE.md` and never calls `harness grok shutdown`.
+- Add project is an explicit absolute path (never `project scan --add` of `C:\dev`).
+
+Without `--features ui`, `coordinator ui` is still listed in `--help` but errors with a rebuild hint.
+
 ## Status Surface mock (track 0003)
 
-**Stack-agnostic** operator Status Surface mock (not wired to a Control Plane). Visual contract for later UI / Control Plane work (**0004+**).
+**Visual contract** for the live window above (static HTML/CSS). Do not invent a new visual language.
 
 | Path | Role |
 |------|------|
@@ -430,8 +451,8 @@ pwsh .\scripts\start-impeccable-live.ps1
 
 **State walkthrough cues:** Coordinator = parallel plan review (agy + opencode); Orca = pause; Ledgerful = token-idle CI; AI-Brains = hard fail + Failure Artifact; Demo-Idle = no active track. Header help = Stop vs Pause. Check narrow width (~980px) once.
 
-This is a **visual contract**, not product orchestration. Real start/resume is Control Plane work (**0004+**).
+This mock remains the **visual reference** after 0014. Live start/resume is `cargo run --features ui -- ui` plus the Control Plane CLI.
 
 ## Status
 
-Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool), **0008** (canonical workflow runner), **0009** (stop/pause + Failure Artifact + toast), **0010** (token-idle `ci-wait` + auto squash-merge).
+Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool), **0008** (canonical workflow runner), **0009** (stop/pause + Failure Artifact + toast), **0010** (token-idle `ci-wait` + auto squash-merge), **0011** (cross-model review), **0012** (Orca dogfood), **0013** (wait + session teardown), **0014** (live Dioxus Status Surface).

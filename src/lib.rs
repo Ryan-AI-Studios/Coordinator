@@ -6,6 +6,7 @@
 //! Failure Artifact + toast + Notify Adapter: track **0009**.
 //! Token-idle CI wait + auto squash-merge: track **0010**.
 //! Cross-model review gate (Codex→Claude→OpenCode): track **0011**.
+//! Status Surface (Dioxus Desktop, `--features ui`): track **0014**.
 
 pub mod api;
 pub mod ci;
@@ -23,6 +24,7 @@ pub mod run;
 pub mod scan;
 pub mod server;
 pub mod state;
+pub mod ui;
 pub mod watch;
 pub mod workflow;
 

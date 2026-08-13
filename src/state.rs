@@ -193,6 +193,9 @@ impl RunState {
 pub struct StatusView {
     pub project_id: String,
     pub path: PathBuf,
+    /// Copied from `ProjectRecord` so cards do not join the registry again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub status: RunStatus,
     pub phase: String,
     pub track_id: Option<String>,
@@ -277,6 +280,7 @@ impl StatusView {
         Self {
             project_id: record.id.clone(),
             path: record.path.clone(),
+            display_name: record.display_name.clone(),
             status: state.status,
             phase: state.phase.clone(),
             track_id: state.track_id.clone(),
@@ -616,6 +620,24 @@ mod tests {
         assert!(json["ci"].is_null());
         assert!(json.as_object().unwrap().contains_key("review"));
         assert!(json["review"].is_null());
+    }
+
+    #[test]
+    fn status_serializes_display_name_when_some_omits_when_none() {
+        let dir = tempdir().unwrap();
+        let mut rec = sample_record(dir.path());
+        rec.display_name = Some("Ops".into());
+        let view = StatusView::from_record(&rec, &RunState::idle(&rec.id));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["display_name"], "Ops");
+
+        rec.display_name = None;
+        let view = StatusView::from_record(&rec, &RunState::idle(&rec.id));
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("display_name"),
+            "None must omit display_name"
+        );
     }
 
     #[test]
