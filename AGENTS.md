@@ -80,3 +80,5 @@ Control Plane entrypoints: `project add|list|show|set|scan` (`--auto-merge true|
 - Wrong cwd for ledgerful/ai-brains  
 - Planning files staged into product  
 - Autonomy safety (timeouts, stop/pause, failure classes) when touching orchestration core  
+
+**Scan footgun:** never `project scan --root C:\dev --add` — `C:\dev` has many conductor markers (Orca, coordinator, coordinated, …). Scan a single workspace (`--root C:\dev\Orca`) or add one project at a time.  
