@@ -8,7 +8,7 @@ web
 
 ## Stack
 
-delegated: mockup-first stack-agnostic Status Surface (static HTML/CSS mock for track 0003); eventual lean Dioxus unless mockup proves otherwise (ADR-0018). Control plane and CLI are Rust-first (ADR-0004).
+Dioxus Desktop 0.7 (WebView2) behind Cargo feature `ui`; `mock/status-surface.html` remains the visual contract. Control plane and CLI are Rust-first (ADR-0004). CLI stays the automation entry (ADR-0017).
 
 ## Users
 
@@ -36,9 +36,9 @@ Same-machine Windows session orchestrator with hybrid Completion Signals and a b
 - Local-only Control Plane (no public internet exposure in v1)
 - Token-idle CI wait outside model sessions
 - Strict review gate: findings above low are not deferrable
-- Status Surface is mockup-first; no permanent UI stack lock before mockup
+- Status Surface is Dioxus Desktop (WebView2); mock HTML stays the visual reference
 - Planning docs and conductor tracks must never ship inside product git
-- Open: concrete phase timeout numbers; Phase Outcome File schema; final Status Surface stack after mockup
+- Open: default-on `ui` feature / installer bundle (owner call after first ship)
 
 ## Brand Commitments
 
@@ -49,7 +49,7 @@ Same-machine Windows session orchestrator with hybrid Completion Signals and a b
 ## Evidence on Hand
 
 - Product intent: planning tree `SHARED-UNDERSTANDING.md` and ADRs 0001–0028 (outside this git repo)
-- Product code today: Rust binary stub + CI; Status Surface **mock** under `mock/status-surface.html` (track 0003); no live Control Plane yet
+- Product code today: Rust Control Plane + live Status Surface (`cargo run --features ui -- ui`); mock under `mock/status-surface.html` is the visual contract
 - Design skills: project-scope Impeccable under `.agents/skills/impeccable/`
 
 ## Product Principles
@@ -58,7 +58,7 @@ Same-machine Windows session orchestrator with hybrid Completion Signals and a b
 2. **Local machine truth** — paths, sessions, and failures are local; never frame as cloud multi-tenant ops.
 3. **Autonomy with interruptibility** — full autonomy after start, always-visible Stop/Pause and failure signals.
 4. **Docs-vs-product split** — design context for UI ships with product git; planning SoT stays outside.
-5. **Mockup before stack lock** — visual world can lead; Dioxus is default lean later, not a pre-mockup freeze.
+5. **Mock is the visual contract** — live Dioxus surface matches `mock/status-surface.html`; do not invent a new visual language.
 
 ## Accessibility & Inclusion
 

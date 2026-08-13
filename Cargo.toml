@@ -6,7 +6,11 @@ description = "Same-machine Windows orchestrator for multi-harness conductor-tra
 repository = "https://github.com/Ryan-AI-Studios/Coordinator"
 readme = "README.md"
 
+[features]
+ui = ["dep:dioxus"]
+
 [dependencies]
+dioxus = { version = "0.7.10", optional = true, features = ["desktop"] }
 axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4.6.6", features = ["derive"] }
