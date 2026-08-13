@@ -352,18 +352,38 @@ pub async fn start(project: Option<&str>, in_process: bool) -> Result<GrokHarnes
             return Ok(s);
         }
     }
-    if let Some(existing) = load_persist(&rec)?
-        && existing.alive
-        && let Some(addr) = &existing.control_addr
-        && holder_rpc(addr, &HoldRequest::Ping).await.is_ok()
-    {
-        return Ok(existing.to_status());
+    if let Some(existing) = reuse_or_reap_existing(&rec).await? {
+        return Ok(existing);
     }
 
     if in_process {
         return spawn_in_process(&rec).await;
     }
     start_holder(&rec, project).await
+}
+
+/// Reuse a live holder that still answers Ping. Otherwise treat leftover persist as
+/// dead (kill `pid` then `holder_pid`) so a new start never clobbers a holder file
+/// with an in-process persist (`control_addr: None`).
+async fn reuse_or_reap_existing(record: &ProjectRecord) -> Result<Option<GrokHarnessStatus>> {
+    let Some(existing) = load_persist(record)? else {
+        return Ok(None);
+    };
+    if !existing.alive {
+        return Ok(None);
+    }
+    if let Some(addr) = &existing.control_addr
+        && holder_rpc(addr, &HoldRequest::Ping).await.is_ok()
+    {
+        return Ok(Some(existing.to_status()));
+    }
+    reap_stale_holder(record, &existing);
+    Ok(None)
+}
+
+fn reap_stale_holder(record: &ProjectRecord, existing: &PersistedGrokHandle) {
+    kill_persist_pids(existing);
+    let _ = clear_stale_holder_persist(record);
 }
 
 /// Drop leftover persist so a retry does not treat a prior start failure as current.
@@ -812,45 +832,103 @@ async fn current_status(record: &ProjectRecord) -> GrokHarnessStatus {
         .unwrap_or_else(GrokHarnessStatus::missing)
 }
 
+/// How long the CLI will wait for a holder `Shutdown` RPC before falling back to pid-kill.
+const HOLDER_SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_millis(750);
+
 pub async fn shutdown(project: Option<&str>) -> Result<GrokHarnessStatus> {
     let rec = resolve_record(project)?;
     if let Some(mut session) = global_pool().lock().await.remove(&rec.id) {
         let _ = session.shutdown().await;
-        let st = GrokHarnessStatus {
-            alive: false,
-            session_id: Some(session.session_id.clone()),
-            cwd: Some(session.cwd.clone()),
-            supports_compact: session.supports_compact,
-            pid: session.pid,
-        };
+        if let Ok(Some(h)) = load_persist(&rec) {
+            kill_persist_pids(&h);
+        }
         let dead = PersistedGrokHandle {
             version: 1,
             project_id: rec.id.clone(),
-            session_id: st.session_id.clone(),
-            cwd: st.cwd.clone(),
-            pid: st.pid,
+            session_id: Some(session.session_id.clone()),
+            cwd: Some(session.cwd.clone()),
+            pid: session.pid,
             holder_pid: None,
             control_addr: None,
-            supports_compact: st.supports_compact,
+            supports_compact: session.supports_compact,
             alive: false,
             error: None,
         };
         let _ = save_persist(&rec, &dead);
-        return Ok(st);
+        return Ok(dead.to_status());
     }
-    if let Some(h) = load_persist(&rec)?
-        && let Some(addr) = h.control_addr
+
+    let persist = load_persist(&rec)?;
+    if let Some(h) = &persist
+        && let Some(addr) = &h.control_addr
     {
-        let _ = holder_rpc(&addr, &HoldRequest::Shutdown).await;
+        let _ = tokio::time::timeout(
+            HOLDER_SHUTDOWN_RPC_TIMEOUT,
+            holder_rpc(addr, &HoldRequest::Shutdown),
+        )
+        .await;
     }
-    let st = GrokHarnessStatus {
+    if let Some(h) = persist {
+        if h.alive {
+            kill_persist_pids(&h);
+        }
+        let dead = persist_marked_dead(&h);
+        let _ = save_persist(&rec, &dead);
+        return Ok(dead.to_status());
+    }
+
+    Ok(GrokHarnessStatus::missing())
+}
+
+fn persist_marked_dead(h: &PersistedGrokHandle) -> PersistedGrokHandle {
+    PersistedGrokHandle {
+        version: h.version,
+        project_id: h.project_id.clone(),
+        session_id: h.session_id.clone(),
+        cwd: h.cwd.clone(),
+        pid: h.pid,
+        holder_pid: h.holder_pid,
+        control_addr: None,
+        supports_compact: h.supports_compact,
         alive: false,
-        session_id: load_persist(&rec).ok().flatten().and_then(|h| h.session_id),
-        cwd: None,
-        supports_compact: true,
-        pid: None,
-    };
-    Ok(st)
+        error: None,
+    }
+}
+
+/// Best-effort kill of persist `pid` then `holder_pid`. Never kills this process.
+/// `taskkill` missing from PATH, or "process not found", is success.
+fn kill_persist_pids(h: &PersistedGrokHandle) {
+    if let Some(pid) = h.pid {
+        kill_pid_best_effort(pid);
+    }
+    if let Some(holder_pid) = h.holder_pid
+        && h.pid != Some(holder_pid)
+    {
+        kill_pid_best_effort(holder_pid);
+    }
+}
+
+fn kill_pid_best_effort(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        // "The process … not found" is already-dead success. Missing taskkill is not an error.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// Insert a mock session (tests).
@@ -1179,6 +1257,161 @@ mod tests {
         };
         let p = persist_path(&rec).unwrap();
         assert!(p.ends_with("harness-grok.json"));
+    }
+
+    fn taskkill_on_path() -> bool {
+        std::process::Command::new("taskkill")
+            .arg("/?")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    fn wait_child_dead(child: &mut std::process::Child, budget_ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(budget_ms);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn spawn_dummy_long_child() -> std::process::Child {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "timeout", "/T", "300", "/NOBREAK"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn dummy child")
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("sleep")
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn dummy child")
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn shutdown_kills_persist_pid_and_writes_dead() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+
+        let mut child = spawn_dummy_long_child();
+        let pid = child.id();
+        let handle = PersistedGrokHandle {
+            version: 1,
+            project_id: rec.id.clone(),
+            session_id: Some("sess-dummy".into()),
+            cwd: Some(proj.path().to_path_buf()),
+            pid: Some(pid),
+            holder_pid: None,
+            control_addr: None,
+            supports_compact: true,
+            alive: true,
+            error: None,
+        };
+        save_persist(&rec, &handle).unwrap();
+        assert!(
+            !global_pool().lock().await.contains(&rec.id),
+            "pool must be empty so shutdown uses persist pid-kill"
+        );
+
+        let st = shutdown(Some(&rec.id)).await.unwrap();
+        let persist = load_persist(&rec).unwrap().expect("persist written");
+        assert!(!persist.alive, "persist must be written dead");
+        assert!(!st.alive, "status must match persist");
+        assert_eq!(st.alive, persist.alive);
+        assert_eq!(st.session_id.as_deref(), Some("sess-dummy"));
+
+        if taskkill_on_path() {
+            assert!(
+                wait_child_dead(&mut child, 1000),
+                "taskkill is present; persist pid must be dead"
+            );
+        } else if !wait_child_dead(&mut child, 50) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ping_fail_reaps_leftover_holder_pids() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+
+        let mut child = spawn_dummy_long_child();
+        let handle = PersistedGrokHandle {
+            version: 1,
+            project_id: rec.id.clone(),
+            session_id: Some("sess-stale".into()),
+            cwd: Some(proj.path().to_path_buf()),
+            pid: Some(child.id()),
+            holder_pid: None,
+            control_addr: Some("127.0.0.1:1".into()),
+            supports_compact: true,
+            alive: true,
+            error: None,
+        };
+        save_persist(&rec, &handle).unwrap();
+
+        let reused = reuse_or_reap_existing(&rec).await.unwrap();
+        assert!(reused.is_none(), "dead control_addr must not reuse");
+        assert!(
+            load_persist(&rec).unwrap().is_none(),
+            "stale holder persist must be cleared before a replacement start"
+        );
+        if taskkill_on_path() {
+            assert!(
+                wait_child_dead(&mut child, 1000),
+                "taskkill is present; leftover persist pid must be reaped"
+            );
+        } else if !wait_child_dead(&mut child, 50) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[test]
+    fn kill_missing_pid_is_success() {
+        kill_pid_best_effort(u32::MAX);
+        kill_pid_best_effort(std::process::id());
     }
 
     #[test]

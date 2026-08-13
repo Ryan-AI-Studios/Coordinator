@@ -112,7 +112,7 @@ Status JSON for this walk includes `layout_profile`, `execution_repo`, `conducto
 
 **Completion contract (hybrid):** the **Phase Outcome File** is the portable done-signal (schema `version: 1`). Hooks, adapters, CLI, and HTTP may write it; **ConPTY / chat pattern-match is not the contract**. Writers must use **temp + replace** (or `coordinator outcome write` / `POST /v1/outcome`) so pollers never read torn JSON.
 
-**Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Override per key via machine `config.json` `phase_timeouts_secs`. Uniform test override: `COORDINATOR_PHASE_TIMEOUT_SECS`. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
+**Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Override per key via machine `config.json` `phase_timeouts_secs`. Uniform test override: `COORDINATOR_PHASE_TIMEOUT_SECS`. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail) and writes `FAILURE.md`. This is **not** `wait --timeout-secs` (that is a CLI poll budget: exit **2**, run stays as it was, Grok stays up). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
 
 **`run` without `--track`:** retains the prior `track_id` (intentional). Fresh `run` **clears** `next_track` (stale Planner handoff).
 
@@ -207,10 +207,10 @@ Long-lived **Grok Build** sessions use `grok agent stdio` (JSON-RPC 2.0, line-de
 | Prompt | `session/prompt` with `sessionId` + content-block array; `session/update` chunks collected |
 | Compact | Inject `/compact` via `session/prompt` (not a separate RPC). If unsupported: `supports_compact=false` and skip (ADR-0021), do not fail the run |
 | Auth | Operator `grok login` (`cached_token`) or `XAI_API_KEY` (`xai.api_key`). Coordinator does **not** own OAuth |
-| Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` kills the child |
+| Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` is teardown: in-process pool, then a quick holder `Shutdown` RPC, then `taskkill /F /PID` on persist `pid` then `holder_pid`. Persist is always written `alive: false`; returned status matches the file. `taskkill` “not found” is success. Missing `taskkill` is not a shutdown error. |
 | Pause | New injects are refused while Paused; the child stays up |
-| Pool | One Grok ACP session per `project_id`. CLI `start` detaches a localhost holder so later `prompt`/`compact` can reuse it. `serve` keeps the session in-process |
-| Persist | `{state_dir}/harness-grok.json` (session id / pid / control addr) — not a transcript |
+| Pool | One Grok ACP session per `project_id`. CLI `start` and adapter ticks from `wait` / `serve` detach a localhost holder so a later `prompt` does not pin the poll loop. In-process spawn is for tests / HTTP start / `insert_test_session`. |
+| Persist | `{state_dir}/harness-grok.json` (session id / pid / holder pid / control addr / alive) — not a transcript |
 
 Optional project hooks (`Stop`, `SessionEnd`, `PreCompact`, `PostCompact`) may also write `outcomes/current.json` (`source: file`). Project hooks need a one-time `grok` `/hooks-trust`. The adapter-written outcome is the automation path.
 
@@ -342,13 +342,15 @@ HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1
 
 | Code | Meaning |
 |------|---------|
-| **0** | An outcome was **applied** (success **or** failure, including synthesized timeout) |
-| **2** | Wait budget (`--timeout-secs`) expired **without** an applied outcome |
+| **0** | An outcome was **applied** (success **or** failure, including synthesized **phase** timeout) |
+| **2** | Wait budget (`--timeout-secs`) expired **without** an applied outcome. The run is unchanged; Grok is not killed; no `FAILURE.md`. |
 | **1** (or other) | Invalid args, unknown project, or other control-plane error |
+
+`wait --timeout-secs` is a **CLI poll budget**. It is not the phase wall clock (`failure_class=timeout` + Stopped + artifact) and not the ACP `session/prompt` timeout. Adapter inject from `wait` / `serve` starts the detached holder without blocking the poll loop, so the wait budget can expire while a prompt is still in flight.
 
 Scripts that want “success only” must inspect `status` / `failure_class` after exit 0 (e.g. `coordinator status`).
 
-Stop aborts advancement with **no merge**; `last_event` records **sessions left for attach**. After Stopped, further outcomes are ignored until a new `run`. `harness grok shutdown` is the explicit teardown.
+Stop aborts advancement with **no merge**; `last_event` records **sessions left for attach**. After Stopped, further outcomes are ignored until a new `run`. `harness grok shutdown` is the explicit teardown (kills the holder / persist pid, including a child that `wait` used to own in-process).
 
 ### Illustrative hook writers (docs only)
 

@@ -348,4 +348,115 @@ mod tests {
         let v = write_and_apply(&r, o).unwrap();
         assert_eq!(v.status, RunStatus::Idle);
     }
+
+    #[test]
+    fn wait_budget_expires_during_long_adapter_inject() {
+        use crate::notify::artifact;
+        use crate::run::run_with_driver;
+        use crate::workflow::drive::arm_slow_adapter_inject;
+        use crate::workflow::{ENV_PHASE_TIMEOUT_SECS, WorkflowDriver};
+
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "50");
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "3600");
+            std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "3600");
+        }
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0013".into()), WorkflowDriver::Adapter).unwrap();
+        let _inject = arm_slow_adapter_inject(Duration::from_secs(30));
+
+        let started = Instant::now();
+        let err = wait_for_outcome(&r, 1).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, CoordinatorError::WaitBudgetExpired),
+            "err={err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "wait must not sit in inject; elapsed={elapsed:?}"
+        );
+
+        let s = crate::run::status(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        assert!(s.failure_class.is_none());
+        assert_eq!(s.phase, crate::workflow::graph::PHASE_PLAN);
+        assert!(artifact::existing_path(&r).is_none());
+        let st = crate::state::load_run_state(&r).unwrap();
+        assert_eq!(st.last_driven_phase.as_deref(), Some(st.phase.as_str()));
+
+        unsafe {
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+            std::env::remove_var(ENV_STUB_PHASE_TIMEOUT_SECS);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn poll_once_returns_while_hang_mock_prompt_in_flight() {
+        use crate::config::ENV_COORDINATOR_HOME;
+        use crate::harness::grok::mock_handshake_ok;
+        use crate::harness::pool::insert_test_session;
+        use crate::notify::ENV_COORDINATOR_NOTIFY;
+        use crate::registry::{ProjectAddOptions, Registry};
+        use crate::run::run_with_driver;
+        use crate::workflow::{ENV_PHASE_TIMEOUT_SECS, WorkflowDriver};
+
+        let _guard = test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "2");
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "50");
+            std::env::set_var(ENV_COORDINATOR_NOTIFY, "off");
+        }
+        let mut reg = Registry::default();
+        let r = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        run_with_driver(&r, Some("0013".into()), WorkflowDriver::Adapter).unwrap();
+
+        let session = crate::harness::GrokSession::start_mock(
+            crate::harness::grok_cwd(&r),
+            mock_handshake_ok("sess-hang"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(r.id.clone(), session).await;
+
+        let started = Instant::now();
+        let tick = poll_once(&r).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            tick.is_none(),
+            "inject must not apply before the prompt returns"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "poll_once must not block on session/prompt; elapsed={elapsed:?}"
+        );
+        let st = crate::state::load_run_state(&r).unwrap();
+        assert_eq!(st.last_driven_phase.as_deref(), Some(st.phase.as_str()));
+        assert_eq!(st.status, RunStatus::Running);
+        let pool_alive = match crate::harness::global_pool().try_lock() {
+            Ok(p) => p.contains(&r.id),
+            Err(_) => true, // prompt still holds the pool lock
+        };
+        assert!(pool_alive, "in-flight inject must leave the session alive");
+
+        // Let the hang mock hit the 2s ACP timeout so it drops the pool lock.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let _ = crate::harness::shutdown(Some(&r.id)).await;
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
 }
