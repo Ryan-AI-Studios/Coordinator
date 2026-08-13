@@ -8,6 +8,7 @@
 //! Cross-model review gate (Codex→Claude→OpenCode): track **0011**.
 //! Status Surface (Dioxus Desktop, `--features ui`): track **0014**.
 //! Hermes inbound webhook notify adapter (opt-in HMAC V2): track **0015**.
+//! Coordinated multi-sibling dogfood (named-map prompt): track **0016**.
 
 pub mod api;
 pub mod ci;

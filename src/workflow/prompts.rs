@@ -20,11 +20,21 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
         .and_then(|id| resolve_track_dir(record, id))
         .map(|p| format!("Track folder: {}\n", p.display()))
         .unwrap_or_default();
+    let repos_block = if paths.execution_repos.is_empty() {
+        String::new()
+    } else {
+        let mut lines = String::from("Execution repos:\n");
+        for (name, path) in &paths.execution_repos {
+            lines.push_str(&format!("- {name} = {}\n", path.display()));
+        }
+        lines
+    };
     format!(
         "Coordinator phase `{phase}` for track `{track}`.\n\
          Honor project skills (plan, review-track, foldin, implement) as applicable.\n\
          Workspace root: {workspace}\n\
          Execution repo: {execution}\n\
+         {repos_block}\
          Conductor directory: {conductor}\n\
          State directory: {state}\n\
          {track_hint}\
@@ -86,6 +96,87 @@ mod tests {
         assert!(text.contains("Honor project skills"));
         assert!(text.contains("Execution repo:"));
         assert!(!text.contains("Execution repo: (unset)"));
+        assert!(
+            !text.contains("Execution repos:"),
+            "nested empty map must omit named-map block: {text}"
+        );
+    }
+
+    fn multi_sibling_record() -> ProjectRecord {
+        let ws = PathBuf::from(r"C:\dev\coordinated");
+        let mut execution_repos = BTreeMap::new();
+        execution_repos.insert("ledgerful".into(), PathBuf::from(r"C:\dev\ledgerful"));
+        execution_repos.insert(
+            "ledgerful-action".into(),
+            PathBuf::from(r"C:\dev\ledgerful-action"),
+        );
+        execution_repos.insert(
+            "ledgerful-frontend".into(),
+            PathBuf::from(r"C:\dev\ledgerful-frontend"),
+        );
+        execution_repos.insert(
+            "ledgerful-web".into(),
+            PathBuf::from(r"C:\dev\ledgerful-web"),
+        );
+        ProjectRecord {
+            id: "coordinated".into(),
+            path: ws,
+            display_name: Some("coordinated".into()),
+            layout_profile: LayoutProfile::MultiSibling,
+            conductor_dir: None,
+            execution_repo: Some(PathBuf::from(r"C:\dev\ledgerful")),
+            execution_repos,
+            state_dir: None,
+            auto_merge: false,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn multi_sibling_prompt_lists_named_map() {
+        let rec = multi_sibling_record();
+        let text = phase_prompt(&rec, "plan", Some("0899-CoordinatorDogfoodProbe"));
+        assert!(
+            text.contains(r"Workspace root: C:\dev\coordinated"),
+            "workspace root missing: {text}"
+        );
+        assert!(
+            text.contains(r"Execution repo: C:\dev\ledgerful"),
+            "primary execution repo missing: {text}"
+        );
+        assert!(
+            text.contains("- ledgerful = C:\\dev\\ledgerful"),
+            "ledgerful map line missing: {text}"
+        );
+        assert!(
+            text.contains("- ledgerful-action = C:\\dev\\ledgerful-action"),
+            "ledgerful-action map line missing: {text}"
+        );
+        assert!(
+            text.contains("- ledgerful-frontend = C:\\dev\\ledgerful-frontend"),
+            "ledgerful-frontend map line missing: {text}"
+        );
+        assert!(
+            text.contains("- ledgerful-web = C:\\dev\\ledgerful-web"),
+            "ledgerful-web map line missing: {text}"
+        );
+        assert!(
+            text.contains("outside"),
+            "planning-outside-product rule missing: {text}"
+        );
+        assert!(
+            text.contains("Execution repos:"),
+            "named-map heading missing: {text}"
+        );
+        let heading = text.find("Execution repos:").expect("heading");
+        let ledgerful = text.find("- ledgerful = ").expect("ledgerful");
+        let action = text.find("- ledgerful-action = ").expect("action");
+        let frontend = text.find("- ledgerful-frontend = ").expect("frontend");
+        let web = text.find("- ledgerful-web = ").expect("web");
+        assert!(
+            heading < ledgerful && ledgerful < action && action < frontend && frontend < web,
+            "named map must follow BTreeMap key order: {text}"
+        );
     }
 
     #[test]
