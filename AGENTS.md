@@ -83,6 +83,10 @@ Control Plane entrypoints: `project add|list|show|set|scan` (`--auto-merge true|
 - Planning files staged into product  
 - Autonomy safety (timeouts, stop/pause, failure classes) when touching orchestration core  
 
+**Two-project CLI:** after more than one registry project, every command that takes `--project` must pass it (`run` / `wait` / `status` / `stop` / `pause` / `show` / `resume`). Omitting `--project` is an error.
+
 **Scan footgun:** never `project scan --root C:\dev --add` — `C:\dev` has many conductor markers (Orca, coordinator, coordinated, …). Scan a single workspace (`--root C:\dev\Orca`) or add one project at a time.
+
+**Scan footgun (coordinated):** `project scan --add` of `C:\dev\coordinated` would register **`nested`** (scan never returns `multi_sibling`; the hub has no nested product children). Use explicit `project add --profile multi_sibling`.
 
 **Wait vs phase timeout vs shutdown:** `wait --timeout-secs` is a CLI poll budget (exit **2**, run unchanged, Grok stays up). Phase wall clock is `failure_class=timeout` + Stopped + `FAILURE.md`. `harness grok shutdown` kills the holder / persist pid (pid-kill fallback) and writes `alive: false`. Operator `stop` (CLI or Status Surface) does not kill sessions and does not write `FAILURE.md`.  

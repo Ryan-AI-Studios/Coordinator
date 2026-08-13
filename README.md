@@ -110,6 +110,41 @@ cargo run -- status --project C:\dev\Orca
 
 Status JSON for this walk includes `layout_profile`, `execution_repo`, `conductor_dir`, `workflow` (`id`, `driver`, `pending_roles`), `next_track` (null when 0099 completes), and `failure_artifact` (null unless a hard fail). `ci` / `review` stay `null` on a stub walk that never parks on those phases.
 
+### Coordinated dogfood (multi-sibling compatibility)
+
+Second live Project is **`C:\dev\coordinated`** (planning hub) + named siblings under `C:\dev\`. Profile is **`multi_sibling`**. State stays at `{workspace}/.coordinator` — do **not** set `COORDINATOR_STATE_DIR` for this path. Keep **`auto_merge=false`** on this record so a mistaken implement PR cannot squash-merge a sibling. Grok cwd is the primary execution repo **`C:\dev\ledgerful`**.
+
+**Never** `project scan --root C:\dev --add`. **Never** `project scan --root C:\dev\coordinated --add` — scan detect returns **`nested`** + null exec (the hub has no nested product children). Always `project add --profile multi_sibling`.
+
+After this add, the machine has two projects (Orca + coordinated). Every `run` / `wait` / `status` / `stop` / `pause` / `show` **must** pass `--project`.
+
+`project set --execution-repos-json` **replaces** the map — include `ledgerful` again.
+
+```powershell
+cd C:\dev\coordinator\coordinator
+# Do NOT: cargo run -- project scan --root C:\dev --add
+# Do NOT: cargo run -- project scan --root C:\dev\coordinated --add
+cargo run -- project add C:\dev\coordinated --profile multi_sibling --auto-merge false --display-name coordinated --execution-repo C:\dev\ledgerful --execution-repo-name ledgerful
+$json = '{"ledgerful":"C:\\dev\\ledgerful","ledgerful-action":"C:\\dev\\ledgerful-action","ledgerful-frontend":"C:\\dev\\ledgerful-frontend","ledgerful-web":"C:\\dev\\ledgerful-web"}'
+cargo run -- project set --project C:\dev\coordinated --execution-repos-json $json --execution-repo C:\dev\ledgerful
+cargo run -- project show --project C:\dev\coordinated
+# expect layout_profile=multi_sibling, execution_repo → C:\dev\ledgerful,
+# four named execution_repos, conductor_dir → C:\dev\coordinated\conductor,
+# state_dir → C:\dev\coordinated\.coordinator, auto_merge=false
+cargo run -- project scan --root C:\dev\coordinated
+# expect already_registered=true; detected_profile may be nested (expected)
+
+# Probe only — never --track 0001–0187 or 0101
+cargo run -- run --project C:\dev\coordinated --track 0899 --driver stub
+cargo run -- wait --project C:\dev\coordinated --timeout-secs 60
+cargo run -- status --project C:\dev\coordinated
+# expect Idle / backlog clear; last_event must not contain "skip: deferred"; next_track null
+```
+
+Status JSON still exposes only the **primary** `execution_repo` + `layout_profile`. The named map is proven via `project show` (`project.execution_repos` + `resolved.execution_repos`).
+
+When more than one project is registered, omit `--project` and the CLI errors (it does not silently target Orca).
+
 **Local-only:** `coordinator serve` binds **`127.0.0.1` only** (default port **7420**, avoids Impeccable live 5500/8400). Non-loopback bind is rejected.
 
 **Completion contract (hybrid):** the **Phase Outcome File** is the portable done-signal (schema `version: 1`). Hooks, adapters, CLI, and HTTP may write it; **ConPTY / chat pattern-match is not the contract**. Writers must use **temp + replace** (or `coordinator outcome write` / `POST /v1/outcome`) so pollers never read torn JSON.
@@ -509,4 +544,4 @@ This mock remains the **visual reference** after 0014. Live start/resume is `car
 
 ## Status
 
-Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool), **0008** (canonical workflow runner), **0009** (stop/pause + Failure Artifact + toast), **0010** (token-idle `ci-wait` + auto squash-merge), **0011** (cross-model review), **0012** (Orca dogfood), **0013** (wait + session teardown), **0014** (live Dioxus Status Surface).
+Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool), **0008** (canonical workflow runner), **0009** (stop/pause + Failure Artifact + toast), **0010** (token-idle `ci-wait` + auto squash-merge), **0011** (cross-model review), **0012** (Orca dogfood), **0013** (wait + session teardown), **0014** (live Dioxus Status Surface), **0015** (Hermes notify adapter), **0016** (coordinated multi-sibling dogfood).
