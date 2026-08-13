@@ -1061,7 +1061,16 @@ mod tests {
         assert_eq!(view.phase, graph::PHASE_CROSS_MODEL);
         let st = load_run_state(&r).unwrap();
         assert_eq!(st.ci.as_ref().and_then(|c| c.pr_number), Some(42));
-        let after = crate::workflow::tick(&r).unwrap().expect("skip 0011");
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let gate = PhaseOutcome::success(
+            graph::PHASE_CROSS_MODEL,
+            OutcomeSource::File,
+            Some("cross-model: stub (no review)".into()),
+            None,
+            None,
+        );
+        crate::outcome::save_current_outcome(&r, &gate).unwrap();
+        let after = poll_once(&r).unwrap().expect("file apply cross-model");
         assert_eq!(after.phase, graph::PHASE_CI_WAIT);
         let st = load_run_state(&r).unwrap();
         assert_eq!(st.ci.as_ref().and_then(|c| c.pr_number), Some(42));

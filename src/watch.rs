@@ -17,8 +17,8 @@ use crate::state::{RunStatus, StatusView, load_run_state};
 /// Returns `Some(view)` when an outcome was applied this tick; `None` otherwise.
 /// Never panics on unreadable/partial JSON (skips file apply for this tick).
 pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
-    // 0) Drive the canonical graph (inject / stub / skip / join).
-    //    `ci-wait` still ticks while Paused (finish current wait).
+    // 0) Drive the canonical graph (inject / stub / named drives / join).
+    //    `cross-model-review` and `ci-wait` still tick while Paused (finish current phase).
     match crate::workflow::tick(record) {
         Ok(Some(view)) => return Ok(Some(view)),
         Ok(None) => {}

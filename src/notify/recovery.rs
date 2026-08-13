@@ -7,7 +7,7 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
     match class {
         FailureClass::Permission => "Fix auth or PATH; do not blind-retry.",
         FailureClass::ModelExhaustion => {
-            "Switch harness / wait for quota (0011). Do not spin this session."
+            "All cross-model tiers exhausted. Wait for quota or fix Role Bindings. Do not spin."
         }
         FailureClass::Difficulty => {
             "Re-prompt Planner/Implementor with online research; adjust approach."
@@ -32,7 +32,7 @@ mod tests {
         );
         assert_eq!(
             recommended_action(FailureClass::ModelExhaustion),
-            "Switch harness / wait for quota (0011). Do not spin this session."
+            "All cross-model tiers exhausted. Wait for quota or fix Role Bindings. Do not spin."
         );
         assert_eq!(
             recommended_action(FailureClass::Difficulty),

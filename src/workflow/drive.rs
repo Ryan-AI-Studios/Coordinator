@@ -9,28 +9,29 @@ use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run
 
 use super::bundle::{self, review_file, reviews_dir};
 use super::graph::{
-    PHASE_COMPACT, PHASE_PLAN_REVIEW, is_canonical, is_recognized_role, is_skip_phase,
-    resolve_track_dir, review_slugs, role_phase, skip_deferred_track,
+    PHASE_COMPACT, PHASE_PLAN_REVIEW, is_canonical, is_recognized_role, resolve_track_dir,
+    review_slugs, role_phase,
 };
 use super::prompts;
 use super::{WorkflowDriver, mark_driven};
 
 /// Idempotent drive step. No-op when Stopped / Idle / leftover stub.
 ///
-/// `ci-wait` is the one phase that still ticks while **Paused** (finish current wait).
+/// `cross-model-review` and `ci-wait` still tick while **Paused** (finish current phase).
 pub fn tick(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> {
     let state = load_run_state(record)?;
-    let ci_wait_while_paused =
-        state.status == RunStatus::Paused && state.phase == super::graph::PHASE_CI_WAIT;
-    if state.status != RunStatus::Running && !ci_wait_while_paused {
+    let tick_while_paused = state.status == RunStatus::Paused
+        && (state.phase == super::graph::PHASE_CROSS_MODEL
+            || state.phase == super::graph::PHASE_CI_WAIT);
+    if state.status != RunStatus::Running && !tick_while_paused {
         return Ok(None);
     }
     if !is_canonical(&state.phase) {
         return Ok(None);
     }
 
-    if is_skip_phase(&state.phase) {
-        return synth_skip(record, &state);
+    if state.phase == super::graph::PHASE_CROSS_MODEL {
+        return crate::review::drive(record, &state);
     }
     if state.phase == super::graph::PHASE_CI_WAIT {
         return crate::ci::drive(record, &state);
@@ -47,15 +48,6 @@ pub fn tick(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
         WorkflowDriver::FileWait => Ok(None),
         WorkflowDriver::Adapter => drive_adapter(record, &state),
     }
-}
-
-fn synth_skip(
-    record: &ProjectRecord,
-    state: &RunState,
-) -> Result<Option<crate::state::StatusView>> {
-    let track = skip_deferred_track(&state.phase).unwrap_or("00xx");
-    let msg = format!("skip: deferred to {track}");
-    synth_success(record, state, Some(msg), OutcomeSource::Test)
 }
 
 fn synth_success(

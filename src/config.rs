@@ -37,6 +37,18 @@ pub const ENV_COORDINATOR_CI_POLL_MS: &str = "COORDINATOR_CI_POLL_MS";
 /// Env: set to `1` to enable ignored live `gh` smoke tests.
 pub const ENV_COORDINATOR_GH_LIVE: &str = "COORDINATOR_GH_LIVE";
 
+/// Env: override `codex` binary for the cross-model gate.
+pub const ENV_COORDINATOR_CODEX_BIN: &str = "COORDINATOR_CODEX_BIN";
+
+/// Env: override `claude` binary for the cross-model gate.
+pub const ENV_COORDINATOR_CLAUDE_BIN: &str = "COORDINATOR_CLAUDE_BIN";
+
+/// Env: override `opencode` binary for the cross-model gate.
+pub const ENV_COORDINATOR_OPENCODE_BIN: &str = "COORDINATOR_OPENCODE_BIN";
+
+/// Env: set to `1` to enable ignored live review-CLI smoke tests.
+pub const ENV_COORDINATOR_REVIEW_LIVE: &str = "COORDINATOR_REVIEW_LIVE";
+
 /// Default stub phase budget (seconds) for `stub:active`.
 pub const DEFAULT_STUB_PHASE_TIMEOUT_SECS: u64 = 300;
 
@@ -172,6 +184,30 @@ pub fn default_role_bindings() -> BTreeMap<String, RoleBinding> {
     );
     map.insert(
         "plan_reviewer_opencode".into(),
+        RoleBinding {
+            harness: "opencode".into(),
+            command: "opencode".into(),
+            model: None,
+        },
+    );
+    map.insert(
+        "cross_model_primary".into(),
+        RoleBinding {
+            harness: "codex".into(),
+            command: "codex".into(),
+            model: None,
+        },
+    );
+    map.insert(
+        "cross_model_secondary".into(),
+        RoleBinding {
+            harness: "claude".into(),
+            command: "claude".into(),
+            model: None,
+        },
+    );
+    map.insert(
+        "cross_model_tertiary".into(),
         RoleBinding {
             harness: "opencode".into(),
             command: "opencode".into(),
@@ -417,6 +453,22 @@ mod tests {
             loaded.role_bindings["plan_reviewer_opencode"].harness,
             "opencode"
         );
+        assert_eq!(loaded.role_bindings["cross_model_primary"].harness, "codex");
+        assert_eq!(
+            loaded.role_bindings["cross_model_secondary"].command,
+            "claude"
+        );
+        assert_eq!(
+            loaded.role_bindings["cross_model_tertiary"].harness,
+            "opencode"
+        );
+        assert!(loaded.role_bindings["cross_model_primary"].model.is_none());
+        assert!(
+            loaded.role_bindings["cross_model_secondary"]
+                .model
+                .is_none()
+        );
+        assert!(loaded.role_bindings["cross_model_tertiary"].model.is_none());
     }
 
     #[test]
@@ -442,5 +494,45 @@ mod tests {
             loaded.role_bindings["plan_reviewer_opencode"].command,
             "opencode"
         );
+        assert_eq!(loaded.role_bindings["cross_model_primary"].command, "codex");
+        assert_eq!(
+            loaded.role_bindings["cross_model_secondary"].harness,
+            "claude"
+        );
+        assert_eq!(
+            loaded.role_bindings["cross_model_tertiary"].command,
+            "opencode"
+        );
+    }
+
+    #[test]
+    fn merge_missing_cross_model_keys_on_old_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "scan_roots": [],
+                "role_bindings": {
+                    "planner": { "harness": "grok", "command": "grok" },
+                    "implementor": { "harness": "grok", "command": "grok" },
+                    "plan_reviewer_agy": { "harness": "antigravity", "command": "agy" },
+                    "plan_reviewer_opencode": { "harness": "opencode", "command": "opencode" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let loaded = load_machine_config_at(&path).unwrap();
+        assert_eq!(loaded.role_bindings["cross_model_primary"].harness, "codex");
+        assert_eq!(
+            loaded.role_bindings["cross_model_secondary"].command,
+            "claude"
+        );
+        assert_eq!(
+            loaded.role_bindings["cross_model_tertiary"].harness,
+            "opencode"
+        );
+        assert!(loaded.role_bindings["cross_model_primary"].model.is_none());
     }
 }
