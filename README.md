@@ -32,7 +32,7 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 |-------|-------------------|----------|
 | Machine home (registry) | `%LOCALAPPDATA%\coordinator\` | `COORDINATOR_HOME` |
 | Registry file | `{home}/registry.json` | — |
-| Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`, `phase_timeouts_secs`) | — |
+| Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`, `phase_timeouts_secs`, `hermes`) | — |
 | Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
 | Active Phase Outcome | `{state_dir}/outcomes/current.json` | same state-dir rules |
 | Last applied outcome | `{state_dir}/outcomes/current.applied.json` | written on successful apply; `current.json` removed |
@@ -150,9 +150,62 @@ Hard failure (apply `status=failure`, including timeout synthesis and adapter fa
 |------|----------|
 | Artifact | Atomic markdown: project/track/phase/class/epoch + fenced `last_event` / message + `recommended_action` (advisory — no auto-retry) |
 | Toast | `tauri-winrt-notification` 0.8.1, PowerShell AUMID (no installer). Title `Coordinator: {class}`. Disabled with `COORDINATOR_NOTIFY=off` |
-| Adapters | `NotifyAdapter` trait: Artifact + Toast + Log + Hermes stub. Hermes v1.x POSTs `NotifyEvent` JSON to a configured local inbound webhook — **not this crate** |
-| Surfaces | `coordinator failure show` prints the markdown; `GET /v1/failure` returns `{path, body}` or **404** |
+| Adapters | `NotifyAdapter` trait: Artifact + Toast + Log + **opt-in Hermes** (HMAC V2 POST of unchanged `NotifyEvent` JSON). Default **off**. Adapter errors never undo `FAILURE.md` or skip toast. |
+| Surfaces | `coordinator failure show` prints the markdown; `GET /v1/failure` returns `{path, body}` or **404**. `coordinator notify hermes-test` probes Hermes only (no artifact, no toast). |
 | Status | Additive `failure_artifact` path (`null` when the file is absent). Existing `failure_class` / `run_epoch` / `phase_started_at` / `next_track` are also on status JSON |
+
+### Hermes notify (opt-in)
+
+Coordinator is **not** a Telegram client and does not hold a bot token. Hermes Agent (typically on WSL) is operator-owned — this crate does not install, start, or bundle it.
+
+Hard failure may POST `NotifyEvent` JSON to a **loopback** Hermes inbound webhook. Toast + `FAILURE.md` still fire first and still succeed when Hermes is off or the POST fails. Operator `stop` / `pause` never POST.
+
+| Item | Rule |
+|------|------|
+| Config | `{COORDINATOR_HOME}/config.json` additive `hermes.enabled` (default `false`) + `hermes.webhook_url`. **Do not** store the HMAC secret. |
+| Env | `COORDINATOR_HERMES=off` force-disables. `COORDINATOR_HERMES_URL` overrides the URL. `COORDINATOR_HERMES_SECRET` is required to POST. `COORDINATOR_NOTIFY=off` still skips **toast only**. |
+| URL | `http://` + literal host in `{127.0.0.1, localhost, ::1, 127.0.0.0/8}` + non-empty path. Docs and examples use **`http://127.0.0.1:8644/...`** (IPv4-deterministic for WSL2). `https://`, non-loopback, empty path, and userinfo are rejected. No redirects off-box. |
+| Auth | Hermes generic **HMAC V2**: `X-Webhook-Signature-V2` + `X-Webhook-Timestamp` over `{timestamp}.{body}` (lowercase hex, no `sha256=` prefix). Unsigned POST is forbidden. |
+| Idempotency | `X-Request-ID` is **Coordinator’s** key `{project_id}:{run_epoch}:{phase}:{failure_class}` (Hermes caches any stable string for 1 hour). |
+
+```json
+{
+  "version": 1,
+  "hermes": {
+    "enabled": true,
+    "webhook_url": "http://127.0.0.1:8644/webhooks/coordinator-failure"
+  }
+}
+```
+
+```powershell
+$env:COORDINATOR_HERMES_SECRET = "<same as Hermes route secret>"
+cargo run -- notify hermes-test
+```
+
+Hermes must be reachable from Windows at **`127.0.0.1:8644`**. Recommended route (`~/.hermes/config.yaml` on the Hermes host) — **`deliver_only: true` is mandatory** so a hard fail does not wake an LLM turn:
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      port: 8644
+      secret: "<same as COORDINATOR_HERMES_SECRET>"
+      routes:
+        coordinator-failure:
+          secret: "<same>"
+          deliver: telegram
+          deliver_only: true
+          prompt: |
+            Coordinator {failure_class}
+            project: {project_id}
+            track: {track_id}
+            phase: {phase}
+            {message}
+```
+
+Omit `events` (or do not filter on GitHub event types).
 
 `COORDINATOR_NOTIFY=off` is the CI / headless default path. `cargo test` never requires a visible toast (recording adapter).
 
@@ -295,6 +348,7 @@ coordinator outcome write --phase <id> --status success|failure
     [--next-track <id>] [--source cli]
 coordinator outcome show [--project …]
 coordinator failure show [--project …]
+coordinator notify hermes-test [--project …]
 coordinator wait [--project …] [--timeout-secs N]
 coordinator harness grok start [--project …]
 coordinator harness grok prompt --text <…> | --file <path> [--project …]

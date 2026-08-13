@@ -1,10 +1,10 @@
-//! Notify Adapter trait + composite + log / hermes stub / recording.
+//! Notify Adapter trait + composite + log / Hermes / recording.
 
 use crate::error::Result;
 
 use super::NotifyEvent;
 
-/// Fan-out slot for Failure Artifact, toast, log, and later Hermes.
+/// Fan-out slot for Failure Artifact, toast, log, and Hermes.
 pub trait NotifyAdapter: Send + Sync {
     fn notify(&self, event: &NotifyEvent) -> Result<()>;
 }
@@ -35,16 +35,7 @@ impl NotifyAdapter for LogAdapter {
     }
 }
 
-/// v1.x slot: POST `NotifyEvent` JSON to a configured local Hermes inbound webhook.
-///
-/// This track: explicit no-op. Do not add an HTTP client or HMAC here.
-pub struct HermesAdapter;
-
-impl NotifyAdapter for HermesAdapter {
-    fn notify(&self, _event: &NotifyEvent) -> Result<()> {
-        Ok(())
-    }
-}
+pub use super::hermes::HermesAdapter;
 
 /// Isolated fan-out. Artifact is first; later adapter errors do not undo it.
 pub struct Composite {
@@ -56,13 +47,13 @@ impl Composite {
         Self { adapters }
     }
 
-    /// Artifact + Toast + Log + Hermes stub.
+    /// Artifact + Toast + Log + Hermes. Tests never read machine-home Hermes config.
     pub fn default_stack() -> Self {
         Self::new(vec![
             Box::new(ArtifactAdapter),
             Box::new(super::toast::ToastAdapter),
             Box::new(LogAdapter),
-            Box::new(HermesAdapter),
+            Box::new(HermesAdapter::for_default_stack()),
         ])
     }
 }
@@ -135,8 +126,8 @@ mod tests {
     }
 
     #[test]
-    fn hermes_is_noop() {
-        HermesAdapter.notify(&event()).unwrap();
+    fn hermes_disabled_is_noop() {
+        HermesAdapter::noop().notify(&event()).unwrap();
     }
 
     #[test]

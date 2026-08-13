@@ -217,6 +217,15 @@ pub fn default_role_bindings() -> BTreeMap<String, RoleBinding> {
     map
 }
 
+/// Opt-in local Hermes inbound webhook (track 0015). Secret is env-only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HermesNotifyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+}
+
 /// Machine-level prefs (`{COORDINATOR_HOME}/config.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MachineConfig {
@@ -228,6 +237,9 @@ pub struct MachineConfig {
     /// Optional per-phase timeout overrides (seconds). Missing keys use table defaults.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub phase_timeouts_secs: BTreeMap<String, u64>,
+    /// Hermes notify adapter. Missing key → disabled defaults (no version bump).
+    #[serde(default)]
+    pub hermes: HermesNotifyConfig,
 }
 
 impl Default for MachineConfig {
@@ -237,6 +249,7 @@ impl Default for MachineConfig {
             scan_roots: default_scan_roots(),
             role_bindings: default_role_bindings(),
             phase_timeouts_secs: BTreeMap::new(),
+            hermes: HermesNotifyConfig::default(),
         }
     }
 }
@@ -335,8 +348,9 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 ///
 /// All tests that set `COORDINATOR_HOME`, `COORDINATOR_STATE_DIR`,
 /// `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`, `COORDINATOR_PHASE_TIMEOUT_SECS`,
-/// `COORDINATOR_WORKFLOW_DRIVER`, `COORDINATOR_OUTCOME_POLL_MS`, or
-/// `COORDINATOR_NOTIFY` must
+/// `COORDINATOR_WORKFLOW_DRIVER`, `COORDINATOR_OUTCOME_POLL_MS`,
+/// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
+/// `COORDINATOR_HERMES_SECRET`, or `COORDINATOR_HERMES_LIVE` must
 /// hold this (survives poison so one failure does not cascade).
 #[cfg(test)]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -377,6 +391,7 @@ mod tests {
             scan_roots: vec![PathBuf::from(r"C:\dev")],
             role_bindings: default_role_bindings(),
             phase_timeouts_secs: BTreeMap::new(),
+            hermes: HermesNotifyConfig::default(),
         };
         atomic_write_json(&path, &cfg).unwrap();
         let loaded = load_machine_config_at(&path).unwrap();
@@ -534,5 +549,43 @@ mod tests {
             "opencode"
         );
         assert!(loaded.role_bindings["cross_model_primary"].model.is_none());
+    }
+
+    #[test]
+    fn old_config_without_hermes_loads_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"version":1,"scan_roots":[]}"#).unwrap();
+        let loaded = load_machine_config_at(&path).unwrap();
+        assert!(!loaded.hermes.enabled);
+        assert!(loaded.hermes.webhook_url.is_none());
+    }
+
+    #[test]
+    fn hermes_enabled_url_round_trip_never_persists_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = MachineConfig {
+            version: MACHINE_CONFIG_VERSION,
+            scan_roots: Vec::new(),
+            role_bindings: default_role_bindings(),
+            phase_timeouts_secs: BTreeMap::new(),
+            hermes: HermesNotifyConfig {
+                enabled: true,
+                webhook_url: Some("http://127.0.0.1:8644/webhooks/coordinator-failure".into()),
+            },
+        };
+        atomic_write_json(&path, &cfg).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("secret"),
+            "HMAC secret must never appear in config.json"
+        );
+        let loaded = load_machine_config_at(&path).unwrap();
+        assert!(loaded.hermes.enabled);
+        assert_eq!(
+            loaded.hermes.webhook_url.as_deref(),
+            Some("http://127.0.0.1:8644/webhooks/coordinator-failure")
+        );
     }
 }

@@ -102,6 +102,20 @@ pub enum Commands {
         #[command(subcommand)]
         action: HarnessCommands,
     },
+    /// Notify probes (Hermes inbound webhook)
+    Notify {
+        #[command(subcommand)]
+        action: NotifyCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NotifyCommands {
+    /// Probe the opt-in Hermes inbound webhook (no artifact, no toast)
+    HermesTest {
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -468,6 +482,26 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 }
             },
         },
+        Commands::Notify { action } => match action {
+            NotifyCommands::HermesTest { project } => {
+                let project_id = match project {
+                    Some(p) => api::load_registry()?.resolve_project(Some(&p))?.id.clone(),
+                    None => "hermes-test".into(),
+                };
+                let event = crate::notify::hermes::synthetic_event(project_id);
+                match crate::notify::hermes::probe(&event) {
+                    crate::notify::hermes::ProbeOutcome::Skipped(reason) => {
+                        println!("hermes skipped: {reason}");
+                    }
+                    crate::notify::hermes::ProbeOutcome::Delivered { status } => {
+                        println!("hermes delivered HTTP {status}");
+                    }
+                    crate::notify::hermes::ProbeOutcome::Failed(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -526,6 +560,13 @@ mod tests {
             ui.get_arguments().any(|a| a.get_id() == "port"),
             "ui --port"
         );
+    }
+
+    #[test]
+    fn notify_hermes_test_in_help() {
+        let cmd = Cli::command();
+        let notify = cmd.find_subcommand("notify").expect("notify");
+        assert!(notify.find_subcommand("hermes-test").is_some());
     }
 
     #[test]
