@@ -563,6 +563,26 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_pass_falls_through_to_next_tier() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let mut crashed_pass = pass_text();
+        crashed_pass.exit = 1;
+        let scripted = ScriptedBackend::new()
+            .push_ok(crashed_pass)
+            .push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("pass");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(view.last_event.contains("cross-model: pass (claude)"));
+        assert_eq!(counts.n(), 2);
+        assert_eq!(counts.slugs(), vec!["codex", "claude"]);
+        clear_env();
+    }
+
+    #[test]
     fn gate_fail_no_fallback() {
         let (_home, _g) = adapter_env();
         let dir = tempdir().unwrap();

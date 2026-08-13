@@ -40,7 +40,17 @@ pub fn parse_report(last_message: &str, stdout: &str) -> ParsedVerdict {
 }
 
 pub fn classify_result(result: &ReviewResult) -> TierClass {
-    match parse_report(&result.last_message, &result.stdout) {
+    let parsed = parse_report(&result.last_message, &result.stdout);
+    // A dirty Verdict is the gate (no fallback), even if the CLI exited nonzero.
+    if parsed == ParsedVerdict::GateFail {
+        return TierClass::GateFail;
+    }
+    // Nonzero / timeout-kill is crash-class fall-through. Do not accept PASS
+    // from a failed process (leftover last-message or template dump).
+    if result.exit != 0 {
+        return classify_unusable(result.exit, &blob(result));
+    }
+    match parsed {
         ParsedVerdict::Pass => TierClass::Pass,
         ParsedVerdict::PassWithLows => TierClass::PassWithLows,
         ParsedVerdict::GateFail => TierClass::GateFail,
@@ -424,5 +434,27 @@ mod tests {
         let mut r = res("");
         r.stderr = "Error: not logged in".into();
         assert_eq!(classify_result(&r), TierClass::Permission);
+    }
+
+    #[test]
+    fn nonzero_exit_with_pass_is_crash() {
+        let mut r = res("## Verdict: PASS\n");
+        r.exit = 1;
+        assert_eq!(classify_result(&r), TierClass::Crash);
+    }
+
+    #[test]
+    fn timeout_kill_with_pass_is_crash() {
+        let mut r = res("## Verdict: PASS\n");
+        r.exit = 124;
+        r.stderr = "review CLI timed out after 60s".into();
+        assert_eq!(classify_result(&r), TierClass::Crash);
+    }
+
+    #[test]
+    fn gate_fail_still_wins_on_nonzero_exit() {
+        let mut r = res("## Verdict: FAIL\n");
+        r.exit = 1;
+        assert_eq!(classify_result(&r), TierClass::GateFail);
     }
 }
