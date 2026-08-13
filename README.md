@@ -83,6 +83,31 @@ When nested `execution_repo` is null, `project show` includes:
 
 `hint: coordinator project set --project <id|path> --execution-repo <path>`
 
+### Orca dogfood (nested default)
+
+First live Project is **`C:\dev\Orca`** (workspace) + **`C:\dev\Orca\OrcaSlicer-ZR`** (execution). State stays at `{workspace}/.coordinator` — do **not** set `COORDINATOR_STATE_DIR` for this path (that would skip the ADR-0014 default). Keep **`auto_merge=false`** on this record so a mistaken implement PR cannot squash-merge the slicer.
+
+**Never** `project scan --root C:\dev --add`. `C:\dev` has many `conductor/conductor.md` trees. Scan only `--root C:\dev\Orca`, or `project add` that path.
+
+```powershell
+cd C:\dev\coordinator\coordinator
+# Do NOT: cargo run -- project scan --root C:\dev --add
+cargo run -- project add C:\dev\Orca --profile nested --auto-merge false --display-name Orca
+cargo run -- project show --project C:\dev\Orca
+# expect layout_profile=nested, execution_repo → OrcaSlicer-ZR,
+# conductor_dir → C:\dev\Orca\conductor, state_dir → C:\dev\Orca\.coordinator, auto_merge=false
+cargo run -- project scan --root C:\dev\Orca
+# expect already_registered
+
+# Probe only — never --track 0001–0005
+cargo run -- run --project C:\dev\Orca --track 0099 --driver stub
+cargo run -- wait --project C:\dev\Orca --timeout-secs 60
+cargo run -- status --project C:\dev\Orca
+# expect Idle / backlog clear; last_event must not contain "skip: deferred"
+```
+
+Status JSON for this walk includes `layout_profile`, `execution_repo`, `conductor_dir`, `workflow` (`id`, `driver`, `pending_roles`), `next_track` (null when 0099 completes), and `failure_artifact` (null unless a hard fail). `ci` / `review` stay `null` on a stub walk that never parks on those phases.
+
 **Local-only:** `coordinator serve` binds **`127.0.0.1` only** (default port **7420**, avoids Impeccable live 5500/8400). Non-loopback bind is rejected.
 
 **Completion contract (hybrid):** the **Phase Outcome File** is the portable done-signal (schema `version: 1`). Hooks, adapters, CLI, and HTTP may write it; **ConPTY / chat pattern-match is not the contract**. Writers must use **temp + replace** (or `coordinator outcome write` / `POST /v1/outcome`) so pollers never read torn JSON.

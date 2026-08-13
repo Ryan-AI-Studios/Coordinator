@@ -335,4 +335,25 @@ mod tests {
         std::fs::create_dir_all(product.join(".git")).unwrap();
         assert_eq!(auto_detect_nested_execution(ws).unwrap(), product);
     }
+
+    #[test]
+    fn auto_detect_orca_shaped_nested() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        for name in ["conductor", "docs", ".agents", ".scratch", ".ledgerful"] {
+            std::fs::create_dir_all(ws.join(name)).unwrap();
+        }
+        std::fs::write(ws.join("conductor").join("conductor.md"), "# tracks").unwrap();
+        let product = ws.join("OrcaSlicer-ZR");
+        std::fs::create_dir_all(product.join(".git")).unwrap();
+        assert!(
+            !ws.join("Cargo.toml").exists(),
+            "fixture must not have a workspace Cargo.toml"
+        );
+        assert!(
+            !product.join("Cargo.toml").exists(),
+            "OrcaSlicer-ZR is CMake — no Cargo.toml"
+        );
+        assert_eq!(auto_detect_nested_execution(ws).unwrap(), product);
+    }
 }
