@@ -135,6 +135,32 @@ fn truncate_reason(msg: &str) -> String {
     format!("{t}…")
 }
 
+/// Adapter ticks from `wait` / `serve` always use the detached holder (`in_process: false`).
+/// In-process spawn stays for same-process tests / `insert_test_session` / HTTP start.
+const ADAPTER_START_IN_PROCESS: bool = false;
+
+#[cfg(test)]
+static TEST_SLOW_INJECT: std::sync::Mutex<Option<std::time::Duration>> =
+    std::sync::Mutex::new(None);
+
+/// Arm a one-shot mock inject that does not block `poll_once` (DoD-1).
+/// Disarm on drop so a panic cannot leak the hook into another test.
+#[cfg(test)]
+pub(crate) fn arm_slow_adapter_inject(delay: std::time::Duration) -> SlowInjectGuard {
+    *TEST_SLOW_INJECT.lock().unwrap_or_else(|p| p.into_inner()) = Some(delay);
+    SlowInjectGuard
+}
+
+#[cfg(test)]
+pub(crate) struct SlowInjectGuard;
+
+#[cfg(test)]
+impl Drop for SlowInjectGuard {
+    fn drop(&mut self) {
+        *TEST_SLOW_INJECT.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
 fn drive_adapter(
     record: &ProjectRecord,
     state: &RunState,
@@ -144,7 +170,23 @@ fn drive_adapter(
     }
     mark_driven(record, &state.phase)?;
 
-    if let Err(e) = crate::harness::resolve_grok_binary() {
+    #[cfg(test)]
+    {
+        let delay = TEST_SLOW_INJECT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(delay) = delay {
+            // Simulate a long in-flight inject without holding the global pool lock.
+            std::thread::spawn(move || std::thread::sleep(delay));
+            return Ok(None);
+        }
+    }
+
+    let has_live_session = crate::harness::status_bundle_sync(record)
+        .and_then(|b| b.grok)
+        .is_some_and(|g| g.alive);
+    if !has_live_session && let Err(e) = crate::harness::resolve_grok_binary() {
         return fail_phase(
             record,
             state,
@@ -156,29 +198,43 @@ fn drive_adapter(
 
     let prompt = prompts::phase_prompt(record, &state.phase, state.track_id.as_deref());
     let selector = record.path.to_string_lossy().to_string();
-    let result = block_on_async(async {
-        crate::harness::start(Some(&selector), true).await?;
-        crate::harness::prompt(Some(&selector), prompt).await
-    });
-    match result {
-        Ok(view) => {
-            if view.applied {
-                return Ok(view.status);
+    let rec = record.clone();
+    // First tick starts the holder Prompt without blocking poll_once. Later ticks
+    // are no-ops (`mark_driven`). The holder / pool apply path writes the outcome.
+    std::thread::Builder::new()
+        .name(format!("adapter-inject-{}", rec.id))
+        .spawn(move || {
+            let result = block_on_async(async {
+                crate::harness::start(Some(&selector), ADAPTER_START_IN_PROCESS).await?;
+                crate::harness::prompt(Some(&selector), prompt).await
+            });
+            match result {
+                Ok(view) => {
+                    if view.applied {
+                        return;
+                    }
+                    if let Some(err) = view.error {
+                        let class = view.failure_class.unwrap_or(FailureClass::HarnessCrash);
+                        apply_adapter_failure(&rec, class, err);
+                    }
+                }
+                Err(e) => apply_adapter_failure(&rec, FailureClass::HarnessCrash, e.to_string()),
             }
-            if let Some(err) = view.error {
-                let class = view.failure_class.unwrap_or(FailureClass::HarnessCrash);
-                return fail_phase(record, state, class, err, OutcomeSource::Adapter);
-            }
-            Ok(None)
-        }
-        Err(e) => fail_phase(
-            record,
-            state,
-            FailureClass::HarnessCrash,
-            e.to_string(),
-            OutcomeSource::Adapter,
-        ),
+        })
+        .map_err(|e| {
+            CoordinatorError::Message(format!("failed to spawn adapter inject thread: {e}"))
+        })?;
+    Ok(None)
+}
+
+fn apply_adapter_failure(record: &ProjectRecord, class: FailureClass, message: String) {
+    let Ok(state) = load_run_state(record) else {
+        return;
+    };
+    if state.status != RunStatus::Running {
+        return;
     }
+    let _ = fail_phase(record, &state, class, message, OutcomeSource::Adapter);
 }
 
 fn drive_plan_review(
