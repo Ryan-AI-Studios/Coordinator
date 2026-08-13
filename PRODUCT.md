@@ -28,7 +28,7 @@ Same-machine Windows session orchestrator with hybrid Completion Signals and a b
 
 - Nested workspace: planning at Workspace Root; product git only under the nested product folder
 - Projects are separate folders; Session pool per Project; shared harness binaries
-- Operator workflows: start track, watch Status Surface, Stop (abort phase) / Pause (finish phase then hold), Failure Artifact + Windows toast on hard fail
+- Operator workflows: start track, watch Status Surface, Stop (abort phase) / Pause (finish phase then hold), Failure Artifact + Windows toast on hard fail. Hermes/Telegram is opt-in v1.x via a local inbound webhook (not a Coordinator Telegram client).
 - Dogfood target later: `C:\dev\Orca` (nested layout); Ledgerful multi-sibling remains a supported Layout Profile
 
 ## Capabilities and Constraints

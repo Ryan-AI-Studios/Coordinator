@@ -7,6 +7,7 @@
 //! Token-idle CI wait + auto squash-merge: track **0010**.
 //! Cross-model review gate (Codex→Claude→OpenCode): track **0011**.
 //! Status Surface (Dioxus Desktop, `--features ui`): track **0014**.
+//! Hermes inbound webhook notify adapter (opt-in HMAC V2): track **0015**.
 
 pub mod api;
 pub mod ci;

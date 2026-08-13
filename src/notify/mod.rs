@@ -1,10 +1,11 @@
-//! Failure notify: artifact + toast + adapter trait (track 0009).
+//! Failure notify: artifact + toast + adapter trait (track 0009) + Hermes (0015).
 //!
 //! Hook only after a successful Phase Outcome **failure** commit. Operator
 //! `stop` is not a Failure Class and must not notify.
 
 pub mod adapter;
 pub mod artifact;
+pub mod hermes;
 pub mod recovery;
 pub mod toast;
 
@@ -23,7 +24,7 @@ pub use toast::{ENV_COORDINATOR_NOTIFY, ToastAdapter, notify_enabled};
 
 /// Payload fanned out to every [`NotifyAdapter`].
 ///
-/// Hermes v1.x will POST this JSON to a configured local inbound webhook.
+/// Hermes v1.x POSTs this JSON (unchanged schema) to an opt-in local inbound webhook.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NotifyEvent {
     pub project_id: String,
@@ -262,5 +263,88 @@ mod tests {
         crate::outcome::apply(&r, o.clone()).unwrap();
         crate::outcome::apply(&r, o).unwrap();
         assert_eq!(toast::take_recorded_toasts().len(), 1);
+    }
+
+    #[test]
+    fn apply_failure_survives_hermes_401() {
+        use crate::config::test_env_lock;
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+        toast::clear_recorded_toasts();
+        let _h = hermes::install_scripted(
+            "http://127.0.0.1:8644/webhooks/coordinator-failure",
+            "s",
+            hermes::ScriptedOutcome::Status(401),
+        );
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_stub(&r, Some("0015".into())).unwrap();
+        let o = PhaseOutcome::failure(
+            STUB_PHASE_ACTIVE,
+            FailureClass::Timeout,
+            OutcomeSource::Test,
+            Some("budget".into()),
+            None,
+        );
+        crate::outcome::apply(&r, o).unwrap();
+        assert!(artifact::existing_path(&r).is_some());
+        assert_eq!(toast::take_recorded_toasts().len(), 1);
+        assert_eq!(_h.take().len(), 1);
+    }
+
+    #[test]
+    fn stop_and_pause_do_not_hermes() {
+        use crate::config::test_env_lock;
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+        let rec_h =
+            hermes::install_recording("http://127.0.0.1:8644/webhooks/coordinator-failure", "s");
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0015".into()), WorkflowDriver::FileWait).unwrap();
+        run::stop(&r).unwrap();
+        assert!(rec_h.take().is_empty());
+        drop(rec_h);
+
+        let rec_h =
+            hermes::install_recording("http://127.0.0.1:8644/webhooks/coordinator-failure", "s");
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, None, WorkflowDriver::FileWait).unwrap();
+        run::pause(&r).unwrap();
+        assert!(rec_h.take().is_empty());
+    }
+
+    #[test]
+    fn notify_off_does_not_disable_hermes() {
+        use crate::config::test_env_lock;
+        let _guard = test_env_lock();
+        toast::clear_recorded_toasts();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_NOTIFY, "off");
+        }
+        let rec_h =
+            hermes::install_recording("http://127.0.0.1:8644/webhooks/coordinator-failure", "s");
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_stub(&r, None).unwrap();
+        let o = PhaseOutcome::failure(
+            STUB_PHASE_ACTIVE,
+            FailureClass::Permission,
+            OutcomeSource::Test,
+            Some("denied".into()),
+            None,
+        );
+        crate::outcome::apply(&r, o).unwrap();
+        assert!(artifact::existing_path(&r).is_some());
+        assert!(toast::take_recorded_toasts().is_empty());
+        assert_eq!(rec_h.take().len(), 1);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
     }
 }
