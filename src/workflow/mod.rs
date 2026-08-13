@@ -115,6 +115,7 @@ pub fn on_success(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseO
                 || m.starts_with("compact:")
                 || m.starts_with("plan-review:")
                 || m.starts_with("ci-wait:")
+                || m.starts_with("cross-model:")
             {
                 state.last_event = m.clone();
             } else {
@@ -202,6 +203,7 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.failure_class = None;
     state.last_applied_outcome_hash = None;
     state.ci = None;
+    state.review = None;
     reset_phase_clock(state);
     state.last_event = format!("workflow: auto-start {track_id}");
 }
@@ -329,8 +331,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         run_with_driver(&r, None, WorkflowDriver::Stub).unwrap();
-        let after_xmodel = walk_until(&r, |v| v.last_event.contains("0011"));
-        assert!(after_xmodel.last_event.contains("skip: deferred to 0011"));
+        let after_xmodel = walk_until(&r, |v| v.last_event.contains("cross-model: stub"));
+        assert!(
+            after_xmodel
+                .last_event
+                .contains("cross-model: stub (no review)"),
+            "last_event={}",
+            after_xmodel.last_event
+        );
+        assert!(!after_xmodel.last_event.contains("skip: deferred to"));
         let after_ci = walk_until(&r, |v| v.last_event.contains("ci-wait: stub"));
         assert!(
             after_ci.last_event.contains("ci-wait: stub (no gh)"),
@@ -338,6 +347,7 @@ mod tests {
             after_ci.last_event
         );
         assert!(!after_ci.last_event.contains("skip: deferred to 0010"));
+        assert!(!after_ci.last_event.contains("skip: deferred to 0011"));
     }
 
     #[test]

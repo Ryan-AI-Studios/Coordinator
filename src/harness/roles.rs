@@ -41,5 +41,9 @@ mod tests {
         assert_eq!(b["plan_reviewer_agy"].harness, "antigravity");
         assert_eq!(b["plan_reviewer_agy"].command, "agy");
         assert_eq!(b["plan_reviewer_opencode"].harness, "opencode");
+        assert_eq!(b["cross_model_primary"].harness, "codex");
+        assert_eq!(b["cross_model_secondary"].harness, "claude");
+        assert_eq!(b["cross_model_tertiary"].harness, "opencode");
+        assert!(b["cross_model_primary"].model.is_none());
     }
 }

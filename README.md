@@ -97,17 +97,17 @@ When nested `execution_repo` is null, `project show` includes:
 
 ```
 plan → plan-review (agy + opencode join) → fold → implement
-  → cross-model-review (skip → 0011) → ci-wait (token-idle gh poll)
+  → cross-model-review (Codex→Claude→OpenCode one-shot) → ci-wait (token-idle gh poll)
   → compact → advance
 ```
 
 | Driver | CLI / env | Behavior |
 |--------|-----------|----------|
-| `adapter` | default | Inject Grok prompt once per phase for plan/fold/implement/advance. **`ci-wait` never injects** (token-idle `gh` poll). Missing `grok` **fails** Grok-bound phases. |
+| `adapter` | default | Inject Grok prompt once per phase for plan/fold/implement/advance. **`cross-model-review` and `ci-wait` never inject** (one-shot review CLIs / token-idle `gh`). Missing `grok` **fails** Grok-bound phases. |
 | `file_wait` | `--driver file_wait` | No inject; poll `current.json` / `outcomes/roles/*.json`. |
 | `stub` | `--driver stub` or `COORDINATOR_WORKFLOW_DRIVER=stub` | Synthesize success each tick so CI can walk the full graph. |
 
-Status JSON includes additive `workflow` `{ id, driver, pending_roles }` and additive `ci` (`pr`, `pr_url`, `head_sha`, `last_summary`, `interval_ms`, `auto_merge`, `merge`) — `null` when phase is not `ci-wait` and no watch state is persisted. Existing additive fields include `failure_class`, `next_track`, `phase_started_at`, `run_epoch`, `failure_artifact`.
+Status JSON includes additive `workflow` `{ id, driver, pending_roles }`, additive `ci` (`pr`, `pr_url`, `head_sha`, `last_summary`, `interval_ms`, `auto_merge`, `merge`) — `null` when phase is not `ci-wait` and no watch state is persisted — and additive `review` (`attempted`, `active`, `verdict`, `report`) — `null` when phase is not `cross-model-review` and no review state is persisted. Existing additive fields include `failure_class`, `next_track`, `phase_started_at`, `run_epoch`, `failure_artifact`.
 
 **Plan-review:** two role files + review markdown; Coordinator assembles `{workspace}/AI-review.md`. One reviewer may degrade; **both** missing/fail → Stopped. Line endings normalized to `\n`.
 
@@ -129,11 +129,32 @@ Hard failure (apply `status=failure`, including timeout synthesis and adapter fa
 
 `COORDINATOR_NOTIFY=off` is the CI / headless default path. `cargo test` never requires a visible toast (recording adapter).
 
-The remaining skip slot is **`cross-model-review` only** (`last_event` `skip: deferred to 0011`). `ci-wait` is a real phase (track 0010).
+There are **no skip slots**. `cross-model-review` is a real one-shot gate (track 0011). `ci-wait` is a real phase (track 0010). 0010 still treats predecessor success as the Review Gate — filling this slot makes that hook honest.
+
+### Cross-model review gate
+
+After implement, Coordinator runs a **fresh, read-only CLI exec** (not a Grok Session) in Role Binding order **Codex → Claude → OpenCode**. Defaults ship `model: null` (omit `-m` / `--model`). File slug is the binding `harness` field (`review.codex.md`). Coordinator **does not** write `review.md`.
+
+| Item | Behavior |
+|------|----------|
+| Spawn cwd | Primary **execution repo**. No execution repo → `permission` (`cross-model: no execution repo`) |
+| Codex | `exec -C {exec} -s read-only --ephemeral -o {tmp} --output-schema {shipped}` — **no** `--add-dir` (writable), **no** `exec review` |
+| Claude | `-p` + `--permission-mode dontAsk` + Read/Glob/Grep only — **no `--bare`**. `--add-dir {workspace_root}` is tool access only |
+| OpenCode | `run --dir {exec} --format default` — **no `--auto`**. Hang backstop = remaining phase budget |
+| Windows | `resolve_command` (PATH + `PATHEXT`). Never spawn `.ps1`. `.cmd`/`.bat` via `cmd.exe /C`. Env: `NO_COLOR=1` |
+| Budget | Do not start a tier if remaining **&lt; 60s** → `timeout`. Process timeout = remaining budget (not the 30s `gh` cap) |
+| Verdict | `## Verdict: PASS \| PASS WITH DEFERRED P3 \| FAIL` (or JSON `verdict`). Findings P0/P1/P2/critical/high/medium override PASS. Unparseable falls through |
+| Fallback | Exhaustion / missing binary / auth / crash / unparseable → next tier. **FAIL / &gt;low = `difficulty`, no fallback** |
+| Empty chain | All exhausted → `model_exhaustion`. All missing/auth → `permission`. Else `harness_crash` |
+| Pause / stop | Pause **finishes** this phase then holds at `ci-wait` Paused. Stop aborts; does not apply success; not a Failure Class |
+| Reports | `{state_dir}/reviews/cross-model-{slug}.md` and `{track_dir}/review.{slug}.md`. Stub last_event: `cross-model: stub (no review)` |
+| Env | `COORDINATOR_CODEX_BIN`, `COORDINATOR_CLAUDE_BIN`, `COORDINATOR_OPENCODE_BIN` |
+
+Default `cargo test` uses a scripted `ReviewBackend` and never needs Codex/Claude/OpenCode auth. Optional live smoke: `$env:COORDINATOR_REVIEW_LIVE='1'; cargo test review_live -- --ignored --nocapture`.
 
 ### Token-idle CI wait + auto squash-merge
 
-After implement (and the 0011 skip), Coordinator watches CI **outside** any model Session (ADR-0011). The serve/`wait` loop already wakes ~every 500ms; `ci-wait` does **not** sleep and does **not** spawn `gh` on every wake.
+After a successful Review Gate, Coordinator watches CI **outside** any model Session (ADR-0011). The serve/`wait` loop already wakes ~every 500ms; `ci-wait` does **not** sleep and does **not** spawn `gh` on every wake.
 
 | Item | Behavior |
 |------|----------|
@@ -142,7 +163,7 @@ After implement (and the 0011 skip), Coordinator watches CI **outside** any mode
 | Checks | `gh pr checks {n} --json bucket,name,state` (all checks, **not** `--required`). Draft PR stays pending (`ci-wait: waiting (draft PR)`). Already `MERGED` is green. Any `fail`/`cancel` → `ci_failed`. Empty check list is green |
 | Default branch | `gh run list --commit {sha}`. Empty runs for &lt; 2 min stay pending; then treat as “no CI configured” (green, **no merge**) |
 | Interval | 15s (0–2 min) → 30s (2–10 min) → 60s (≥10 min), cap 120s. Reset to 15s when the check/run set changes. Tests: `COORDINATOR_CI_POLL_MS` is a **fixed** interval |
-| Merge | Green PR + Project `auto_merge=true` (default) → `gh pr merge {n} --squash`. **No** `--admin`, **no** `--delete-branch`. `auto_merge=false` succeeds with `ci-wait: green; merge skipped (auto_merge=false)`. Operator `stop` never merges. Pause **finishes** `ci-wait` (the one phase that ticks while Paused) then stays Paused at `compact` |
+| Merge | Green PR + Project `auto_merge=true` (default) → `gh pr merge {n} --squash`. **No** `--admin`, **no** `--delete-branch`. `auto_merge=false` succeeds with `ci-wait: green; merge skipped (auto_merge=false)`. Operator `stop` never merges. Pause **finishes** `ci-wait` (and `cross-model-review`) then stays Paused at the successor |
 | Fail | `failure_class=ci_failed` → Stopped + Failure Artifact + toast. No auto-retry of the workflow |
 | Process cap | Each `gh`/`git` spawn: 30s then kill (transient, `ci-wait: gh timed out`) |
 

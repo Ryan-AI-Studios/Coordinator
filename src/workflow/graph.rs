@@ -18,6 +18,9 @@ pub const ROLE_PLANNER: &str = "planner";
 pub const ROLE_IMPLEMENTOR: &str = "implementor";
 pub const ROLE_REVIEWER_AGY: &str = "plan_reviewer_agy";
 pub const ROLE_REVIEWER_OPENCODE: &str = "plan_reviewer_opencode";
+pub const ROLE_CROSS_MODEL_PRIMARY: &str = "cross_model_primary";
+pub const ROLE_CROSS_MODEL_SECONDARY: &str = "cross_model_secondary";
+pub const ROLE_CROSS_MODEL_TERTIARY: &str = "cross_model_tertiary";
 
 /// Ordered canonical phase ids.
 pub fn canonical_phases() -> &'static [&'static str] {
@@ -55,15 +58,23 @@ pub fn successor(phase: &str) -> Option<&'static str> {
     }
 }
 
-pub fn is_skip_phase(phase: &str) -> bool {
-    matches!(phase, PHASE_CROSS_MODEL)
+/// No skip slots remain after 0011. Kept as a hook for a future skip profile.
+pub fn is_skip_phase(_phase: &str) -> bool {
+    false
 }
 
-pub fn skip_deferred_track(phase: &str) -> Option<&'static str> {
-    match phase {
-        PHASE_CROSS_MODEL => Some("0011"),
-        _ => None,
-    }
+/// No skip slots remain after 0011.
+pub fn skip_deferred_track(_phase: &str) -> Option<&'static str> {
+    None
+}
+
+/// Ordered cross-model Role Binding keys (not BTreeMap iteration).
+pub fn cross_model_roles() -> &'static [&'static str] {
+    &[
+        ROLE_CROSS_MODEL_PRIMARY,
+        ROLE_CROSS_MODEL_SECONDARY,
+        ROLE_CROSS_MODEL_TERTIARY,
+    ]
 }
 
 pub fn is_grok_bound(phase: &str) -> bool {
@@ -84,7 +95,13 @@ pub fn role_phase(slug: &str) -> String {
 pub fn is_recognized_role(role: &str) -> bool {
     matches!(
         role,
-        ROLE_PLANNER | ROLE_IMPLEMENTOR | ROLE_REVIEWER_AGY | ROLE_REVIEWER_OPENCODE
+        ROLE_PLANNER
+            | ROLE_IMPLEMENTOR
+            | ROLE_REVIEWER_AGY
+            | ROLE_REVIEWER_OPENCODE
+            | ROLE_CROSS_MODEL_PRIMARY
+            | ROLE_CROSS_MODEL_SECONDARY
+            | ROLE_CROSS_MODEL_TERTIARY
     )
 }
 
@@ -142,14 +159,24 @@ mod tests {
     }
 
     #[test]
-    fn skip_slot_is_0011_only() {
-        assert!(is_skip_phase(PHASE_CROSS_MODEL));
-        assert!(!is_skip_phase(PHASE_CI_WAIT));
-        assert_eq!(skip_deferred_track(PHASE_CROSS_MODEL), Some("0011"));
-        assert_eq!(skip_deferred_track(PHASE_CI_WAIT), None);
-        assert!(!is_skip_phase(PHASE_PLAN));
-        assert!(!is_skip_phase(PHASE_COMPACT));
+    fn no_skip_slots_remain() {
+        for phase in canonical_phases() {
+            assert!(!is_skip_phase(phase), "skip leftover on {phase}");
+            assert_eq!(skip_deferred_track(phase), None);
+        }
         assert!(!is_grok_bound(PHASE_CI_WAIT));
+        assert!(!is_grok_bound(PHASE_CROSS_MODEL));
+        assert!(is_recognized_role(ROLE_CROSS_MODEL_PRIMARY));
+        assert!(is_recognized_role(ROLE_CROSS_MODEL_SECONDARY));
+        assert!(is_recognized_role(ROLE_CROSS_MODEL_TERTIARY));
+        assert_eq!(
+            cross_model_roles(),
+            [
+                ROLE_CROSS_MODEL_PRIMARY,
+                ROLE_CROSS_MODEL_SECONDARY,
+                ROLE_CROSS_MODEL_TERTIARY
+            ]
+        );
     }
 
     #[test]

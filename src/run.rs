@@ -48,6 +48,7 @@ pub fn run_with_driver(
                 state.next_track = None;
                 state.last_applied_outcome_hash = None;
                 state.ci = None;
+                state.review = None;
                 state.last_event = format!("run: started {WORKFLOW_ID}");
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);

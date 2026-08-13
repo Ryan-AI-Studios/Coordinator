@@ -103,6 +103,24 @@ pub struct RunState {
     /// Token-idle CI watch (0010). Cleared on fresh `run`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci: Option<CiWatchState>,
+    /// Cross-model review gate (0011). Cleared on fresh `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewWatchState>,
+}
+
+/// Persisted `cross-model-review` watcher (additive; old run-state.json loads as None).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewWatchState {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    /// `PASS` | `PASS_WITH_LOWS` | `FAIL`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    /// Relative name e.g. `review.codex.md`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
 }
 
 /// Persisted `ci-wait` watcher (additive; old run-state.json loads as None).
@@ -150,6 +168,7 @@ impl RunState {
             pending_roles: Vec::new(),
             last_driven_phase: None,
             ci: None,
+            review: None,
         }
     }
 
@@ -207,6 +226,22 @@ pub struct StatusView {
     /// Token-idle CI watch; `null` when phase ≠ `ci-wait` and no persisted state.
     #[serde(default)]
     pub ci: Option<CiStatusView>,
+    /// Cross-model review; `null` when phase ≠ `cross-model-review` and no persisted state.
+    #[serde(default)]
+    pub review: Option<ReviewStatusView>,
+}
+
+/// Status JSON `review` object (0011).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewStatusView {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
 }
 
 /// Status JSON `ci` object (0010).
@@ -261,6 +296,7 @@ impl StatusView {
             }),
             failure_artifact: crate::notify::artifact::existing_path(record),
             ci: ci_status_view(record, state),
+            review: review_status_view(state),
         }
     }
 }
@@ -292,6 +328,27 @@ fn ci_status_view(record: &ProjectRecord, state: &RunState) -> Option<CiStatusVi
         interval_ms,
         auto_merge: record.auto_merge,
         merge,
+    })
+}
+
+fn review_status_view(state: &RunState) -> Option<ReviewStatusView> {
+    if state.phase != crate::workflow::graph::PHASE_CROSS_MODEL && state.review.is_none() {
+        return None;
+    }
+    let (attempted, active, verdict, report) = match state.review.as_ref() {
+        Some(r) => (
+            r.attempted.clone(),
+            r.active.clone(),
+            r.verdict.clone(),
+            r.report.clone(),
+        ),
+        None => (Vec::new(), None, None, None),
+    };
+    Some(ReviewStatusView {
+        attempted,
+        active,
+        verdict,
+        report,
     })
 }
 
@@ -557,6 +614,8 @@ mod tests {
         assert!(json["failure_artifact"].is_null());
         assert!(json.as_object().unwrap().contains_key("ci"));
         assert!(json["ci"].is_null());
+        assert!(json.as_object().unwrap().contains_key("review"));
+        assert!(json["review"].is_null());
     }
 
     #[test]
