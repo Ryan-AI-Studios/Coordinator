@@ -733,6 +733,7 @@ mod tests {
                 enabled: true,
                 webhook_url: Some(url.into()),
             },
+            progress_stall_secs: None,
         };
         save_machine_config(&cfg).unwrap();
     }

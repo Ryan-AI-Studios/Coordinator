@@ -106,6 +106,19 @@ pub struct RunState {
     /// Cross-model review gate (0011). Cleared on fresh `run`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewWatchState>,
+    /// First time the progress watchdog fired this inject (0026). Cleared on resume / fresh run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_at: Option<DateTime<Utc>>,
+    /// Completed pause intervals for this phase (stall idle window; 0026).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pause_spans: Vec<PauseSpan>,
+}
+
+/// One completed pause interval (start inclusive, end exclusive-ish).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PauseSpan {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
 }
 
 /// Persisted `cross-model-review` watcher (additive; old run-state.json loads as None).
@@ -169,6 +182,8 @@ impl RunState {
             last_driven_phase: None,
             ci: None,
             review: None,
+            stalled_at: None,
+            pause_spans: Vec::new(),
         }
     }
 
@@ -232,6 +247,19 @@ pub struct StatusView {
     /// Cross-model review; `null` when phase ≠ `cross-model-review` and no persisted state.
     #[serde(default)]
     pub review: Option<ReviewStatusView>,
+    /// Last adapter heartbeat (`harness-progress.json`); omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<DateTime<Utc>>,
+    /// Progress stall (0026). `null` when not stalled. Run stays Running.
+    #[serde(default)]
+    pub stall: Option<StallView>,
+}
+
+/// Status JSON `stall` object (0026).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StallView {
+    pub since: DateTime<Utc>,
+    pub idle_secs: u64,
 }
 
 /// Status JSON `review` object (0011).
@@ -301,8 +329,29 @@ impl StatusView {
             failure_artifact: crate::notify::artifact::existing_path(record),
             ci: ci_status_view(record, state),
             review: review_status_view(state),
+            last_progress_at: if state.status == RunStatus::Running {
+                crate::workflow::watchdog::last_progress_at(record)
+            } else {
+                None
+            },
+            stall: stall_status_view(record, state),
         }
     }
+}
+
+fn stall_status_view(record: &ProjectRecord, state: &RunState) -> Option<StallView> {
+    if state.status != RunStatus::Running {
+        return None;
+    }
+    let since = state.stalled_at?;
+    let last = crate::workflow::watchdog::last_progress_at(record)
+        .or(state.phase_started_at)
+        .unwrap_or(since);
+    let idle = crate::workflow::watchdog::idle_since(last, state, Utc::now());
+    Some(StallView {
+        since,
+        idle_secs: idle.as_secs(),
+    })
 }
 
 fn ci_status_view(record: &ProjectRecord, state: &RunState) -> Option<CiStatusView> {
@@ -620,6 +669,13 @@ mod tests {
         assert!(json["ci"].is_null());
         assert!(json.as_object().unwrap().contains_key("review"));
         assert!(json["review"].is_null());
+        assert!(json.as_object().unwrap().contains_key("stall"));
+        assert!(json["stall"].is_null());
+        let last = json.get("last_progress_at");
+        assert!(
+            last.is_none() || last.is_some_and(|v| v.is_null()),
+            "idle last_progress_at must be omitted or null"
+        );
     }
 
     #[test]

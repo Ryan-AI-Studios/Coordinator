@@ -169,6 +169,15 @@ fn drive_adapter(
         return Ok(None);
     }
     mark_driven(record, &state.phase)?;
+    // Inject-start heartbeat so a slow ACP start is not an immediate stall.
+    let inject_sid = crate::harness::status_bundle_sync(record)
+        .and_then(|b| b.grok)
+        .and_then(|g| g.session_id);
+    crate::workflow::watchdog::note_progress(
+        record,
+        crate::workflow::watchdog::ProgressKind::Inject,
+        inject_sid.as_deref(),
+    );
 
     #[cfg(test)]
     {

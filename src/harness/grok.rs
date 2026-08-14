@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::{CoordinatorError, Result};
 use crate::outcome::FailureClass;
+use crate::registry::ProjectRecord;
 
 /// Absolute override for the `grok` binary.
 pub const ENV_GROK_BIN: &str = "COORDINATOR_GROK_BIN";
@@ -42,6 +43,8 @@ pub struct GrokSession {
     pub supports_compact: bool,
     next_id: u64,
     collected_text: String,
+    /// When set, every ACP `session/update` writes `{state_dir}/harness-progress.json`.
+    progress_record: Option<ProjectRecord>,
 }
 
 enum AcpTransport {
@@ -128,6 +131,7 @@ impl GrokSession {
             supports_compact: true,
             next_id: 1,
             collected_text: String::new(),
+            progress_record: None,
         };
         session.handshake(timeout).await?;
         Ok(session)
@@ -150,6 +154,7 @@ impl GrokSession {
             supports_compact: true,
             next_id: 1,
             collected_text: String::new(),
+            progress_record: None,
         };
         session.handshake(timeout).await?;
         Ok(session)
@@ -172,6 +177,11 @@ impl GrokSession {
 
     pub fn set_supports_compact(&mut self, value: bool) {
         self.supports_compact = value;
+    }
+
+    /// Bind this session to a project so ACP `session/update` writes the progress sidecar.
+    pub fn set_progress_record(&mut self, record: ProjectRecord) {
+        self.progress_record = Some(record);
     }
 
     async fn handshake(&mut self, timeout: Duration) -> Result<()> {
@@ -318,6 +328,18 @@ impl GrokSession {
                 .map_err(|e| CoordinatorError::Message(format!("invalid ACP JSON line: {e}")))?;
             if v.get("method").and_then(|m| m.as_str()) == Some("session/update") {
                 collect_update(&v, &mut self.collected_text);
+                if let Some(ref rec) = self.progress_record {
+                    let sid = if self.session_id.is_empty() {
+                        None
+                    } else {
+                        Some(self.session_id.as_str())
+                    };
+                    crate::workflow::watchdog::note_progress(
+                        rec,
+                        crate::workflow::watchdog::ProgressKind::SessionUpdate,
+                        sid,
+                    );
+                }
                 continue;
             }
             if v.get("id") == Some(&json!(id)) {
@@ -538,6 +560,23 @@ pub fn session_update_chunk(text: &str) -> String {
             "update": {
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "text": text }
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Mock ACP `session/update` with `tool_call` (any `sessionUpdate` kind is progress).
+pub fn session_update_tool_call(title: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_1",
+                "title": title,
+                "kind": "read"
             }
         }
     })

@@ -49,11 +49,14 @@ pub fn run_with_driver(
                 state.last_applied_outcome_hash = None;
                 state.ci = None;
                 state.review = None;
+                state.stalled_at = None;
+                state.pause_spans.clear();
                 state.last_event = format!("run: started {WORKFLOW_ID}");
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);
                 crate::workflow::drive::clear_plan_review_artifacts(record);
                 crate::notify::clear_artifact(record);
+                crate::workflow::watchdog::clear_progress(record);
                 save_run_state(record, &state)?;
                 Ok(StatusView::from_record(record, &state))
             }
@@ -88,10 +91,13 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.pause_started_at = None;
                 state.failure_class = None;
                 state.last_applied_outcome_hash = None;
+                state.stalled_at = None;
+                state.pause_spans.clear();
                 state.last_event = "run: started stub".into();
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);
                 crate::notify::clear_artifact(record);
+                crate::workflow::watchdog::clear_progress(record);
                 save_run_state(record, &state)?;
                 Ok(StatusView::from_record(record, &state))
             }
@@ -143,6 +149,10 @@ pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
             if let Some(pstart) = state.pause_started_at.take() {
                 let delta = (now - pstart).num_milliseconds().max(0) as u64;
                 state.total_paused_ms = state.total_paused_ms.saturating_add(delta);
+                state.pause_spans.push(crate::state::PauseSpan {
+                    start: pstart,
+                    end: now,
+                });
             }
             state.status = RunStatus::Running;
             if state.phase.is_empty() {

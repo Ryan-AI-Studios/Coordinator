@@ -240,6 +240,9 @@ pub struct MachineConfig {
     /// Hermes notify adapter. Missing key → disabled defaults (no version bump).
     #[serde(default)]
     pub hermes: HermesNotifyConfig,
+    /// Adapter progress stall interval (seconds). Missing → 600. `0` disables. No version bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_stall_secs: Option<u64>,
 }
 
 impl Default for MachineConfig {
@@ -250,6 +253,7 @@ impl Default for MachineConfig {
             role_bindings: default_role_bindings(),
             phase_timeouts_secs: BTreeMap::new(),
             hermes: HermesNotifyConfig::default(),
+            progress_stall_secs: None,
         }
     }
 }
@@ -350,7 +354,8 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`, `COORDINATOR_PHASE_TIMEOUT_SECS`,
 /// `COORDINATOR_WORKFLOW_DRIVER`, `COORDINATOR_OUTCOME_POLL_MS`,
 /// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
-/// `COORDINATOR_HERMES_SECRET`, or `COORDINATOR_HERMES_LIVE` must
+/// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`, or
+/// `COORDINATOR_PROGRESS_STALL_SECS` must
 /// hold this (survives poison so one failure does not cascade).
 #[cfg(test)]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -392,6 +397,7 @@ mod tests {
             role_bindings: default_role_bindings(),
             phase_timeouts_secs: BTreeMap::new(),
             hermes: HermesNotifyConfig::default(),
+            progress_stall_secs: None,
         };
         atomic_write_json(&path, &cfg).unwrap();
         let loaded = load_machine_config_at(&path).unwrap();
@@ -574,6 +580,7 @@ mod tests {
                 enabled: true,
                 webhook_url: Some("http://127.0.0.1:8644/webhooks/coordinator-failure".into()),
             },
+            progress_stall_secs: None,
         };
         atomic_write_json(&path, &cfg).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
