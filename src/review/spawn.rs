@@ -143,7 +143,7 @@ pub(crate) fn resolve_review_bin(harness: &str, command: &str) -> Result<PathBuf
     reject_or_replace_ps1(resolved)
 }
 
-fn reject_or_replace_ps1(path: PathBuf) -> Result<PathBuf> {
+pub(crate) fn reject_or_replace_ps1(path: PathBuf) -> Result<PathBuf> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -168,13 +168,18 @@ fn reject_or_replace_ps1(path: PathBuf) -> Result<PathBuf> {
     )))
 }
 
-struct ProcOut {
-    exit: i32,
-    stdout: String,
-    stderr: String,
+pub(crate) struct ProcOut {
+    pub exit: i32,
+    pub stdout: String,
+    pub stderr: String,
 }
 
-fn run_process(bin: &Path, args: &[String], cwd: &Path, timeout: Duration) -> Result<ProcOut> {
+pub(crate) fn run_process(
+    bin: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<ProcOut> {
     let mut cmd = spawn_command(bin);
     cmd.args(args)
         .current_dir(cwd)

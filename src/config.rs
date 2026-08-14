@@ -46,6 +46,12 @@ pub const ENV_COORDINATOR_CLAUDE_BIN: &str = "COORDINATOR_CLAUDE_BIN";
 /// Env: override `opencode` binary for the cross-model gate.
 pub const ENV_COORDINATOR_OPENCODE_BIN: &str = "COORDINATOR_OPENCODE_BIN";
 
+/// Env: override `agy` binary for the plan-review Antigravity slot (0017).
+pub const ENV_COORDINATOR_AGY_BIN: &str = "COORDINATOR_AGY_BIN";
+
+/// Env: set to `1` to enable ignored live `agy --print` smoke tests.
+pub const ENV_COORDINATOR_AGY_LIVE: &str = "COORDINATOR_AGY_LIVE";
+
 /// Env: set to `1` to enable ignored live review-CLI smoke tests.
 pub const ENV_COORDINATOR_REVIEW_LIVE: &str = "COORDINATOR_REVIEW_LIVE";
 
@@ -355,7 +361,8 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_WORKFLOW_DRIVER`, `COORDINATOR_OUTCOME_POLL_MS`,
 /// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
 /// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`,
-/// `COORDINATOR_PROGRESS_STALL_SECS`, or `COORDINATOR_CANCEL_WAIT_SECS` must
+/// `COORDINATOR_PROGRESS_STALL_SECS`, `COORDINATOR_CANCEL_WAIT_SECS`,
+/// or `COORDINATOR_AGY_BIN` must
 /// hold this (survives poison so one failure does not cascade).
 #[cfg(test)]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

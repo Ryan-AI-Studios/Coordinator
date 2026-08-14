@@ -118,6 +118,9 @@ pub struct RunState {
     /// Session id being recycled; apply skips fallout from this id only (0027).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aborted_session_id: Option<String>,
+    /// Plan-review one-shot slots already launched this phase (0017). Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_review_spawned: Vec<String>,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -192,6 +195,7 @@ impl RunState {
             pause_spans: Vec::new(),
             stall_recycles: 0,
             aborted_session_id: None,
+            plan_review_spawned: Vec::new(),
         }
     }
 
