@@ -253,7 +253,7 @@ fn drive_plan_review(
     ensure_plan_review_pending(record, state)?;
     match state.driver {
         WorkflowDriver::Stub => write_stub_reviews(record, state)?,
-        WorkflowDriver::Adapter => super::plan_review::maybe_spawn_agy(record, state)?,
+        WorkflowDriver::Adapter => super::plan_review::maybe_spawn_plan_review(record, state)?,
         WorkflowDriver::FileWait => {}
     }
     consume_role_files(record)?;

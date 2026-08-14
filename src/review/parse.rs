@@ -102,6 +102,7 @@ fn looks_permission(text: &str) -> bool {
         || t.contains("not found on path")
         || t.contains("missing binary")
         || t.contains("refusing to spawn .ps1")
+        || t.contains("refusing to spawn shim")
 }
 
 fn parse_json(text: &str) -> Option<ParsedVerdict> {

@@ -29,7 +29,7 @@ impl ReviewBackend for LiveCli {
         crate::persist::atomic_write(&schema_path, VERDICT_SCHEMA_JSON.as_bytes())?;
 
         let args = argv_for(req, &last_path, &schema_path);
-        let out = run_process(&bin, &args, &req.exec_repo, req.remaining_timeout)?;
+        let out = run_process(&bin, &args, &req.exec_repo, req.remaining_timeout, &[])?;
         let last_message = std::fs::read_to_string(&last_path).unwrap_or_default();
         let last_message = if last_message.trim().is_empty() {
             out.stdout.clone()
@@ -143,13 +143,10 @@ pub(crate) fn resolve_review_bin(harness: &str, command: &str) -> Result<PathBuf
     reject_or_replace_ps1(resolved)
 }
 
+/// Replace Windows npm shims (`.ps1` or extensionless `#!` shebang) with a
+/// sibling `.exe` then `.cmd`. Never `Command::new` the sh script.
 pub(crate) fn reject_or_replace_ps1(path: PathBuf) -> Result<PathBuf> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ext != "ps1" {
+    if !needs_shim_replace(&path) {
         return Ok(path);
     }
     if let Some(parent) = path.parent()
@@ -163,9 +160,33 @@ pub(crate) fn reject_or_replace_ps1(path: PathBuf) -> Result<PathBuf> {
         }
     }
     Err(CoordinatorError::Message(format!(
-        "refusing to spawn .ps1 shim: {}",
+        "refusing to spawn shim: {}",
         path.display()
     )))
+}
+
+fn needs_shim_replace(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "ps1" {
+        return true;
+    }
+    if !ext.is_empty() {
+        return false;
+    }
+    is_shebang(path)
+}
+
+fn is_shebang(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 2];
+    matches!(f.read_exact(&mut buf), Ok(()) if &buf == b"#!")
 }
 
 pub(crate) struct ProcOut {
@@ -179,6 +200,7 @@ pub(crate) fn run_process(
     args: &[String],
     cwd: &Path,
     timeout: Duration,
+    extra_env: &[(&str, String)],
 ) -> Result<ProcOut> {
     let mut cmd = spawn_command(bin);
     cmd.args(args)
@@ -187,6 +209,9 @@ pub(crate) fn run_process(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -294,6 +319,30 @@ mod tests {
     }
 
     #[test]
+    fn shebang_plus_cmd_resolves_to_cmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = dir.path().join("tool");
+        std::fs::write(&sh, "#!/bin/sh\necho hi\n").unwrap();
+        let cmd = dir.path().join("tool.cmd");
+        std::fs::write(&cmd, "@echo off\n").unwrap();
+        let got = reject_or_replace_ps1(sh).unwrap();
+        assert_eq!(got, cmd);
+    }
+
+    #[test]
+    fn shebang_only_is_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = dir.path().join("tool");
+        std::fs::write(&sh, "#!/bin/sh\necho hi\n").unwrap();
+        let err = reject_or_replace_ps1(sh).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to spawn shim"),
+            "expected permission, got {msg}"
+        );
+    }
+
+    #[test]
     fn claude_argv_has_no_bare() {
         let r = req("claude");
         let args = argv_for(&r, Path::new("last.txt"), Path::new("schema.json"));
@@ -310,8 +359,14 @@ mod tests {
         let args = argv_for(&r, Path::new("last.txt"), Path::new("schema.json"));
         assert_eq!(args[0], "run");
         assert!(!args.iter().any(|a| a == "--auto"));
-        assert!(args.iter().any(|a| a == "--dir"));
-        assert!(args.iter().any(|a| a == "--format"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--dir" && w[1] == r"C:\dev\proj\app")
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--format" && w[1] == "default")
+        );
     }
 
     #[test]

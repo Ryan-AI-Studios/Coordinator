@@ -12,6 +12,7 @@
 //! Harness progress watchdog (detect + surface stall): track **0026**.
 //! Abort stuck Prompt + refuse wedged-session reuse: track **0027**.
 //! Plan-review Antigravity one-shot (`agy --print`): track **0017**.
+//! Plan-review OpenCode one-shot (`opencode run`): track **0018**.
 
 pub mod api;
 pub mod ci;
