@@ -1,12 +1,14 @@
 //! Grok harness adapter, session pool, and role-binding helpers (track **0007**).
+//! Abort/recycle of a wedged ACP Prompt: track **0027**.
 
+pub mod abort;
 pub mod grok;
 pub mod pool;
 pub mod roles;
 
 pub use grok::{
-    ENV_GROK_BIN, ENV_GROK_LIVE, GrokSession, PromptResult, map_failure_class, resolve_command,
-    resolve_grok_binary,
+    CancelHandle, ENV_GROK_BIN, ENV_GROK_LIVE, GrokSession, PromptResult, map_failure_class,
+    resolve_command, resolve_grok_binary,
 };
 pub use pool::{
     GrokHarnessStatus, HarnessPromptView, HarnessStatusBundle, SessionPool, global_pool,

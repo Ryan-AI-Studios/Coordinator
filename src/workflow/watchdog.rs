@@ -1,7 +1,7 @@
 //! Adapter progress heartbeat + stall detect (track 0026).
 //!
-//! Detects and surfaces a silent ACP hang. Does **not** cancel the Prompt,
-//! recycle the session, write `FAILURE.md`, toast, or stop the run (0027 acts).
+//! Detects and surfaces a silent ACP hang. Does **not** write `FAILURE.md`,
+//! toast, or stop the run. First stall this phase is recycled by **0027**.
 
 use std::time::Duration;
 
@@ -312,6 +312,7 @@ mod tests {
             std::env::set_var(ENV_COORDINATOR_HOME, home);
             std::env::set_var(ENV_PROGRESS_STALL_SECS, stall_secs);
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, phase_secs);
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
         }
     }
 
@@ -320,6 +321,7 @@ mod tests {
             std::env::remove_var(ENV_COORDINATOR_HOME);
             std::env::remove_var(ENV_PROGRESS_STALL_SECS);
             std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
         }
     }
 
@@ -341,13 +343,16 @@ mod tests {
         let view = poll_once(&r).unwrap().expect("stall should fire");
         assert_eq!(view.status, RunStatus::Running);
         assert!(
-            view.last_event.contains("watchdog: stall"),
+            view.last_event.contains("recycle: stall"),
             "last_event={}",
             view.last_event
         );
-        assert!(view.stall.is_some());
+        assert!(view.stall.is_none(), "recycle clears stalled_at");
         assert!(view.failure_class.is_none());
         assert!(artifact::existing_path(&r).is_none());
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(loaded.stall_recycles, 1);
+        assert!(loaded.last_driven_phase.is_none());
         clear_clocks();
     }
 
@@ -389,11 +394,11 @@ mod tests {
             ProgressKind::Inject,
             "sess-1",
         );
-        let stalled = poll_once(&r).unwrap().expect("stall");
+        let stalled = check_stall(&r).unwrap().expect("stall");
         assert!(stalled.last_event.contains("watchdog: stall"));
 
         note_progress(&r, ProgressKind::SessionUpdate, Some("sess-1"));
-        let view = poll_once(&r).unwrap().expect("resume");
+        let view = check_stall(&r).unwrap().expect("resume");
         assert_eq!(view.last_event, "watchdog: progress");
         assert!(view.stall.is_none());
         assert_eq!(view.status, RunStatus::Running);
@@ -491,7 +496,8 @@ mod tests {
         );
         let view = poll_once(&r).unwrap().expect("stall despite earlier pause");
         assert!(
-            view.last_event.contains("watchdog: stall"),
+            view.last_event.contains("recycle: stall")
+                || view.last_event.contains("watchdog: stall"),
             "pre-heartbeat pause must not delay stall; last_event={}",
             view.last_event
         );
@@ -609,7 +615,12 @@ mod tests {
         })
         .unwrap();
         let view = poll_once(&r).unwrap().expect("last-resort stall");
-        assert!(view.last_event.contains("watchdog: stall"));
+        assert!(
+            view.last_event.contains("recycle: stall")
+                || view.last_event.contains("watchdog: stall"),
+            "last_event={}",
+            view.last_event
+        );
         assert_eq!(view.status, RunStatus::Running);
         clear_clocks();
     }
@@ -647,14 +658,21 @@ mod tests {
             ProgressKind::Inject,
             "sess",
         );
-        poll_once(&r).unwrap();
+        check_stall(&r).unwrap();
         assert!(progress_path(&r).unwrap().exists());
         assert!(load_run_state(&r).unwrap().stalled_at.is_some());
+        with_run_state_lock(&r, || {
+            let mut s = load_run_state(&r)?;
+            s.stall_recycles = 1;
+            save_run_state(&r, &s)
+        })
+        .unwrap();
 
         run::stop(&r).unwrap();
         let view = run_with_driver(&r, Some("0026".into()), WorkflowDriver::Adapter).unwrap();
         assert!(view.stall.is_none());
         assert!(load_run_state(&r).unwrap().stalled_at.is_none());
+        assert_eq!(load_run_state(&r).unwrap().stall_recycles, 0);
         assert!(
             !progress_path(&r).unwrap().exists(),
             "fresh run must drop previous sidecar"
@@ -777,6 +795,43 @@ mod tests {
     }
 
     #[test]
+    fn second_stall_same_phase_does_not_recycle_again() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        isolate_clocks(home.path(), "1", "3600");
+        let r = rec(dir.path());
+        start_driven_adapter(&r);
+        write_sidecar_at(
+            &r,
+            Utc::now() - chrono::Duration::seconds(5),
+            ProgressKind::Inject,
+            "sess-1",
+        );
+        let first = poll_once(&r).unwrap().expect("first stall recycles");
+        assert!(first.last_event.contains("recycle: stall"));
+        assert_eq!(load_run_state(&r).unwrap().stall_recycles, 1);
+
+        mark_driven(&r, graph::PHASE_PLAN).unwrap();
+        write_sidecar_at(
+            &r,
+            Utc::now() - chrono::Duration::seconds(5),
+            ProgressKind::Inject,
+            "sess-2",
+        );
+        let second = poll_once(&r).unwrap().expect("second stall surfaces");
+        assert!(
+            second.last_event.contains("watchdog: stall"),
+            "last_event={}",
+            second.last_event
+        );
+        assert_eq!(load_run_state(&r).unwrap().stall_recycles, 1);
+        assert!(artifact::existing_path(&r).is_none());
+        assert_eq!(second.status, RunStatus::Running);
+        clear_clocks();
+    }
+
+    #[test]
     fn pause_then_resume_restores_stall_last_event() {
         let _guard = test_env_lock();
         let home = tempdir().unwrap();
@@ -790,10 +845,10 @@ mod tests {
             ProgressKind::Inject,
             "sess-1",
         );
-        poll_once(&r).unwrap();
+        check_stall(&r).unwrap().expect("first stall surface");
         run::pause(&r).unwrap();
         run::resume(&r).unwrap();
-        let view = poll_once(&r).unwrap().expect("re-stamp stall event");
+        let view = check_stall(&r).unwrap().expect("re-stamp stall event");
         assert!(
             view.last_event.contains("watchdog: stall"),
             "last_event={}",

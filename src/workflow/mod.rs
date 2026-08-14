@@ -147,6 +147,7 @@ pub fn reset_phase_clock(state: &mut RunState) {
     state.total_paused_ms = 0;
     state.pause_spans.clear();
     state.stalled_at = None;
+    state.stall_recycles = 0;
     if state.status == RunStatus::Paused {
         state.pause_started_at = Some(now);
     } else {

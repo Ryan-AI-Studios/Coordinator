@@ -61,7 +61,13 @@ pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
     // 2) Timeout while Running only — decide+apply under the same run-state lock
     // so a concurrent pause cannot lose to a stale pre-lock snapshot.
     match outcome::try_timeout_under_lock(record) {
-        Ok(Some(view)) => return Ok(Some(view)),
+        Ok(Some(view)) => {
+            crate::harness::abort::abort_stuck_prompt(
+                record,
+                crate::harness::abort::AbortReason::Timeout,
+            );
+            return Ok(Some(view));
+        }
         Ok(None) => {}
         // Race lost to another apply (e.g. late success): not a poll crash; retry next tick.
         Err(e) => {
@@ -79,7 +85,12 @@ pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
 
     // 3) Progress watchdog — surface only. Never fails the poll (torn sidecar = skip).
     match crate::workflow::watchdog::check_stall(record) {
-        Ok(Some(view)) => return Ok(Some(view)),
+        Ok(Some(view)) => {
+            if let Some(stamped) = crate::harness::abort::maybe_stamp_and_abort_stall(record) {
+                return Ok(Some(stamped));
+            }
+            return Ok(Some(view));
+        }
         Ok(None) => {}
         Err(_) => {}
     }
@@ -267,6 +278,7 @@ mod tests {
         unsafe {
             std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "1");
             std::env::set_var(ENV_OUTCOME_POLL_MS, "50");
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
         }
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
@@ -277,6 +289,7 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_STUB_PHASE_TIMEOUT_SECS);
             std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
         }
     }
 

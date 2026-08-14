@@ -112,6 +112,9 @@ pub struct RunState {
     /// Completed pause intervals for this phase (stall idle window; 0026).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pause_spans: Vec<PauseSpan>,
+    /// Stall recycles this phase (0027). Cap 1. Not cleared by the recycle itself.
+    #[serde(default)]
+    pub stall_recycles: u32,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -184,6 +187,7 @@ impl RunState {
             review: None,
             stalled_at: None,
             pause_spans: Vec::new(),
+            stall_recycles: 0,
         }
     }
 
