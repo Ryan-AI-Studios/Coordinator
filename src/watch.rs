@@ -62,10 +62,12 @@ pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
     // so a concurrent pause cannot lose to a stale pre-lock snapshot.
     match outcome::try_timeout_under_lock(record) {
         Ok(Some(view)) => {
-            crate::harness::abort::abort_stuck_prompt(
-                record,
-                crate::harness::abort::AbortReason::Timeout,
-            );
+            if crate::harness::abort::should_abort_on_timeout(record) {
+                crate::harness::abort::abort_stuck_prompt(
+                    record,
+                    crate::harness::abort::AbortReason::Timeout,
+                );
+            }
             return Ok(Some(view));
         }
         Ok(None) => {}

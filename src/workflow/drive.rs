@@ -243,8 +243,7 @@ fn apply_adapter_failure(record: &ProjectRecord, class: FailureClass, message: S
     if state.status != RunStatus::Running {
         return;
     }
-    if crate::harness::abort::last_event_is_recycle(&state.last_event) || state.stall_recycles >= 1
-    {
+    if crate::harness::abort::last_event_is_recycle(&state.last_event) {
         return;
     }
     let _ = fail_phase(record, &state, class, message, OutcomeSource::Adapter);

@@ -52,6 +52,7 @@ pub fn run_with_driver(
                 state.stalled_at = None;
                 state.pause_spans.clear();
                 state.stall_recycles = 0;
+                state.aborted_session_id = None;
                 state.last_event = format!("run: started {WORKFLOW_ID}");
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);
@@ -95,6 +96,7 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.stalled_at = None;
                 state.pause_spans.clear();
                 state.stall_recycles = 0;
+                state.aborted_session_id = None;
                 state.last_event = "run: started stub".into();
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);

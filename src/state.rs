@@ -115,6 +115,9 @@ pub struct RunState {
     /// Stall recycles this phase (0027). Cap 1. Not cleared by the recycle itself.
     #[serde(default)]
     pub stall_recycles: u32,
+    /// Session id being recycled; apply skips fallout from this id only (0027).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aborted_session_id: Option<String>,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -188,6 +191,7 @@ impl RunState {
             stalled_at: None,
             pause_spans: Vec::new(),
             stall_recycles: 0,
+            aborted_session_id: None,
         }
     }
 

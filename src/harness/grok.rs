@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -51,6 +51,7 @@ pub struct GrokSession {
     writer: AcpWriter,
     in_flight_id: Arc<AtomicU64>,
     session_id_shared: Arc<std::sync::Mutex<String>>,
+    cancel_requested: Arc<AtomicBool>,
 }
 
 /// Cloneable stdin writer so abort can send `session/cancel` without the pool lock.
@@ -59,6 +60,7 @@ pub struct CancelHandle {
     session_id: Arc<std::sync::Mutex<String>>,
     writer: AcpWriter,
     in_flight_id: Arc<AtomicU64>,
+    cancel_requested: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for CancelHandle {
@@ -173,6 +175,7 @@ impl GrokSession {
         };
         let in_flight_id = Arc::new(AtomicU64::new(0));
         let session_id_shared = Arc::new(std::sync::Mutex::new(String::new()));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
         let mut session = Self {
             transport: AcpTransport::Process {
                 child: Box::new(child),
@@ -188,6 +191,7 @@ impl GrokSession {
             writer,
             in_flight_id,
             session_id_shared,
+            cancel_requested,
         };
         session.handshake(timeout).await?;
         Ok(session)
@@ -214,6 +218,7 @@ impl GrokSession {
         };
         let in_flight_id = Arc::new(AtomicU64::new(0));
         let session_id_shared = Arc::new(std::sync::Mutex::new(String::new()));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
         let mut session = Self {
             transport: AcpTransport::Mock {
                 incoming_rx,
@@ -229,6 +234,7 @@ impl GrokSession {
             writer,
             in_flight_id,
             session_id_shared,
+            cancel_requested,
         };
         session.handshake(timeout).await?;
         Ok(session)
@@ -257,6 +263,7 @@ impl GrokSession {
             session_id: self.session_id_shared.clone(),
             writer: self.writer.clone(),
             in_flight_id: self.in_flight_id.clone(),
+            cancel_requested: self.cancel_requested.clone(),
         }
     }
 
@@ -445,7 +452,9 @@ impl GrokSession {
                 }
                 continue;
             }
-            if v.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
+            if v.get("method").and_then(|m| m.as_str()) == Some("session/request_permission")
+                && self.cancel_requested.load(Ordering::SeqCst)
+            {
                 if let Some(perm_id) = v.get("id").cloned() {
                     let reply = json!({
                         "jsonrpc": "2.0",
@@ -531,6 +540,7 @@ impl CancelHandle {
                 "no Grok sessionId; start the session first".into(),
             ));
         }
+        self.cancel_requested.store(true, Ordering::SeqCst);
         let payload = json!({
             "jsonrpc": "2.0",
             "method": "session/cancel",
@@ -956,6 +966,7 @@ mod tests {
         let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
             .await
             .unwrap();
+        session.cancel().await.unwrap();
         let result = session.inject_prompt("ok", timeout()).await.unwrap();
         assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
         let written = session.mock_written().unwrap();

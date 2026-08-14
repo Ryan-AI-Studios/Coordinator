@@ -82,6 +82,28 @@ pub fn stop_reason_is_cancelled(reason: Option<&str>) -> bool {
     reason.is_some_and(|s| s.eq_ignore_ascii_case("cancelled"))
 }
 
+/// Timeout abort only for adapter Grok-bound phases (not stub / plan-review / CI / cross-model).
+pub fn should_abort_on_timeout(record: &ProjectRecord) -> bool {
+    let Ok(state) = load_run_state(record) else {
+        return false;
+    };
+    if state.driver != crate::workflow::WorkflowDriver::Adapter {
+        return false;
+    }
+    if crate::workflow::graph::is_stub_phase(&state.phase) {
+        return false;
+    }
+    if !crate::workflow::graph::is_canonical(&state.phase) {
+        return false;
+    }
+    !matches!(
+        state.phase.as_str(),
+        crate::workflow::graph::PHASE_PLAN_REVIEW
+            | crate::workflow::graph::PHASE_CROSS_MODEL
+            | crate::workflow::graph::PHASE_CI_WAIT
+    )
+}
+
 /// Refuse Ping-reuse of a mid-Prompt / stall / recycle persist.
 pub fn should_refuse_reuse(record: &ProjectRecord) -> bool {
     if crate::harness::pool::persist_prompt_in_flight(record) {
@@ -132,12 +154,25 @@ pub fn abort_stuck_prompt_sync(record: &ProjectRecord, reason: AbortReason) {
     }
 }
 
+fn note_aborted_session(record: &ProjectRecord) {
+    let sid = crate::harness::pool::persist_session_id(record);
+    let _ = with_run_state_lock(record, || {
+        let mut state = load_run_state(record)?;
+        if state.aborted_session_id.is_none() && sid.is_some() {
+            state.aborted_session_id = sid;
+            save_run_state(record, &state)?;
+        }
+        Ok(())
+    });
+}
+
 fn tracing_or_eprint(record: &ProjectRecord, err: &CoordinatorError) {
     let _ = record;
     eprintln!("coordinator abort/recycle: {err}");
 }
 
 async fn abort_stuck_prompt_async(record: &ProjectRecord, reason: AbortReason) -> Result<()> {
+    note_aborted_session(record);
     if let Some(handle) = cancel_handle_for(&record.id) {
         let _ = handle.cancel().await;
     } else {
@@ -179,6 +214,9 @@ pub fn maybe_stamp_and_abort_stall(record: &ProjectRecord) -> Option<StatusView>
         state.stall_recycles = state.stall_recycles.saturating_add(1);
         state.last_driven_phase = None;
         state.stalled_at = None;
+        if state.aborted_session_id.is_none() {
+            state.aborted_session_id = crate::harness::pool::persist_session_id(record);
+        }
         state.last_event = RECYCLE_STALL_EVENT.into();
         state.updated_at = chrono::Utc::now();
         save_run_state(record, &state)?;

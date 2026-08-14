@@ -228,6 +228,13 @@ pub(crate) fn persist_prompt_in_flight(record: &ProjectRecord) -> bool {
         .is_some_and(|h| h.prompt_in_flight)
 }
 
+pub(crate) fn persist_session_id(record: &ProjectRecord) -> Option<String> {
+    load_persist(record)
+        .ok()
+        .flatten()
+        .and_then(|h| h.session_id)
+}
+
 fn set_prompt_in_flight(record: &ProjectRecord, value: bool) {
     if let Ok(Some(mut h)) = load_persist(record) {
         h.prompt_in_flight = value;
@@ -301,7 +308,8 @@ async fn apply_turn(
             let mut applied = false;
             let mut status = None;
             let skip = state.status != RunStatus::Running
-                || crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref());
+                || crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref())
+                || harness_is_aborted(&state, &harness);
             if !skip {
                 let msg = if pr.text.is_empty() {
                     None
@@ -334,8 +342,9 @@ async fn apply_turn(
             let mut status = None;
             let mut applied = false;
             let skip = state.status != RunStatus::Running
-                || crate::harness::abort::last_event_is_recycle(&state.last_event)
-                || state.stall_recycles >= 1;
+                || harness_is_aborted(&state, &harness)
+                || (crate::harness::abort::last_event_is_recycle(&state.last_event)
+                    && state.aborted_session_id.is_none());
             if !skip {
                 let outcome = PhaseOutcome::failure(
                     state.phase.clone(),
@@ -358,6 +367,16 @@ async fn apply_turn(
                 harness: Some(harness),
             })
         }
+    }
+}
+
+fn harness_is_aborted(state: &crate::state::RunState, harness: &GrokHarnessStatus) -> bool {
+    match (
+        state.aborted_session_id.as_deref(),
+        harness.session_id.as_deref(),
+    ) {
+        (Some(aborted), Some(sid)) => aborted == sid,
+        _ => false,
     }
 }
 
@@ -1708,6 +1727,7 @@ mod tests {
         crate::state::with_run_state_lock(&rec, || {
             let mut s = crate::state::load_run_state(&rec)?;
             s.last_event = crate::harness::abort::RECYCLE_STALL_EVENT.into();
+            s.aborted_session_id = Some("sess-rec-err".into());
             crate::state::save_run_state(&rec, &s)
         })
         .unwrap();
@@ -1867,7 +1887,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn stall_recycles_skips_error_apply_without_recycle_prefix() {
+    async fn aborted_session_id_skips_error_apply_without_recycle_prefix() {
         let _guard = test_env_lock();
         let home = tempdir().unwrap();
         let proj = tempdir().unwrap();
@@ -1886,7 +1906,7 @@ mod tests {
         .unwrap();
         crate::state::with_run_state_lock(&rec, || {
             let mut s = crate::state::load_run_state(&rec)?;
-            s.stall_recycles = 1;
+            s.aborted_session_id = Some("sess-stall-skip".into());
             s.last_event = "resume: continue".into();
             crate::state::save_run_state(&rec, &s)
         })
