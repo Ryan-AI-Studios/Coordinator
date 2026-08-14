@@ -5,6 +5,7 @@ pub mod drive;
 pub mod graph;
 pub mod prompts;
 pub mod timeouts;
+pub mod watchdog;
 
 use serde::{Deserialize, Serialize};
 
@@ -144,6 +145,8 @@ pub fn reset_phase_clock(state: &mut RunState) {
     let now = chrono::Utc::now();
     state.phase_started_at = Some(now);
     state.total_paused_ms = 0;
+    state.pause_spans.clear();
+    state.stalled_at = None;
     if state.status == RunStatus::Paused {
         state.pause_started_at = Some(now);
     } else {
@@ -181,6 +184,7 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
                 crate::outcome::clear_active_outcome_file(record);
                 crate::workflow::drive::clear_plan_review_artifacts(record);
                 crate::notify::clear_artifact(record);
+                crate::workflow::watchdog::clear_progress(record);
             } else {
                 state.status = RunStatus::Idle;
                 state.last_event = format!("workflow: invalid next_track {id}");
@@ -204,6 +208,7 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.last_applied_outcome_hash = None;
     state.ci = None;
     state.review = None;
+    state.stalled_at = None;
     reset_phase_clock(state);
     state.last_event = format!("workflow: auto-start {track_id}");
 }

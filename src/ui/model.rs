@@ -453,6 +453,8 @@ mod tests {
             failure_artifact,
             ci: None,
             review: None,
+            last_progress_at: None,
+            stall: None,
         }
     }
 

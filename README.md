@@ -151,6 +151,8 @@ When more than one project is registered, omit `--project` and the CLI errors (i
 
 **Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Override per key via machine `config.json` `phase_timeouts_secs`. Uniform test override: `COORDINATOR_PHASE_TIMEOUT_SECS`. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail) and writes `FAILURE.md`. This is **not** `wait --timeout-secs` (that is a CLI poll budget: exit **2**, run stays as it was, Grok stays up). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
 
+**Four clocks (do not collapse):** (1) `wait --timeout-secs` — CLI poll budget, exit **2**, run unchanged; (2) phase wall clock — `failure_class=timeout` + Stopped + `FAILURE.md`; (3) ACP `session/prompt` timeout — Prompt error mapped onto the phase; (4) **progress stall** (default **600s**) — adapter `session/update` / inject heartbeat went silent; run stays **Running**, `last_event` becomes `watchdog: stall — no harness progress for {idle}s`, Status JSON adds `last_progress_at` + `stall` `{ since, idle_secs }`. No `FAILURE.md`, no Failure Class, no toast. Override via `COORDINATOR_PROGRESS_STALL_SECS` or machine `progress_stall_secs` (`0` disables). A later heartbeat sets `last_event` to `watchdog: progress` and clears `stall`. Aborting a stuck Prompt is **0027**.
+
 **`run` without `--track`:** retains the prior `track_id` (intentional). Fresh `run` **clears** `next_track` (stale Planner handoff).
 
 ### Canonical workflow (`canonical_v1`)
@@ -437,7 +439,7 @@ HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1
 | **2** | Wait budget (`--timeout-secs`) expired **without** an applied outcome. The run is unchanged; Grok is not killed; no `FAILURE.md`. |
 | **1** (or other) | Invalid args, unknown project, or other control-plane error |
 
-`wait --timeout-secs` is a **CLI poll budget**. It is not the phase wall clock (`failure_class=timeout` + Stopped + artifact) and not the ACP `session/prompt` timeout. Adapter inject from `wait` / `serve` starts the detached holder without blocking the poll loop, so the wait budget can expire while a prompt is still in flight.
+`wait --timeout-secs` is a **CLI poll budget**. It is not the phase wall clock (`failure_class=timeout` + Stopped + artifact), not the ACP `session/prompt` timeout, and not the progress stall (`watchdog: stall`, run stays Running). Adapter inject from `wait` / `serve` starts the detached holder without blocking the poll loop, so the wait budget can expire while a prompt is still in flight.
 
 Scripts that want “success only” must inspect `status` / `failure_class` after exit 0 (e.g. `coordinator status`).
 
@@ -544,4 +546,4 @@ This mock remains the **visual reference** after 0014. Live start/resume is `car
 
 ## Status
 
-Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool), **0008** (canonical workflow runner), **0009** (stop/pause + Failure Artifact + toast), **0010** (token-idle `ci-wait` + auto squash-merge), **0011** (cross-model review), **0012** (Orca dogfood), **0013** (wait + session teardown), **0014** (live Dioxus Status Surface), **0015** (Hermes notify adapter), **0016** (coordinated multi-sibling dogfood).
+Tracks **0001** (crate + CI), **0002** (Impeccable + design context), **0003** (Status Surface mock + module map), **0004** (Control Plane skeleton), **0005** (Phase Outcome File + apply + wait/timeout), **0006** (layout profiles + scan), **0007** (Grok ACP adapter + session pool), **0008** (canonical workflow runner), **0009** (stop/pause + Failure Artifact + toast), **0010** (token-idle `ci-wait` + auto squash-merge), **0011** (cross-model review), **0012** (Orca dogfood), **0013** (wait + session teardown), **0014** (live Dioxus Status Surface), **0015** (Hermes notify adapter), **0016** (coordinated multi-sibling dogfood), **0026** (harness progress watchdog — detect + surface).

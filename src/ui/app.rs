@@ -916,7 +916,13 @@ fn note_for(card: &ProjectCard) -> Option<(&'static str, String)> {
             "note",
             "Parallel plan reviewers (agy + opencode). Not a single waiting reviewer.".into(),
         )),
-        CardState::Running => None,
+        CardState::Running => {
+            if card.view.stall.is_some() {
+                Some(("note warn", card.view.last_event.clone()))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -936,5 +942,46 @@ mod tests {
         assert!(SURFACE_CSS.contains("grid-template-columns: 1fr"));
         assert_eq!(WINDOW_TITLE, "Coordinator — Local Ops Console");
         const { assert!(DEFAULT_INNER_WIDTH > 980.0) };
+    }
+
+    #[test]
+    fn running_card_warns_from_last_event_when_stalled() {
+        use crate::registry::ProjectRecord;
+        use crate::state::{RunState, RunStatus, StallView};
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            created_at: Utc::now(),
+        };
+        let mut state = RunState::idle(&rec.id);
+        state.status = RunStatus::Running;
+        state.phase = crate::workflow::graph::PHASE_PLAN.into();
+        state.last_event = "watchdog: stall — no harness progress for 12s".into();
+        state.stalled_at = Some(Utc::now());
+        let mut view = crate::state::StatusView::from_record(&rec, &state);
+        view.stall = Some(StallView {
+            since: Utc::now(),
+            idle_secs: 12,
+        });
+        let card = ProjectCard {
+            view,
+            card_state: CardState::Running,
+            sessions: Vec::new(),
+        };
+        let (cls, text) = note_for(&card).expect("stall note");
+        assert_eq!(cls, "note warn");
+        assert!(text.contains("watchdog: stall"));
+        assert_ne!(card.card_state, CardState::HardFailure);
     }
 }

@@ -326,7 +326,8 @@ async fn apply_turn(
 
 async fn spawn_in_process(record: &ProjectRecord) -> Result<GrokHarnessStatus> {
     let cwd = grok_cwd(record);
-    let session = GrokSession::start(cwd, prompt_timeout_for(record)).await?;
+    let mut session = GrokSession::start(cwd, prompt_timeout_for(record)).await?;
+    session.set_progress_record(record.clone());
     write_session_persist(record, &session, None);
     let status = GrokHarnessStatus {
         alive: true,
@@ -450,6 +451,9 @@ fn spawn_holder_process(project_spec: &str) -> Result<()> {
         CoordinatorError::Message(format!("cannot resolve coordinator executable: {e}"))
     })?;
     let mut cmd = std::process::Command::new(exe);
+    // Inherit COORDINATOR_HOME / COORDINATOR_STATE_DIR so the holder writes
+    // harness-grok.json and harness-progress.json to the same resolve_state_dir
+    // as wait/serve. Do not invent a second location.
     cmd.arg("harness")
         .arg("grok")
         .arg("hold")
@@ -499,6 +503,7 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
         .await
         .map_err(|e| CoordinatorError::Message(format!("holder bind 127.0.0.1:0 failed: {e}")))?;
     let addr = listener.local_addr()?.to_string();
+    session.set_progress_record(rec.clone());
     write_session_persist(&rec, &session, Some(addr));
 
     loop {
@@ -582,6 +587,11 @@ async fn handle_hold_conn(
                 false,
             ),
             Ok(()) => {
+                crate::workflow::watchdog::note_progress(
+                    record,
+                    crate::workflow::watchdog::ProgressKind::Inject,
+                    Some(&session.session_id),
+                );
                 let turn = session
                     .inject_prompt(&text, prompt_timeout_for(record))
                     .await;
@@ -745,6 +755,11 @@ pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPrompt
                 "no Grok session; run `coordinator harness grok start` first".into(),
             )
         })?;
+        crate::workflow::watchdog::note_progress(
+            &rec,
+            crate::workflow::watchdog::ProgressKind::Inject,
+            Some(&session.session_id),
+        );
         session.inject_prompt(&text, prompt_timeout_for(&rec)).await
     };
     let harness = current_status(&rec).await;

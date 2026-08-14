@@ -12,9 +12,10 @@ use crate::registry::ProjectRecord;
 use crate::run;
 use crate::state::{RunStatus, StatusView, load_run_state};
 
-/// One poll tick: **tick first**, then file apply, then timeout.
+/// One poll tick: **tick first**, then file apply, then timeout, then progress watchdog.
 ///
-/// Returns `Some(view)` when an outcome was applied this tick; `None` otherwise.
+/// Returns `Some(view)` when an outcome was applied this tick, or when the
+/// progress watchdog first fires / clears a stall. `None` otherwise.
 /// Never panics on unreadable/partial JSON (skips file apply for this tick).
 pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
     // 0) Drive the canonical graph (inject / stub / named drives / join).
@@ -74,6 +75,13 @@ pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
                 return Err(e);
             }
         }
+    }
+
+    // 3) Progress watchdog — surface only. Never fails the poll (torn sidecar = skip).
+    match crate::workflow::watchdog::check_stall(record) {
+        Ok(Some(view)) => return Ok(Some(view)),
+        Ok(None) => {}
+        Err(_) => {}
     }
 
     Ok(None)

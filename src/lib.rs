@@ -9,6 +9,7 @@
 //! Status Surface (Dioxus Desktop, `--features ui`): track **0014**.
 //! Hermes inbound webhook notify adapter (opt-in HMAC V2): track **0015**.
 //! Coordinated multi-sibling dogfood (named-map prompt): track **0016**.
+//! Harness progress watchdog (detect + surface stall): track **0026**.
 
 pub mod api;
 pub mod ci;
