@@ -60,9 +60,13 @@ pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
 
     // 2) Timeout while Running only — decide+apply under the same run-state lock
     // so a concurrent pause cannot lose to a stale pre-lock snapshot.
+    let pre_timeout = load_run_state(record).ok();
     match outcome::try_timeout_under_lock(record) {
         Ok(Some(view)) => {
-            if crate::harness::abort::should_abort_on_timeout(record) {
+            if pre_timeout
+                .as_ref()
+                .is_some_and(crate::harness::abort::should_abort_on_timeout_state)
+            {
                 crate::harness::abort::abort_stuck_prompt(
                     record,
                     crate::harness::abort::AbortReason::Timeout,

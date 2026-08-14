@@ -83,10 +83,14 @@ pub fn stop_reason_is_cancelled(reason: Option<&str>) -> bool {
 }
 
 /// Timeout abort only for adapter Grok-bound phases (not stub / plan-review / CI / cross-model).
+/// Call on the **pre-apply** run state — after apply, plan-review may have advanced to fold.
 pub fn should_abort_on_timeout(record: &ProjectRecord) -> bool {
-    let Ok(state) = load_run_state(record) else {
-        return false;
-    };
+    load_run_state(record)
+        .ok()
+        .is_some_and(|s| should_abort_on_timeout_state(&s))
+}
+
+pub fn should_abort_on_timeout_state(state: &crate::state::RunState) -> bool {
     if state.driver != crate::workflow::WorkflowDriver::Adapter {
         return false;
     }
@@ -249,5 +253,48 @@ mod tests {
         assert!(!last_event_is_recycle(
             "watchdog: stall — no harness progress for 12s"
         ));
+    }
+
+    #[test]
+    fn timeout_abort_uses_pre_apply_phase() {
+        use crate::registry::ProjectRecord;
+        use tempfile::tempdir;
+        use uuid::Uuid;
+
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            created_at: chrono::Utc::now(),
+        };
+        crate::run::run_stub(&rec, None).unwrap();
+        let stub = crate::state::load_run_state(&rec).unwrap();
+        assert!(!should_abort_on_timeout_state(&stub));
+
+        crate::run::stop(&rec).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0027".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        let plan = crate::state::load_run_state(&rec).unwrap();
+        assert!(should_abort_on_timeout_state(&plan));
+
+        let mut review = plan.clone();
+        review.phase = crate::workflow::graph::PHASE_PLAN_REVIEW.into();
+        assert!(!should_abort_on_timeout_state(&review));
+        review.phase = crate::workflow::graph::PHASE_FOLD.into();
+        assert!(
+            should_abort_on_timeout_state(&review),
+            "fold itself is Grok-bound; plan-review must be classified before apply"
+        );
     }
 }
