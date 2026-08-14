@@ -917,7 +917,7 @@ fn note_for(card: &ProjectCard) -> Option<(&'static str, String)> {
             "Parallel plan reviewers (agy + opencode). Not a single waiting reviewer.".into(),
         )),
         CardState::Running => {
-            if card.view.stall.is_some() {
+            if card.view.stall.is_some() || card.view.last_event.starts_with("recycle:") {
                 Some(("note warn", card.view.last_event.clone()))
             } else {
                 None
@@ -982,6 +982,42 @@ mod tests {
         let (cls, text) = note_for(&card).expect("stall note");
         assert_eq!(cls, "note warn");
         assert!(text.contains("watchdog: stall"));
+        assert_ne!(card.card_state, CardState::HardFailure);
+    }
+
+    #[test]
+    fn running_card_warns_from_recycle_last_event() {
+        use crate::registry::ProjectRecord;
+        use crate::state::{RunState, RunStatus};
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            created_at: Utc::now(),
+        };
+        let mut state = RunState::idle(&rec.id);
+        state.status = RunStatus::Running;
+        state.phase = crate::workflow::graph::PHASE_PLAN.into();
+        state.last_event = crate::harness::abort::RECYCLE_STALL_EVENT.into();
+        let view = crate::state::StatusView::from_record(&rec, &state);
+        let card = ProjectCard {
+            view,
+            card_state: CardState::Running,
+            sessions: Vec::new(),
+        };
+        let (cls, text) = note_for(&card).expect("recycle note");
+        assert_eq!(cls, "note warn");
+        assert!(text.starts_with("recycle:"));
         assert_ne!(card.card_state, CardState::HardFailure);
     }
 }

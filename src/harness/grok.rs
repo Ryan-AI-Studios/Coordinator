@@ -8,13 +8,15 @@
 //!
 //! Windows I/O: every stdin write is `json + '\n'` then **flush**; stdout is a line reader.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::error::{CoordinatorError, Result};
 use crate::outcome::FailureClass;
@@ -45,15 +47,70 @@ pub struct GrokSession {
     collected_text: String,
     /// When set, every ACP `session/update` writes `{state_dir}/harness-progress.json`.
     progress_record: Option<ProjectRecord>,
+    /// Shared with [`CancelHandle`] so cancel can flush stdin during `inject_prompt`.
+    writer: AcpWriter,
+    in_flight_id: Arc<AtomicU64>,
+    session_id_shared: Arc<std::sync::Mutex<String>>,
+    cancel_requested: Arc<AtomicBool>,
+}
+
+/// Cloneable stdin writer so abort can send `session/cancel` without the pool lock.
+#[derive(Clone)]
+pub struct CancelHandle {
+    session_id: Arc<std::sync::Mutex<String>>,
+    writer: AcpWriter,
+    in_flight_id: Arc<AtomicU64>,
+    cancel_requested: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for CancelHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sid = self
+            .session_id
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        f.debug_struct("CancelHandle")
+            .field("session_id", &sid)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AcpWriter {
+    inner: AcpWriterInner,
+}
+
+#[derive(Clone)]
+enum AcpWriterInner {
+    Process(Arc<TokioMutex<tokio::process::ChildStdin>>),
+    Mock(MockIo),
+}
+
+impl std::fmt::Debug for AcpWriterInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Process(_) => f.debug_tuple("Process").finish_non_exhaustive(),
+            Self::Mock(m) => f.debug_tuple("Mock").field(m).finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MockIo {
+    written: Arc<std::sync::Mutex<Vec<String>>>,
+    incoming_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 enum AcpTransport {
     Process {
         child: Box<tokio::process::Child>,
-        stdin: tokio::process::ChildStdin,
         stdout: BufReader<tokio::process::ChildStdout>,
     },
-    Mock(MockTransport),
+    Mock {
+        incoming_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        written: Arc<std::sync::Mutex<Vec<String>>>,
+    },
 }
 
 impl std::fmt::Debug for AcpTransport {
@@ -63,15 +120,9 @@ impl std::fmt::Debug for AcpTransport {
                 .debug_struct("Process")
                 .field("pid", &child.id())
                 .finish_non_exhaustive(),
-            Self::Mock(m) => f.debug_tuple("Mock").field(m).finish(),
+            Self::Mock { .. } => f.debug_tuple("Mock").finish(),
         }
     }
-}
-
-#[derive(Debug)]
-struct MockTransport {
-    responses: VecDeque<String>,
-    written: Vec<String>,
 }
 
 impl GrokSession {
@@ -119,10 +170,15 @@ impl GrokSession {
             });
         }
         let pid = child.id();
+        let writer = AcpWriter {
+            inner: AcpWriterInner::Process(Arc::new(TokioMutex::new(stdin))),
+        };
+        let in_flight_id = Arc::new(AtomicU64::new(0));
+        let session_id_shared = Arc::new(std::sync::Mutex::new(String::new()));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
         let mut session = Self {
             transport: AcpTransport::Process {
                 child: Box::new(child),
-                stdin,
                 stdout: BufReader::new(stdout),
             },
             session_id: String::new(),
@@ -132,6 +188,10 @@ impl GrokSession {
             next_id: 1,
             collected_text: String::new(),
             progress_record: None,
+            writer,
+            in_flight_id,
+            session_id_shared,
+            cancel_requested,
         };
         session.handshake(timeout).await?;
         Ok(session)
@@ -143,11 +203,27 @@ impl GrokSession {
         responses: Vec<String>,
         timeout: Duration,
     ) -> Result<Self> {
-        let mut session = Self {
-            transport: AcpTransport::Mock(MockTransport {
-                responses: responses.into(),
-                written: Vec::new(),
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        for line in responses {
+            incoming_tx
+                .send(line)
+                .map_err(|_| CoordinatorError::Message("mock inbox closed".into()))?;
+        }
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = AcpWriter {
+            inner: AcpWriterInner::Mock(MockIo {
+                written: written.clone(),
+                incoming_tx,
             }),
+        };
+        let in_flight_id = Arc::new(AtomicU64::new(0));
+        let session_id_shared = Arc::new(std::sync::Mutex::new(String::new()));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let mut session = Self {
+            transport: AcpTransport::Mock {
+                incoming_rx,
+                written,
+            },
             session_id: String::new(),
             cwd,
             pid: Some(4242),
@@ -155,24 +231,45 @@ impl GrokSession {
             next_id: 1,
             collected_text: String::new(),
             progress_record: None,
+            writer,
+            in_flight_id,
+            session_id_shared,
+            cancel_requested,
         };
         session.handshake(timeout).await?;
         Ok(session)
     }
 
     /// Recorded JSON-RPC request payloads (mock only).
-    pub fn mock_written(&self) -> Option<&[String]> {
+    pub fn mock_written(&self) -> Option<Vec<String>> {
         match &self.transport {
-            AcpTransport::Mock(m) => Some(&m.written),
+            AcpTransport::Mock { written, .. } => Some(written.lock().ok()?.clone()),
             AcpTransport::Process { .. } => None,
         }
     }
 
-    /// Queue extra mock response lines (after handshake).
+    /// Queue extra mock response lines (after handshake). Wakes a pending `read_line`.
     pub fn mock_push_responses(&mut self, lines: impl IntoIterator<Item = String>) {
-        if let AcpTransport::Mock(m) = &mut self.transport {
-            m.responses.extend(lines);
+        if let AcpWriterInner::Mock(m) = &self.writer.inner {
+            for line in lines {
+                let _ = m.incoming_tx.send(line);
+            }
         }
+    }
+
+    /// Cloneable cancel writer (safe to use while `inject_prompt` holds `&mut self`).
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle {
+            session_id: self.session_id_shared.clone(),
+            writer: self.writer.clone(),
+            in_flight_id: self.in_flight_id.clone(),
+            cancel_requested: self.cancel_requested.clone(),
+        }
+    }
+
+    /// ACP `session/cancel` notification (no JSON-RPC `id`) on the same stdio child.
+    pub async fn cancel(&self) -> Result<()> {
+        self.cancel_handle().cancel().await
     }
 
     pub fn set_supports_compact(&mut self, value: bool) {
@@ -229,6 +326,9 @@ impl GrokSession {
                 CoordinatorError::Message("session/new result missing sessionId".into())
             })?;
         self.session_id = session_id.to_string();
+        if let Ok(mut shared) = self.session_id_shared.lock() {
+            *shared = self.session_id.clone();
+        }
         Ok(())
     }
 
@@ -276,14 +376,14 @@ impl GrokSession {
             AcpTransport::Process { child, .. } => {
                 let _ = child.kill().await;
             }
-            AcpTransport::Mock(_) => {}
+            AcpTransport::Mock { .. } => {}
         }
         Ok(())
     }
 
     pub fn is_process_alive(&mut self) -> bool {
         match &mut self.transport {
-            AcpTransport::Mock(_) => true,
+            AcpTransport::Mock { .. } => true,
             AcpTransport::Process { child, .. } => matches!(child.try_wait(), Ok(None)),
         }
     }
@@ -291,6 +391,7 @@ impl GrokSession {
     async fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
+        self.in_flight_id.store(id, Ordering::SeqCst);
         let payload = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -303,6 +404,7 @@ impl GrokSession {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                self.in_flight_id.store(0, Ordering::SeqCst);
                 return Err(CoordinatorError::Message(format!(
                     "ACP {method} timed out after {}s",
                     timeout.as_secs()
@@ -315,8 +417,16 @@ impl GrokSession {
                         "ACP {method} timed out after {}s",
                         timeout.as_secs()
                     ))
-                })??;
+                });
+            let line = match line {
+                Ok(inner) => inner?,
+                Err(e) => {
+                    self.in_flight_id.store(0, Ordering::SeqCst);
+                    return Err(e);
+                }
+            };
             let Some(line) = line else {
+                self.in_flight_id.store(0, Ordering::SeqCst);
                 return Err(CoordinatorError::Message(format!(
                     "ACP stdout closed during {method}"
                 )));
@@ -342,7 +452,21 @@ impl GrokSession {
                 }
                 continue;
             }
+            if v.get("method").and_then(|m| m.as_str()) == Some("session/request_permission")
+                && self.cancel_requested.load(Ordering::SeqCst)
+            {
+                if let Some(perm_id) = v.get("id").cloned() {
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": perm_id,
+                        "result": { "outcome": "cancelled" }
+                    });
+                    self.write_line(&reply.to_string()).await?;
+                }
+                continue;
+            }
             if v.get("id") == Some(&json!(id)) {
+                self.in_flight_id.store(0, Ordering::SeqCst);
                 if let Some(err) = v.get("error") {
                     let msg = err
                         .get("message")
@@ -356,18 +480,8 @@ impl GrokSession {
         }
     }
 
-    async fn write_line(&mut self, json_line: &str) -> Result<()> {
-        match &mut self.transport {
-            AcpTransport::Process { stdin, .. } => {
-                stdin.write_all(json_line.as_bytes()).await?;
-                stdin.write_all(b"\n").await?;
-                stdin.flush().await?;
-            }
-            AcpTransport::Mock(m) => {
-                m.written.push(json_line.to_string());
-            }
-        }
-        Ok(())
+    async fn write_line(&self, json_line: &str) -> Result<()> {
+        self.writer.write_line(json_line).await
     }
 
     async fn read_line(&mut self) -> Result<Option<String>> {
@@ -386,15 +500,66 @@ impl GrokSession {
                 }
                 Ok(Some(line))
             }
-            AcpTransport::Mock(m) => {
-                if let Some(line) = m.responses.pop_front() {
-                    Ok(Some(line))
-                } else {
-                    std::future::pending::<()>().await;
-                    Ok(None)
+            AcpTransport::Mock { incoming_rx, .. } => match incoming_rx.recv().await {
+                Some(line) => Ok(Some(line)),
+                None => Ok(None),
+            },
+        }
+    }
+}
+
+impl AcpWriter {
+    async fn write_line(&self, json_line: &str) -> Result<()> {
+        match &self.inner {
+            AcpWriterInner::Process(stdin) => {
+                let mut guard = stdin.lock().await;
+                guard.write_all(json_line.as_bytes()).await?;
+                guard.write_all(b"\n").await?;
+                guard.flush().await?;
+            }
+            AcpWriterInner::Mock(m) => {
+                if let Ok(mut written) = m.written.lock() {
+                    written.push(json_line.to_string());
                 }
             }
         }
+        Ok(())
+    }
+}
+
+impl CancelHandle {
+    /// Notification only — never a JSON-RPC request (`id` must be absent).
+    pub async fn cancel(&self) -> Result<()> {
+        let sid = self
+            .session_id
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        if sid.is_empty() {
+            return Err(CoordinatorError::Message(
+                "no Grok sessionId; start the session first".into(),
+            ));
+        }
+        self.cancel_requested.store(true, Ordering::SeqCst);
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": sid }
+        });
+        debug_assert!(
+            payload.get("id").is_none(),
+            "session/cancel must be a notification"
+        );
+        self.writer.write_line(&payload.to_string()).await?;
+        if let AcpWriterInner::Mock(m) = &self.writer.inner {
+            let id = self.in_flight_id.load(Ordering::SeqCst);
+            if id > 0 {
+                let _ = m
+                    .incoming_tx
+                    .send(rpc_result(id, json!({ "stopReason": "cancelled" })));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -583,6 +748,21 @@ pub fn session_update_tool_call(title: &str) -> String {
     .to_string()
 }
 
+/// Agent → client `session/request_permission` (JSON-RPC request; client must reply).
+pub fn session_request_permission(id: u64, session_id: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": session_id,
+            "toolCall": { "toolCallId": "call_perm", "title": "write" },
+            "options": []
+        }
+    })
+    .to_string()
+}
+
 /// Scripted handshake: initialize (cached_token + compact) → authenticate → session/new.
 pub fn mock_handshake_ok(session_id: &str) -> Vec<String> {
     vec![
@@ -747,6 +927,56 @@ mod tests {
             map_failure_class("child io broken pipe"),
             FailureClass::HarnessCrash
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_writes_notification_without_id_and_unblocks_prompt() {
+        let dir = tempdir().unwrap();
+        let lines = mock_handshake_ok("sess-cancel");
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        let handle = session.cancel_handle();
+        let prompt = session.inject_prompt("hang", Duration::from_secs(2));
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            handle.cancel().await.unwrap();
+        };
+        let (result, _) = tokio::join!(prompt, cancel);
+        let result = result.unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("cancelled"));
+
+        let written = session.mock_written().unwrap();
+        let cancel_line = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v["method"] == "session/cancel")
+            .expect("session/cancel written");
+        assert!(cancel_line.get("id").is_none(), "cancel is a notification");
+        assert_eq!(cancel_line["params"]["sessionId"], "sess-cancel");
+        assert_eq!(cancel_line["jsonrpc"], "2.0");
+    }
+
+    #[tokio::test]
+    async fn permission_request_during_prompt_is_answered_cancelled() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-perm");
+        lines.push(session_request_permission(99, "sess-perm"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.cancel().await.unwrap();
+        let result = session.inject_prompt("ok", timeout()).await.unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("permission result written");
+        assert_eq!(reply["result"]["outcome"], "cancelled");
+        assert!(reply.get("method").is_none());
     }
 }
 

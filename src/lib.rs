@@ -10,6 +10,7 @@
 //! Hermes inbound webhook notify adapter (opt-in HMAC V2): track **0015**.
 //! Coordinated multi-sibling dogfood (named-map prompt): track **0016**.
 //! Harness progress watchdog (detect + surface stall): track **0026**.
+//! Abort stuck Prompt + refuse wedged-session reuse: track **0027**.
 
 pub mod api;
 pub mod ci;

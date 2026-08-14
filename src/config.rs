@@ -354,8 +354,8 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`, `COORDINATOR_PHASE_TIMEOUT_SECS`,
 /// `COORDINATOR_WORKFLOW_DRIVER`, `COORDINATOR_OUTCOME_POLL_MS`,
 /// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
-/// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`, or
-/// `COORDINATOR_PROGRESS_STALL_SECS` must
+/// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`,
+/// `COORDINATOR_PROGRESS_STALL_SECS`, or `COORDINATOR_CANCEL_WAIT_SECS` must
 /// hold this (survives poison so one failure does not cascade).
 #[cfg(test)]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

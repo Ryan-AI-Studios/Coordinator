@@ -219,7 +219,7 @@ fn drive_adapter(
             });
             match result {
                 Ok(view) => {
-                    if view.applied {
+                    if view.applied || view.skipped == Some(true) {
                         return;
                     }
                     if let Some(err) = view.error {

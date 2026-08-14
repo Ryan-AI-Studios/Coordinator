@@ -130,6 +130,9 @@ struct PersistedGrokHandle {
     #[serde(default)]
     supports_compact: bool,
     alive: bool,
+    /// Mid-`session/prompt` (0027). Missing key = false. No persist version bump.
+    #[serde(default)]
+    prompt_in_flight: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -154,6 +157,7 @@ enum HoldRequest {
     Compact,
     Status,
     Shutdown,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +203,7 @@ fn write_session_persist(
     record: &ProjectRecord,
     session: &GrokSession,
     control_addr: Option<String>,
+    prompt_in_flight: bool,
 ) {
     let handle = PersistedGrokHandle {
         version: 1,
@@ -210,9 +215,43 @@ fn write_session_persist(
         control_addr,
         supports_compact: session.supports_compact,
         alive: true,
+        prompt_in_flight,
         error: None,
     };
     let _ = save_persist(record, &handle);
+}
+
+pub(crate) fn persist_prompt_in_flight(record: &ProjectRecord) -> bool {
+    load_persist(record)
+        .ok()
+        .flatten()
+        .is_some_and(|h| h.prompt_in_flight)
+}
+
+pub(crate) fn persist_session_id(record: &ProjectRecord) -> Option<String> {
+    load_persist(record)
+        .ok()
+        .flatten()
+        .and_then(|h| h.session_id)
+}
+
+fn set_prompt_in_flight(record: &ProjectRecord, value: bool) {
+    if let Ok(Some(mut h)) = load_persist(record) {
+        h.prompt_in_flight = value;
+        let _ = save_persist(record, &h);
+    }
+}
+
+/// Holder `Cancel` RPC (no-op if no live control addr).
+pub(crate) async fn holder_cancel(record: &ProjectRecord) -> Result<()> {
+    let Some(h) = load_persist(record)? else {
+        return Ok(());
+    };
+    let Some(addr) = h.control_addr else {
+        return Ok(());
+    };
+    let _ = holder_rpc(&addr, &HoldRequest::Cancel).await;
+    Ok(())
 }
 
 /// Sync snapshot for `StatusView` (in-process pool, else persist file).
@@ -268,7 +307,10 @@ async fn apply_turn(
         Ok(pr) => {
             let mut applied = false;
             let mut status = None;
-            if state.status == RunStatus::Running {
+            let skip = state.status != RunStatus::Running
+                || crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref())
+                || harness_is_aborted(&state, &harness);
+            if !skip {
                 let msg = if pr.text.is_empty() {
                     None
                 } else {
@@ -288,7 +330,7 @@ async fn apply_turn(
                 text: Some(pr.text),
                 stop_reason: pr.stop_reason,
                 applied,
-                skipped: None,
+                skipped: if skip { Some(true) } else { None },
                 error: None,
                 failure_class: None,
                 status,
@@ -299,7 +341,8 @@ async fn apply_turn(
             let class = map_failure_class(&e.to_string());
             let mut status = None;
             let mut applied = false;
-            if state.status == RunStatus::Running {
+            let skip = state.status != RunStatus::Running || harness_is_aborted(&state, &harness);
+            if !skip {
                 let outcome = PhaseOutcome::failure(
                     state.phase.clone(),
                     class,
@@ -314,7 +357,7 @@ async fn apply_turn(
                 text: None,
                 stop_reason: None,
                 applied,
-                skipped: None,
+                skipped: if skip { Some(true) } else { None },
                 error: Some(e.to_string()),
                 failure_class: Some(class),
                 status,
@@ -324,11 +367,22 @@ async fn apply_turn(
     }
 }
 
+fn harness_is_aborted(state: &crate::state::RunState, harness: &GrokHarnessStatus) -> bool {
+    match (
+        state.aborted_session_id.as_deref(),
+        harness.session_id.as_deref(),
+    ) {
+        (Some(aborted), Some(sid)) => aborted == sid,
+        _ => false,
+    }
+}
+
 async fn spawn_in_process(record: &ProjectRecord) -> Result<GrokHarnessStatus> {
     let cwd = grok_cwd(record);
     let mut session = GrokSession::start(cwd, prompt_timeout_for(record)).await?;
     session.set_progress_record(record.clone());
-    write_session_persist(record, &session, None);
+    crate::harness::abort::register_cancel_handle(record.id.clone(), session.cancel_handle());
+    write_session_persist(record, &session, None, false);
     let status = GrokHarnessStatus {
         alive: true,
         session_id: Some(session.session_id.clone()),
@@ -345,22 +399,35 @@ async fn spawn_in_process(record: &ProjectRecord) -> Result<GrokHarnessStatus> {
 
 pub async fn start(project: Option<&str>, in_process: bool) -> Result<GrokHarnessStatus> {
     let rec = resolve_record(project)?;
+    let refuse = crate::harness::abort::should_refuse_reuse(&rec);
     {
         let mut pool = global_pool().lock().await;
         if let Some(s) = pool.status_of(&rec.id)
             && s.alive
         {
-            return Ok(s);
+            if refuse {
+                if let Some(mut session) = pool.remove(&rec.id) {
+                    let _ = session.shutdown().await;
+                }
+                crate::harness::abort::unregister_cancel_handle(&rec.id);
+            } else {
+                return Ok(s);
+            }
         }
     }
-    if let Some(existing) = reuse_or_reap_existing(&rec).await? {
+    if refuse {
+        if let Ok(Some(existing)) = load_persist(&rec) {
+            reap_stale_holder(&rec, &existing);
+        }
+    } else if let Some(existing) = reuse_or_reap_existing(&rec).await? {
         return Ok(existing);
     }
 
     if in_process {
-        return spawn_in_process(&rec).await;
+        spawn_in_process(&rec).await
+    } else {
+        start_holder(&rec, project).await
     }
-    start_holder(&rec, project).await
 }
 
 /// Reuse a live holder that still answers Ping. Otherwise treat leftover persist as
@@ -371,6 +438,10 @@ async fn reuse_or_reap_existing(record: &ProjectRecord) -> Result<Option<GrokHar
         return Ok(None);
     };
     if !existing.alive {
+        return Ok(None);
+    }
+    if crate::harness::abort::should_refuse_reuse(record) {
+        reap_stale_holder(record, &existing);
         return Ok(None);
     }
     if let Some(addr) = &existing.control_addr
@@ -479,7 +550,7 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
         Err(e) => return Err(e),
     };
     let cwd = grok_cwd(&rec);
-    let mut session = match GrokSession::start(cwd, prompt_timeout_for(&rec)).await {
+    let session = match GrokSession::start(cwd, prompt_timeout_for(&rec)).await {
         Ok(s) => s,
         Err(e) => {
             let handle = PersistedGrokHandle {
@@ -492,6 +563,7 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
                 control_addr: None,
                 supports_compact: true,
                 alive: false,
+                prompt_in_flight: false,
                 error: Some(e.to_string()),
             };
             let _ = save_persist(&rec, &handle);
@@ -499,21 +571,55 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
         }
     };
 
+    hold_accept_loop(rec, session).await
+}
+
+/// Scripted holder for tests (mock ACP session).
+#[cfg(test)]
+pub async fn hold_loop_with_session(record: ProjectRecord, session: GrokSession) -> Result<()> {
+    hold_accept_loop(record, session).await
+}
+
+async fn hold_accept_loop(rec: ProjectRecord, mut session: GrokSession) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| CoordinatorError::Message(format!("holder bind 127.0.0.1:0 failed: {e}")))?;
     let addr = listener.local_addr()?.to_string();
     session.set_progress_record(rec.clone());
-    write_session_persist(&rec, &session, Some(addr));
+    crate::harness::abort::register_cancel_handle(rec.id.clone(), session.cancel_handle());
+    write_session_persist(&rec, &session, Some(addr.clone()), false);
+
+    let snapshot = std::sync::Mutex::new(session_status(&session));
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let shared = std::sync::Arc::new(HolderShared {
+        session: tokio::sync::Mutex::new(session),
+        prompt_gate: tokio::sync::Mutex::new(()),
+        rec: rec.clone(),
+        snapshot,
+        shutdown_tx,
+    });
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        match handle_hold_conn(stream, &mut session, &rec).await {
-            Ok(true) => break,
-            Ok(false) => {}
-            Err(_) => {}
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            acc = listener.accept() => {
+                let (stream, _) = match acc {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    let _ = handle_hold_conn(stream, shared).await;
+                });
+            }
         }
     }
+    crate::harness::abort::unregister_cancel_handle(&rec.id);
+    let mut session = shared.session.lock().await;
     let _ = session.shutdown().await;
     let dead = PersistedGrokHandle {
         version: 1,
@@ -525,52 +631,71 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
         control_addr: None,
         supports_compact: session.supports_compact,
         alive: false,
+        prompt_in_flight: false,
         error: None,
     };
     let _ = save_persist(&rec, &dead);
     Ok(())
 }
 
-async fn handle_hold_conn(
-    stream: TcpStream,
-    session: &mut GrokSession,
-    record: &ProjectRecord,
-) -> Result<bool> {
+struct HolderShared {
+    session: tokio::sync::Mutex<GrokSession>,
+    prompt_gate: tokio::sync::Mutex<()>,
+    rec: ProjectRecord,
+    snapshot: std::sync::Mutex<GrokHarnessStatus>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+fn snapshot_status(shared: &HolderShared) -> GrokHarnessStatus {
+    shared
+        .snapshot
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_else(|_| GrokHarnessStatus::missing())
+}
+
+async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared>) -> Result<bool> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let Some(line) = lines.next_line().await? else {
         return Ok(false);
     };
     let req: HoldRequest = serde_json::from_str(&line)?;
+    let record = &shared.rec;
     let (resp, shutdown) = match req {
-        HoldRequest::Ping => (
+        HoldRequest::Ping | HoldRequest::Status => (
             HoldResponse {
                 ok: true,
                 error: None,
                 text: None,
                 stop_reason: None,
                 status: None,
-                harness: Some(session_status(session)),
+                harness: Some(snapshot_status(&shared)),
                 applied: None,
                 skipped: None,
                 failure_class: None,
             },
             false,
         ),
-        HoldRequest::Status => (
-            HoldResponse {
-                ok: true,
-                error: None,
-                text: None,
-                stop_reason: None,
-                status: None,
-                harness: Some(session_status(session)),
-                applied: None,
-                skipped: None,
-                failure_class: None,
-            },
-            false,
-        ),
+        HoldRequest::Cancel => {
+            if let Some(h) = crate::harness::abort::cancel_handle_for(&record.id) {
+                let _ = h.cancel().await;
+            }
+            (
+                HoldResponse {
+                    ok: true,
+                    error: None,
+                    text: None,
+                    stop_reason: None,
+                    status: None,
+                    harness: Some(snapshot_status(&shared)),
+                    applied: None,
+                    skipped: None,
+                    failure_class: None,
+                },
+                false,
+            )
+        }
         HoldRequest::Prompt { text } => match refuse_if_paused(record) {
             Err(e) => (
                 HoldResponse {
@@ -579,27 +704,64 @@ async fn handle_hold_conn(
                     text: None,
                     stop_reason: None,
                     status: None,
-                    harness: Some(session_status(session)),
+                    harness: Some(snapshot_status(&shared)),
                     applied: None,
                     skipped: None,
                     failure_class: None,
                 },
                 false,
             ),
-            Ok(()) => {
-                crate::workflow::watchdog::note_progress(
-                    record,
-                    crate::workflow::watchdog::ProgressKind::Inject,
-                    Some(&session.session_id),
-                );
-                let turn = session
-                    .inject_prompt(&text, prompt_timeout_for(record))
-                    .await;
-                let view = apply_turn(record, turn, session_status(session)).await?;
-                (view_to_hold(view), false)
-            }
+            Ok(()) => match shared.prompt_gate.try_lock() {
+                Err(_) => (
+                    HoldResponse {
+                        ok: false,
+                        error: Some("prompt already in flight".into()),
+                        text: None,
+                        stop_reason: None,
+                        status: None,
+                        harness: Some(snapshot_status(&shared)),
+                        applied: None,
+                        skipped: None,
+                        failure_class: None,
+                    },
+                    false,
+                ),
+                Ok(_gate) => {
+                    set_prompt_in_flight(record, true);
+                    let turn = {
+                        let mut session = shared.session.lock().await;
+                        if let Ok(mut snap) = shared.snapshot.lock() {
+                            *snap = session_status(&session);
+                        }
+                        crate::workflow::watchdog::note_progress(
+                            record,
+                            crate::workflow::watchdog::ProgressKind::Inject,
+                            Some(&session.session_id),
+                        );
+                        session
+                            .inject_prompt(&text, prompt_timeout_for(record))
+                            .await
+                    };
+                    let normal = matches!(&turn, Ok(pr) if !crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()));
+                    if normal {
+                        set_prompt_in_flight(record, false);
+                    }
+                    if let Err(e) = &turn {
+                        let msg = e.to_string().to_ascii_lowercase();
+                        if msg.contains("timed out") || msg.contains("timeout") {
+                            crate::harness::abort::abort_stuck_prompt_sync(
+                                record,
+                                crate::harness::abort::AbortReason::PromptTimeout,
+                            );
+                        }
+                    }
+                    let view = apply_turn(record, turn, snapshot_status(&shared)).await?;
+                    (view_to_hold(view), false)
+                }
+            },
         },
         HoldRequest::Compact => {
+            let session = shared.session.lock().await;
             if !session.supports_compact {
                 (
                     HoldResponse {
@@ -608,7 +770,7 @@ async fn handle_hold_conn(
                         text: None,
                         stop_reason: None,
                         status: None,
-                        harness: Some(session_status(session)),
+                        harness: Some(session_status(&session)),
                         applied: Some(false),
                         skipped: Some(true),
                         failure_class: None,
@@ -616,6 +778,8 @@ async fn handle_hold_conn(
                     false,
                 )
             } else {
+                drop(session);
+                let mut session = shared.session.lock().await;
                 match session.compact(prompt_timeout_for(record)).await {
                     Ok(pr) => (
                         HoldResponse {
@@ -624,7 +788,7 @@ async fn handle_hold_conn(
                             text: Some(pr.text),
                             stop_reason: pr.stop_reason,
                             status: None,
-                            harness: Some(session_status(session)),
+                            harness: Some(session_status(&session)),
                             applied: Some(false),
                             skipped: None,
                             failure_class: None,
@@ -638,7 +802,7 @@ async fn handle_hold_conn(
                             text: None,
                             stop_reason: None,
                             status: None,
-                            harness: Some(session_status(session)),
+                            harness: Some(session_status(&session)),
                             applied: Some(false),
                             skipped: None,
                             failure_class: Some(map_failure_class(&e.to_string())),
@@ -648,26 +812,32 @@ async fn handle_hold_conn(
                 }
             }
         }
-        HoldRequest::Shutdown => (
-            HoldResponse {
-                ok: true,
-                error: None,
-                text: None,
-                stop_reason: None,
-                status: None,
-                harness: Some(GrokHarnessStatus {
-                    alive: false,
-                    session_id: Some(session.session_id.clone()),
-                    cwd: Some(session.cwd.clone()),
-                    supports_compact: session.supports_compact,
-                    pid: session.pid,
-                }),
-                applied: None,
-                skipped: None,
-                failure_class: None,
-            },
-            true,
-        ),
+        HoldRequest::Shutdown => {
+            if let Some(h) = crate::harness::abort::cancel_handle_for(&record.id) {
+                let _ = h.cancel().await;
+            }
+            let _ = shared.shutdown_tx.send(true);
+            (
+                HoldResponse {
+                    ok: true,
+                    error: None,
+                    text: None,
+                    stop_reason: None,
+                    status: None,
+                    harness: Some(GrokHarnessStatus {
+                        alive: false,
+                        session_id: snapshot_status(&shared).session_id,
+                        cwd: snapshot_status(&shared).cwd,
+                        supports_compact: snapshot_status(&shared).supports_compact,
+                        pid: snapshot_status(&shared).pid,
+                    }),
+                    applied: None,
+                    skipped: None,
+                    failure_class: None,
+                },
+                true,
+            )
+        }
     };
     let payload = serde_json::to_string(&resp)?;
     writer.write_all(payload.as_bytes()).await?;
@@ -748,6 +918,7 @@ pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPrompt
         let resp = holder_rpc(addr, &HoldRequest::Prompt { text }).await?;
         return hold_view(resp);
     }
+    set_prompt_in_flight(&rec, true);
     let turn = {
         let mut pool = global_pool().lock().await;
         let session = pool.get_mut(&rec.id).ok_or_else(|| {
@@ -762,6 +933,18 @@ pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPrompt
         );
         session.inject_prompt(&text, prompt_timeout_for(&rec)).await
     };
+    let normal = matches!(&turn, Ok(pr) if !crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()));
+    if normal {
+        set_prompt_in_flight(&rec, false);
+    } else if let Err(e) = &turn {
+        let msg = e.to_string().to_ascii_lowercase();
+        if msg.contains("timed out") || msg.contains("timeout") {
+            crate::harness::abort::abort_stuck_prompt_sync(
+                &rec,
+                crate::harness::abort::AbortReason::PromptTimeout,
+            );
+        }
+    }
     let harness = current_status(&rec).await;
     apply_turn(&rec, turn, harness).await
 }
@@ -847,12 +1030,30 @@ async fn current_status(record: &ProjectRecord) -> GrokHarnessStatus {
         .unwrap_or_else(GrokHarnessStatus::missing)
 }
 
+/// Recycle without waiting on `global_pool()` (prompt() holds that mutex).
+/// CancelHandle + persist pid-kill + dead persist. Best-effort pool remove.
+pub(crate) async fn recycle_without_pool_lock(record: &ProjectRecord) -> Result<()> {
+    crate::harness::abort::unregister_cancel_handle(&record.id);
+    if let Ok(mut pool) = global_pool().try_lock()
+        && let Some(mut session) = pool.remove(&record.id)
+    {
+        let _ = session.shutdown().await;
+    }
+    if let Ok(Some(h)) = load_persist(record) {
+        kill_persist_pids(&h);
+        let dead = persist_marked_dead(&h);
+        let _ = save_persist(record, &dead);
+    }
+    Ok(())
+}
+
 /// How long the CLI will wait for a holder `Shutdown` RPC before falling back to pid-kill.
 const HOLDER_SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_millis(750);
 
 pub async fn shutdown(project: Option<&str>) -> Result<GrokHarnessStatus> {
     let rec = resolve_record(project)?;
     if let Some(mut session) = global_pool().lock().await.remove(&rec.id) {
+        crate::harness::abort::unregister_cancel_handle(&rec.id);
         let _ = session.shutdown().await;
         if let Ok(Some(h)) = load_persist(&rec) {
             kill_persist_pids(&h);
@@ -867,6 +1068,7 @@ pub async fn shutdown(project: Option<&str>) -> Result<GrokHarnessStatus> {
             control_addr: None,
             supports_compact: session.supports_compact,
             alive: false,
+            prompt_in_flight: false,
             error: None,
         };
         let _ = save_persist(&rec, &dead);
@@ -906,6 +1108,7 @@ fn persist_marked_dead(h: &PersistedGrokHandle) -> PersistedGrokHandle {
         control_addr: None,
         supports_compact: h.supports_compact,
         alive: false,
+        prompt_in_flight: false,
         error: None,
     }
 }
@@ -948,6 +1151,7 @@ fn kill_pid_best_effort(pid: u32) {
 
 /// Insert a mock session (tests).
 pub async fn insert_test_session(project_id: String, session: GrokSession) {
+    crate::harness::abort::register_cancel_handle(project_id.clone(), session.cancel_handle());
     global_pool().lock().await.insert(project_id, session);
 }
 
@@ -1201,6 +1405,7 @@ mod tests {
             control_addr: None,
             supports_compact: false,
             alive: false,
+            prompt_in_flight: false,
             error: Some("ACP authenticate: not logged in".into()),
         };
         save_persist(&rec, &stale).unwrap();
@@ -1226,6 +1431,7 @@ mod tests {
             control_addr: Some("127.0.0.1:9".into()),
             supports_compact: true,
             alive: true,
+            prompt_in_flight: false,
             error: None,
         };
         assert_eq!(interpret_persist_after_spawn(&ready), PersistWait::Ready);
@@ -1344,6 +1550,7 @@ mod tests {
             control_addr: None,
             supports_compact: true,
             alive: true,
+            prompt_in_flight: false,
             error: None,
         };
         save_persist(&rec, &handle).unwrap();
@@ -1398,6 +1605,7 @@ mod tests {
             control_addr: Some("127.0.0.1:1".into()),
             supports_compact: true,
             alive: true,
+            prompt_in_flight: false,
             error: None,
         };
         save_persist(&rec, &handle).unwrap();
@@ -1447,5 +1655,374 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         assert_eq!(grok_cwd(&rec), exec);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cancelled_stop_reason_does_not_apply_phase() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0027".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+
+        let mut lines = mock_handshake_ok("sess-cancel-apply");
+        lines.push(rpc_result(4, json!({ "stopReason": "cancelled" })));
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            lines,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+
+        let view = prompt(Some(&rec.id), "x".into()).await.unwrap();
+        assert!(!view.applied, "cancelled must not apply");
+        assert_eq!(view.skipped, Some(true));
+        let st = run::status(&rec).unwrap();
+        assert_eq!(st.status, crate::state::RunStatus::Running);
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN);
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        let _ = shutdown(Some(&rec.id)).await;
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn recycle_stamp_skips_inject_error_apply() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0027".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.last_event = crate::harness::abort::RECYCLE_STALL_EVENT.into();
+            s.aborted_session_id = Some("sess-rec-err".into());
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+
+        let mut lines = mock_handshake_ok("sess-rec-err");
+        lines.push(crate::harness::grok::rpc_error(4, "stdout closed"));
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            lines,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+
+        let view = prompt(Some(&rec.id), "x".into()).await.unwrap();
+        assert!(!view.applied);
+        let st = run::status(&rec).unwrap();
+        assert_eq!(st.status, crate::state::RunStatus::Running);
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN);
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        let _ = shutdown(Some(&rec.id)).await;
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn holder_cancel_and_status_return_during_hung_prompt() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0027".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            mock_handshake_ok("sess-hold"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let rec_hold = rec.clone();
+        let hold = tokio::spawn(async move { hold_loop_with_session(rec_hold, session).await });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let addr = loop {
+            if let Ok(Some(h)) = load_persist(&rec)
+                && let Some(addr) = h.control_addr
+            {
+                break addr;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("holder persist never became ready");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let prompt_addr = addr.clone();
+        let prompt_task = tokio::spawn(async move {
+            holder_rpc(
+                &prompt_addr,
+                &HoldRequest::Prompt {
+                    text: "hang".into(),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        let status = holder_rpc(&addr, &HoldRequest::Status).await.unwrap();
+        let ping = holder_rpc(&addr, &HoldRequest::Ping).await.unwrap();
+        let cancel = holder_rpc(&addr, &HoldRequest::Cancel).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(status.ok && ping.ok && cancel.ok);
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "Status/Ping/Cancel must not wait on Prompt; elapsed={elapsed:?}"
+        );
+
+        let prompt_view = tokio::time::timeout(Duration::from_secs(2), prompt_task)
+            .await
+            .expect("prompt task")
+            .expect("join")
+            .expect("rpc");
+        assert_eq!(prompt_view.stop_reason.as_deref(), Some("cancelled"));
+
+        let _ = holder_rpc(&addr, &HoldRequest::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), hold).await;
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn abort_recycle_marks_persist_dead() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+
+        let mut child = spawn_dummy_long_child();
+        let handle = PersistedGrokHandle {
+            version: 1,
+            project_id: rec.id.clone(),
+            session_id: Some("sess-old".into()),
+            cwd: Some(proj.path().to_path_buf()),
+            pid: Some(child.id()),
+            holder_pid: None,
+            control_addr: None,
+            supports_compact: true,
+            alive: true,
+            prompt_in_flight: true,
+            error: None,
+        };
+        save_persist(&rec, &handle).unwrap();
+        crate::harness::abort::abort_stuck_prompt_sync(
+            &rec,
+            crate::harness::abort::AbortReason::Stall,
+        );
+        let persist = load_persist(&rec).unwrap().expect("persist");
+        assert!(!persist.alive);
+        assert!(!persist.prompt_in_flight);
+        if taskkill_on_path() {
+            assert!(wait_child_dead(&mut child, 1000));
+        } else if !wait_child_dead(&mut child, 50) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn aborted_session_id_skips_error_apply_without_recycle_prefix() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0027".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.aborted_session_id = Some("sess-stall-skip".into());
+            s.last_event = "resume: continue".into();
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+
+        let mut lines = mock_handshake_ok("sess-stall-skip");
+        lines.push(crate::harness::grok::rpc_error(4, "stdout closed"));
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            lines,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+
+        let view = prompt(Some(&rec.id), "x".into()).await.unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        let st = run::status(&rec).unwrap();
+        assert_eq!(st.status, crate::state::RunStatus::Running);
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        let _ = shutdown(Some(&rec.id)).await;
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn start_refuses_wedged_persist_session() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0027".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.last_event = crate::harness::abort::RECYCLE_STALL_EVENT.into();
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+
+        let old = PersistedGrokHandle {
+            version: 1,
+            project_id: rec.id.clone(),
+            session_id: Some("sess-wedged".into()),
+            cwd: Some(proj.path().to_path_buf()),
+            pid: None,
+            holder_pid: None,
+            control_addr: Some("127.0.0.1:1".into()),
+            supports_compact: true,
+            alive: true,
+            prompt_in_flight: true,
+            error: None,
+        };
+        save_persist(&rec, &old).unwrap();
+
+        let reused = reuse_or_reap_existing(&rec).await.unwrap();
+        assert!(reused.is_none());
+        assert!(
+            crate::harness::abort::should_refuse_reuse(&rec),
+            "recycle last_event must refuse reuse"
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
+        }
+    }
+
+    #[test]
+    fn fresh_run_clears_stall_recycles() {
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: "p".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            created_at: chrono::Utc::now(),
+        };
+        crate::run::run_with_driver(
+            &rec,
+            Some("0027".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.stall_recycles = 3;
+            s.status = crate::state::RunStatus::Stopped;
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0027".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::state::load_run_state(&rec).unwrap().stall_recycles,
+            0
+        );
     }
 }
