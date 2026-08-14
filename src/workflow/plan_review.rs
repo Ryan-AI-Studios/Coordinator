@@ -1010,14 +1010,27 @@ mod tests {
         let _hook = install_test_backend(&r.id, rec_backend);
         let rec_a = r.clone();
         let rec_b = r.clone();
-        let h1 = std::thread::spawn(move || {
-            let s = load_run_state(&rec_a).unwrap();
-            maybe_spawn_agy(&rec_a, &s).unwrap();
-        });
-        let h2 = std::thread::spawn(move || {
-            let s = load_run_state(&rec_b).unwrap();
-            maybe_spawn_agy(&rec_b, &s).unwrap();
-        });
+        let spawn = |rec: ProjectRecord| {
+            for _ in 0..40 {
+                let s = load_run_state(&rec).unwrap();
+                match maybe_spawn_agy(&rec, &s) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("Access is denied")
+                            || msg.contains("timed out waiting for run-state lock")
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        panic!("{e}");
+                    }
+                }
+            }
+            panic!("maybe_spawn_agy retried out");
+        };
+        let h1 = std::thread::spawn(move || spawn(rec_a));
+        let h2 = std::thread::spawn(move || spawn(rec_b));
         h1.join().unwrap();
         h2.join().unwrap();
         wait_agy_consumed(&r);

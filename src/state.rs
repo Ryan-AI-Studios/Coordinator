@@ -480,8 +480,13 @@ where
                 let _ = std::fs::remove_dir(&lock_path);
                 return result;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || (e.kind() == std::io::ErrorKind::PermissionDenied && lock_path.exists()) =>
+            {
                 // Break stale lock if older than 60s.
+                // Windows can surface PermissionDenied instead of AlreadyExists
+                // while another thread is creating or removing the lock dir.
                 if let Ok(meta) = std::fs::metadata(&lock_path)
                     && let Ok(modified) = meta.modified()
                     && let Ok(age) = std::time::SystemTime::now().duration_since(modified)
