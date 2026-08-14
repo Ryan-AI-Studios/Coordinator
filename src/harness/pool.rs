@@ -341,10 +341,7 @@ async fn apply_turn(
             let class = map_failure_class(&e.to_string());
             let mut status = None;
             let mut applied = false;
-            let skip = state.status != RunStatus::Running
-                || harness_is_aborted(&state, &harness)
-                || (crate::harness::abort::last_event_is_recycle(&state.last_event)
-                    && state.aborted_session_id.is_none());
+            let skip = state.status != RunStatus::Running || harness_is_aborted(&state, &harness);
             if !skip {
                 let outcome = PhaseOutcome::failure(
                     state.phase.clone(),
