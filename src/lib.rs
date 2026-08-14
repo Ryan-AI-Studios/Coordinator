@@ -11,6 +11,7 @@
 //! Coordinated multi-sibling dogfood (named-map prompt): track **0016**.
 //! Harness progress watchdog (detect + surface stall): track **0026**.
 //! Abort stuck Prompt + refuse wedged-session reuse: track **0027**.
+//! Plan-review Antigravity one-shot (`agy --print`): track **0017**.
 
 pub mod api;
 pub mod ci;

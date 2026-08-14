@@ -251,8 +251,10 @@ fn drive_plan_review(
     state: &RunState,
 ) -> Result<Option<crate::state::StatusView>> {
     ensure_plan_review_pending(record, state)?;
-    if state.driver == WorkflowDriver::Stub {
-        write_stub_reviews(record, state)?;
+    match state.driver {
+        WorkflowDriver::Stub => write_stub_reviews(record, state)?,
+        WorkflowDriver::Adapter => super::plan_review::maybe_spawn_agy(record, state)?,
+        WorkflowDriver::FileWait => {}
     }
     consume_role_files(record)?;
     try_join(record)
@@ -408,6 +410,14 @@ pub fn clear_plan_review_artifacts(record: &ProjectRecord) {
         && dir.exists()
     {
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    if let Ok(state) = load_run_state(record)
+        && let Some(ref track_id) = state.track_id
+        && let Some(track_dir) = resolve_track_dir(record, track_id)
+    {
+        for slug in review_slugs() {
+            let _ = std::fs::remove_file(track_dir.join(format!("{slug}-review.md")));
+        }
     }
 }
 

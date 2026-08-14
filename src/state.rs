@@ -118,6 +118,9 @@ pub struct RunState {
     /// Session id being recycled; apply skips fallout from this id only (0027).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aborted_session_id: Option<String>,
+    /// Plan-review one-shot slots already launched this phase (0017). Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_review_spawned: Vec<String>,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -192,6 +195,7 @@ impl RunState {
             pause_spans: Vec::new(),
             stall_recycles: 0,
             aborted_session_id: None,
+            plan_review_spawned: Vec::new(),
         }
     }
 
@@ -476,8 +480,13 @@ where
                 let _ = std::fs::remove_dir(&lock_path);
                 return result;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || (e.kind() == std::io::ErrorKind::PermissionDenied && lock_path.exists()) =>
+            {
                 // Break stale lock if older than 60s.
+                // Windows can surface PermissionDenied instead of AlreadyExists
+                // while another thread is creating or removing the lock dir.
                 if let Ok(meta) = std::fs::metadata(&lock_path)
                     && let Ok(modified) = meta.modified()
                     && let Ok(age) = std::time::SystemTime::now().duration_since(modified)

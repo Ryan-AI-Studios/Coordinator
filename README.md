@@ -167,13 +167,13 @@ plan → plan-review (agy + opencode join) → fold → implement
 
 | Driver | CLI / env | Behavior |
 |--------|-----------|----------|
-| `adapter` | default | Inject Grok prompt once per phase for plan/fold/implement/advance. **`cross-model-review` and `ci-wait` never inject** (one-shot review CLIs / token-idle `gh`). Missing `grok` **fails** Grok-bound phases. |
+| `adapter` | default | Inject Grok prompt once per phase for plan/fold/implement/advance. **plan-review** starts `agy --print` once for the agy slot (no operator `agy.json`). The opencode slot stays file-wait until **0018**. **`cross-model-review` and `ci-wait` never inject** (one-shot review CLIs / token-idle `gh`). Missing `grok` **fails** Grok-bound phases. |
 | `file_wait` | `--driver file_wait` | No inject; poll `current.json` / `outcomes/roles/*.json`. |
 | `stub` | `--driver stub` or `COORDINATOR_WORKFLOW_DRIVER=stub` | Synthesize success each tick so CI can walk the full graph. |
 
 Status JSON includes additive `workflow` `{ id, driver, pending_roles }`, additive `ci` (`pr`, `pr_url`, `head_sha`, `last_summary`, `interval_ms`, `auto_merge`, `merge`) — `null` when phase is not `ci-wait` and no watch state is persisted — and additive `review` (`attempted`, `active`, `verdict`, `report`) — `null` when phase is not `cross-model-review` and no review state is persisted. Existing additive fields include `failure_class`, `next_track`, `phase_started_at`, `run_epoch`, `failure_artifact`.
 
-**Plan-review:** two role files + review markdown; Coordinator assembles `{workspace}/AI-review.md`. One reviewer may degrade; **both** missing/fail → Stopped. Line endings normalized to `\n`.
+**Plan-review:** adapter starts `agy --print` once (cwd = workspace root; `--print-timeout` = remaining budget; `--dangerously-skip-permissions`; `--output-format json`). The review file is source of truth (`agy-review.md` on the track, copied into `{state_dir}/reviews/`). OpenCode stays file-wait / stub / timeout-degrade until **0018** — the operator may still drop `opencode.json`. Join still assembles `{workspace}/AI-review.md`. One reviewer may degrade; **both** missing/fail → Stopped. Line endings normalized to `\n`. Override the binary with `COORDINATOR_AGY_BIN` (else Role Binding `command`, else PATH).
 
 **`next_track`:** Planner writes `metadata.next_track`. On `advance` success: valid track dir → auto-start at `plan`; null/empty → Idle (`workflow: backlog clear`); unknown id → Idle (does not fail the completed track). Pause holds auto-start until resume.
 

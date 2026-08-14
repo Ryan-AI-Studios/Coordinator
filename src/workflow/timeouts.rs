@@ -79,10 +79,14 @@ mod tests {
 
     #[test]
     fn stub_env_does_not_apply_to_plan() {
+        use crate::config::ENV_COORDINATOR_HOME;
+
         let _guard = test_env_lock();
+        let home = tempfile::tempdir().unwrap();
         unsafe {
             std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
             std::env::set_var(crate::config::ENV_STUB_PHASE_TIMEOUT_SECS, "11");
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
         }
         assert_eq!(timeout_for_phase("stub:active"), Duration::from_secs(11));
         assert_eq!(
@@ -91,6 +95,7 @@ mod tests {
         );
         unsafe {
             std::env::remove_var(crate::config::ENV_STUB_PHASE_TIMEOUT_SECS);
+            std::env::remove_var(ENV_COORDINATOR_HOME);
         }
     }
 }

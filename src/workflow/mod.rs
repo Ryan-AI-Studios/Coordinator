@@ -3,6 +3,7 @@
 pub mod bundle;
 pub mod drive;
 pub mod graph;
+pub mod plan_review;
 pub mod prompts;
 pub mod timeouts;
 pub mod watchdog;
@@ -149,6 +150,7 @@ pub fn reset_phase_clock(state: &mut RunState) {
     state.stalled_at = None;
     state.stall_recycles = 0;
     state.aborted_session_id = None;
+    state.plan_review_spawned.clear();
     if state.status == RunStatus::Paused {
         state.pause_started_at = Some(now);
     } else {
