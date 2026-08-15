@@ -127,12 +127,25 @@ impl std::fmt::Debug for AcpTransport {
 
 impl GrokSession {
     /// Spawn `grok agent stdio`, initialize, authenticate, `session/new`.
+    ///
+    /// CLI / HTTP start path: implementor-first binary, no `-m`.
     pub async fn start(cwd: PathBuf, timeout: Duration) -> Result<Self> {
         let bin = resolve_grok_binary()?;
+        Self::start_with_bin(cwd, timeout, bin, None).await
+    }
+
+    /// Spawn with an already-resolved phase binary and optional `-m` model.
+    pub async fn start_with_bin(
+        cwd: PathBuf,
+        timeout: Duration,
+        bin: PathBuf,
+        model: Option<&str>,
+    ) -> Result<Self> {
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.arg("agent")
-            .arg("stdio")
-            .stdin(Stdio::piped())
+        for arg in grok_agent_argv(model) {
+            cmd.arg(arg);
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false)
@@ -640,6 +653,20 @@ pub fn map_failure_class(err: &str) -> FailureClass {
     FailureClass::HarnessCrash
 }
 
+/// `grok agent [-m {model}] stdio`. Omit `-m` when model is none/empty.
+pub fn grok_agent_argv(model: Option<&str>) -> Vec<String> {
+    let mut args = vec!["agent".into()];
+    if let Some(m) = model {
+        let t = m.trim();
+        if !t.is_empty() {
+            args.push("-m".into());
+            args.push(t.to_string());
+        }
+    }
+    args.push("stdio".into());
+    args
+}
+
 /// Resolve `COORDINATOR_GROK_BIN` or the role-binding `grok` command on PATH.
 pub fn resolve_grok_binary() -> Result<PathBuf> {
     if let Ok(over) = std::env::var(ENV_GROK_BIN)
@@ -707,6 +734,52 @@ pub fn resolve_command(command: &str) -> Result<PathBuf> {
     Err(CoordinatorError::Message(format!(
         "command not found on PATH: {command}"
     )))
+}
+
+/// Replace Windows npm shims (`.ps1` or extensionless `#!` shebang) with a
+/// sibling `.exe` then `.cmd`. Never `Command::new` the sh script.
+pub(crate) fn reject_or_replace_ps1(path: PathBuf) -> Result<PathBuf> {
+    if !needs_shim_replace(&path) {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent()
+        && let Some(stem) = path.file_stem()
+    {
+        for alt_ext in ["exe", "cmd"] {
+            let alt = parent.join(stem).with_extension(alt_ext);
+            if alt.is_file() {
+                return Ok(alt);
+            }
+        }
+    }
+    Err(CoordinatorError::Message(format!(
+        "refusing to spawn shim: {}",
+        path.display()
+    )))
+}
+
+fn needs_shim_replace(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "ps1" {
+        return true;
+    }
+    if !ext.is_empty() {
+        return false;
+    }
+    is_shebang(path)
+}
+
+fn is_shebang(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 2];
+    matches!(f.read_exact(&mut buf), Ok(()) if &buf == b"#!")
 }
 
 pub fn rpc_result(id: u64, result: Value) -> String {
@@ -788,6 +861,21 @@ mod tests {
         Duration::from_secs(2)
     }
 
+    #[test]
+    fn grok_agent_argv_includes_model_between_agent_and_stdio() {
+        let args = grok_agent_argv(Some("grok-build"));
+        assert_eq!(args, ["agent", "-m", "grok-build", "stdio"]);
+        assert!(!args.iter().any(|a| a == "--always-approve"));
+        assert!(!args.iter().any(|a| a == "--yolo"));
+    }
+
+    #[test]
+    fn grok_agent_argv_omits_empty_model() {
+        assert_eq!(grok_agent_argv(None), ["agent", "stdio"]);
+        assert_eq!(grok_agent_argv(Some("")), ["agent", "stdio"]);
+        assert_eq!(grok_agent_argv(Some("   ")), ["agent", "stdio"]);
+    }
+
     #[tokio::test]
     async fn mock_start_and_prompt_happy_path() {
         let dir = tempdir().unwrap();
@@ -830,6 +918,8 @@ mod tests {
         assert_eq!(new["method"], "session/new");
         assert!(new["params"]["mcpServers"].as_array().unwrap().is_empty());
         assert!(new["params"]["cwd"].as_str().is_some());
+        assert!(new["params"].get("model").is_none());
+        assert!(new["params"].get("_meta").is_none());
 
         let prompt: Value = serde_json::from_str(&written[3]).unwrap();
         assert_eq!(prompt["method"], "session/prompt");

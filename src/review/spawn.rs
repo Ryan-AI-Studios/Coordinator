@@ -8,6 +8,7 @@ use crate::config::{
     ENV_COORDINATOR_CLAUDE_BIN, ENV_COORDINATOR_CODEX_BIN, ENV_COORDINATOR_OPENCODE_BIN,
 };
 use crate::error::{CoordinatorError, Result};
+use crate::harness::grok::reject_or_replace_ps1;
 use crate::harness::resolve_command;
 
 use super::backend::{ReviewBackend, ReviewRequest, ReviewResult};
@@ -141,52 +142,6 @@ pub(crate) fn resolve_review_bin(harness: &str, command: &str) -> Result<PathBuf
     }
     let resolved = resolve_command(&raw)?;
     reject_or_replace_ps1(resolved)
-}
-
-/// Replace Windows npm shims (`.ps1` or extensionless `#!` shebang) with a
-/// sibling `.exe` then `.cmd`. Never `Command::new` the sh script.
-pub(crate) fn reject_or_replace_ps1(path: PathBuf) -> Result<PathBuf> {
-    if !needs_shim_replace(&path) {
-        return Ok(path);
-    }
-    if let Some(parent) = path.parent()
-        && let Some(stem) = path.file_stem()
-    {
-        for alt_ext in ["exe", "cmd"] {
-            let alt = parent.join(stem).with_extension(alt_ext);
-            if alt.is_file() {
-                return Ok(alt);
-            }
-        }
-    }
-    Err(CoordinatorError::Message(format!(
-        "refusing to spawn shim: {}",
-        path.display()
-    )))
-}
-
-fn needs_shim_replace(path: &Path) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ext == "ps1" {
-        return true;
-    }
-    if !ext.is_empty() {
-        return false;
-    }
-    is_shebang(path)
-}
-
-fn is_shebang(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut buf = [0u8; 2];
-    matches!(f.read_exact(&mut buf), Ok(()) if &buf == b"#!")
 }
 
 pub(crate) struct ProcOut {

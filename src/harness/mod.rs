@@ -7,14 +7,17 @@ pub mod pool;
 pub mod roles;
 
 pub use grok::{
-    CancelHandle, ENV_GROK_BIN, ENV_GROK_LIVE, GrokSession, PromptResult, map_failure_class,
-    resolve_command, resolve_grok_binary,
+    CancelHandle, ENV_GROK_BIN, ENV_GROK_LIVE, GrokSession, PromptResult, grok_agent_argv,
+    map_failure_class, resolve_command, resolve_grok_binary,
 };
 pub use pool::{
     GrokHarnessStatus, HarnessPromptView, HarnessStatusBundle, SessionPool, global_pool,
     persist_path, status_bundle_sync,
 };
-pub use roles::{load_role_bindings, resolve_grok_command};
+pub use roles::{
+    load_role_bindings, resolve_grok_command, resolve_phase_binary, resolve_phase_binding,
+    resolve_phase_role_key,
+};
 
 use std::path::PathBuf;
 
@@ -31,6 +34,16 @@ pub fn grok_cwd(record: &ProjectRecord) -> PathBuf {
 /// Start (or reuse) a Grok session for the project.
 pub async fn start(project: Option<&str>, in_process: bool) -> Result<GrokHarnessStatus> {
     pool::start(project, in_process).await
+}
+
+/// Start a new session with a phase-resolved binary and optional model.
+pub async fn start_with_bin(
+    project: Option<&str>,
+    in_process: bool,
+    bin: PathBuf,
+    model: Option<String>,
+) -> Result<GrokHarnessStatus> {
+    pool::start_with_bin(project, in_process, bin, model).await
 }
 
 pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPromptView> {

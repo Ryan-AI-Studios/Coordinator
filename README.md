@@ -167,7 +167,7 @@ plan → plan-review (agy + opencode join) → fold → implement
 
 | Driver | CLI / env | Behavior |
 |--------|-----------|----------|
-| `adapter` | default | Inject Grok prompt once per phase for plan/fold/implement/advance. **plan-review** starts `agy --print` and `opencode run` once each (no operator role JSON). **`cross-model-review` and `ci-wait` never inject** (one-shot review CLIs / token-idle `gh`). Missing `grok` **fails** Grok-bound phases. |
+| `adapter` | default | Inject the phase Role Binding once per phase for plan/fold/implement/advance (default Grok ACP). **plan-review** starts `agy --print` and `opencode run` once each (no operator role JSON). **`cross-model-review` and `ci-wait` never inject** (one-shot review CLIs / token-idle `gh`). Missing / non-Grok long-lived binding **fails** those phases with `permission`. |
 | `file_wait` | `--driver file_wait` | No inject; poll `current.json` / `outcomes/roles/*.json`. |
 | `stub` | `--driver stub` or `COORDINATOR_WORKFLOW_DRIVER=stub` | Synthesize success each tick so CI can walk the full graph. |
 
@@ -294,7 +294,7 @@ Long-lived **Grok Build** sessions use `grok agent stdio` (JSON-RPC 2.0, line-de
 
 | Item | Behavior |
 |------|----------|
-| Spawn | `grok agent stdio` — `initialize` → `authenticate` (`methodId`, `_meta.headless`) → `session/new` `{ cwd, mcpServers: [] }` |
+| Spawn | `grok agent [-m {model}] stdio` (`-m` only when the phase Role Binding has a non-empty `model`) — `initialize` → `authenticate` (`methodId`, `_meta.headless`) → `session/new` `{ cwd, mcpServers: [] }` |
 | Cwd | Layout-resolved `execution_repo` if set, else `workspace_root` |
 | Prompt | `session/prompt` with `sessionId` + content-block array; `session/update` chunks collected |
 | Compact | Inject `/compact` via `session/prompt` (not a separate RPC). If unsupported: `supports_compact=false` and skip (ADR-0021), do not fail the run |
@@ -313,7 +313,7 @@ $env:COORDINATOR_GROK_LIVE = "1"
 cargo test grok_live -- --ignored --nocapture
 ```
 
-`COORDINATOR_GROK_BIN` overrides the `grok` executable (absolute path). Default resolution walks `PATH` + Windows `PATHEXT` using the `implementor`/`planner` role binding `command` (no `which` crate).
+`COORDINATOR_GROK_BIN` overrides the `grok` executable (absolute path) for the **grok** harness. Adapter ticks for plan/fold/implement/advance resolve the **phase** Role Binding (`plan` → `planner`, `implement` → `implementor`, `fold`/`advance` inherit `planner` unless optional `fold`/`next` keys are present with a non-empty `command`). CLI / HTTP `harness grok start` still uses implementor-then-planner (no phase context). Default resolution walks `PATH` + Windows `PATHEXT` (no `which` crate). A non-empty binding `model` is passed as `grok agent -m {model} stdio` on **new** session start only; a reused live session keeps its model. Non-Grok `harness` values have no long-lived adapter yet and fail `permission`.
 
 Default `role_bindings` in `config.json`:
 
@@ -326,7 +326,7 @@ Default `role_bindings` in `config.json`:
 }
 ```
 
-Saved configs that only have `planner` + `implementor` gain the reviewer keys on load.
+Optional keys `fold` and `next` are recognized when the operator writes them; they are **not** inserted into old configs. Saved configs that only have `planner` + `implementor` gain the reviewer keys on load.
 
 ```powershell
 # Smoke (temp home + fake project)
@@ -425,7 +425,7 @@ HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1
 | `failure_class` | Required when `failure`; must be null on `success`. Values: `permission`, `model_exhaustion`, `difficulty`, `harness_crash`, `timeout`, `ci_failed` |
 | `source` | `file` \| `http` \| `cli` \| `timeout` \| `test` \| `adapter` |
 | `metadata.next_track` | Optional; copied to status on success |
-| `metadata.role` | `planner` / `implementor` / `plan_reviewer_agy` / `plan_reviewer_opencode`; unknown ignored |
+| `metadata.role` | `planner` / `implementor` / `plan_reviewer_agy` / `plan_reviewer_opencode`; unknown ignored. Optional Role Binding keys `fold` / `next` rebind those phases — they are not plan-review consume slugs. |
 | `metadata.pr_number` / `pr_url` | Optional implement hint; copied onto `RunState.ci` when present |
 | `run_epoch` | Optional; when present must match run-state epoch |
 

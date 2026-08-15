@@ -10,8 +10,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{CoordinatorError, Result};
-use crate::harness::grok::{GrokSession, PromptResult, map_failure_class};
+use crate::harness::grok::{ENV_GROK_BIN, GrokSession, PromptResult, map_failure_class};
 use crate::harness::{grok_cwd, resolve_grok_binary};
+
+/// Child-only model pin for the detached holder (never `set_var` on the parent).
+pub(crate) const ENV_GROK_MODEL: &str = "COORDINATOR_GROK_MODEL";
 use crate::outcome::{FailureClass, OutcomeSource, PhaseOutcome, write_and_apply};
 use crate::persist::atomic_write_json;
 use crate::registry::ProjectRecord;
@@ -377,9 +380,19 @@ fn harness_is_aborted(state: &crate::state::RunState, harness: &GrokHarnessStatu
     }
 }
 
-async fn spawn_in_process(record: &ProjectRecord) -> Result<GrokHarnessStatus> {
+async fn spawn_in_process(
+    record: &ProjectRecord,
+    bin: Option<PathBuf>,
+    model: Option<String>,
+) -> Result<GrokHarnessStatus> {
     let cwd = grok_cwd(record);
-    let mut session = GrokSession::start(cwd, prompt_timeout_for(record)).await?;
+    let mut session = match bin {
+        Some(b) => {
+            GrokSession::start_with_bin(cwd, prompt_timeout_for(record), b, model.as_deref())
+                .await?
+        }
+        None => GrokSession::start(cwd, prompt_timeout_for(record)).await?,
+    };
     session.set_progress_record(record.clone());
     crate::harness::abort::register_cancel_handle(record.id.clone(), session.cancel_handle());
     write_session_persist(record, &session, None, false);
@@ -398,6 +411,25 @@ async fn spawn_in_process(record: &ProjectRecord) -> Result<GrokHarnessStatus> {
 }
 
 pub async fn start(project: Option<&str>, in_process: bool) -> Result<GrokHarnessStatus> {
+    start_inner(project, in_process, None, None).await
+}
+
+/// Adapter ticks pass the already-resolved phase bin / model. CLI start does not.
+pub async fn start_with_bin(
+    project: Option<&str>,
+    in_process: bool,
+    bin: PathBuf,
+    model: Option<String>,
+) -> Result<GrokHarnessStatus> {
+    start_inner(project, in_process, Some(bin), model).await
+}
+
+async fn start_inner(
+    project: Option<&str>,
+    in_process: bool,
+    bin: Option<PathBuf>,
+    model: Option<String>,
+) -> Result<GrokHarnessStatus> {
     let rec = resolve_record(project)?;
     let refuse = crate::harness::abort::should_refuse_reuse(&rec);
     {
@@ -424,9 +456,9 @@ pub async fn start(project: Option<&str>, in_process: bool) -> Result<GrokHarnes
     }
 
     if in_process {
-        spawn_in_process(&rec).await
+        spawn_in_process(&rec, bin, model).await
     } else {
-        start_holder(&rec, project).await
+        start_holder(&rec, project, bin, model).await
     }
 }
 
@@ -485,13 +517,26 @@ fn interpret_persist_after_spawn(h: &PersistedGrokHandle) -> PersistWait {
     PersistWait::Pending
 }
 
-async fn start_holder(record: &ProjectRecord, project: Option<&str>) -> Result<GrokHarnessStatus> {
-    // Fail fast if grok cannot be resolved (holder would exit immediately).
-    let _ = resolve_grok_binary()?;
+async fn start_holder(
+    record: &ProjectRecord,
+    project: Option<&str>,
+    bin: Option<PathBuf>,
+    model: Option<String>,
+) -> Result<GrokHarnessStatus> {
+    // CLI / HTTP start: implementor-first resolve. Adapter ticks pass the
+    // already-resolved phase bin — do not call resolve_grok_binary() there
+    // (that would fail plan when implementor is broken).
+    if bin.is_none() {
+        let _ = resolve_grok_binary()?;
+    }
     // A previous failed start writes `error` into harness-grok.json. Clear it
     // before spawn so we never return that stale error on retry.
     clear_stale_holder_persist(record)?;
-    spawn_holder_process(project.unwrap_or(record.path.to_str().unwrap_or(&record.id)))?;
+    spawn_holder_process(
+        project.unwrap_or(record.path.to_str().unwrap_or(&record.id)),
+        bin.as_deref(),
+        model.as_deref(),
+    )?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(45);
     loop {
@@ -517,7 +562,38 @@ async fn start_holder(record: &ProjectRecord, project: Option<&str>) -> Result<G
     }
 }
 
-fn spawn_holder_process(project_spec: &str) -> Result<()> {
+/// Env pairs set only on the holder child Command — never `std::env::set_var`.
+pub(crate) fn holder_child_env(
+    bin: &std::path::Path,
+    model: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = vec![(ENV_GROK_BIN.to_string(), bin.to_string_lossy().into_owned())];
+    if let Some(m) = model {
+        let t = m.trim();
+        if !t.is_empty() {
+            env.push((ENV_GROK_MODEL.to_string(), t.to_string()));
+        }
+    }
+    env
+}
+
+fn apply_holder_child_env(
+    cmd: &mut std::process::Command,
+    bin: Option<&std::path::Path>,
+    model: Option<&str>,
+) {
+    if let Some(bin) = bin {
+        for (k, v) in holder_child_env(bin, model) {
+            cmd.env(k, v);
+        }
+    }
+}
+
+fn spawn_holder_process(
+    project_spec: &str,
+    bin: Option<&std::path::Path>,
+    model: Option<&str>,
+) -> Result<()> {
     let exe = std::env::current_exe().map_err(|e| {
         CoordinatorError::Message(format!("cannot resolve coordinator executable: {e}"))
     })?;
@@ -533,6 +609,7 @@ fn spawn_holder_process(project_spec: &str) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    apply_holder_child_env(&mut cmd, bin, model);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -550,7 +627,15 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
         Err(e) => return Err(e),
     };
     let cwd = grok_cwd(&rec);
-    let session = match GrokSession::start(cwd, prompt_timeout_for(&rec)).await {
+    let model = std::env::var(ENV_GROK_MODEL)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let started = async {
+        let bin = resolve_grok_binary()?;
+        GrokSession::start_with_bin(cwd, prompt_timeout_for(&rec), bin, model.as_deref()).await
+    }
+    .await;
+    let session = match started {
         Ok(s) => s,
         Err(e) => {
             let handle = PersistedGrokHandle {
@@ -1165,6 +1250,31 @@ mod tests {
     use crate::state::{STUB_PHASE_ACTIVE, STUB_PHASE_COMPLETED, STUB_PHASE_STOPPED};
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn holder_child_env_sets_bin_not_process_var() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::remove_var(ENV_GROK_BIN);
+            std::env::remove_var(ENV_GROK_MODEL);
+        }
+        let env = holder_child_env(
+            std::path::Path::new(r"C:\phase\grok.exe"),
+            Some("grok-build"),
+        );
+        assert_eq!(env[0].0, ENV_GROK_BIN);
+        assert_eq!(env[0].1, r"C:\phase\grok.exe");
+        assert_eq!(env[1].0, ENV_GROK_MODEL);
+        assert_eq!(env[1].1, "grok-build");
+        assert!(
+            std::env::var(ENV_GROK_BIN).is_err(),
+            "must not set_var COORDINATOR_GROK_BIN on the parent"
+        );
+        assert!(
+            std::env::var(ENV_GROK_MODEL).is_err(),
+            "must not set_var COORDINATOR_GROK_MODEL on the parent"
+        );
+    }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
