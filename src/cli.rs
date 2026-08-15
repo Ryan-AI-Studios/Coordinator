@@ -44,7 +44,7 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Start (or re-start) the canonical workflow at `plan`
+    /// Start the canonical workflow at `plan` and tick until Idle/Stopped
     Run {
         #[arg(long)]
         project: Option<String>,
@@ -53,6 +53,12 @@ pub enum Commands {
         /// adapter | file_wait | stub (default adapter, or COORDINATOR_WORKFLOW_DRIVER)
         #[arg(long)]
         driver: Option<String>,
+        /// Write-only start. Use when `serve` already ticks.
+        #[arg(long)]
+        detach: bool,
+        /// CLI poll budget (same contract as `wait`). `N>0`; omit to tick until terminal.
+        #[arg(long, conflicts_with = "detach")]
+        timeout_secs: Option<u64>,
     },
     /// Pause a running workflow
     Pause {
@@ -385,8 +391,23 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             project,
             track,
             driver,
+            detach,
+            timeout_secs,
         } => {
-            let view = api::cmd_run(project.as_deref(), track, driver.as_deref())?;
+            let view = api::cmd_run_cli(
+                project.as_deref(),
+                track,
+                driver.as_deref(),
+                api::RunCliOpts {
+                    detach,
+                    timeout_secs,
+                    detect_serve_port: if detach {
+                        None
+                    } else {
+                        Some(DEFAULT_SERVE_PORT)
+                    },
+                },
+            )?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Pause { project } => {
@@ -533,7 +554,7 @@ fn read_prompt_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn run_has_driver_flag() {
@@ -543,6 +564,25 @@ mod tests {
             run.get_arguments().any(|a| a.get_id() == "driver"),
             "run --driver"
         );
+        assert!(
+            run.get_arguments().any(|a| a.get_id() == "detach"),
+            "run --detach"
+        );
+        assert!(
+            run.get_arguments().any(|a| a.get_id() == "timeout_secs"),
+            "run --timeout-secs"
+        );
+        let about = run.get_about().map(|s| s.to_string()).unwrap_or_default();
+        assert!(
+            about.contains("Idle/Stopped"),
+            "run about should say it ticks until Idle/Stopped: {about}"
+        );
+    }
+
+    #[test]
+    fn run_detach_conflicts_with_timeout_secs() {
+        let err = Cli::try_parse_from(["coordinator", "run", "--detach", "--timeout-secs", "1"]);
+        assert!(err.is_err(), "detach + timeout-secs must conflict");
     }
 
     #[test]

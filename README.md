@@ -102,8 +102,8 @@ cargo run -- project scan --root C:\dev\Orca
 # expect already_registered
 
 # Probe only — never --track 0001–0005
+# Bare `run` ticks until Idle/Stopped (no separate `wait`).
 cargo run -- run --project C:\dev\Orca --track 0099 --driver stub
-cargo run -- wait --project C:\dev\Orca --timeout-secs 60
 cargo run -- status --project C:\dev\Orca
 # expect Idle / backlog clear; last_event must not contain "skip: deferred"
 ```
@@ -135,8 +135,8 @@ cargo run -- project scan --root C:\dev\coordinated
 # expect already_registered=true; detected_profile may be nested (expected)
 
 # Probe only — never --track 0001–0187 or 0101
+# Bare `run` ticks until Idle/Stopped (no separate `wait`).
 cargo run -- run --project C:\dev\coordinated --track 0899 --driver stub
-cargo run -- wait --project C:\dev\coordinated --timeout-secs 60
 cargo run -- status --project C:\dev\coordinated
 # expect Idle / backlog clear; last_event must not contain "skip: deferred"; next_track null
 ```
@@ -149,9 +149,9 @@ When more than one project is registered, omit `--project` and the CLI errors (i
 
 **Completion contract (hybrid):** the **Phase Outcome File** is the portable done-signal (schema `version: 1`). Hooks, adapters, CLI, and HTTP may write it; **ConPTY / chat pattern-match is not the contract**. Writers must use **temp + replace** (or `coordinator outcome write` / `POST /v1/outcome`) so pollers never read torn JSON.
 
-**Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Override per key via machine `config.json` `phase_timeouts_secs`. Uniform test override: `COORDINATOR_PHASE_TIMEOUT_SECS`. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail) and writes `FAILURE.md`. This is **not** `wait --timeout-secs` (that is a CLI poll budget: exit **2**, run stays as it was, Grok stays up). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
+**Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Override per key via machine `config.json` `phase_timeouts_secs`. Uniform test override: `COORDINATOR_PHASE_TIMEOUT_SECS`. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail) and writes `FAILURE.md`. This is **not** the CLI poll budget (`wait --timeout-secs` or optional `run --timeout-secs`: exit **2**, run stays as it was, Grok stays up). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
 
-**Four clocks (do not collapse):** (1) `wait --timeout-secs` — CLI poll budget, exit **2**, run unchanged, **no abort**; (2) phase wall clock — `failure_class=timeout` + Stopped + `FAILURE.md` **and** abort/recycle the in-flight Prompt; (3) ACP `session/prompt` timeout — Prompt error mapped onto the phase **and** recycle so the next `start` is a new `session/new`; (4) **progress stall** (default **600s**) — adapter `session/update` / inject heartbeat went silent. First stall this phase: cancel then recycle (`last_event` = `recycle: stall — new session`), stay **Running**, no `FAILURE.md`. Second stall: surface only (`watchdog: stall`) until the phase wall clock. Override via `COORDINATOR_PROGRESS_STALL_SECS` or machine `progress_stall_secs` (`0` disables). Cancel wait: `COORDINATOR_CANCEL_WAIT_SECS` (default **10**; `0` recycles immediately). Operator `stop` still leaves sessions for attach.
+**Four clocks (do not collapse):** (1) CLI poll budget — `wait --timeout-secs` (default **3600**) or optional `run --timeout-secs N` (`N>0`). Bare `run` has **no** poll budget and ticks until Idle/Stopped. Budget expiry is exit **2**, run unchanged, **no abort**. (2) phase wall clock — `failure_class=timeout` + Stopped + `FAILURE.md` **and** abort/recycle the in-flight Prompt; (3) ACP `session/prompt` timeout — Prompt error mapped onto the phase **and** recycle so the next `start` is a new `session/new`; (4) **progress stall** (default **600s**) — adapter `session/update` / inject heartbeat went silent. First stall this phase: cancel then recycle (`last_event` = `recycle: stall — new session`), stay **Running**, no `FAILURE.md`. Second stall: surface only (`watchdog: stall`) until the phase wall clock. Override via `COORDINATOR_PROGRESS_STALL_SECS` or machine `progress_stall_secs` (`0` disables). Cancel wait: `COORDINATOR_CANCEL_WAIT_SECS` (default **10**; `0` recycles immediately). Operator `stop` still leaves sessions for attach. Ctrl-C during a ticking `run`/`wait` also leaves the run **Running** (no abort, no artifact).
 
 **`run` without `--track`:** retains the prior `track_id` (intentional). Fresh `run` **clears** `next_track` (stale Planner handoff).
 
@@ -301,7 +301,7 @@ Long-lived **Grok Build** sessions use `grok agent stdio` (JSON-RPC 2.0, line-de
 | Auth | Operator `grok login` (`cached_token`) or `XAI_API_KEY` (`xai.api_key`). Coordinator does **not** own OAuth |
 | Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` is teardown: in-process pool, then a quick holder `Shutdown` RPC, then `taskkill /F /PID` on persist `pid` then `holder_pid`. Persist is always written `alive: false`; returned status matches the file. `taskkill` “not found” is success. Missing `taskkill` is not a shutdown error. |
 | Pause | New injects are refused while Paused; the child stays up |
-| Pool | One Grok ACP session per `project_id`. CLI `start` and adapter ticks from `wait` / `serve` detach a localhost holder so a later `prompt` does not pin the poll loop. In-process spawn is for tests / HTTP start / `insert_test_session`. |
+| Pool | One Grok ACP session per `project_id`. CLI `start` and adapter ticks from `run` / `wait` / `serve` detach a localhost holder so a later `prompt` does not pin the poll loop. In-process spawn is for tests / HTTP start / `insert_test_session`. |
 | Persist | `{state_dir}/harness-grok.json` (session id / pid / holder pid / control addr / alive) — not a transcript |
 
 Optional project hooks (`Stop`, `SessionEnd`, `PreCompact`, `PostCompact`) may also write `outcomes/current.json` (`source: file`). Project hooks need a one-time `grok` `/hooks-trust`. The adapter-written outcome is the automation path.
@@ -338,14 +338,15 @@ New-Item -ItemType Directory -Force -Path $proj | Out-Null
 cargo run -- project add $proj
 cargo run -- project list
 cargo run -- run --project $proj --track 0005 --driver stub
+# expect Idle (backlog clear) — stub walks the full graph; no separate `wait`
 cargo run -- status --project $proj
-# expect Running / plan / workflow.driver=stub
-cargo run -- wait --project $proj --timeout-secs 30
-cargo run -- status --project $proj
-# expect Idle (backlog clear) — stub walks the full graph
+
+# file-wait / serve-owned / already-running: `wait` still attaches
+# cargo run -- run --project $proj --track 0005 --driver stub --detach
+# cargo run -- wait --project $proj --timeout-secs 30
 
 # file-wait single phase
-cargo run -- run --project $proj --track 0005 --driver file_wait
+cargo run -- run --project $proj --track 0005 --driver file_wait --detach
 cargo run -- outcome write --project $proj --phase plan --status success
 cargo run -- status --project $proj
 # expect Running / plan-review
@@ -376,7 +377,7 @@ coordinator project set [--project …]
     [--auto-merge true|false]
 coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]
 coordinator status [--project <path|id>]
-coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait|stub]
+coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait|stub] [--detach] [--timeout-secs N]
 coordinator pause [--project <path|id>]
 coordinator resume [--project <path|id>]
 coordinator stop [--project <path|id>]
@@ -431,7 +432,7 @@ HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1
 
 **Apply (single path):** leftover `stub:*` success → Idle / `stub:completed` (Paused stays Paused). Canonical success → **successor phase, stay Running** (Paused stays Paused). Canonical failure → Stopped and **keeps the failed phase id**. Operator `stop` still sets `stub:stopped`. Idle/Stopped and phase mismatch reject for CLI/HTTP. After apply: history best-effort → `current.applied.json` → remove `current.json` → hash on run-state.
 
-### `wait` exit codes
+### `run` / `wait` exit codes
 
 | Code | Meaning |
 |------|---------|
@@ -439,7 +440,7 @@ HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1
 | **2** | Wait budget (`--timeout-secs`) expired **without** an applied outcome. The run is unchanged; Grok is not killed; no `FAILURE.md`. |
 | **1** (or other) | Invalid args, unknown project, or other control-plane error |
 
-`wait --timeout-secs` is a **CLI poll budget**. It is not the phase wall clock (`failure_class=timeout` + Stopped + artifact + abort), not the ACP `session/prompt` timeout (recycle), and not the progress stall (first fire: recycle + stay Running; second: `watchdog: stall` until the wall clock). Adapter inject from `wait` / `serve` starts the detached holder without blocking the poll loop, so the wait budget can expire while a prompt is still in flight **without aborting it**.
+`wait --timeout-secs` (and optional `run --timeout-secs`) is a **CLI poll budget**. Bare `run` ticks with **no** poll deadline until Idle/Stopped. If `GET http://127.0.0.1:7420/health` returns `{ok:true, service:"coordinator"}`, default `run` skips the wait loop (stderr: serve owns the ticker). `--detach` keeps today’s write-only start when `serve` already ticks (custom-port serve also uses `--detach`). It is not the phase wall clock (`failure_class=timeout` + Stopped + artifact + abort), not the ACP `session/prompt` timeout (recycle), and not the progress stall (first fire: recycle + stay Running; second: `watchdog: stall` until the wall clock). Adapter inject from `run` / `wait` / `serve` starts the detached holder without blocking the poll loop, so the wait budget can expire while a prompt is still in flight **without aborting it**. `run --timeout-secs 0` is rejected (omit the flag for unlimited). `wait --timeout-secs 0` still expires immediately.
 
 Scripts that want “success only” must inspect `status` / `failure_class` after exit 0 (e.g. `coordinator status`).
 

@@ -23,7 +23,7 @@ pub enum CoordinatorError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// `coordinator wait` budget expired without an applied outcome (exit 2).
+    /// CLI `run` / `wait` poll budget expired without an applied outcome (exit 2).
     #[error("wait budget expired without an applied outcome")]
     WaitBudgetExpired,
 }
