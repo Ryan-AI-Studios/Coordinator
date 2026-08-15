@@ -1,7 +1,8 @@
 //! Poll loop for Phase Outcome files and stub phase timeouts (track 0005).
 //!
-//! Used by `coordinator wait` and the `serve` background task. File discovery is
-//! poll-based (no `notify` crate); transient Windows share/parse errors skip a tick.
+//! Used by CLI `run` (default tick), `coordinator wait`, and the `serve`
+//! background task. File discovery is poll-based (no `notify` crate); transient
+//! Windows share/parse errors skip a tick.
 
 use std::time::{Duration, Instant};
 
@@ -104,17 +105,21 @@ pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
     Ok(None)
 }
 
-/// Block until the run reaches Idle/Stopped or `timeout_secs` elapses.
+/// Block until the run reaches Idle/Stopped or an optional poll budget elapses.
+///
+/// `None` ticks until Idle/Stopped (no CLI poll deadline). Phase wall clocks,
+/// stall/abort, and Stop still apply. `Some(n)` is today's wait budget
+/// (`Some(0)` expires after at most one `poll_once`).
 ///
 /// Intermediate phase applies keep the loop going so `--driver stub` can walk
-/// the full graph in one `wait`.
+/// the full graph in one `wait` / CLI `run`.
 ///
 /// Exit mapping for CLI:
 /// - Ok(view) → exit 0 (terminal success **or** failure applied, including timeout)
 /// - Err(WaitBudgetExpired) → exit 2
 /// - other Err → exit 1 / mapped codes
-pub fn wait_for_outcome(record: &ProjectRecord, timeout_secs: u64) -> Result<StatusView> {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+pub fn wait_for_outcome(record: &ProjectRecord, timeout_secs: Option<u64>) -> Result<StatusView> {
+    let deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
     let interval = outcome_poll_interval();
     let mut last: Option<StatusView> = None;
 
@@ -132,16 +137,47 @@ pub fn wait_for_outcome(record: &ProjectRecord, timeout_secs: u64) -> Result<Sta
             }
             return run::status(record);
         }
-        if Instant::now() >= deadline {
-            return Err(CoordinatorError::WaitBudgetExpired);
+        match deadline {
+            Some(deadline) => {
+                if Instant::now() >= deadline {
+                    return Err(CoordinatorError::WaitBudgetExpired);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let sleep_for = interval.min(remaining);
+                if sleep_for.is_zero() {
+                    return Err(CoordinatorError::WaitBudgetExpired);
+                }
+                std::thread::sleep(sleep_for);
+            }
+            None => std::thread::sleep(interval),
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let sleep_for = interval.min(remaining);
-        if sleep_for.is_zero() {
-            return Err(CoordinatorError::WaitBudgetExpired);
-        }
-        std::thread::sleep(sleep_for);
     }
+}
+
+/// True when Coordinator `serve` answers `/health` on `127.0.0.1:{port}`.
+///
+/// Requires JSON `{ ok: true, service: "coordinator" }`. Connection refused,
+/// timeout, non-JSON, or a non-coordinator occupant is `false` (caller ticks).
+pub fn coordinator_serve_listening(port: u16) -> bool {
+    const PROBE: Duration = Duration::from_millis(200);
+    let url = format!("http://127.0.0.1:{port}/health");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(PROBE))
+        .max_redirects(0)
+        .proxy(None)
+        .build()
+        .into();
+    let Ok(mut resp) = agent.get(&url).call() else {
+        return false;
+    };
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    v.get("ok") == Some(&serde_json::Value::Bool(true))
+        && v.get("service").and_then(|s| s.as_str()) == Some("coordinator")
 }
 
 /// Async variant for the serve background loop (one project).
@@ -270,7 +306,7 @@ mod tests {
             save_current_outcome(&rec, &o).unwrap();
         });
 
-        let view = wait_for_outcome(&r, 5).unwrap();
+        let view = wait_for_outcome(&r, Some(5)).unwrap();
         handle.join().unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         unsafe {
@@ -289,7 +325,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         crate::run::run_stub(&r, None).unwrap();
-        let view = wait_for_outcome(&r, 5).unwrap();
+        let view = wait_for_outcome(&r, Some(5)).unwrap();
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::Timeout));
         unsafe {
@@ -320,7 +356,7 @@ mod tests {
 
         // Resume: remaining budget continues from freeze (elapsed before pause was ~0).
         run::resume(&r).unwrap();
-        let view = wait_for_outcome(&r, 5).unwrap();
+        let view = wait_for_outcome(&r, Some(5)).unwrap();
         assert_eq!(view.failure_class, Some(FailureClass::Timeout));
         unsafe {
             std::env::remove_var(ENV_STUB_PHASE_TIMEOUT_SECS);
@@ -358,7 +394,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         crate::run::run_stub(&r, None).unwrap();
-        let err = wait_for_outcome(&r, 1).unwrap_err();
+        let err = wait_for_outcome(&r, Some(1)).unwrap_err();
         assert!(matches!(err, CoordinatorError::WaitBudgetExpired));
         unsafe {
             std::env::remove_var(ENV_STUB_PHASE_TIMEOUT_SECS);
@@ -395,7 +431,7 @@ mod tests {
         let _inject = arm_slow_adapter_inject(Duration::from_secs(30));
 
         let started = Instant::now();
-        let err = wait_for_outcome(&r, 1).unwrap_err();
+        let err = wait_for_outcome(&r, Some(1)).unwrap_err();
         let elapsed = started.elapsed();
         assert!(
             matches!(err, CoordinatorError::WaitBudgetExpired),
@@ -485,5 +521,88 @@ mod tests {
             std::env::remove_var(ENV_OUTCOME_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
         }
+    }
+
+    #[test]
+    fn wait_none_walks_stub_to_idle() {
+        use crate::run::run_with_driver;
+        use crate::workflow::{ENV_PHASE_TIMEOUT_SECS, WorkflowDriver};
+
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "10");
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
+        }
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0020".into()), WorkflowDriver::Stub).unwrap();
+        let view = wait_for_outcome(&r, None).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        unsafe {
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+    }
+
+    #[test]
+    fn wait_some_zero_expires_immediately() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "3600");
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "50");
+        }
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        crate::run::run_stub(&r, None).unwrap();
+        let started = Instant::now();
+        let err = wait_for_outcome(&r, Some(0)).unwrap_err();
+        assert!(
+            matches!(err, CoordinatorError::WaitBudgetExpired),
+            "err={err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "Some(0) must expire immediately"
+        );
+        let s = crate::run::status(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        unsafe {
+            std::env::remove_var(ENV_STUB_PHASE_TIMEOUT_SECS);
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+        }
+    }
+
+    fn spawn_health_once(body: &str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        port
+    }
+
+    #[test]
+    fn serve_listening_requires_coordinator_service() {
+        let port = spawn_health_once(r#"{"ok":true,"service":"coordinator"}"#);
+        assert!(coordinator_serve_listening(port));
+
+        let port = spawn_health_once(r#"{"ok":true}"#);
+        assert!(!coordinator_serve_listening(port));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(!coordinator_serve_listening(refused));
     }
 }

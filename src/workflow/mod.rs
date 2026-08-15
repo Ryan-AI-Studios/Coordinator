@@ -322,7 +322,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::Stub).unwrap();
-        let view = wait_for_outcome(&r, 15).unwrap();
+        let view = wait_for_outcome(&r, Some(15)).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         assert!(
             view.last_event.contains("backlog clear"),

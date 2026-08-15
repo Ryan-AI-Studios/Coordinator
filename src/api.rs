@@ -381,7 +381,42 @@ pub fn cmd_failure_show(project: Option<&str>) -> Result<Option<crate::notify::F
 pub fn cmd_wait(project: Option<&str>, timeout_secs: u64) -> Result<StatusView> {
     let reg = load_registry()?;
     let rec = reg.resolve_project(project)?.clone();
-    watch::wait_for_outcome(&rec, timeout_secs)
+    watch::wait_for_outcome(&rec, Some(timeout_secs))
+}
+
+/// CLI-only `run` options. HTTP / UI / [`cmd_run`] stay write-only.
+#[derive(Debug, Clone)]
+pub struct RunCliOpts {
+    pub detach: bool,
+    pub timeout_secs: Option<u64>,
+    pub detect_serve_port: Option<u16>,
+}
+
+/// Start a run, then tick until Idle/Stopped unless detached or serve owns the loop.
+pub fn cmd_run_cli(
+    project: Option<&str>,
+    track: Option<String>,
+    driver: Option<&str>,
+    opts: RunCliOpts,
+) -> Result<StatusView> {
+    if opts.timeout_secs == Some(0) {
+        return Err(CoordinatorError::Message(
+            "timeout-secs must be > 0; omit the flag to tick until Idle/Stopped".into(),
+        ));
+    }
+    let view = cmd_run(project, track, driver)?;
+    if opts.detach {
+        return Ok(view);
+    }
+    if let Some(port) = opts.detect_serve_port
+        && watch::coordinator_serve_listening(port)
+    {
+        eprintln!("serve owns the ticker on 127.0.0.1:{port}; not waiting");
+        return Ok(view);
+    }
+    let reg = load_registry()?;
+    let rec = reg.resolve_project(project)?.clone();
+    watch::wait_for_outcome(&rec, opts.timeout_secs)
 }
 
 /// POST /v1/harness/grok/prompt body.
@@ -460,4 +495,229 @@ pub fn save_scan_root(root: &Path) -> Result<config::MachineConfig> {
         config::save_machine_config(&cfg)?;
     }
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        ENV_COORDINATOR_HOME, ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, test_env_lock,
+    };
+    use crate::notify::artifact;
+    use crate::state::RunStatus;
+    use crate::workflow::ENV_PHASE_TIMEOUT_SECS;
+    use tempfile::tempdir;
+
+    fn add_isolated_project() -> (tempfile::TempDir, tempfile::TempDir, ProjectRecord) {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let rec = project_add(proj.path(), ProjectAddOptions::default()).unwrap();
+        (home, proj, rec)
+    }
+
+    fn clear_home() {
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    fn spawn_health_once(body: &str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        port
+    }
+
+    #[test]
+    fn cmd_run_cli_stub_ticks_to_idle() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "10");
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
+        }
+        let (_home, _proj, rec) = add_isolated_project();
+        let view = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: None,
+                detect_serve_port: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        unsafe {
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_detach_stays_running_at_plan() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let view = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            RunCliOpts {
+                detach: true,
+                timeout_secs: None,
+                detect_serve_port: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_timeout_expires_without_abort() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "50");
+            std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "3600");
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "3600");
+        }
+        let (_home, _proj, rec) = add_isolated_project();
+        let err = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("file_wait"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: Some(1),
+                detect_serve_port: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CoordinatorError::WaitBudgetExpired),
+            "err={err}"
+        );
+        let s = status(Some(&rec.id)).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        assert!(s.failure_class.is_none());
+        assert!(artifact::existing_path(&rec).is_none());
+        unsafe {
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(ENV_STUB_PHASE_TIMEOUT_SECS);
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_timeout_zero_rejected_before_write() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let err = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: Some(0),
+                detect_serve_port: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("timeout-secs must be > 0"),
+            "err={err}"
+        );
+        let s = status(Some(&rec.id)).unwrap();
+        assert_eq!(s.status, RunStatus::Idle);
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_serve_owns_skips_wait() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let port = spawn_health_once(r#"{"ok":true,"service":"coordinator"}"#);
+        let view = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("file_wait"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: Some(1),
+                detect_serve_port: Some(port),
+            },
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
+        assert!(artifact::existing_path(&rec).is_none());
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_non_coordinator_health_ticks() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "10");
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
+        }
+        let (_home, _proj, rec) = add_isolated_project();
+        let port = spawn_health_once(r#"{"ok":true}"#);
+        let view = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: None,
+                detect_serve_port: Some(port),
+            },
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        unsafe {
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_file_wait_detach_stays_running() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let view = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("file_wait"),
+            RunCliOpts {
+                detach: true,
+                timeout_secs: None,
+                detect_serve_port: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
+        clear_home();
+    }
 }
