@@ -8,12 +8,13 @@ use std::time::Duration;
 
 use crate::config::{ENV_COORDINATOR_AGY_BIN, RoleBinding};
 use crate::error::{CoordinatorError, Result};
+use crate::harness::grok::reject_or_replace_ps1;
 use crate::harness::resolve_command;
 use crate::outcome::{
     FailureClass, OutcomeMetadata, OutcomeSource, OutcomeStatus, PhaseOutcome, outcome_roles_dir,
 };
 use crate::registry::ProjectRecord;
-use crate::review::spawn::{reject_or_replace_ps1, resolve_review_bin, run_process};
+use crate::review::spawn::{resolve_review_bin, run_process};
 use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock};
 use crate::workflow::drive::write_review_markdown;
 use crate::workflow::graph::{

@@ -365,7 +365,8 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
 /// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`,
 /// `COORDINATOR_PROGRESS_STALL_SECS`, `COORDINATOR_CANCEL_WAIT_SECS`,
-/// `COORDINATOR_AGY_BIN`, or `COORDINATOR_OPENCODE_BIN` must
+/// `COORDINATOR_AGY_BIN`, `COORDINATOR_OPENCODE_BIN`, or
+/// `COORDINATOR_GROK_BIN` must
 /// hold this (survives poison so one failure does not cascade).
 #[cfg(test)]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -500,6 +501,8 @@ mod tests {
                 .is_none()
         );
         assert!(loaded.role_bindings["cross_model_tertiary"].model.is_none());
+        assert!(!loaded.role_bindings.contains_key("fold"));
+        assert!(!loaded.role_bindings.contains_key("next"));
     }
 
     #[test]
