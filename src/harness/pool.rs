@@ -300,26 +300,38 @@ async fn apply_turn(
     record: &ProjectRecord,
     turn: std::result::Result<PromptResult, CoordinatorError>,
     harness: GrokHarnessStatus,
+    injected_phase: &str,
 ) -> Result<HarnessPromptView> {
     let state = load_run_state(record)?;
+    let drifted = state.phase != injected_phase;
     match turn {
         Ok(pr) => {
             let mut applied = false;
             let mut status = None;
             let skip = state.status != RunStatus::Running
                 || crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref())
-                || harness_is_aborted(&state, &harness);
+                || harness_is_aborted(&state, &harness)
+                || drifted;
             if !skip {
                 let msg = if pr.text.is_empty() {
                     None
                 } else {
                     Some(pr.text.clone())
                 };
+                let next = if injected_phase == crate::workflow::graph::PHASE_ADVANCE {
+                    match crate::workflow::prompts::parse_next_track_line(&pr.text) {
+                        Some(Some(id)) => Some(id),
+                        Some(None) => Some(String::new()),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
                 let outcome = PhaseOutcome::success(
-                    state.phase.clone(),
+                    injected_phase,
                     OutcomeSource::Adapter,
                     msg,
-                    None,
+                    next,
                     Some(state.run_epoch),
                 );
                 status = Some(write_and_apply(record, outcome)?);
@@ -340,10 +352,12 @@ async fn apply_turn(
             let class = map_failure_class(&e.to_string());
             let mut status = None;
             let mut applied = false;
-            let skip = state.status != RunStatus::Running || harness_is_aborted(&state, &harness);
+            let skip = state.status != RunStatus::Running
+                || harness_is_aborted(&state, &harness)
+                || drifted;
             if !skip {
                 let outcome = PhaseOutcome::failure(
-                    state.phase.clone(),
+                    injected_phase,
                     class,
                     OutcomeSource::Adapter,
                     Some(e.to_string()),
@@ -808,6 +822,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     false,
                 ),
                 Ok(_gate) => {
+                    let injected_phase = load_run_state(record)?.phase;
                     set_prompt_in_flight(record, true);
                     let turn = {
                         let mut session = shared.session.lock().await;
@@ -836,7 +851,8 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             );
                         }
                     }
-                    let view = apply_turn(record, turn, snapshot_status(&shared)).await?;
+                    let view =
+                        apply_turn(record, turn, snapshot_status(&shared), &injected_phase).await?;
                     (view_to_hold(view), false)
                 }
             },
@@ -999,6 +1015,7 @@ pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPrompt
         let resp = holder_rpc(addr, &HoldRequest::Prompt { text }).await?;
         return hold_view(resp);
     }
+    let injected_phase = load_run_state(&rec)?.phase;
     set_prompt_in_flight(&rec, true);
     let turn = {
         let mut pool = global_pool().lock().await;
@@ -1027,7 +1044,7 @@ pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPrompt
         }
     }
     let harness = current_status(&rec).await;
-    apply_turn(&rec, turn, harness).await
+    apply_turn(&rec, turn, harness, &injected_phase).await
 }
 
 pub async fn compact(project: Option<&str>) -> Result<HarnessPromptView> {
@@ -2181,5 +2198,263 @@ mod tests {
             crate::state::load_run_state(&rec).unwrap().stall_recycles,
             0
         );
+    }
+
+    fn harness_stub() -> GrokHarnessStatus {
+        GrokHarnessStatus {
+            alive: true,
+            session_id: Some("sess-apply".into()),
+            cwd: None,
+            supports_compact: false,
+            pid: None,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn apply_turn_skips_ok_when_phase_drifted() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0021".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        let o = crate::outcome::PhaseOutcome::success(
+            crate::workflow::graph::PHASE_PLAN,
+            crate::outcome::OutcomeSource::Test,
+            None,
+            None,
+            None,
+        );
+        crate::outcome::write_and_apply(&rec, o).unwrap();
+        assert_eq!(
+            crate::state::load_run_state(&rec).unwrap().phase,
+            crate::workflow::graph::PHASE_PLAN_REVIEW
+        );
+
+        let turn = Ok(PromptResult {
+            text: "plan done".into(),
+            stop_reason: Some("end_turn".into()),
+        });
+        let view = apply_turn(
+            &rec,
+            turn,
+            harness_stub(),
+            crate::workflow::graph::PHASE_PLAN,
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        let st = run::status(&rec).unwrap();
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN_REVIEW);
+        assert_eq!(st.status, crate::state::RunStatus::Running);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn apply_turn_skips_err_when_phase_drifted() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0021".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        let o = crate::outcome::PhaseOutcome::success(
+            crate::workflow::graph::PHASE_PLAN,
+            crate::outcome::OutcomeSource::Test,
+            None,
+            None,
+            None,
+        );
+        crate::outcome::write_and_apply(&rec, o).unwrap();
+
+        let turn = Err(CoordinatorError::Message("inject failed".into()));
+        let view = apply_turn(
+            &rec,
+            turn,
+            harness_stub(),
+            crate::workflow::graph::PHASE_PLAN,
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        let st = run::status(&rec).unwrap();
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN_REVIEW);
+        assert_eq!(st.status, crate::state::RunStatus::Running);
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn apply_turn_advance_line_auto_starts() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        std::fs::create_dir_all(proj.path().join("conductor").join("0001-Example")).unwrap();
+        std::fs::create_dir_all(proj.path().join("conductor").join("0002-Next")).unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0001".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.phase = crate::workflow::graph::PHASE_ADVANCE.into();
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+
+        let turn = Ok(PromptResult {
+            text: "picking next\nnext_track: 0002\n".into(),
+            stop_reason: Some("end_turn".into()),
+        });
+        let view = apply_turn(
+            &rec,
+            turn,
+            harness_stub(),
+            crate::workflow::graph::PHASE_ADVANCE,
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        let st = view.status.expect("applied status");
+        assert_eq!(st.status, crate::state::RunStatus::Running);
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN);
+        assert_eq!(st.track_id.as_deref(), Some("0002"));
+        assert!(st.last_event.contains("auto-start"));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn apply_turn_explicit_null_clears_stale_next_track() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0001".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.phase = crate::workflow::graph::PHASE_ADVANCE.into();
+            s.next_track = Some("stale-leftover".into());
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+
+        let turn = Ok(PromptResult {
+            text: "backlog empty\nnext_track: null\n".into(),
+            stop_reason: Some("end_turn".into()),
+        });
+        let view = apply_turn(
+            &rec,
+            turn,
+            harness_stub(),
+            crate::workflow::graph::PHASE_ADVANCE,
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        let st = view.status.expect("applied status");
+        assert_eq!(st.status, crate::state::RunStatus::Idle);
+        assert!(st.next_track.is_none());
+        assert!(st.last_event.contains("backlog clear"));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn apply_turn_no_line_leaves_stale_next_track() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        std::fs::create_dir_all(proj.path().join("conductor").join("0002-Next")).unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0001".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.phase = crate::workflow::graph::PHASE_ADVANCE.into();
+            s.next_track = Some("0002".into());
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+
+        let turn = Ok(PromptResult {
+            text: "advance finished with no next_track line".into(),
+            stop_reason: Some("end_turn".into()),
+        });
+        let view = apply_turn(
+            &rec,
+            turn,
+            harness_stub(),
+            crate::workflow::graph::PHASE_ADVANCE,
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        let st = view.status.expect("applied status");
+        assert_eq!(st.status, crate::state::RunStatus::Running);
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN);
+        assert_eq!(st.track_id.as_deref(), Some("0002"));
+        assert!(st.last_event.contains("auto-start"));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
     }
 }

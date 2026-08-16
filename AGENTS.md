@@ -69,6 +69,8 @@ Control Plane entrypoints: `project add|list|show|set|scan` (`--auto-merge true|
 | Cross-model gate | `.agents/skills/codex-review` |
 | Plan only | `C:\dev\coordinator\.agents\skills\plan` |
 
+Adapter injects name the phase skill as `{workspace|execution}/.agents/skills/<phase>/SKILL.md` (planning skills under the workspace root are not visible from the product `grok_cwd`).
+
 ## PR discipline
 
 - Feature branch → PR → CI green → squash-merge (default for later tracks)  

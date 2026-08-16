@@ -186,14 +186,19 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
         .and_then(|id| resolve_track_dir(record, id))
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(track dir unresolved)".into());
-    let exec = paths
-        .execution_repo
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "(unset)".into());
+    let skill = paths
+        .workspace_root
+        .join(".agents")
+        .join("skills")
+        .join("review-track")
+        .join("SKILL.md");
     let file = format!("{slug}-review.md");
+    let layout = crate::workflow::prompts::layout_block(record, track_id);
     format!(
         "You are reviewing a Coordinator conductor-track plan (review-track).\n\
+         This slot loads the `review-track` skill from {}.\n\
+         \n\
+         {layout}\
          \n\
          Read spec.md and plan.md in:\n\
          {track_dir}\n\
@@ -201,17 +206,17 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
          Write your review to this exact path (overwrite):\n\
          {track_dir}/{file}\n\
          \n\
+         Knowledge is stale. Verify pins, APIs, and hooks against primary sources \
+         (crates.io, docs.rs, official harness docs) before trusting training data or \
+         the track's plan-time snapshot.\n\
+         \n\
          Requirements:\n\
          - Review the plan for completeness, risks, and missing Definition of Done.\n\
          - Do not require a Verdict/PASS header. This is not the post-implement \
          cross-model review gate.\n\
-         - Planning, conductor tracks, ADRs, and deferred.md stay outside the product git. \
-         Never commit them into the execution repo.\n\
          - You may inspect product source under the execution repo when it is available.\n\
-         \n\
-         Workspace root: {workspace}\n\
-         Execution repo: {exec}\n",
-        workspace = paths.workspace_root.display(),
+         - Do not run `coordinator outcome write`.\n",
+        skill.display(),
     )
 }
 
@@ -1380,6 +1385,36 @@ mod tests {
         assert!(oc.contains("opencode-review.md"));
         assert!(!oc.contains("## Verdict: PASS"));
         assert!(oc.contains("spec.md"));
+        assert!(oc.to_ascii_lowercase().contains("outside the product git"));
+    }
+
+    fn contains_skill(text: &str, name: &str) -> bool {
+        let n = text.replace('\\', "/");
+        n.contains(&format!(".agents/skills/{name}/SKILL.md"))
+    }
+
+    #[test]
+    fn slot_prompt_names_review_track_research_and_layout() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let mut r = rec(dir.path());
+        r.layout_profile = crate::layout::LayoutProfile::MultiSibling;
+        r.execution_repos
+            .insert("app".into(), dir.path().join("app"));
+        let text = agy_prompt(&r, Some("0001"));
+        assert!(contains_skill(&text, "review-track"), "skill path: {text}");
+        assert!(text.contains("review-track"));
+        assert!(text.contains("stale") && text.contains("primary sources"));
+        assert!(text.contains("Workspace root:"));
+        assert!(text.contains("Execution repos:"));
+        assert!(text.contains("agy-review.md"));
+        assert!(!text.contains("## Verdict: PASS"));
+        assert!(text.contains("outcome write"));
+        let oc = opencode_prompt(&r, Some("0001"));
+        assert!(contains_skill(&oc, "review-track"));
+        assert!(oc.contains("stale"));
+        assert!(oc.contains("opencode-review.md"));
+        assert!(!oc.contains("## Verdict: PASS"));
     }
 
     #[test]
