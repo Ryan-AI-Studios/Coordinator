@@ -110,7 +110,7 @@ pub enum Commands {
         #[arg(long)]
         check: bool,
     },
-    /// Open the Local Ops Console (Status Surface). Requires `--features ui`.
+    /// Open the Local Ops Console (Status Surface).
     Ui {
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
@@ -726,6 +726,15 @@ mod tests {
         assert!(
             ui.get_arguments().any(|a| a.get_id() == "port"),
             "ui --port"
+        );
+        let about = ui.get_about().map(|s| s.to_string()).unwrap_or_default();
+        let mut ui_help = ui.clone();
+        let help = ui_help.render_long_help().to_string();
+        let combined = format!("{about}\n{help}");
+        assert!(
+            !combined.contains("Requires `--features ui`")
+                && !combined.contains("Requires --features ui"),
+            "ui help must not require --features ui: about={about} help={help}"
         );
     }
 

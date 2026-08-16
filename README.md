@@ -10,6 +10,29 @@ This directory is the **product git root** (Execution Repo). Planning, ADRs, and
 https://github.com/Ryan-AI-Studios/Coordinator
 ```
 
+## Install
+
+Requires [rustup](https://rustup.rs/) and [WebView2 Evergreen](https://developer.microsoft.com/microsoft-edge/webview2/). The binary lands in `%USERPROFILE%\.cargo\bin` (must be on PATH). `--locked` honors this repo’s `Cargo.lock`. Default features include the Status Surface. Not published to crates.io — do **not** `cargo install coordinator`.
+
+From a clone:
+
+```powershell
+git clone https://github.com/Ryan-AI-Studios/Coordinator
+cd Coordinator
+cargo install --path . --locked
+coordinator --help
+coordinator serve
+coordinator ui
+```
+
+Without a clone:
+
+```powershell
+cargo install --git https://github.com/Ryan-AI-Studios/Coordinator --locked
+```
+
+CLI-only (no Dioxus / no window): `cargo install --path . --locked --no-default-features`. Installing without `--locked` still gets `ui` (it is default) but may float dependencies — prefer `--locked`.
+
 ## Build / test
 
 ```powershell
@@ -17,12 +40,12 @@ cd C:\dev\coordinator\coordinator   # or your clone root
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo test --features ui
+cargo test --no-default-features
 cargo run -- --help
-cargo run --features ui -- ui
+cargo run -- ui
 ```
 
-Same gate as CI and ledgerful verify: `fmt --check`, `clippy -D warnings`, and `test` on `windows-latest`.
+Same gate as ledgerful verify: `fmt --check`, `clippy -D warnings`, and `test` on `windows-latest`. CI also runs `cargo test --no-default-features --lib`. Default features include `ui`. Use `--no-default-features` for Control Plane-only iteration.
 
 ## Control Plane (local CLI + HTTP)
 
@@ -150,7 +173,7 @@ When more than one project is registered, omit `--project` and the CLI errors (i
 
 ### Two daily paths
 
-Keep both. After a reboot the operator starts `serve` (or `ui`) again — there is **no** login installer or Windows Service.
+Keep both. After a reboot the operator starts installed `coordinator serve` (or `coordinator ui`) again — there is **no** login installer or Windows Service.
 
 | Path | When | What happens |
 |------|------|----------------|
@@ -557,17 +580,18 @@ Live **Dioxus Desktop** window (WebView2) bound to in-process Control Plane `api
 ```powershell
 # Requires Microsoft Edge WebView2 Evergreen:
 # https://developer.microsoft.com/microsoft-edge/webview2/
-cargo run --features ui -- ui
-# optional: cargo run --features ui -- ui --port 7420
+coordinator ui
+# or from a clone: cargo run -- ui
+# optional: coordinator ui --port 7420
 ```
 
-- Feature `ui` is **not** default (keeps `cargo test` / CI default path off the Dioxus compile). CI also runs `cargo test --features ui` (compiles the window crate; does **not** launch WebView2).
+- Feature `ui` **is** default. Default `cargo test` / clippy compile the window crate (do **not** launch WebView2). CI also runs `cargo test --no-default-features --lib` so the compile-out hint path does not bitrot.
 - If WebView2 is missing, `coordinator ui` prints an Evergreen install hint and exits non-zero (no panic, no LAN/browser fallback).
 - Bind stays `127.0.0.1` only. The window attaches via **health JSON / lease**: if the requested port (or a healthy lease when the requested port is default 7420) is coordinator, it does **not** start a second serve. Occupied by a non-coordinator process is a warning, not “serve already up.” Window still uses in-process `api::*`. Header `.stat` shows `Ticker serve :N` or `Ticker none`.
 - Pause all / Stop selected / Resume match ADR-0024. Stop copy includes **sessions left for attach**. Stop never writes `FAILURE.md` and never calls `harness grok shutdown`.
 - Add project is an explicit absolute path (never `project scan --add` of `C:\dev`).
 
-Without `--features ui`, `coordinator ui` is still listed in `--help` but errors with a rebuild hint.
+Built with `--no-default-features`, `coordinator ui` is still listed in `--help` but errors with a rebuild hint (`cargo install --path . --locked`).
 
 ## Status Surface mock (track 0003)
 
@@ -591,7 +615,7 @@ pwsh .\scripts\start-impeccable-live.ps1
 
 **State walkthrough cues:** Coordinator = parallel plan review (agy + opencode); Orca = pause; Ledgerful = token-idle CI; AI-Brains = hard fail + Failure Artifact; Demo-Idle = no active track. Header help = Stop vs Pause. Check narrow width (~980px) once.
 
-This mock remains the **visual reference** after 0014. Live start/resume is `cargo run --features ui -- ui` plus the Control Plane CLI.
+This mock remains the **visual reference** after 0014. Live start/resume is `coordinator ui` plus the Control Plane CLI.
 
 ## Status
 
