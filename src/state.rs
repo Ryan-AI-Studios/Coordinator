@@ -265,6 +265,17 @@ pub struct StatusView {
     /// Progress stall (0026). `null` when not stalled. Run stays Running.
     #[serde(default)]
     pub stall: Option<StallView>,
+    /// Who ticks the machine. Filled only at `api::status` / `status_all` / `cmd_run_cli`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticker: Option<TickerView>,
+}
+
+/// Status JSON `ticker` object (0023). `owner` is `serve` or `none` — never `cli`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TickerView {
+    pub owner: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 /// Status JSON `stall` object (0026).
@@ -347,6 +358,7 @@ impl StatusView {
                 None
             },
             stall: stall_status_view(record, state),
+            ticker: None,
         }
     }
 }
@@ -689,6 +701,10 @@ mod tests {
         assert!(json["review"].is_null());
         assert!(json.as_object().unwrap().contains_key("stall"));
         assert!(json["stall"].is_null());
+        assert!(
+            !json.as_object().unwrap().contains_key("ticker"),
+            "from_record must omit ticker"
+        );
         let last = json.get("last_progress_at");
         assert!(
             last.is_none() || last.is_some_and(|v| v.is_null()),

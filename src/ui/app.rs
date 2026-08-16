@@ -1,6 +1,5 @@
 //! Dioxus Desktop Local Ops Console (`--features ui`). In-process `api::*` only.
 
-use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
@@ -10,9 +9,10 @@ use crate::error::CoordinatorError;
 use crate::ui::model::{
     CardPrimaryAction, CardState, ChipKind, FleetSnapshot, ProjectCard, add_project,
     card_primary_action, load_fleet, pause_all, resume_selected, run_selected, selected_is_paused,
-    stop_selected,
+    stop_selected, ticker_label,
 };
 use crate::ui::{WEBVIEW2_MISSING_HINT, model::card_title};
+use crate::watch::ServeAttach;
 
 /// Tokens + layout copied from `mock/status-surface.html` `:root` / `DESIGN.md`.
 pub const SURFACE_CSS: &str = r#"
@@ -348,40 +348,39 @@ pub fn webview2_available() -> bool {
     }
 }
 
-/// If `127.0.0.1:port` is free, start `server::serve` on a background Runtime.
-/// `AddrInUse` → leave the existing serve alone; window still uses in-process `api::*`.
+/// Attach to a healthy serve (health/lease) or start one. Occupied non-coordinator → skip.
 /// The `JoinHandle` is dropped — process exit reaps the thread.
 fn maybe_spawn_serve(port: u16) {
-    match std::net::TcpListener::bind(("127.0.0.1", port)) {
-        Ok(_listener) => {
-            // Drop the probe listener so `serve` can bind the same loopback port.
-        }
-        Err(e) if e.kind() == ErrorKind::AddrInUse => {
+    match crate::watch::decide_serve_attach(port) {
+        ServeAttach::Attach { port: p } => {
             eprintln!(
-                "coordinator ui: serve already up on 127.0.0.1:{port}; window uses in-process api"
+                "coordinator ui: serve already up on 127.0.0.1:{p}; window uses in-process api"
             );
             return;
         }
-        Err(e) => {
-            eprintln!("coordinator ui: cannot probe 127.0.0.1:{port}: {e}; skipping owned serve");
+        ServeAttach::SkipOccupied { port: p } => {
+            eprintln!(
+                "coordinator ui: 127.0.0.1:{p} is occupied but is not coordinator; skipping owned serve"
+            );
             return;
         }
+        ServeAttach::Start { port: p } => {
+            let _handle = std::thread::Builder::new()
+                .name("coordinator-ui-serve".into())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            eprintln!("coordinator ui: failed to start serve runtime: {e}");
+                            return;
+                        }
+                    };
+                    if let Err(e) = rt.block_on(crate::server::serve(p)) {
+                        eprintln!("coordinator ui: serve exited: {e}");
+                    }
+                });
+        }
     }
-
-    let _handle = std::thread::Builder::new()
-        .name("coordinator-ui-serve".into())
-        .spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("coordinator ui: failed to start serve runtime: {e}");
-                    return;
-                }
-            };
-            if let Err(e) = rt.block_on(crate::server::serve(port)) {
-                eprintln!("coordinator ui: serve exited: {e}");
-            }
-        });
 }
 
 /// Main-thread WebView2 launch. Never binds LAN. Never panics on missing runtime.
@@ -468,6 +467,7 @@ fn LocalOpsConsole() -> Element {
                 span { class: "stat", title: "Active phases (models or CP watch)", "Active " strong { "{snap.counts.active}" } }
                 span { class: "stat", title: "Needs operator attention", "Attention " strong { "{snap.counts.attention}" } }
                 span { class: "stat", title: "No active track", "Idle " strong { "{snap.counts.idle}" } }
+                span { class: "stat", title: "Who ticks the machine", "{ticker_label(snap.ticker.as_ref())}" }
                 div { class: "controls",
                     button {
                         class: "primary",

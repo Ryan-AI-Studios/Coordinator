@@ -285,19 +285,27 @@ pub fn project_scan(
     Ok((candidates, added))
 }
 
+fn attach_ticker(mut view: StatusView) -> StatusView {
+    view.ticker = Some(watch::ticker_view());
+    view
+}
+
 /// Resolve project selector then return status view.
 pub fn status(project: Option<&str>) -> Result<StatusView> {
     let reg = load_registry()?;
     let rec = reg.resolve_project(project)?;
-    run::status(rec)
+    Ok(attach_ticker(run::status(rec)?))
 }
 
-/// Status for all projects (aggregate).
+/// Status for all projects (aggregate). One health probe; ticker cloned onto every view.
 pub fn status_all() -> Result<Vec<StatusView>> {
     let reg = load_registry()?;
+    let ticker = watch::ticker_view();
     let mut out = Vec::with_capacity(reg.projects.len());
     for rec in reg.list() {
-        out.push(run::status(rec)?);
+        let mut view = run::status(rec)?;
+        view.ticker = Some(ticker.clone());
+        out.push(view);
     }
     Ok(out)
 }
@@ -418,12 +426,14 @@ pub fn cmd_wait(project: Option<&str>, timeout_secs: u64) -> Result<StatusView> 
     watch::wait_for_outcome(&rec, Some(timeout_secs))
 }
 
+pub use crate::watch::ServeProbe;
+
 /// CLI-only `run` options. HTTP / UI / [`cmd_run`] stay write-only.
 #[derive(Debug, Clone)]
 pub struct RunCliOpts {
     pub detach: bool,
     pub timeout_secs: Option<u64>,
-    pub detect_serve_port: Option<u16>,
+    pub probe: ServeProbe,
 }
 
 /// Start a run, then tick until Idle/Stopped unless detached or serve owns the loop.
@@ -440,17 +450,23 @@ pub fn cmd_run_cli(
     }
     let view = cmd_run(project, track, driver)?;
     if opts.detach {
-        return Ok(view);
+        return Ok(attach_ticker(view));
     }
-    if let Some(port) = opts.detect_serve_port
-        && watch::coordinator_serve_listening(port)
-    {
+    if let Some(port) = watch::listening_port(opts.probe) {
         eprintln!("serve owns the ticker on 127.0.0.1:{port}; not waiting");
+        let mut view = view;
+        view.ticker = Some(crate::state::TickerView {
+            owner: "serve".into(),
+            port: Some(port),
+        });
         return Ok(view);
     }
     let reg = load_registry()?;
     let rec = reg.resolve_project(project)?.clone();
-    watch::wait_for_outcome(&rec, opts.timeout_secs)
+    Ok(attach_ticker(watch::wait_for_outcome(
+        &rec,
+        opts.timeout_secs,
+    )?))
 }
 
 /// POST /v1/harness/grok/prompt body.
@@ -593,7 +609,7 @@ mod tests {
             RunCliOpts {
                 detach: false,
                 timeout_secs: None,
-                detect_serve_port: None,
+                probe: ServeProbe::Skip,
             },
         )
         .unwrap();
@@ -616,7 +632,7 @@ mod tests {
             RunCliOpts {
                 detach: true,
                 timeout_secs: None,
-                detect_serve_port: None,
+                probe: ServeProbe::Skip,
             },
         )
         .unwrap();
@@ -641,7 +657,7 @@ mod tests {
             RunCliOpts {
                 detach: false,
                 timeout_secs: Some(1),
-                detect_serve_port: None,
+                probe: ServeProbe::Skip,
             },
         )
         .unwrap_err();
@@ -672,7 +688,7 @@ mod tests {
             RunCliOpts {
                 detach: false,
                 timeout_secs: Some(0),
-                detect_serve_port: None,
+                probe: ServeProbe::Skip,
             },
         )
         .unwrap_err();
@@ -697,13 +713,16 @@ mod tests {
             RunCliOpts {
                 detach: false,
                 timeout_secs: Some(1),
-                detect_serve_port: Some(port),
+                probe: ServeProbe::Port(port),
             },
         )
         .unwrap();
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
         assert!(artifact::existing_path(&rec).is_none());
+        let ticker = view.ticker.expect("ticker");
+        assert_eq!(ticker.owner, "serve");
+        assert_eq!(ticker.port, Some(port));
         clear_home();
     }
 
@@ -723,7 +742,7 @@ mod tests {
             RunCliOpts {
                 detach: false,
                 timeout_secs: None,
-                detect_serve_port: Some(port),
+                probe: ServeProbe::Port(port),
             },
         )
         .unwrap();
@@ -746,12 +765,157 @@ mod tests {
             RunCliOpts {
                 detach: true,
                 timeout_secs: None,
-                detect_serve_port: None,
+                probe: ServeProbe::Skip,
             },
         )
         .unwrap();
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_auto_healthy_lease_skips_wait() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let hold = watch::spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        crate::serve_lease::write_serve_lease(hold.port).unwrap();
+        let view = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("file_wait"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: Some(1),
+                probe: ServeProbe::Auto,
+            },
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
+        let ticker = view.ticker.expect("ticker");
+        assert_eq!(ticker.owner, "serve");
+        assert_eq!(ticker.port, Some(hold.port));
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_auto_stale_lease_ticks() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "10");
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
+        }
+        let (_home, _proj, rec) = add_isolated_project();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = listener.local_addr().unwrap().port();
+        drop(listener);
+        crate::serve_lease::write_serve_lease(dead).unwrap();
+        if watch::coordinator_serve_listening(crate::config::DEFAULT_SERVE_PORT) {
+            unsafe {
+                std::env::remove_var(ENV_OUTCOME_POLL_MS);
+                std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+            }
+            clear_home();
+            return;
+        }
+        let view = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: None,
+                probe: ServeProbe::Auto,
+            },
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        unsafe {
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_explicit_port_ignores_healthy_lease() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "10");
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
+        }
+        let (_home, _proj, rec) = add_isolated_project();
+        let hold = watch::spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        crate::serve_lease::write_serve_lease(hold.port).unwrap();
+        let other = spawn_health_once(r#"{"ok":true}"#);
+        let view = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: None,
+                probe: ServeProbe::Port(other),
+            },
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        unsafe {
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+        clear_home();
+    }
+
+    #[test]
+    fn api_status_ticker_serve_vs_none() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        if !watch::coordinator_serve_listening(crate::config::DEFAULT_SERVE_PORT) {
+            let view = status(Some(&rec.id)).unwrap();
+            let ticker = view.ticker.expect("ticker");
+            assert_eq!(ticker.owner, "none");
+            assert!(ticker.port.is_none());
+        }
+        let hold = watch::spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        crate::serve_lease::write_serve_lease(hold.port).unwrap();
+        let view = status(Some(&rec.id)).unwrap();
+        let ticker = view.ticker.expect("ticker");
+        assert_eq!(ticker.owner, "serve");
+        assert_eq!(ticker.port, Some(hold.port));
+        clear_home();
+    }
+
+    #[test]
+    fn status_all_clones_one_ticker() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let _proj2 = tempfile::tempdir().unwrap();
+        let rec2 = project_add(_proj2.path(), ProjectAddOptions::default()).unwrap();
+        assert_ne!(rec.id, rec2.id);
+        let hold = watch::spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        crate::serve_lease::write_serve_lease(hold.port).unwrap();
+        let all = status_all().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].ticker, all[1].ticker);
+        let ticker = all[0].ticker.as_ref().expect("ticker");
+        assert_eq!(ticker.owner, "serve");
+        assert_eq!(ticker.port, Some(hold.port));
+        clear_home();
+    }
+
+    #[test]
+    fn run_status_and_from_record_omit_ticker() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let view = run::status(&rec).unwrap();
+        assert!(view.ticker.is_none());
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("ticker"),
+            "poll-path status must omit ticker"
+        );
         clear_home();
     }
 

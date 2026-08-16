@@ -46,6 +46,8 @@ pub enum Commands {
         project: Option<String>,
     },
     /// Start the canonical workflow at `plan` and tick until Idle/Stopped
+    ///
+    /// Skips wait when serve answers (lease then 7420). `--serve-port N` probes N only.
     Run {
         #[arg(long)]
         project: Option<String>,
@@ -60,6 +62,9 @@ pub enum Commands {
         /// CLI poll budget (same contract as `wait`). `N>0`; omit to tick until terminal.
         #[arg(long, conflicts_with = "detach")]
         timeout_secs: Option<u64>,
+        /// Probe this port only for an already-on serve (conflicts with --detach).
+        #[arg(long, conflicts_with = "detach")]
+        serve_port: Option<u16>,
     },
     /// Pause a running workflow
     Pause {
@@ -95,9 +100,15 @@ pub enum Commands {
         timeout_secs: u64,
     },
     /// Serve localhost HTTP API (127.0.0.1 only)
+    ///
+    /// Always-on machine ticker. `--check` prints health JSON and exits 0/1 without binding.
     Serve {
-        #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
-        port: u16,
+        /// Bind port (default 7420). With --check, presence of this flag means probe N only.
+        #[arg(long)]
+        port: Option<u16>,
+        /// One-shot health check. Does not bind and does not write a lease.
+        #[arg(long)]
+        check: bool,
     },
     /// Open the Local Ops Console (Status Surface). Requires `--features ui`.
     Ui {
@@ -419,7 +430,15 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             driver,
             detach,
             timeout_secs,
+            serve_port,
         } => {
+            let probe = if detach {
+                api::ServeProbe::Skip
+            } else if let Some(n) = serve_port {
+                api::ServeProbe::Port(n)
+            } else {
+                api::ServeProbe::Auto
+            };
             let view = api::cmd_run_cli(
                 project.as_deref(),
                 track,
@@ -427,11 +446,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 api::RunCliOpts {
                     detach,
                     timeout_secs,
-                    detect_serve_port: if detach {
-                        None
-                    } else {
-                        Some(DEFAULT_SERVE_PORT)
-                    },
+                    probe,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&view)?);
@@ -491,8 +506,12 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             let view = api::cmd_wait(project.as_deref(), timeout_secs)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
-        Commands::Serve { port } => {
-            block_on(server::serve(port))?;
+        Commands::Serve { port, check } => {
+            if check {
+                serve_check(port)?;
+            } else {
+                block_on(server::serve(port.unwrap_or(DEFAULT_SERVE_PORT)))?;
+            }
         }
         Commands::Ui { port } => {
             crate::ui::run_cli(port)?;
@@ -553,6 +572,35 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
     Ok(())
 }
 
+/// `serve --check`: print JSON, exit 0 if coordinator health, 1 otherwise.
+/// Does not bind and does not write a lease.
+fn serve_check(port: Option<u16>) -> Result<(), CoordinatorError> {
+    let report = crate::watch::serve_check_report(port);
+    let body = if report.ok {
+        serde_json::json!({
+            "ok": true,
+            "service": "coordinator",
+            "port": report.port,
+            "source": report.source,
+        })
+    } else {
+        serde_json::json!({
+            "ok": false,
+            "port": report.port,
+            "source": report.source,
+        })
+    };
+    println!("{}", serde_json::to_string(&body)?);
+    if report.ok {
+        Ok(())
+    } else {
+        Err(CoordinatorError::Message(format!(
+            "no coordinator serve on 127.0.0.1:{}",
+            report.port
+        )))
+    }
+}
+
 fn block_on<T>(
     fut: impl std::future::Future<Output = Result<T, CoordinatorError>>,
 ) -> Result<T, CoordinatorError> {
@@ -598,10 +646,20 @@ mod tests {
             run.get_arguments().any(|a| a.get_id() == "timeout_secs"),
             "run --timeout-secs"
         );
+        assert!(
+            run.get_arguments().any(|a| a.get_id() == "serve_port"),
+            "run --serve-port"
+        );
         let about = run.get_about().map(|s| s.to_string()).unwrap_or_default();
         assert!(
             about.contains("Idle/Stopped"),
             "run about should say it ticks until Idle/Stopped: {about}"
+        );
+        let mut run_help = run.clone();
+        let help = run_help.render_long_help().to_string();
+        assert!(
+            help.contains("--serve-port"),
+            "run --help should mention --serve-port: {help}"
         );
     }
 
@@ -609,6 +667,49 @@ mod tests {
     fn run_detach_conflicts_with_timeout_secs() {
         let err = Cli::try_parse_from(["coordinator", "run", "--detach", "--timeout-secs", "1"]);
         assert!(err.is_err(), "detach + timeout-secs must conflict");
+    }
+
+    #[test]
+    fn run_detach_conflicts_with_serve_port() {
+        let err = Cli::try_parse_from(["coordinator", "run", "--detach", "--serve-port", "7500"]);
+        assert!(err.is_err(), "detach + serve-port must conflict");
+    }
+
+    #[test]
+    fn serve_has_check_and_optional_port() {
+        let cmd = Cli::command();
+        let serve = cmd.find_subcommand("serve").expect("serve");
+        assert!(
+            serve.get_arguments().any(|a| a.get_id() == "check"),
+            "serve --check"
+        );
+        assert!(
+            serve.get_arguments().any(|a| a.get_id() == "port"),
+            "serve --port"
+        );
+        let mut serve_help = serve.clone();
+        let help = serve_help.render_long_help().to_string();
+        assert!(
+            help.contains("--check"),
+            "serve --help should mention --check: {help}"
+        );
+        let bare = Cli::try_parse_from(["coordinator", "serve", "--check"]).unwrap();
+        match bare.command {
+            Commands::Serve { port, check } => {
+                assert!(check);
+                assert!(port.is_none(), "default --check must not pin port 7420");
+            }
+            other => panic!("expected serve, got {other:?}"),
+        }
+        let flagged =
+            Cli::try_parse_from(["coordinator", "serve", "--check", "--port", "7500"]).unwrap();
+        match flagged.command {
+            Commands::Serve { port, check } => {
+                assert!(check);
+                assert_eq!(port, Some(7500));
+            }
+            other => panic!("expected serve, got {other:?}"),
+        }
     }
 
     #[test]
