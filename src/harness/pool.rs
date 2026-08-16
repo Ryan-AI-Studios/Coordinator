@@ -20,7 +20,7 @@ use crate::persist::atomic_write_json;
 use crate::registry::ProjectRecord;
 use crate::state::{RunStatus, StatusView, ensure_state_dir, load_run_state, resolve_state_dir};
 
-/// In-process pool (HTTP `serve` + tests). CLI uses a detached holder.
+/// In-process pool (tests / `insert_test_session`). CLI and HTTP start use a detached holder.
 static POOL: OnceLock<tokio::sync::Mutex<SessionPool>> = OnceLock::new();
 
 pub fn global_pool() -> &'static tokio::sync::Mutex<SessionPool> {

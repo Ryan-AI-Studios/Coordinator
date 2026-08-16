@@ -114,7 +114,7 @@ async fn post_outcome(Json(body): Json<OutcomeWriteBody>) -> Result<impl IntoRes
 }
 
 async fn post_grok_start(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_harness_grok_start(body.project.as_deref(), true).await?;
+    let view = api::cmd_harness_grok_start(body.project.as_deref(), false).await?;
     Ok(Json(view))
 }
 
@@ -168,25 +168,43 @@ async fn get_outcome(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, 
 
 /// Serve on loopback only; background task polls outcomes + timeouts.
 pub async fn serve(port: u16) -> Result<(), CoordinatorError> {
+    serve_until(port, shutdown_signal()).await
+}
+
+/// Bind + tick until `shutdown` completes. Writes `{COORDINATOR_HOME}/serve.json`
+/// after a successful bind; deletes it on the way out.
+pub async fn serve_until<F>(port: u16, shutdown: F) -> Result<(), CoordinatorError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     require_loopback(crate::config::LOOPBACK)?;
+    if crate::watch::coordinator_serve_listening(port) {
+        eprintln!("already listening on 127.0.0.1:{port}");
+        return Ok(());
+    }
     let addr = loopback_addr(port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| CoordinatorError::Message(format!("bind {addr}: {e}")))?;
-    eprintln!("coordinator serve listening on http://{addr}");
+    let bound = listener
+        .local_addr()
+        .map_err(|e| CoordinatorError::Message(format!("local_addr: {e}")))?;
+    crate::serve_lease::write_serve_lease(bound.port())?;
+    eprintln!("coordinator serve listening on http://{bound}");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let poll_handle = tokio::spawn(crate::watch::serve_poll_loop(shutdown_rx));
 
     let result = axum::serve(listener, app())
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+            shutdown.await;
             let _ = shutdown_tx.send(true);
         })
         .await
         .map_err(|e| CoordinatorError::Message(format!("server error: {e}")));
 
     let _ = poll_handle.await;
+    crate::serve_lease::clear_serve_lease();
     result
 }
 
@@ -854,5 +872,114 @@ mod tests {
     fn validated_bind_accepts_loopback() {
         let addr = validated_bind_addr(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 7420).unwrap();
         assert!(addr.ip().is_loopback());
+    }
+
+    fn spawn_health_once(body: &str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        port
+    }
+
+    #[test]
+    fn serve_writes_and_clears_lease() {
+        use crate::serve_lease::{read_serve_lease, serve_lease_path};
+        use crate::watch::coordinator_serve_listening;
+        use std::time::Duration;
+
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(serve_until(port, async move {
+                    let _ = rx.await;
+                }))
+        });
+
+        let started = std::time::Instant::now();
+        while !coordinator_serve_listening(port) {
+            if started.elapsed() > Duration::from_secs(5) {
+                let _ = tx.send(());
+                let _ = handle.join();
+                unsafe {
+                    std::env::remove_var(ENV_COORDINATOR_HOME);
+                }
+                panic!("serve did not become healthy on {port}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let lease = read_serve_lease().expect("lease after bind");
+        assert_eq!(lease.port, port);
+        assert!(serve_lease_path().unwrap().exists());
+
+        let _ = tx.send(());
+        handle.join().unwrap().unwrap();
+        assert!(read_serve_lease().is_none());
+        assert!(!home.path().join("serve.json").exists());
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn second_serve_on_coordinator_health_is_ok() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let port = spawn_health_once(r#"{"ok":true,"service":"coordinator"}"#);
+        serve(port).await.unwrap();
+        assert!(
+            !home.path().join("serve.json").exists(),
+            "already-listening serve must not write a lease"
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn serve_non_coordinator_occupant_errors() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = serve(port).await.unwrap_err();
+        assert!(err.to_string().contains("bind"), "err={err}");
+        assert!(!home.path().join("serve.json").exists());
+        drop(listener);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
     }
 }

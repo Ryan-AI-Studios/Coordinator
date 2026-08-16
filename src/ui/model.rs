@@ -6,7 +6,7 @@ use crate::api;
 use crate::error::{CoordinatorError, Result};
 use crate::layout::LayoutProfile;
 use crate::registry::{ProjectAddOptions, ProjectRecord};
-use crate::state::{RunStatus, STOP_LAST_EVENT, StatusView};
+use crate::state::{RunStatus, STOP_LAST_EVENT, StatusView, TickerView};
 use crate::workflow::graph::{
     PHASE_CI_WAIT, PHASE_PLAN_REVIEW, REVIEW_SLUG_AGY, REVIEW_SLUG_OPENCODE, canonical_phases,
     is_canonical, is_stub_phase,
@@ -92,6 +92,8 @@ pub struct FleetSnapshot {
     pub phase_caption: String,
     pub failure: Option<FailurePanel>,
     pub last_error: Option<String>,
+    /// Shared machine ticker from `status_all` (same object on every view).
+    pub ticker: Option<TickerView>,
 }
 
 /// Map live status → mock card `data-state` (spec §2 table).
@@ -270,6 +272,7 @@ pub fn build_fleet(views: Vec<StatusView>, selected: Option<&str>) -> FleetSnaps
         .map(phase_caption)
         .unwrap_or_else(|| "No project selected".into());
     let failure = selected_view.and_then(failure_panel);
+    let ticker = views.first().and_then(|v| v.ticker.clone());
     let cards = views
         .into_iter()
         .map(|view| {
@@ -290,6 +293,18 @@ pub fn build_fleet(views: Vec<StatusView>, selected: Option<&str>) -> FleetSnaps
         phase_caption,
         failure,
         last_error: None,
+        ticker,
+    }
+}
+
+/// Header `.stat` copy: `Ticker serve :N` or `Ticker none`.
+pub fn ticker_label(ticker: Option<&TickerView>) -> String {
+    match ticker {
+        Some(t) if t.owner == "serve" => match t.port {
+            Some(p) => format!("Ticker serve :{p}"),
+            None => "Ticker serve".into(),
+        },
+        _ => "Ticker none".into(),
     }
 }
 
@@ -455,6 +470,7 @@ mod tests {
             review: None,
             last_progress_at: None,
             stall: None,
+            ticker: None,
         }
     }
 
@@ -746,5 +762,20 @@ mod tests {
             card_primary_action(&view(RunStatus::Idle, STUB_PHASE_IDLE, None, None)),
             CardPrimaryAction::Run
         );
+    }
+
+    #[test]
+    fn ticker_label_serve_and_none() {
+        assert_eq!(ticker_label(None), "Ticker none");
+        let none = TickerView {
+            owner: "none".into(),
+            port: None,
+        };
+        assert_eq!(ticker_label(Some(&none)), "Ticker none");
+        let serve = TickerView {
+            owner: "serve".into(),
+            port: Some(7420),
+        };
+        assert_eq!(ticker_label(Some(&serve)), "Ticker serve :7420");
     }
 }

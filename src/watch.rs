@@ -180,6 +180,193 @@ pub fn coordinator_serve_listening(port: u16) -> bool {
         && v.get("service").and_then(|s| s.as_str()) == Some("coordinator")
 }
 
+/// How CLI `run` looks for an already-on `serve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeProbe {
+    /// Do not probe (`--detach`, or tests that force a local tick).
+    Skip,
+    /// Healthy lease port, else 7420, else none.
+    Auto,
+    /// Probe this port only (`--serve-port` / `--check --port`).
+    Port(u16),
+}
+
+/// Port whose `/health` is coordinator, following `probe`. Uses default 7420.
+pub fn listening_port(probe: ServeProbe) -> Option<u16> {
+    listening_port_with_default(probe, crate::config::DEFAULT_SERVE_PORT)
+}
+
+/// Same as [`listening_port`] with an injectable default (tests; do not change 7420).
+pub fn listening_port_with_default(probe: ServeProbe, default_port: u16) -> Option<u16> {
+    match probe {
+        ServeProbe::Skip => None,
+        ServeProbe::Port(n) => coordinator_serve_listening(n).then_some(n),
+        ServeProbe::Auto => {
+            if let Some(lease) = crate::serve_lease::read_serve_lease()
+                && coordinator_serve_listening(lease.port)
+            {
+                return Some(lease.port);
+            }
+            if coordinator_serve_listening(default_port) {
+                return Some(default_port);
+            }
+            None
+        }
+    }
+}
+
+/// `serve --check` JSON `source`: `flag` | `lease` | `default`.
+pub fn check_source(probe: ServeProbe, found: Option<u16>) -> &'static str {
+    match probe {
+        ServeProbe::Port(_) => "flag",
+        ServeProbe::Skip | ServeProbe::Auto => {
+            if let (Some(p), Some(lease)) = (found, crate::serve_lease::read_serve_lease())
+                && lease.port == p
+            {
+                "lease"
+            } else {
+                "default"
+            }
+        }
+    }
+}
+
+/// One-shot `--check` result. Does not bind and does not write a lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeCheckReport {
+    pub ok: bool,
+    pub port: u16,
+    pub source: &'static str,
+}
+
+pub fn serve_check_report(port_flag: Option<u16>) -> ServeCheckReport {
+    serve_check_report_with_default(port_flag, crate::config::DEFAULT_SERVE_PORT)
+}
+
+pub fn serve_check_report_with_default(
+    port_flag: Option<u16>,
+    default_port: u16,
+) -> ServeCheckReport {
+    let probe = match port_flag {
+        Some(n) => ServeProbe::Port(n),
+        None => ServeProbe::Auto,
+    };
+    let found = listening_port_with_default(probe, default_port);
+    let source = check_source(probe, found);
+    match found {
+        Some(p) => ServeCheckReport {
+            ok: true,
+            port: p,
+            source,
+        },
+        None => ServeCheckReport {
+            ok: false,
+            port: port_flag.unwrap_or(default_port),
+            source,
+        },
+    }
+}
+
+/// Additive ticker for `api::status` / `status_all` / `cmd_run_cli` only.
+pub fn ticker_view() -> crate::state::TickerView {
+    ticker_view_with_default(crate::config::DEFAULT_SERVE_PORT)
+}
+
+pub fn ticker_view_with_default(default_port: u16) -> crate::state::TickerView {
+    match listening_port_with_default(ServeProbe::Auto, default_port) {
+        Some(p) => crate::state::TickerView {
+            owner: "serve".into(),
+            port: Some(p),
+        },
+        None => crate::state::TickerView {
+            owner: "none".into(),
+            port: None,
+        },
+    }
+}
+
+/// Status Surface attach vs start vs skip (health JSON, never bind-probe for “up”).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeAttach {
+    Attach { port: u16 },
+    Start { port: u16 },
+    SkipOccupied { port: u16 },
+}
+
+pub fn decide_serve_attach(requested: u16) -> ServeAttach {
+    decide_serve_attach_with_default(requested, crate::config::DEFAULT_SERVE_PORT)
+}
+
+pub fn decide_serve_attach_with_default(requested: u16, default_port: u16) -> ServeAttach {
+    if coordinator_serve_listening(requested) {
+        return ServeAttach::Attach { port: requested };
+    }
+    if requested == default_port
+        && let Some(lease) = crate::serve_lease::read_serve_lease()
+        && coordinator_serve_listening(lease.port)
+    {
+        return ServeAttach::Attach { port: lease.port };
+    }
+    match std::net::TcpListener::bind(("127.0.0.1", requested)) {
+        Ok(_listener) => ServeAttach::Start { port: requested },
+        Err(_) => ServeAttach::SkipOccupied { port: requested },
+    }
+}
+
+/// Repeating `/health` listener for multi-probe tests. Drop to stop.
+#[cfg(test)]
+pub struct HealthHold {
+    pub port: u16,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+}
+
+#[cfg(test)]
+impl Drop for HealthHold {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn spawn_health_hold(body: &str) -> HealthHold {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = body.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        loop {
+            if rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf);
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    HealthHold {
+        port,
+        stop: Some(tx),
+    }
+}
+
 /// Async variant for the serve background loop (one project).
 pub async fn poll_once_async(record: &ProjectRecord) -> Result<Option<StatusView>> {
     // Blocking file/state IO is short; spawn_blocking keeps the runtime responsive.
@@ -606,5 +793,180 @@ mod tests {
         let refused = listener.local_addr().unwrap().port();
         drop(listener);
         assert!(!coordinator_serve_listening(refused));
+    }
+
+    fn isolate_home() -> tempfile::TempDir {
+        use crate::config::ENV_COORDINATOR_HOME;
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        home
+    }
+
+    fn clear_home() {
+        unsafe {
+            std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+        }
+    }
+
+    fn refused_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    #[test]
+    fn listening_port_skip_and_explicit() {
+        assert_eq!(listening_port(ServeProbe::Skip), None);
+        let port = spawn_health_once(r#"{"ok":true,"service":"coordinator"}"#);
+        assert_eq!(listening_port(ServeProbe::Port(port)), Some(port));
+        let dead = refused_port();
+        assert_eq!(listening_port(ServeProbe::Port(dead)), None);
+    }
+
+    #[test]
+    fn listening_port_auto_stale_lease_falls_through_to_default() {
+        let _guard = test_env_lock();
+        let _home = isolate_home();
+        let dead = refused_port();
+        crate::serve_lease::write_serve_lease(dead).unwrap();
+        assert_eq!(
+            listening_port_with_default(ServeProbe::Auto, dead),
+            None,
+            "stale lease + dead default must not invent a port"
+        );
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        assert_eq!(
+            listening_port_with_default(ServeProbe::Auto, hold.port),
+            Some(hold.port)
+        );
+        let report = serve_check_report_with_default(None, hold.port);
+        assert!(report.ok);
+        assert_eq!(report.port, hold.port);
+        assert_eq!(report.source, "default");
+        assert_eq!(check_source(ServeProbe::Auto, Some(hold.port)), "default");
+        clear_home();
+    }
+
+    #[test]
+    fn listening_port_auto_healthy_lease_wins() {
+        let _guard = test_env_lock();
+        let _home = isolate_home();
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        crate::serve_lease::write_serve_lease(hold.port).unwrap();
+        let other = refused_port();
+        assert_eq!(
+            listening_port_with_default(ServeProbe::Auto, other),
+            Some(hold.port)
+        );
+        let report = serve_check_report_with_default(None, other);
+        assert!(report.ok);
+        assert_eq!(report.source, "lease");
+        assert_eq!(report.port, hold.port);
+        clear_home();
+    }
+
+    #[test]
+    fn explicit_port_ignores_healthy_lease() {
+        let _guard = test_env_lock();
+        let _home = isolate_home();
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        crate::serve_lease::write_serve_lease(hold.port).unwrap();
+        let dead = refused_port();
+        assert_eq!(listening_port(ServeProbe::Port(dead)), None);
+        let report = serve_check_report(Some(dead));
+        assert!(!report.ok);
+        assert_eq!(report.port, dead);
+        assert_eq!(report.source, "flag");
+        clear_home();
+    }
+
+    #[test]
+    fn serve_check_does_not_write_lease() {
+        let _guard = test_env_lock();
+        let home = isolate_home();
+        let port = spawn_health_once(r#"{"ok":true,"service":"coordinator"}"#);
+        let report = serve_check_report(Some(port));
+        assert!(report.ok);
+        assert_eq!(report.source, "flag");
+        assert!(!home.path().join("serve.json").exists());
+        let dead = refused_port();
+        let miss = serve_check_report(Some(dead));
+        assert!(!miss.ok);
+        assert_eq!(miss.source, "flag");
+        assert!(!home.path().join("serve.json").exists());
+        clear_home();
+    }
+
+    #[test]
+    fn ticker_view_serve_vs_none() {
+        let _guard = test_env_lock();
+        let _home = isolate_home();
+        let dead = refused_port();
+        let none = ticker_view_with_default(dead);
+        assert_eq!(none.owner, "none");
+        assert!(none.port.is_none());
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        crate::serve_lease::write_serve_lease(hold.port).unwrap();
+        let serve = ticker_view_with_default(dead);
+        assert_eq!(serve.owner, "serve");
+        assert_eq!(serve.port, Some(hold.port));
+        clear_home();
+    }
+
+    #[test]
+    fn decide_attach_lease_when_requested_is_default() {
+        let _guard = test_env_lock();
+        let _home = isolate_home();
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        crate::serve_lease::write_serve_lease(hold.port).unwrap();
+        let fake_default = refused_port();
+        assert_ne!(fake_default, hold.port);
+        assert_eq!(
+            decide_serve_attach_with_default(fake_default, fake_default),
+            ServeAttach::Attach { port: hold.port }
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn decide_attach_requested_healthy_wins() {
+        let _guard = test_env_lock();
+        let _home = isolate_home();
+        let requested = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        let lease = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        crate::serve_lease::write_serve_lease(lease.port).unwrap();
+        assert_eq!(
+            decide_serve_attach(requested.port),
+            ServeAttach::Attach {
+                port: requested.port
+            }
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn decide_skip_occupied_non_coordinator() {
+        let _guard = test_env_lock();
+        let _home = isolate_home();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(
+            decide_serve_attach(port),
+            ServeAttach::SkipOccupied { port }
+        );
+        drop(listener);
+        clear_home();
+    }
+
+    #[test]
+    fn decide_start_when_requested_free() {
+        let _guard = test_env_lock();
+        let _home = isolate_home();
+        let port = refused_port();
+        assert_eq!(decide_serve_attach(port), ServeAttach::Start { port });
+        clear_home();
     }
 }

@@ -33,6 +33,7 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 | Machine home (registry) | `%LOCALAPPDATA%\coordinator\` | `COORDINATOR_HOME` |
 | Registry file | `{home}/registry.json` | — |
 | Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`, `phase_timeouts_secs`, `hermes`) | — |
+| Serve lease | `{home}/serve.json` | written after a successful `serve` bind; deleted on graceful shutdown |
 | Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
 | Active Phase Outcome | `{state_dir}/outcomes/current.json` | same state-dir rules |
 | Last applied outcome | `{state_dir}/outcomes/current.applied.json` | written on successful apply; `current.json` removed |
@@ -147,6 +148,40 @@ When more than one project is registered, omit `--project` and the CLI errors (i
 
 **Local-only:** `coordinator serve` binds **`127.0.0.1` only** (default port **7420**, avoids Impeccable live 5500/8400). Non-loopback bind is rejected.
 
+### Two daily paths
+
+Keep both. After a reboot the operator starts `serve` (or `ui`) again — there is **no** login installer or Windows Service.
+
+| Path | When | What happens |
+|------|------|----------------|
+| **Foreground `run`** | One project, stay in the terminal | Bare `coordinator run` writes Running and **ticks** until Idle/Stopped (track 0020). |
+| **Always-on `serve`** | Multi-project / close the terminal | `coordinator serve` is the machine ticker. `run` writes Running and **skips wait** when it finds that serve (healthy lease, then 7420, or `--serve-port N`). `--detach` is the explicit write-only hatch. |
+
+```powershell
+coordinator serve
+coordinator serve --check
+coordinator run --project C:\dev\Orca --track 0099 --detach
+# or omit --detach: run skips wait when serve health/lease is up
+coordinator status --project C:\dev\Orca
+# expect ticker.owner = serve
+```
+
+**Lease:** `{COORDINATOR_HOME}/serve.json` (not `config.json`). Written after a successful bind; deleted on graceful shutdown. A stale file after a crash is OK — **health JSON** `{ok:true, service:"coordinator"}` is the truth. Unknown `version` is ignored.
+
+**`serve --check`:** one-shot. Does **not** bind and does **not** write a lease. Default probe is the same Auto as `run` (healthy lease, else 7420). `--check --port N` probes N only. Exit **0** + `{ok:true, service, port, source}` when coordinator; exit **1** + `{ok:false, port, source}` otherwise. `source` is `flag` | `lease` | `default`.
+
+**Already listening:** a second `serve` on a live coordinator port does **not** bind. stderr: already listening. Exit **0**. Occupied by a non-coordinator process → error (exit 1).
+
+**Custom-port serve:** `serve --port 7500` writes the lease. A later default `run` finds that port via the lease — `--detach` is no longer required.
+
+**Optional operator login task (not a CLI, not installed by this product):**
+
+```
+schtasks /Create /TN "Coordinator serve" /TR "<full-path>\coordinator.exe serve" /SC ONLOGON /IT /F
+```
+
+Owner machine policy. `/IT` so it runs only while that user is logged on. `/ru System` is wrong (not interactive). Coordinator does **not** install this.
+
 **Completion contract (hybrid):** the **Phase Outcome File** is the portable done-signal (schema `version: 1`). Hooks, adapters, CLI, and HTTP may write it; **ConPTY / chat pattern-match is not the contract**. Writers must use **temp + replace** (or `coordinator outcome write` / `POST /v1/outcome`) so pollers never read torn JSON.
 
 **Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Resolve order: uniform `COORDINATOR_PHASE_TIMEOUT_SECS` (if set) → **project** `phase_timeouts_secs` → machine `config.json` `phase_timeouts_secs` → table. Set a project override with `project set --phase-timeout PHASE=SECS` (seconds only; `0` is rejected). Machine hand-edit of `config.json` is still valid for machine-wide keys. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail) and writes `FAILURE.md`. This is **not** the CLI poll budget (`wait --timeout-secs` or optional `run --timeout-secs`: exit **2**, run stays as it was, Grok stays up). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
@@ -180,7 +215,7 @@ plan → plan-review (agy + opencode join) → fold → implement
 | `file_wait` | `--driver file_wait` | No inject; poll `current.json` / `outcomes/roles/*.json`. |
 | `stub` | `--driver stub` or `COORDINATOR_WORKFLOW_DRIVER=stub` | Synthesize success each tick so CI can walk the full graph. |
 
-Status JSON includes additive `workflow` `{ id, driver, pending_roles }`, additive `ci` (`pr`, `pr_url`, `head_sha`, `last_summary`, `interval_ms`, `auto_merge`, `merge`) — `null` when phase is not `ci-wait` and no watch state is persisted — and additive `review` (`attempted`, `active`, `verdict`, `report`) — `null` when phase is not `cross-model-review` and no review state is persisted. Existing additive fields include `failure_class`, `next_track`, `phase_started_at`, `run_epoch`, `failure_artifact`.
+Status JSON includes additive `workflow` `{ id, driver, pending_roles }`, additive `ci` (`pr`, `pr_url`, `head_sha`, `last_summary`, `interval_ms`, `auto_merge`, `merge`) — `null` when phase is not `ci-wait` and no watch state is persisted — and additive `review` (`attempted`, `active`, `verdict`, `report`) — `null` when phase is not `cross-model-review` and no review state is persisted. Existing additive fields include `failure_class`, `next_track`, `phase_started_at`, `run_epoch`, `failure_artifact`. CLI `status` / `GET /v1/status` also attach additive `ticker` (`{ owner: "serve", port }` when coordinator health answers, or `{ owner: "none" }`). Poll-path `run::status` / `from_record` omit `ticker`.
 
 **Plan-review:** adapter starts `agy --print` and `opencode run` once each (cwd = workspace root). Agy uses `--print-timeout` = remaining budget, `--dangerously-skip-permissions`, `--output-format json`. OpenCode uses `--dir` = workspace root, `--format json`, no `--auto`. Review files are source of truth (`agy-review.md` / `opencode-review.md` on the track, copied into `{state_dir}/reviews/`). Join assembles `{workspace}/AI-review.md`. One reviewer may degrade; **both** missing/fail → Stopped. Line endings normalized to `\n`. Override binaries with `COORDINATOR_AGY_BIN` / `COORDINATOR_OPENCODE_BIN` (else Role Binding `command`, else PATH). Optional ignored live smokes: `COORDINATOR_AGY_LIVE=1` and `COORDINATOR_OPENCODE_LIVE=1` (do not reuse `COORDINATOR_REVIEW_LIVE`). The 0011 cross-model gate still uses `opencode run --dir {execution_repo} --format default` with no `--auto`.
 
@@ -310,7 +345,7 @@ Long-lived **Grok Build** sessions use `grok agent stdio` (JSON-RPC 2.0, line-de
 | Auth | Operator `grok login` (`cached_token`) or `XAI_API_KEY` (`xai.api_key`). Coordinator does **not** own OAuth |
 | Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` is teardown: in-process pool, then a quick holder `Shutdown` RPC, then `taskkill /F /PID` on persist `pid` then `holder_pid`. Persist is always written `alive: false`; returned status matches the file. `taskkill` “not found” is success. Missing `taskkill` is not a shutdown error. |
 | Pause | New injects are refused while Paused; the child stays up |
-| Pool | One Grok ACP session per `project_id`. CLI `start` and adapter ticks from `run` / `wait` / `serve` detach a localhost holder so a later `prompt` does not pin the poll loop. In-process spawn is for tests / HTTP start / `insert_test_session`. |
+| Pool | One Grok ACP session per `project_id`. CLI `start`, HTTP `POST /v1/harness/grok/start`, and adapter ticks from `run` / `wait` / `serve` detach a localhost holder so a later `prompt` does not pin the poll loop. In-process spawn is for tests / `insert_test_session`. |
 | Persist | `{state_dir}/harness-grok.json` (session id / pid / holder pid / control addr / alive) — not a transcript |
 
 Optional project hooks (`Stop`, `SessionEnd`, `PreCompact`, `PostCompact`) may also write `outcomes/current.json` (`source: file`). Project hooks need a one-time `grok` `/hooks-trust`. The adapter-written outcome is the automation path.
@@ -363,8 +398,9 @@ cargo run -- status --project $proj
 # leftover stub timeout (tests / old state): COORDINATOR_STUB_PHASE_TIMEOUT_SECS
 # canonical uniform override for tests: COORDINATOR_PHASE_TIMEOUT_SECS
 
-# HTTP (separate terminal)
+# HTTP (separate terminal) — always-on ticker
 cargo run -- serve --port 7420
+# cargo run -- serve --check
 # Invoke-RestMethod http://127.0.0.1:7420/health
 # Invoke-RestMethod http://127.0.0.1:7420/v1/status
 # POST http://127.0.0.1:7420/v1/outcome  body = Phase Outcome JSON
@@ -389,7 +425,7 @@ coordinator project set [--project …]
     [--clear-phase-timeouts]
 coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]
 coordinator status [--project <path|id>]
-coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait|stub] [--detach] [--timeout-secs N]
+coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait|stub] [--detach] [--timeout-secs N] [--serve-port N]
 coordinator pause [--project <path|id>]
 coordinator resume [--project <path|id>]
 coordinator stop [--project <path|id>]
@@ -405,10 +441,10 @@ coordinator harness grok prompt --text <…> | --file <path> [--project …]
 coordinator harness grok compact [--project …]
 coordinator harness grok status [--project …]
 coordinator harness grok shutdown [--project …]
-coordinator serve [--port <u16>]   # default 7420, 127.0.0.1 only
+coordinator serve [--port <u16>] [--check]   # default 7420, 127.0.0.1 only
 ```
 
-HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver`), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), `ci` (watch object or `null`), `failure_artifact` (path or `null`), and optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists.
+HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver`), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), `ci` (watch object or `null`), `failure_artifact` (path or `null`), optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists, and additive `ticker` (`owner` `serve` + `port`, or `owner` `none`).
 
 ### Phase Outcome schema v1
 
@@ -452,7 +488,7 @@ HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1
 | **2** | Wait budget (`--timeout-secs`) expired **without** an applied outcome. The run is unchanged; Grok is not killed; no `FAILURE.md`. |
 | **1** (or other) | Invalid args, unknown project, or other control-plane error |
 
-`wait --timeout-secs` (and optional `run --timeout-secs`) is a **CLI poll budget**. Bare `run` ticks with **no** poll deadline until Idle/Stopped. If `GET http://127.0.0.1:7420/health` returns `{ok:true, service:"coordinator"}`, default `run` skips the wait loop (stderr: serve owns the ticker). `--detach` keeps today’s write-only start when `serve` already ticks (custom-port serve also uses `--detach`). It is not the phase wall clock (`failure_class=timeout` + Stopped + artifact + abort), not the ACP `session/prompt` timeout (recycle), and not the progress stall (first fire: recycle + stay Running; second: `watchdog: stall` until the wall clock). Adapter inject from `run` / `wait` / `serve` starts the detached holder without blocking the poll loop, so the wait budget can expire while a prompt is still in flight **without aborting it**. `run --timeout-secs 0` is rejected (omit the flag for unlimited). `wait --timeout-secs 0` still expires immediately.
+`wait --timeout-secs` (and optional `run --timeout-secs`) is a **CLI poll budget**. Bare `run` ticks with **no** poll deadline until Idle/Stopped. Default `run` (no `--detach`) skips the wait loop when coordinator `/health` answers on the **lease port or 7420** (stderr: serve owns the ticker). `run --serve-port N` probes N only. `--detach` is the explicit write-only hatch (still conflicts with `--timeout-secs` and `--serve-port`). Custom-port serve no longer requires `--detach` when the lease exists. It is not the phase wall clock (`failure_class=timeout` + Stopped + artifact + abort), not the ACP `session/prompt` timeout (recycle), and not the progress stall (first fire: recycle + stay Running; second: `watchdog: stall` until the wall clock). Adapter inject from `run` / `wait` / `serve` starts the detached holder without blocking the poll loop, so the wait budget can expire while a prompt is still in flight **without aborting it**. `run --timeout-secs 0` is rejected (omit the flag for unlimited). `wait --timeout-secs 0` still expires immediately.
 
 Scripts that want “success only” must inspect `status` / `failure_class` after exit 0 (e.g. `coordinator status`).
 
@@ -527,7 +563,7 @@ cargo run --features ui -- ui
 
 - Feature `ui` is **not** default (keeps `cargo test` / CI default path off the Dioxus compile). CI also runs `cargo test --features ui` (compiles the window crate; does **not** launch WebView2).
 - If WebView2 is missing, `coordinator ui` prints an Evergreen install hint and exits non-zero (no panic, no LAN/browser fallback).
-- Bind stays `127.0.0.1` only. If `:7420` is already taken by `coordinator serve`, the window skips owned serve and still uses in-process `api::*`.
+- Bind stays `127.0.0.1` only. The window attaches via **health JSON / lease**: if the requested port (or a healthy lease when the requested port is default 7420) is coordinator, it does **not** start a second serve. Occupied by a non-coordinator process is a warning, not “serve already up.” Window still uses in-process `api::*`. Header `.stat` shows `Ticker serve :N` or `Ticker none`.
 - Pause all / Stop selected / Resume match ADR-0024. Stop copy includes **sessions left for attach**. Stop never writes `FAILURE.md` and never calls `harness grok shutdown`.
 - Add project is an explicit absolute path (never `project scan --add` of `C:\dev`).
 

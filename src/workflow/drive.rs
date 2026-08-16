@@ -137,7 +137,7 @@ fn truncate_reason(msg: &str) -> String {
 }
 
 /// Adapter ticks from `wait` / `serve` always use the detached holder (`in_process: false`).
-/// In-process spawn stays for same-process tests / `insert_test_session` / HTTP start.
+/// In-process spawn stays for same-process tests / `insert_test_session`.
 const ADAPTER_START_IN_PROCESS: bool = false;
 
 #[cfg(test)]

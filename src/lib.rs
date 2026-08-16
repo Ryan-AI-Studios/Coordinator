@@ -29,6 +29,7 @@ pub mod registry;
 pub mod review;
 pub mod run;
 pub mod scan;
+pub mod serve_lease;
 pub mod server;
 pub mod state;
 pub mod ui;
