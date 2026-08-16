@@ -229,7 +229,10 @@ pub fn mark_driven(record: &ProjectRecord, phase: &str) -> Result<()> {
         let mut state = load_run_state(record)?;
         state.last_driven_phase = Some(phase.into());
         state.updated_at = chrono::Utc::now();
-        save_run_state(record, &state)
+        save_run_state(record, &state)?;
+        let track = state.track_id.as_deref().unwrap_or("-");
+        crate::progress_log::append(record, "inject", &format!("track={track} phase={phase}"));
+        Ok(())
     })
 }
 

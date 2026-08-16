@@ -224,6 +224,12 @@ pub fn maybe_stamp_and_abort_stall(record: &ProjectRecord) -> Option<StatusView>
         state.last_event = RECYCLE_STALL_EVENT.into();
         state.updated_at = chrono::Utc::now();
         save_run_state(record, &state)?;
+        let track = state.track_id.as_deref().unwrap_or("-");
+        crate::progress_log::append(
+            record,
+            "stall",
+            &format!("track={track} phase={}  {}", state.phase, state.last_event),
+        );
         Ok(Some(StatusView::from_record(record, &state)))
     })
     .ok()
