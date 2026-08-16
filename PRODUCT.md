@@ -8,7 +8,7 @@ web
 
 ## Stack
 
-Dioxus Desktop 0.7 (WebView2) behind Cargo feature `ui`; `mock/status-surface.html` remains the visual contract. Control plane and CLI are Rust-first (ADR-0004). CLI stays the automation entry (ADR-0017).
+Dioxus Desktop 0.7 default-on (WebView2); `mock/status-surface.html` remains the visual contract. `--no-default-features` is the CLI-only escape. Control plane and CLI are Rust-first (ADR-0004). CLI stays the automation entry (ADR-0017).
 
 ## Users
 
@@ -38,7 +38,7 @@ Same-machine Windows session orchestrator with hybrid Completion Signals and a b
 - Strict review gate: findings above low are not deferrable
 - Status Surface is Dioxus Desktop (WebView2); mock HTML stays the visual reference
 - Planning docs and conductor tracks must never ship inside product git
-- Open: default-on `ui` feature / installer bundle (owner call after first ship)
+- Status Surface ships in the default install (`cargo install --path . --locked` → `coordinator ui`)
 
 ## Brand Commitments
 
@@ -49,7 +49,7 @@ Same-machine Windows session orchestrator with hybrid Completion Signals and a b
 ## Evidence on Hand
 
 - Product intent: planning tree `SHARED-UNDERSTANDING.md` and ADRs 0001–0028 (outside this git repo)
-- Product code today: Rust Control Plane + live Status Surface (`cargo run --features ui -- ui`); mock under `mock/status-surface.html` is the visual contract
+- Product code today: Rust Control Plane + live Status Surface (`cargo run -- ui` / installed `coordinator ui`); mock under `mock/status-surface.html` is the visual contract
 - Design skills: project-scope Impeccable under `.agents/skills/impeccable/`
 
 ## Product Principles

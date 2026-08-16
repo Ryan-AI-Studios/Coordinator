@@ -33,5 +33,5 @@ jobs:
       - name: cargo test
         run: cargo test
 
-      - name: cargo test --features ui
-        run: cargo test --features ui
+      - name: cargo test --no-default-features --lib
+        run: cargo test --no-default-features --lib

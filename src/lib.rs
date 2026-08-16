@@ -6,7 +6,7 @@
 //! Failure Artifact + toast + Notify Adapter: track **0009**.
 //! Token-idle CI wait + auto squash-merge: track **0010**.
 //! Cross-model review gate (Codex→Claude→OpenCode): track **0011**.
-//! Status Surface (Dioxus Desktop, `--features ui`): track **0014**.
+//! Status Surface (Dioxus Desktop, default-on `ui`; `--no-default-features` escape): track **0014** / **0024**.
 //! Hermes inbound webhook notify adapter (opt-in HMAC V2): track **0015**.
 //! Coordinated multi-sibling dogfood (named-map prompt): track **0016**.
 //! Harness progress watchdog (detect + surface stall): track **0026**.

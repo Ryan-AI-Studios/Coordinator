@@ -1,4 +1,5 @@
-//! Dioxus Desktop Local Ops Console (`--features ui`). In-process `api::*` only.
+//! Dioxus Desktop Local Ops Console (default-on `ui`; `--no-default-features` compiles this out).
+//! In-process `api::*` only.
 
 use std::path::PathBuf;
 
@@ -356,13 +357,11 @@ fn maybe_spawn_serve(port: u16) {
             eprintln!(
                 "coordinator ui: serve already up on 127.0.0.1:{p}; window uses in-process api"
             );
-            return;
         }
         ServeAttach::SkipOccupied { port: p } => {
             eprintln!(
                 "coordinator ui: 127.0.0.1:{p} is occupied but is not coordinator; skipping owned serve"
             );
-            return;
         }
         ServeAttach::Start { port: p } => {
             let _handle = std::thread::Builder::new()
