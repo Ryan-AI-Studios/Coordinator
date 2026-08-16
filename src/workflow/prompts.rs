@@ -89,6 +89,10 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                 "{}\n\
                  {RESEARCH}\n\
                  Write spec.md and plan.md in the track folder. Mark the track Ready.\n\
+                 If spec.md and plan.md already exist, do not re-plan from scratch. \
+                 Do not run cargo, ledgerful, or ai-brains unless the track spec \
+                 execution path is the execution repo. Write evidence.md if the spec \
+                 asks for it, then end this turn.\n\
                  {END_TURN}\n",
                 honor_skill("plan", &path)
             )
@@ -109,6 +113,9 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                 "Honor project skills. This phase loads the `implement` skill from {implement} \
                  and the `onboarding` skill from {onboarding}.\n\
                  Honor the track spec execution path.\n\
+                 If the spec execution path is the workspace (planning-only), write \
+                 evidence.md there. Do not edit the execution repo and do not run \
+                 cargo, ledgerful, or ai-brains there.\n\
                  {RESEARCH}\n\
                  {END_TURN}\n"
             )
@@ -323,6 +330,9 @@ mod tests {
         assert!(text.contains("stale") && text.contains("primary sources"));
         assert!(text.contains("spec.md"));
         assert!(text.contains("plan.md"));
+        assert!(text.contains("already exist"));
+        assert!(text.contains("evidence.md"));
+        assert!(text.contains("Do not run cargo"));
         assert!(text.contains("end this turn") || text.contains("end the turn"));
         assert!(text.contains("Do not") && text.contains("outcome write"));
         assert!(!contains_skill(&text, "foldin"));
@@ -382,6 +392,8 @@ mod tests {
         );
         assert!(text.contains("stale") && text.contains("primary sources"));
         assert!(text.contains("execution path"));
+        assert!(text.contains("planning-only"));
+        assert!(text.contains("evidence.md"));
         assert!(text.contains("end this turn") || text.contains("end the turn"));
         assert!(text.contains("Do not") && text.contains("outcome write"));
         assert!(text.contains("Honor project skills"));
