@@ -202,7 +202,8 @@ async fn abort_stuck_prompt_async(record: &ProjectRecord, reason: AbortReason) -
     Ok(())
 }
 
-/// First stall this phase: stamp recycle, then abort. Second stall: surface only.
+/// First stall this phase: stamp recycle, then abort — unless the last
+/// heartbeat was `session/update` (mid-tool). Second stall: surface only.
 pub fn maybe_stamp_and_abort_stall(record: &ProjectRecord) -> Option<StatusView> {
     let stamped = with_run_state_lock(record, || {
         let mut state = load_run_state(record)?;
@@ -213,6 +214,11 @@ pub fn maybe_stamp_and_abort_stall(record: &ProjectRecord) -> Option<StatusView>
             return Ok(None);
         }
         if state.stalled_at.is_none() && !last_event_is_stall(&state.last_event) {
+            return Ok(None);
+        }
+        // Recycle is for a silent inject (no ACP updates). If Grok already
+        // sent session/update, it is mid-tool — aborting restarts the hang.
+        if crate::workflow::watchdog::last_progress_was_session_update(record) {
             return Ok(None);
         }
         state.stall_recycles = state.stall_recycles.saturating_add(1);

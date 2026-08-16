@@ -185,6 +185,7 @@ pub fn drive_with(
                 &paths.workspace_root,
                 &exec_repo,
                 track_dir.as_deref(),
+                state.track_id.as_deref(),
                 &deferred,
             ),
             remaining_timeout: remaining,
@@ -278,12 +279,12 @@ pub fn drive_with(
             "cross-model: all reviewers unavailable".into(),
         );
     }
-    apply_failure(
-        record,
-        state,
-        FailureClass::HarnessCrash,
-        "cross-model: all reviewers failed".into(),
-    )
+    let crash_msg = if last_note.is_empty() {
+        "cross-model: all reviewers failed".into()
+    } else {
+        format!("cross-model: all reviewers failed ({last_note})")
+    };
+    apply_failure(record, state, FailureClass::HarnessCrash, crash_msg)
 }
 
 fn remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
@@ -564,6 +565,12 @@ mod tests {
         let view = crate::workflow::tick(&r).unwrap().expect("fail");
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::ModelExhaustion));
+        assert!(
+            view.last_event.contains("all tiers exhausted")
+                && view.last_event.contains("opencode: exhausted"),
+            "last_event={}",
+            view.last_event
+        );
         assert!(crate::notify::artifact::existing_path(&r).is_some());
         assert_eq!(counts.n(), 3);
         clear_env();

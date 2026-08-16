@@ -86,13 +86,15 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
         PHASE_PLAN => {
             let path = workspace_skill(record, "plan");
             format!(
-                "{}\n\
+                "If spec.md and plan.md already exist in the track folder: write \
+                 evidence.md there now. Use `coordinator --version` and an ISO-8601 \
+                 UTC timestamp only. Do not load the plan skill. Do not run cargo, \
+                 ledgerful, or ai-brains. Do not read Coordinator product source. \
+                 Then end this turn.\n\
+                 Otherwise:\n\
+                 {}\n\
                  {RESEARCH}\n\
                  Write spec.md and plan.md in the track folder. Mark the track Ready.\n\
-                 If spec.md and plan.md already exist, do not re-plan from scratch. \
-                 Do not run cargo, ledgerful, or ai-brains unless the track spec \
-                 execution path is the execution repo. Write evidence.md if the spec \
-                 asks for it, then end this turn.\n\
                  {END_TURN}\n",
                 honor_skill("plan", &path)
             )
@@ -331,7 +333,10 @@ mod tests {
         assert!(text.contains("spec.md"));
         assert!(text.contains("plan.md"));
         assert!(text.contains("already exist"));
+        assert!(text.contains("Otherwise:"));
         assert!(text.contains("evidence.md"));
+        assert!(text.contains("coordinator --version"));
+        assert!(text.contains("Do not load the plan skill"));
         assert!(text.contains("Do not run cargo"));
         assert!(text.contains("end this turn") || text.contains("end the turn"));
         assert!(text.contains("Do not") && text.contains("outcome write"));

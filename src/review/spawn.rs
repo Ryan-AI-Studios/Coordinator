@@ -30,7 +30,20 @@ impl ReviewBackend for LiveCli {
         crate::persist::atomic_write(&schema_path, VERDICT_SCHEMA_JSON.as_bytes())?;
 
         let args = argv_for(req, &last_path, &schema_path);
-        let out = run_process(&bin, &args, &req.exec_repo, req.remaining_timeout, &[])?;
+        // Codex: prompt on stdin (`exec -`) so cmd.exe /C cannot strip TRACK:.
+        let stdin = if req.harness.eq_ignore_ascii_case("codex") {
+            Some(req.prompt.as_bytes())
+        } else {
+            None
+        };
+        let out = run_process(
+            &bin,
+            &args,
+            &req.exec_repo,
+            req.remaining_timeout,
+            &[],
+            stdin,
+        )?;
         let last_message = std::fs::read_to_string(&last_path).unwrap_or_default();
         let last_message = if last_message.trim().is_empty() {
             out.stdout.clone()
@@ -67,6 +80,8 @@ fn codex_argv(req: &ReviewRequest, last_path: &Path, schema_path: &Path) -> Vec<
         last_path.to_string_lossy().into_owned(),
         "--output-schema".into(),
         schema_path.to_string_lossy().into_owned(),
+        "--add-dir".into(),
+        req.workspace_root.to_string_lossy().into_owned(),
     ];
     if let Some(ref model) = req.model
         && !model.trim().is_empty()
@@ -74,11 +89,12 @@ fn codex_argv(req: &ReviewRequest, last_path: &Path, schema_path: &Path) -> Vec<
         args.push("-m".into());
         args.push(model.clone());
     }
-    args.push(req.prompt.clone());
+    // `-` = read the audit prompt from stdin (see LiveCli::run).
+    args.push("-".into());
     args
 }
 
-fn claude_argv(req: &ReviewRequest, schema_path: &Path) -> Vec<String> {
+fn claude_argv(req: &ReviewRequest, _schema_path: &Path) -> Vec<String> {
     let mut args = vec![
         "-p".into(),
         req.prompt.clone(),
@@ -93,7 +109,8 @@ fn claude_argv(req: &ReviewRequest, schema_path: &Path) -> Vec<String> {
         "--add-dir".into(),
         req.workspace_root.to_string_lossy().into_owned(),
         "--json-schema".into(),
-        schema_path.to_string_lossy().into_owned(),
+        // Claude wants the schema JSON inline, not a path (file path parses as "C").
+        super::prompt::VERDICT_SCHEMA_JSON.to_string(),
     ];
     if let Some(ref model) = req.model
         && !model.trim().is_empty()
@@ -156,12 +173,17 @@ pub(crate) fn run_process(
     cwd: &Path,
     timeout: Duration,
     extra_env: &[(&str, String)],
+    stdin: Option<&[u8]>,
 ) -> Result<ProcOut> {
     let mut cmd = spawn_command(bin);
     cmd.args(args)
         .current_dir(cwd)
         .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in extra_env {
@@ -182,6 +204,12 @@ pub(crate) fn run_process(
             )));
         }
     };
+    if let Some(bytes) = stdin
+        && let Some(mut pipe) = child.stdin.take()
+    {
+        use std::io::Write;
+        let _ = pipe.write_all(bytes);
+    }
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -260,17 +288,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_argv_has_no_add_dir_or_exec_review() {
+    fn codex_argv_reads_prompt_from_stdin_and_adds_workspace() {
         let r = req("codex");
         let args = argv_for(&r, Path::new("last.txt"), Path::new("schema.json"));
         assert_eq!(args[0], "exec");
         assert!(!args.iter().any(|a| a == "review"));
-        assert!(!args.iter().any(|a| a == "--add-dir"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--add-dir" && w[1] == r"C:\dev\proj")
+        );
         assert!(args.iter().any(|a| a == "--ephemeral"));
         assert!(args.iter().any(|a| a == "--output-schema"));
         assert!(args.iter().any(|a| a == "-s"));
         assert!(!args.iter().any(|a| a == "-m"));
-        assert_eq!(args.last().map(String::as_str), Some("audit please"));
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+        assert!(!args.iter().any(|a| a == "audit please"));
     }
 
     #[test]
@@ -306,6 +338,19 @@ mod tests {
         assert!(args.iter().any(|a| a == "--add-dir"));
         assert!(args.iter().any(|a| a == "--json-schema"));
         assert!(args.iter().any(|a| a == "-p"));
+        let schema = args
+            .windows(2)
+            .find(|w| w[0] == "--json-schema")
+            .map(|w| w[1].as_str())
+            .expect("schema arg");
+        assert!(
+            schema.trim_start().starts_with('{'),
+            "Claude --json-schema must be inline JSON, got {schema}"
+        );
+        assert!(
+            !schema.ends_with(".json"),
+            "Claude --json-schema must not be a file path: {schema}"
+        );
     }
 
     #[test]
