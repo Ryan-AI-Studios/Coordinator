@@ -71,6 +71,8 @@ Control Plane entrypoints: `project add|list|show|set|scan` (`--auto-merge true|
 
 Adapter injects name the phase skill as `{workspace|execution}/.agents/skills/<phase>/SKILL.md` (planning skills under the workspace root are not visible from the product `grok_cwd`).
 
+**Live autonomous walk:** `--project C:\dev\Helping-Hands --track 0099` only. Do not drive HH **0001–0013**. Do not drop review files or `outcome write`.
+
 ## PR discipline
 
 - Feature branch → PR → CI green → squash-merge (default for later tracks)  

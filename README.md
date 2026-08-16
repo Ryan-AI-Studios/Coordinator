@@ -205,6 +205,25 @@ schtasks /Create /TN "Coordinator serve" /TR "<full-path>\coordinator.exe serve"
 
 Owner machine policy. `/IT` so it runs only while that user is logged on. `/ru System` is wrong (not interactive). Coordinator does **not** install this.
 
+### Autonomous pipeline dogfood
+
+Live proof of the installed daily path on registered Project **`C:\dev\Helping-Hands`** (nested, `execution_repo` = `hands\`, `auto_merge=false`). Probe track is **`0099-AutonomousPipelineProbe`** (planning-only; not a Helping Hands product milestone). Default driver is **adapter** — omit `--driver`.
+
+```powershell
+cd C:\dev\coordinator\coordinator
+# Do NOT: coordinator project scan --root C:\dev --add
+# Do NOT: coordinator run --track 0001   (or 0002–0013, including 0009)
+cargo install --path . --locked
+coordinator serve                 # leave running; default 7420
+coordinator serve --check         # exit 0; service=coordinator
+coordinator ui                    # attach; do not start a second ticker
+coordinator run --project C:\dev\Helping-Hands --track 0099 --detach
+coordinator status --project C:\dev\Helping-Hands
+# expect ticker.owner=serve, driver=adapter, track=0099
+```
+
+Zero operator role JSON: do not `outcome write`, do not drop `agy-review.md` / `opencode-review.md`. Coordinator injects Grok for plan/fold/implement and **spawns** `agy --print` + `opencode run` for plan-review. `next_track` on 0099 is **null** — this walk must not start Helping Hands **0001–0013**.
+
 **Completion contract (hybrid):** the **Phase Outcome File** is the portable done-signal (schema `version: 1`). Hooks, adapters, CLI, and HTTP may write it; **ConPTY / chat pattern-match is not the contract**. Writers must use **temp + replace** (or `coordinator outcome write` / `POST /v1/outcome`) so pollers never read torn JSON.
 
 **Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Resolve order: uniform `COORDINATOR_PHASE_TIMEOUT_SECS` (if set) → **project** `phase_timeouts_secs` → machine `config.json` `phase_timeouts_secs` → table. Set a project override with `project set --phase-timeout PHASE=SECS` (seconds only; `0` is rejected). Machine hand-edit of `config.json` is still valid for machine-wide keys. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail) and writes `FAILURE.md`. This is **not** the CLI poll budget (`wait --timeout-secs` or optional `run --timeout-secs`: exit **2**, run stays as it was, Grok stays up). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
@@ -366,6 +385,7 @@ Long-lived **Grok Build** sessions use `grok agent stdio` (JSON-RPC 2.0, line-de
 | Spawn | `grok agent [-m {model}] stdio` (`-m` only when the phase Role Binding has a non-empty `model`) — `initialize` → `authenticate` (`methodId`, `_meta.headless`) → `session/new` `{ cwd, mcpServers: [] }` |
 | Cwd | Layout-resolved `execution_repo` if set, else `workspace_root` |
 | Prompt | `session/prompt` with `sessionId` + content-block array; `session/update` chunks collected |
+| FS | `initialize` advertises `fs.readTextFile` / `fs.writeTextFile`. The adapter **replies** to agent `fs/read_text_file` and `fs/write_text_file` (absolute paths under session cwd, workspace root, or execution repo; parent dirs created on write). Unanswered fs RPCs hang Grok `read_file` until stall / phase timeout. |
 | Compact | Inject `/compact` via `session/prompt` (not a separate RPC). If unsupported: `supports_compact=false` and skip (ADR-0021), do not fail the run |
 | Auth | Operator `grok login` (`cached_token`) or `XAI_API_KEY` (`xai.api_key`). Coordinator does **not** own OAuth |
 | Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` is teardown: in-process pool, then a quick holder `Shutdown` RPC, then `taskkill /F /PID` on persist `pid` then `holder_pid`. Persist is always written `alive: false`; returned status matches the file. `taskkill` “not found” is success. Missing `taskkill` is not a shutdown error. |
