@@ -278,14 +278,10 @@ fn resolve_record(project: Option<&str>) -> Result<ProjectRecord> {
     Ok(reg.resolve_project(project)?.clone())
 }
 
-fn prompt_timeout() -> Duration {
-    crate::workflow::timeout_for_phase(crate::workflow::graph::PHASE_PLAN)
-}
-
 fn prompt_timeout_for(record: &ProjectRecord) -> Duration {
     match load_run_state(record) {
-        Ok(s) => crate::workflow::timeout_for_phase(&s.phase),
-        Err(_) => prompt_timeout(),
+        Ok(s) => crate::workflow::timeout_for_phase(record, &s.phase),
+        Err(_) => crate::workflow::timeout_for_phase(record, crate::workflow::graph::PHASE_PLAN),
     }
 }
 
@@ -1503,6 +1499,7 @@ mod tests {
             execution_repos: Default::default(),
             state_dir: Some(dir.path().join("state")),
             auto_merge: true,
+            phase_timeouts_secs: Default::default(),
             created_at: chrono::Utc::now(),
         };
         let stale = PersistedGrokHandle {
@@ -1549,6 +1546,14 @@ mod tests {
 
     #[test]
     fn prompt_timeout_uses_current_phase_budget() {
+        use crate::config::{ENV_COORDINATOR_HOME, test_env_lock};
+        use crate::workflow::timeouts::ENV_PHASE_TIMEOUT_SECS;
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
         let dir = tempdir().unwrap();
         let rec = ProjectRecord {
             id: "p".into(),
@@ -1560,15 +1565,54 @@ mod tests {
             execution_repos: Default::default(),
             state_dir: Some(dir.path().join("state")),
             auto_merge: true,
+            phase_timeouts_secs: Default::default(),
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(&rec, None, crate::workflow::WorkflowDriver::FileWait).unwrap();
         let t = prompt_timeout_for(&rec);
         assert_eq!(
             t,
-            crate::workflow::timeout_for_phase(crate::workflow::graph::PHASE_PLAN)
+            crate::workflow::timeout_for_phase(&rec, crate::workflow::graph::PHASE_PLAN)
         );
         assert_ne!(t, Duration::from_secs(300));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[test]
+    fn prompt_timeout_missing_file_is_stub_not_plan() {
+        use crate::config::{ENV_COORDINATOR_HOME, test_env_lock};
+        use crate::workflow::timeouts::ENV_PHASE_TIMEOUT_SECS;
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: "p".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: Default::default(),
+            created_at: chrono::Utc::now(),
+        };
+        let t = prompt_timeout_for(&rec);
+        assert_eq!(t, Duration::from_secs(300));
+        assert_ne!(
+            t,
+            crate::workflow::timeout_for_phase(&rec, crate::workflow::graph::PHASE_PLAN)
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
     }
 
     #[test]
@@ -1584,6 +1628,7 @@ mod tests {
             execution_repos: Default::default(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: Default::default(),
             created_at: chrono::Utc::now(),
         };
         let p = persist_path(&rec).unwrap();
@@ -1762,6 +1807,7 @@ mod tests {
             execution_repos: Default::default(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: Default::default(),
             created_at: chrono::Utc::now(),
         };
         assert_eq!(grok_cwd(&rec), exec);
@@ -2109,6 +2155,7 @@ mod tests {
             execution_repos: Default::default(),
             state_dir: Some(dir.path().join("state")),
             auto_merge: true,
+            phase_timeouts_secs: Default::default(),
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(

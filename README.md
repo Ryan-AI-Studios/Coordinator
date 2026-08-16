@@ -149,9 +149,18 @@ When more than one project is registered, omit `--project` and the CLI errors (i
 
 **Completion contract (hybrid):** the **Phase Outcome File** is the portable done-signal (schema `version: 1`). Hooks, adapters, CLI, and HTTP may write it; **ConPTY / chat pattern-match is not the contract**. Writers must use **temp + replace** (or `coordinator outcome write` / `POST /v1/outcome`) so pollers never read torn JSON.
 
-**Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Override per key via machine `config.json` `phase_timeouts_secs`. Uniform test override: `COORDINATOR_PHASE_TIMEOUT_SECS`. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail) and writes `FAILURE.md`. This is **not** the CLI poll budget (`wait --timeout-secs` or optional `run --timeout-secs`: exit **2**, run stays as it was, Grok stays up). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
+**Per-phase timeouts:** canonical phases use table defaults (`plan` 1800s, `plan-review` 1200s, `fold` 1200s, `implement` 7200s, `cross-model-review` 2700s, `ci-wait` 3600s, `compact` 600s, `advance` 900s). Resolve order: uniform `COORDINATOR_PHASE_TIMEOUT_SECS` (if set) → **project** `phase_timeouts_secs` → machine `config.json` `phase_timeouts_secs` → table. Set a project override with `project set --phase-timeout PHASE=SECS` (seconds only; `0` is rejected). Machine hand-edit of `config.json` is still valid for machine-wide keys. Leftover `stub:*` phases still use **300s** / `COORDINATOR_STUB_PHASE_TIMEOUT_SECS`. Budget is **frozen while Paused**. On fire, Control Plane synthesizes `failure_class=timeout` via the same apply path (compact timeout **skips**, does not fail) and writes `FAILURE.md`. This is **not** the CLI poll budget (`wait --timeout-secs` or optional `run --timeout-secs`: exit **2**, run stays as it was, Grok stays up). Poll interval: default **500ms** (`COORDINATOR_OUTCOME_POLL_MS`).
 
-**Four clocks (do not collapse):** (1) CLI poll budget — `wait --timeout-secs` (default **3600**) or optional `run --timeout-secs N` (`N>0`). Bare `run` has **no** poll budget and ticks until Idle/Stopped. Budget expiry is exit **2**, run unchanged, **no abort**. (2) phase wall clock — `failure_class=timeout` + Stopped + `FAILURE.md` **and** abort/recycle the in-flight Prompt; (3) ACP `session/prompt` timeout — Prompt error mapped onto the phase **and** recycle so the next `start` is a new `session/new`; (4) **progress stall** (default **600s**) — adapter `session/update` / inject heartbeat went silent. First stall this phase: cancel then recycle (`last_event` = `recycle: stall — new session`), stay **Running**, no `FAILURE.md`. Second stall: surface only (`watchdog: stall`) until the phase wall clock. Override via `COORDINATOR_PROGRESS_STALL_SECS` or machine `progress_stall_secs` (`0` disables). Cancel wait: `COORDINATOR_CANCEL_WAIT_SECS` (default **10**; `0` recycles immediately). Operator `stop` still leaves sessions for attach. Ctrl-C during a ticking `run`/`wait` also leaves the run **Running** (no abort, no artifact).
+Helping Hands / Orca-shaped recipe (plan 1h / implement 3h as seconds). This is **not** `run --timeout-secs`:
+
+```
+coordinator project set --project C:\dev\Orca --phase-timeout plan=3600 --phase-timeout implement=10800
+coordinator project show --project C:\dev\Orca
+```
+
+CLI `run` / `wait` keep the start-of-command `ProjectRecord` snapshot — set timeouts **before** `run`. `serve` reloads the registry each tick.
+
+**Four clocks (do not collapse):** (1) CLI poll budget — `wait --timeout-secs` (default **3600**) or optional `run --timeout-secs N` (`N>0`). Bare `run` has **no** poll budget and ticks until Idle/Stopped. Budget expiry is exit **2**, run unchanged, **no abort**. (2) phase wall clock — project `phase_timeouts_secs` (then machine, then table; env still wins) — `failure_class=timeout` + Stopped + `FAILURE.md` **and** abort/recycle the in-flight Prompt; (3) ACP `session/prompt` timeout — Prompt error mapped onto the phase **and** recycle so the next `start` is a new `session/new`; (4) **progress stall** (default **600s**) — adapter `session/update` / inject heartbeat went silent. First stall this phase: cancel then recycle (`last_event` = `recycle: stall — new session`), stay **Running**, no `FAILURE.md`. Second stall: surface only (`watchdog: stall`) until the phase wall clock. Override via `COORDINATOR_PROGRESS_STALL_SECS` or machine `progress_stall_secs` (`0` disables). Cancel wait: `COORDINATOR_CANCEL_WAIT_SECS` (default **10**; `0` recycles immediately). Operator `stop` still leaves sessions for attach. Ctrl-C during a ticking `run`/`wait` also leaves the run **Running** (no abort, no artifact).
 
 **`run` without `--track`:** retains the prior `track_id` (intentional). Fresh `run` **clears** `next_track` (stale Planner handoff).
 
@@ -369,12 +378,15 @@ coordinator project add <path>
     [--execution-repo <path>] [--conductor-dir <path>] [--state-dir <path>]
     [--display-name <name>] [--execution-repo-name <name>]
     [--auto-merge true|false]
+    [--phase-timeout PHASE=SECS]...
 coordinator project list
 coordinator project show [--project <path|id>]
 coordinator project set [--project …]
     [--profile …] [--execution-repo …] [--conductor-dir …] [--state-dir …]
     [--display-name …] [--execution-repos-json <json>] [--execution-repo-name …]
     [--auto-merge true|false]
+    [--phase-timeout PHASE=SECS]... [--clear-phase-timeout PHASE]...
+    [--clear-phase-timeouts]
 coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]
 coordinator status [--project <path|id>]
 coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait|stub] [--detach] [--timeout-secs N]

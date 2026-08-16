@@ -689,6 +689,7 @@ mod tests {
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         };
         run::run_with_driver(&rec, Some("0014".into()), WorkflowDriver::FileWait).unwrap();

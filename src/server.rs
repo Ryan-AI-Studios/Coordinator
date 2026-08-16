@@ -427,6 +427,80 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["layout_profile"], "single_root");
 
+        // Merge phase_timeouts_secs across two POSTs
+        let body = serde_json::to_vec(&json!({
+            "phase_timeouts_secs": { "plan": 3600 }
+        }))
+        .unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/set")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["phase_timeouts_secs"]["plan"], 3600);
+
+        let body = serde_json::to_vec(&json!({
+            "phase_timeouts_secs": { "implement": 10800 }
+        }))
+        .unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/set")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["phase_timeouts_secs"]["plan"], 3600);
+        assert_eq!(v["phase_timeouts_secs"]["implement"], 10800);
+
+        // Reject 0 before write
+        let body = serde_json::to_vec(&json!({
+            "phase_timeouts_secs": { "plan": 0 }
+        }))
+        .unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/set")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let listed = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/projects")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let bytes = listed.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["projects"][0]["phase_timeouts_secs"]["plan"], 3600);
+        assert_eq!(v["projects"][0]["phase_timeouts_secs"]["implement"], 10800);
+
         // Status always includes execution_repo key (may be string or null)
         let response = app()
             .oneshot(

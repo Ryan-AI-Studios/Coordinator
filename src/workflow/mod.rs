@@ -17,7 +17,7 @@ use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run
 
 pub use drive::tick;
 pub use graph::{WORKFLOW_ID, is_canonical, is_stub_phase, resolve_track_dir, successor};
-pub use timeouts::{ENV_PHASE_TIMEOUT_SECS, timeout_for_phase};
+pub use timeouts::{ENV_PHASE_TIMEOUT_SECS, TimeoutSource, timeout_for_phase, timeout_source};
 
 /// Env fallback when CLI/HTTP omit `--driver`.
 pub const ENV_WORKFLOW_DRIVER: &str = "COORDINATOR_WORKFLOW_DRIVER";
@@ -255,6 +255,7 @@ mod tests {
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
     }

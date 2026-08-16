@@ -287,8 +287,8 @@ fn slot_role(slug: &str) -> &'static str {
     }
 }
 
-fn remaining_budget(state: &RunState) -> Duration {
-    timeout_for_phase(PHASE_PLAN_REVIEW)
+fn remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
+    timeout_for_phase(record, PHASE_PLAN_REVIEW)
         .saturating_sub(state.effective_running_elapsed(chrono::Utc::now()))
 }
 
@@ -347,7 +347,7 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
         if s.status != RunStatus::Running || s.phase != PHASE_PLAN_REVIEW {
             return Ok(false);
         }
-        if remaining_budget(&s) < MIN_SPAWN_BUDGET {
+        if remaining_budget(record, &s) < MIN_SPAWN_BUDGET {
             return Ok(false);
         }
         if s.plan_review_spawned.iter().any(|x| x == slug) {
@@ -367,7 +367,7 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
 
     let rec = record.clone();
     let spawn_state = load_run_state(record).unwrap_or(live);
-    let remaining = remaining_budget(&spawn_state);
+    let remaining = remaining_budget(record, &spawn_state);
     let paths = crate::layout::resolve(record);
     let spawn_track_id = spawn_state.track_id.clone();
     let spawn_epoch = spawn_state.run_epoch;
@@ -1207,6 +1207,7 @@ mod tests {
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
     }

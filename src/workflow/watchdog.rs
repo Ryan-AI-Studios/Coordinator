@@ -145,7 +145,7 @@ fn check_stall_inner(record: &ProjectRecord) -> Result<Option<StatusView>> {
             return Ok(None);
         };
         let now = Utc::now();
-        let budget = timeout_for_phase(&state.phase);
+        let budget = timeout_for_phase(record, &state.phase);
         let elapsed = state.effective_running_elapsed(now);
         let remaining = budget.saturating_sub(elapsed);
         if stall >= remaining {
@@ -282,6 +282,7 @@ mod tests {
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
     }

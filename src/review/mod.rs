@@ -97,7 +97,7 @@ pub fn drive_with(
         );
     };
 
-    let remaining = remaining_budget(state);
+    let remaining = remaining_budget(record, state);
     if remaining < MIN_TIER_BUDGET {
         return apply_failure(
             record,
@@ -145,7 +145,10 @@ pub fn drive_with(
             continue;
         }
 
-        let remaining = remaining_budget(&load_run_state(record).unwrap_or_else(|_| state.clone()));
+        let remaining = remaining_budget(
+            record,
+            &load_run_state(record).unwrap_or_else(|_| state.clone()),
+        );
         if remaining < MIN_TIER_BUDGET {
             if !any_started {
                 return apply_failure(
@@ -238,7 +241,10 @@ pub fn drive_with(
         }
     }
 
-    let remaining = remaining_budget(&load_run_state(record).unwrap_or_else(|_| state.clone()));
+    let remaining = remaining_budget(
+        record,
+        &load_run_state(record).unwrap_or_else(|_| state.clone()),
+    );
     if remaining < MIN_TIER_BUDGET && !any_started {
         return apply_failure(
             record,
@@ -280,8 +286,8 @@ pub fn drive_with(
     )
 }
 
-fn remaining_budget(state: &RunState) -> Duration {
-    let budget = timeout_for_phase(&state.phase);
+fn remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
+    let budget = timeout_for_phase(record, &state.phase);
     let elapsed = state.effective_running_elapsed(Utc::now());
     budget.saturating_sub(elapsed)
 }
@@ -404,6 +410,7 @@ mod tests {
             execution_repos: Default::default(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: Default::default(),
             created_at: Utc::now(),
         }
     }
