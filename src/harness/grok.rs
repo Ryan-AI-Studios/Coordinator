@@ -5,6 +5,9 @@
 //! - `authenticate` `{ methodId, _meta: { headless: true } }`
 //! - `session/new` `{ cwd, mcpServers: [] }`
 //! - `session/prompt` `{ sessionId, prompt: [{ type: "text", text }] }`
+//! - Agent → client `fs/read_text_file` / `fs/write_text_file` (also camelCase aliases)
+//!   because `initialize` advertises `fs.readTextFile` / `fs.writeTextFile`. Unanswered
+//!   fs requests hang Grok `read_file` until the stall/phase clocks.
 //!
 //! Windows I/O: every stdin write is `json + '\n'` then **flush**; stdout is a line reader.
 
@@ -478,6 +481,9 @@ impl GrokSession {
                 }
                 continue;
             }
+            if self.handle_agent_fs(&v).await? {
+                continue;
+            }
             if v.get("id") == Some(&json!(id)) {
                 self.in_flight_id.store(0, Ordering::SeqCst);
                 if let Some(err) = v.get("error") {
@@ -491,6 +497,54 @@ impl GrokSession {
                 return Ok(v.get("result").cloned().unwrap_or(json!({})));
             }
         }
+    }
+
+    /// Reply to agent→client filesystem RPCs advertised at `initialize`.
+    async fn handle_agent_fs(&mut self, v: &Value) -> Result<bool> {
+        let Some(method) = v.get("method").and_then(|m| m.as_str()) else {
+            return Ok(false);
+        };
+        let read = method == "fs/read_text_file" || method == "fs/readTextFile";
+        let write = method == "fs/write_text_file" || method == "fs/writeTextFile";
+        if !read && !write {
+            return Ok(false);
+        }
+        let Some(req_id) = v.get("id").cloned() else {
+            return Ok(true);
+        };
+        if let Some(ref rec) = self.progress_record {
+            let sid = if self.session_id.is_empty() {
+                None
+            } else {
+                Some(self.session_id.as_str())
+            };
+            crate::workflow::watchdog::note_progress(
+                rec,
+                crate::workflow::watchdog::ProgressKind::SessionUpdate,
+                sid,
+            );
+        }
+        let roots = self.fs_allowed_roots();
+        let reply = if read {
+            fs_read_reply(req_id, v.get("params"), &roots)
+        } else {
+            fs_write_reply(req_id, v.get("params"), &roots)
+        };
+        self.write_line(&reply).await?;
+        Ok(true)
+    }
+
+    /// Session cwd plus layout workspace / execution (planning tree is outside grok_cwd).
+    fn fs_allowed_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.cwd.clone()];
+        if let Some(rec) = &self.progress_record {
+            let paths = crate::layout::resolve(rec);
+            roots.push(paths.workspace_root);
+            if let Some(exec) = paths.execution_repo {
+                roots.push(exec);
+            }
+        }
+        roots
     }
 
     async fn write_line(&self, json_line: &str) -> Result<()> {
@@ -790,6 +844,122 @@ pub fn rpc_error(id: u64, message: &str) -> String {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}}).to_string()
 }
 
+fn rpc_error_id(id: Value, code: i32, message: &str) -> String {
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}).to_string()
+}
+
+/// ACP `line` is 1-based. Missing / `0` starts at the first line.
+fn slice_text_lines(content: &str, line: Option<u64>, limit: Option<u64>) -> String {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let start = match line {
+        Some(n) if n > 0 => (n as usize).saturating_sub(1),
+        _ => 0,
+    };
+    if start >= lines.len() {
+        return String::new();
+    }
+    let end = match limit {
+        Some(n) => start.saturating_add(n as usize).min(lines.len()),
+        None => lines.len(),
+    };
+    lines[start..end].concat()
+}
+
+fn path_is_under(root: &Path, candidate: &Path) -> bool {
+    let root_s = match dunce::canonicalize(root) {
+        Ok(r) => dunce::simplified(&r).to_path_buf(),
+        Err(_) => dunce::simplified(root).to_path_buf(),
+    };
+    let mut cur = dunce::simplified(candidate).to_path_buf();
+    loop {
+        if let Ok(c) = dunce::canonicalize(&cur) {
+            return dunce::simplified(&c).starts_with(&root_s);
+        }
+        match cur.parent() {
+            Some(parent) if parent != cur => cur = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    dunce::simplified(candidate).starts_with(&root_s)
+}
+
+fn fs_path_allowed(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path_is_under(root, path))
+}
+
+fn fs_read_reply(id: Value, params: Option<&Value>, roots: &[PathBuf]) -> String {
+    let Some(path) = params.and_then(|p| p.get("path")).and_then(|v| v.as_str()) else {
+        return rpc_error_id(id, -32602, "fs/read_text_file missing path");
+    };
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return rpc_error_id(id, -32602, "fs/read_text_file path must be absolute");
+    }
+    if !fs_path_allowed(p, roots) {
+        return rpc_error_id(id, -32602, "fs/read_text_file path is outside the project");
+    }
+    let line = params.and_then(|p| p.get("line")).and_then(|v| v.as_u64());
+    let limit = params.and_then(|p| p.get("limit")).and_then(|v| v.as_u64());
+    match std::fs::read_to_string(p) {
+        Ok(content) => {
+            let content = slice_text_lines(&content, line, limit);
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":content}}).to_string()
+        }
+        Err(e) => rpc_error_id(id, -32000, &format!("fs/read_text_file: {e}")),
+    }
+}
+
+fn fs_write_reply(id: Value, params: Option<&Value>, roots: &[PathBuf]) -> String {
+    let Some(path) = params.and_then(|p| p.get("path")).and_then(|v| v.as_str()) else {
+        return rpc_error_id(id, -32602, "fs/write_text_file missing path");
+    };
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return rpc_error_id(id, -32602, "fs/write_text_file path must be absolute");
+    }
+    if !fs_path_allowed(p, roots) {
+        return rpc_error_id(id, -32602, "fs/write_text_file path is outside the project");
+    }
+    let Some(content) = params
+        .and_then(|p| p.get("content"))
+        .and_then(|v| v.as_str())
+    else {
+        return rpc_error_id(id, -32602, "fs/write_text_file missing content");
+    };
+    if let Some(parent) = p.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return rpc_error_id(id, -32000, &format!("fs/write_text_file: {e}"));
+    }
+    match std::fs::write(p, content) {
+        Ok(()) => json!({"jsonrpc":"2.0","id":id,"result":null}).to_string(),
+        Err(e) => rpc_error_id(id, -32000, &format!("fs/write_text_file: {e}")),
+    }
+}
+
+/// Agent → client `fs/read_text_file` (official ACP snake_case method).
+pub fn fs_read_text_file(id: u64, session_id: &str, path: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "fs/read_text_file",
+        "params": { "sessionId": session_id, "path": path }
+    })
+    .to_string()
+}
+
+/// Agent → client `fs/write_text_file`.
+pub fn fs_write_text_file(id: u64, session_id: &str, path: &str, content: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "fs/write_text_file",
+        "params": { "sessionId": session_id, "path": path, "content": content }
+    })
+    .to_string()
+}
+
 pub fn session_update_chunk(text: &str) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -1067,6 +1237,259 @@ mod tests {
             .expect("permission result written");
         assert_eq!(reply["result"]["outcome"], "cancelled");
         assert!(reply.get("method").is_none());
+    }
+
+    #[tokio::test]
+    async fn fs_read_text_file_during_prompt_returns_content() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("outside").join("note.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "hello from parent\nline2\n").unwrap();
+        let mut lines = mock_handshake_ok("sess-fs");
+        lines.push(fs_read_text_file(99, "sess-fs", file.to_str().unwrap()));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        let result = session.inject_prompt("read", timeout()).await.unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("fs/read_text_file result written");
+        assert_eq!(reply["result"]["content"], "hello from parent\nline2\n");
+        assert!(reply.get("method").is_none());
+    }
+
+    #[tokio::test]
+    async fn fs_read_text_file_camel_case_alias() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "ok").unwrap();
+        let mut lines = mock_handshake_ok("sess-fs2");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "fs/readTextFile",
+                "params": { "sessionId": "sess-fs2", "path": file.to_str().unwrap() }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("read", timeout()).await.unwrap();
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(77)))
+            .expect("camelCase fs reply");
+        assert_eq!(reply["result"]["content"], "ok");
+    }
+
+    #[tokio::test]
+    async fn fs_read_text_file_relative_path_is_invalid() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-fs3");
+        lines.push(fs_read_text_file(55, "sess-fs3", "relative.txt"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("read", timeout()).await.unwrap();
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(55)))
+            .expect("relative path error");
+        assert_eq!(reply["error"]["code"], -32602);
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("absolute")
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_write_text_file_during_prompt_creates_file() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("track").join("evidence.md");
+        let mut lines = mock_handshake_ok("sess-fsw");
+        lines.push(fs_write_text_file(
+            88,
+            "sess-fsw",
+            file.to_str().unwrap(),
+            "coordinator 0.1.0\n",
+        ));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("write", timeout()).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "coordinator 0.1.0\n"
+        );
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(88)))
+            .expect("fs/write_text_file result");
+        assert!(reply["result"].is_null());
+    }
+
+    #[tokio::test]
+    async fn fs_read_workspace_parent_allowed_when_progress_bound() {
+        let ws = tempdir().unwrap();
+        let exec = ws.path().join("hands");
+        std::fs::create_dir_all(&exec).unwrap();
+        let file = ws.path().join("conductor").join("0099").join("spec.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "probe spec\n").unwrap();
+        let mut lines = mock_handshake_ok("sess-ws");
+        lines.push(fs_read_text_file(41, "sess-ws", file.to_str().unwrap()));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(exec.clone(), lines, timeout())
+            .await
+            .unwrap();
+        session.set_progress_record(ProjectRecord {
+            id: "hh".into(),
+            path: ws.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: Some(exec),
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: false,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        });
+        session.inject_prompt("read", timeout()).await.unwrap();
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(41)))
+            .expect("workspace parent read");
+        assert_eq!(reply["result"]["content"], "probe spec\n");
+    }
+
+    #[tokio::test]
+    async fn fs_read_outside_project_is_invalid() {
+        let dir = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let file = other.path().join("secret.txt");
+        std::fs::write(&file, "nope").unwrap();
+        let mut lines = mock_handshake_ok("sess-deny");
+        lines.push(fs_read_text_file(42, "sess-deny", file.to_str().unwrap()));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("read", timeout()).await.unwrap();
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(42)))
+            .expect("outside project error");
+        assert_eq!(reply["error"]["code"], -32602);
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("outside")
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_write_through_junction_outside_project_is_invalid() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let link = dir.path().join("escape");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                link.to_str().unwrap(),
+                outside.path().to_str().unwrap(),
+            ])
+            .status()
+            .expect("mklink");
+        if !status.success() {
+            eprintln!("skip: mklink /J not available");
+            return;
+        }
+        let file = link.join("pwned.txt");
+        let mut lines = mock_handshake_ok("sess-junc");
+        lines.push(fs_write_text_file(
+            44,
+            "sess-junc",
+            file.to_str().unwrap(),
+            "escaped\n",
+        ));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("write", timeout()).await.unwrap();
+        assert!(!file.exists());
+        assert!(!outside.path().join("pwned.txt").exists());
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(44)))
+            .expect("junction escape error");
+        assert_eq!(reply["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn fs_write_missing_content_is_invalid() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("x.md");
+        let mut lines = mock_handshake_ok("sess-noc");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "fs/write_text_file",
+                "params": { "sessionId": "sess-noc", "path": file.to_str().unwrap() }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("write", timeout()).await.unwrap();
+        assert!(!file.exists());
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(43)))
+            .expect("missing content error");
+        assert_eq!(reply["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn slice_text_lines_line_and_limit() {
+        let text = "a\nb\nc\nd\n";
+        assert_eq!(slice_text_lines(text, Some(2), Some(2)), "b\nc\n");
+        assert_eq!(slice_text_lines(text, Some(1), None), text);
+        assert_eq!(slice_text_lines(text, Some(10), Some(2)), "");
+        assert_eq!(slice_text_lines(text, None, Some(1)), "a\n");
     }
 }
 
