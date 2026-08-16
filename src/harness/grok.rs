@@ -8,6 +8,9 @@
 //! - Agent → client `fs/read_text_file` / `fs/write_text_file` (also camelCase aliases)
 //!   because `initialize` advertises `fs.readTextFile` / `fs.writeTextFile`. Unanswered
 //!   fs requests hang Grok `read_file` until the stall/phase clocks.
+//! - Agent → client `terminal/create|output|wait_for_exit|kill|release` because
+//!   `initialize` advertises `terminal: true`. Unanswered `terminal/create` hangs
+//!   Grok `run_terminal_command` the same way.
 //!
 //! Windows I/O: every stdin write is `json + '\n'` then **flush**; stdout is a line reader.
 
@@ -55,6 +58,7 @@ pub struct GrokSession {
     in_flight_id: Arc<AtomicU64>,
     session_id_shared: Arc<std::sync::Mutex<String>>,
     cancel_requested: Arc<AtomicBool>,
+    terminals: crate::harness::terminal::TerminalHub,
 }
 
 /// Cloneable stdin writer so abort can send `session/cancel` without the pool lock.
@@ -208,6 +212,7 @@ impl GrokSession {
             in_flight_id,
             session_id_shared,
             cancel_requested,
+            terminals: crate::harness::terminal::TerminalHub::new(),
         };
         session.handshake(timeout).await?;
         Ok(session)
@@ -251,6 +256,7 @@ impl GrokSession {
             in_flight_id,
             session_id_shared,
             cancel_requested,
+            terminals: crate::harness::terminal::TerminalHub::new(),
         };
         session.handshake(timeout).await?;
         Ok(session)
@@ -468,20 +474,26 @@ impl GrokSession {
                 }
                 continue;
             }
-            if v.get("method").and_then(|m| m.as_str()) == Some("session/request_permission")
-                && self.cancel_requested.load(Ordering::SeqCst)
-            {
+            if v.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 if let Some(perm_id) = v.get("id").cloned() {
-                    let reply = json!({
-                        "jsonrpc": "2.0",
-                        "id": perm_id,
-                        "result": { "outcome": "cancelled" }
-                    });
+                    let reply = if self.cancel_requested.load(Ordering::SeqCst) {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": perm_id,
+                            "result": { "outcome": "cancelled" }
+                        })
+                    } else {
+                        permission_allow_reply(perm_id, v.get("params"))
+                    };
                     self.write_line(&reply.to_string()).await?;
+                    self.note_session_progress();
                 }
                 continue;
             }
             if self.handle_agent_fs(&v).await? {
+                continue;
+            }
+            if self.handle_agent_terminal(&v).await? {
                 continue;
             }
             if v.get("id") == Some(&json!(id)) {
@@ -512,18 +524,7 @@ impl GrokSession {
         let Some(req_id) = v.get("id").cloned() else {
             return Ok(true);
         };
-        if let Some(ref rec) = self.progress_record {
-            let sid = if self.session_id.is_empty() {
-                None
-            } else {
-                Some(self.session_id.as_str())
-            };
-            crate::workflow::watchdog::note_progress(
-                rec,
-                crate::workflow::watchdog::ProgressKind::SessionUpdate,
-                sid,
-            );
-        }
+        self.note_session_progress();
         let roots = self.fs_allowed_roots();
         let reply = if read {
             fs_read_reply(req_id, v.get("params"), &roots)
@@ -532,6 +533,68 @@ impl GrokSession {
         };
         self.write_line(&reply).await?;
         Ok(true)
+    }
+
+    /// Reply to agent→client `terminal/*` RPCs advertised at `initialize`.
+    async fn handle_agent_terminal(&mut self, v: &Value) -> Result<bool> {
+        let Some(method) = v.get("method").and_then(|m| m.as_str()) else {
+            return Ok(false);
+        };
+        let Some(kind) = crate::harness::terminal::TerminalHub::classify(method) else {
+            return Ok(false);
+        };
+        let Some(req_id) = v.get("id").cloned() else {
+            return Ok(true);
+        };
+        self.note_session_progress();
+        if kind == crate::harness::terminal::TerminalMethod::Create
+            && let Some(raw) = v
+                .get("params")
+                .and_then(|p| p.get("cwd"))
+                .and_then(|x| x.as_str())
+        {
+            let p = Path::new(raw);
+            if p.is_absolute() && !fs_path_allowed(p, &self.fs_allowed_roots()) {
+                self.write_line(&rpc_error_value(
+                    &req_id,
+                    "terminal/create cwd is outside the project",
+                ))
+                .await?;
+                return Ok(true);
+            }
+        }
+        if kind == crate::harness::terminal::TerminalMethod::WaitForExit {
+            let params = v.get("params").cloned();
+            let hub = self.terminals.clone();
+            let writer = self.writer.clone();
+            tokio::spawn(async move {
+                let reply = hub.wait_for_exit_reply(req_id, params.as_ref()).await;
+                let _ = writer.write_line(&reply).await;
+            });
+            return Ok(true);
+        }
+        let reply = self
+            .terminals
+            .handle_sync(kind, req_id, v.get("params"), &self.cwd)
+            .await;
+        self.write_line(&reply).await?;
+        Ok(true)
+    }
+
+    fn note_session_progress(&self) {
+        let Some(ref rec) = self.progress_record else {
+            return;
+        };
+        let sid = if self.session_id.is_empty() {
+            None
+        } else {
+            Some(self.session_id.as_str())
+        };
+        crate::workflow::watchdog::note_progress(
+            rec,
+            crate::workflow::watchdog::ProgressKind::SessionUpdate,
+            sid,
+        );
     }
 
     /// Session cwd plus layout workspace / execution (planning tree is outside grok_cwd).
@@ -841,6 +904,10 @@ pub fn rpc_result(id: u64, result: Value) -> String {
 }
 
 pub fn rpc_error(id: u64, message: &str) -> String {
+    rpc_error_value(&json!(id), message)
+}
+
+pub fn rpc_error_value(id: &Value, message: &str) -> String {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}}).to_string()
 }
 
@@ -1000,10 +1067,41 @@ pub fn session_request_permission(id: u64, session_id: &str) -> String {
         "params": {
             "sessionId": session_id,
             "toolCall": { "toolCallId": "call_perm", "title": "write" },
-            "options": []
+            "options": [
+                { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+                { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+            ]
         }
     })
     .to_string()
+}
+
+fn permission_allow_reply(id: Value, params: Option<&Value>) -> Value {
+    let option_id = params
+        .and_then(|p| p.get("options"))
+        .and_then(|o| o.as_array())
+        .and_then(|opts| {
+            opts.iter()
+                .find(|o| {
+                    matches!(
+                        o.get("kind").and_then(|k| k.as_str()),
+                        Some("allow_once" | "allow_always")
+                    )
+                })
+                .or_else(|| opts.first())
+                .and_then(|o| o.get("optionId").and_then(|i| i.as_str()))
+        })
+        .unwrap_or("allow-once");
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id
+            }
+        }
+    })
 }
 
 /// Scripted handshake: initialize (cached_token + compact) → authenticate → session/new.
@@ -1237,6 +1335,142 @@ mod tests {
             .expect("permission result written");
         assert_eq!(reply["result"]["outcome"], "cancelled");
         assert!(reply.get("method").is_none());
+    }
+
+    #[tokio::test]
+    async fn permission_request_during_prompt_is_allowed_when_not_cancelling() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-perm-ok");
+        lines.push(session_request_permission(99, "sess-perm-ok"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        let result = session.inject_prompt("ok", timeout()).await.unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("permission result written");
+        assert_eq!(reply["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(reply["result"]["outcome"]["optionId"], "allow-once");
+    }
+
+    #[tokio::test]
+    async fn terminal_create_during_prompt_returns_terminal_id() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-term");
+        let (command, args) = if cfg!(windows) {
+            ("cmd.exe", vec!["/C", "echo hi"])
+        } else {
+            ("echo", vec!["hi"])
+        };
+        lines.push(crate::harness::terminal::terminal_create(
+            99,
+            "sess-term",
+            command,
+            &args,
+        ));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        let result = session.inject_prompt("ok", timeout()).await.unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("terminal/create result written");
+        assert!(
+            reply["result"]["terminalId"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("term-")),
+            "reply={reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_create_string_rpc_id_is_echoed() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-term-sid");
+        let (command, args) = if cfg!(windows) {
+            ("cmd.exe", vec!["/C", "echo hi"])
+        } else {
+            ("echo", vec!["hi"])
+        };
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "term-req-1",
+                "method": "terminal/create",
+                "params": {
+                    "sessionId": "sess-term-sid",
+                    "command": command,
+                    "args": args
+                }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("ok", timeout()).await.unwrap();
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!("term-req-1")))
+            .expect("string id terminal/create reply");
+        assert!(
+            reply["result"]["terminalId"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("term-")),
+            "reply={reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_create_cwd_outside_project_is_invalid() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-term-cwd");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "terminal/create",
+                "params": {
+                    "sessionId": "sess-term-cwd",
+                    "command": "cmd.exe",
+                    "args": ["/C", "echo hi"],
+                    "cwd": outside.path().to_str().unwrap()
+                }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("ok", timeout()).await.unwrap();
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("terminal/create cwd error");
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("outside"),
+            "reply={reply}"
+        );
     }
 
     #[tokio::test]

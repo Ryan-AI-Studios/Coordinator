@@ -61,6 +61,12 @@ pub fn run_with_driver(
                 crate::notify::clear_artifact(record);
                 crate::workflow::watchdog::clear_progress(record);
                 save_run_state(record, &state)?;
+                let track = state.track_id.as_deref().unwrap_or("-");
+                crate::progress_log::append(
+                    record,
+                    "start",
+                    &format!("track={track} phase={}  {}", state.phase, state.last_event),
+                );
                 Ok(StatusView::from_record(record, &state))
             }
             other => Err(CoordinatorError::InvalidTransition {
@@ -193,6 +199,12 @@ pub fn stop(record: &ProjectRecord) -> Result<StatusView> {
                 state.pause_started_at = None;
                 state.updated_at = chrono::Utc::now();
                 save_run_state(record, &state)?;
+                let track = state.track_id.as_deref().unwrap_or("-");
+                crate::progress_log::append(
+                    record,
+                    "stop",
+                    &format!("track={track} phase={}  {}", state.phase, state.last_event),
+                );
                 Ok(StatusView::from_record(record, &state))
             }
             RunStatus::Stopped => {
@@ -277,6 +289,9 @@ mod tests {
         assert_eq!(s.status, RunStatus::Stopped);
         assert_eq!(s.last_event, STOP_LAST_EVENT);
         assert_eq!(s.phase, STUB_PHASE_STOPPED);
+        let log = std::fs::read_to_string(dir.path().join("status.md")).unwrap();
+        assert!(log.contains("start  track=0004"));
+        assert!(log.contains("stop  track=0004"));
     }
 
     #[test]

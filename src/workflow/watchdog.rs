@@ -1,7 +1,8 @@
 //! Adapter progress heartbeat + stall detect (track 0026).
 //!
 //! Detects and surfaces a silent ACP hang. Does **not** write `FAILURE.md`,
-//! toast, or stop the run. First stall this phase is recycled by **0027**.
+//! toast, or stop the run. First stall this phase is recycled by **0027**
+//! only when the last heartbeat was inject (not `session/update`).
 
 use std::time::Duration;
 
@@ -216,6 +217,14 @@ fn should_watch(state: &RunState) -> bool {
         return false;
     }
     state.last_driven_phase.as_deref() == Some(state.phase.as_str())
+}
+
+/// True when the sidecar's last heartbeat was an ACP `session/update` (Grok already worked).
+pub fn last_progress_was_session_update(record: &ProjectRecord) -> bool {
+    matches!(
+        read_sidecar(record).map(|s| s.kind),
+        Some(ProgressKind::SessionUpdate)
+    )
 }
 
 fn read_sidecar(record: &ProjectRecord) -> Option<ProgressSidecar> {
@@ -829,6 +838,36 @@ mod tests {
         assert_eq!(load_run_state(&r).unwrap().stall_recycles, 1);
         assert!(artifact::existing_path(&r).is_none());
         assert_eq!(second.status, RunStatus::Running);
+        clear_clocks();
+    }
+
+    #[test]
+    fn first_stall_after_session_update_does_not_recycle() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        isolate_clocks(home.path(), "1", "3600");
+        let r = rec(dir.path());
+        start_driven_adapter(&r);
+        write_sidecar_at(
+            &r,
+            Utc::now() - chrono::Duration::seconds(5),
+            ProgressKind::SessionUpdate,
+            "sess-work",
+        );
+        let view = poll_once(&r).unwrap().expect("stall surfaces");
+        assert!(
+            view.last_event.contains("watchdog: stall"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(!view.last_event.contains("recycle: stall"));
+        assert_eq!(load_run_state(&r).unwrap().stall_recycles, 0);
+        assert_eq!(
+            load_run_state(&r).unwrap().last_driven_phase.as_deref(),
+            Some(graph::PHASE_PLAN)
+        );
+        assert_eq!(view.status, RunStatus::Running);
         clear_clocks();
     }
 

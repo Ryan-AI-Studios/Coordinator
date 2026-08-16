@@ -514,6 +514,16 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
     clear_active_outcome_file(record);
 
     save_run_state(record, &state)?;
+    let track = state.track_id.as_deref().unwrap_or("-");
+    let kind = match outcome.status {
+        OutcomeStatus::Success => "end",
+        OutcomeStatus::Failure => "fail",
+    };
+    crate::progress_log::append(
+        record,
+        kind,
+        &format!("track={track} phase={}  {}", state.phase, state.last_event),
+    );
 
     let notify = match outcome.status {
         OutcomeStatus::Failure => outcome.failure_class.map(|class| {

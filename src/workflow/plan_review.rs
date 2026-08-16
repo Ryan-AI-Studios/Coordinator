@@ -62,7 +62,14 @@ pub struct AgyCli;
 impl PlanReviewBackend for AgyCli {
     fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
         let bin = resolve_agy_bin(&req.command)?;
-        let out = run_process(&bin, &req.argv, &req.workspace_root, req.remaining, &[])?;
+        let out = run_process(
+            &bin,
+            &req.argv,
+            &req.workspace_root,
+            req.remaining,
+            &[],
+            None,
+        )?;
         Ok(PlanReviewResult {
             exit: out.exit,
             stdout: out.stdout,
@@ -83,7 +90,14 @@ impl PlanReviewBackend for OpenCodeCli {
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let out = run_process(&bin, &req.argv, &req.workspace_root, req.remaining, &extra)?;
+        let out = run_process(
+            &bin,
+            &req.argv,
+            &req.workspace_root,
+            req.remaining,
+            &extra,
+            None,
+        )?;
         Ok(PlanReviewResult {
             exit: out.exit,
             stdout: out.stdout,

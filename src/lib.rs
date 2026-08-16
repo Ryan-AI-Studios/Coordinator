@@ -25,6 +25,7 @@ pub mod layout;
 pub mod notify;
 pub mod outcome;
 pub mod persist;
+pub mod progress_log;
 pub mod registry;
 pub mod review;
 pub mod run;

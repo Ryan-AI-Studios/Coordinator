@@ -5,6 +5,7 @@ pub mod abort;
 pub mod grok;
 pub mod pool;
 pub mod roles;
+pub mod terminal;
 
 pub use grok::{
     CancelHandle, ENV_GROK_BIN, ENV_GROK_LIVE, GrokSession, PromptResult, grok_agent_argv,
