@@ -654,7 +654,7 @@ pub fn try_timeout_under_lock(record: &ProjectRecord) -> Result<Option<StatusVie
             let Some(_started) = state.phase_started_at else {
                 return Ok(None);
             };
-            let budget = crate::workflow::timeout_for_phase(&state.phase);
+            let budget = crate::workflow::timeout_for_phase(record, &state.phase);
             let elapsed = state.effective_running_elapsed(Utc::now());
             if elapsed < budget {
                 return Ok(None);
@@ -765,6 +765,7 @@ mod tests {
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
     }
@@ -1095,5 +1096,32 @@ mod tests {
         assert_eq!(s.status, RunStatus::Idle);
         assert_eq!(s.phase, STUB_PHASE_COMPLETED);
         assert!(s.last_event.contains("release hold"));
+    }
+
+    #[test]
+    fn try_timeout_under_lock_fires_on_project_plan_budget() {
+        use crate::config::{ENV_COORDINATOR_HOME, test_env_lock};
+        use crate::run::run_with_driver;
+        use crate::workflow::WorkflowDriver;
+        use crate::workflow::timeouts::ENV_PHASE_TIMEOUT_SECS;
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path());
+        r.phase_timeouts_secs.insert("plan".into(), 1);
+        run_with_driver(&r, None, WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase_started_at = Some(Utc::now() - chrono::Duration::seconds(5));
+        save_run_state(&r, &state).unwrap();
+        let view = try_timeout_under_lock(&r).unwrap().expect("timeout");
+        assert_eq!(view.failure_class, Some(FailureClass::Timeout));
+        assert_eq!(view.status, RunStatus::Stopped);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
     }
 }

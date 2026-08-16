@@ -623,6 +623,7 @@ mod tests {
             execution_repos: Default::default(),
             state_dir: None,
             auto_merge,
+            phase_timeouts_secs: Default::default(),
             created_at: Utc::now(),
         }
     }

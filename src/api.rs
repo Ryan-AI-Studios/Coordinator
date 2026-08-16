@@ -37,6 +37,8 @@ pub struct ProjectAddRequest {
     pub execution_repos: Option<BTreeMap<String, PathBuf>>,
     #[serde(default)]
     pub auto_merge: Option<bool>,
+    #[serde(default)]
+    pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +61,12 @@ pub struct ProjectSetRequest {
     pub execution_repo_name: Option<String>,
     #[serde(default)]
     pub auto_merge: Option<bool>,
+    #[serde(default)]
+    pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
+    #[serde(default)]
+    pub clear_phase_timeouts: Option<bool>,
+    #[serde(default)]
+    pub clear_phase_timeout: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +87,13 @@ pub struct ProjectRefBody {
     pub driver: Option<String>,
 }
 
+/// Effective phase wall clock for `project show`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhaseTimeoutView {
+    pub secs: u64,
+    pub source: String,
+}
+
 /// Show response: raw record + resolved paths + optional remediation hint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectShowView {
@@ -86,6 +101,8 @@ pub struct ProjectShowView {
     pub resolved: WorkspacePaths,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Effective `{secs, source}` for every canonical phase.
+    pub phase_timeouts: BTreeMap<String, PhaseTimeoutView>,
 }
 
 /// POST /v1/outcome body: Phase Outcome fields + optional project selector.
@@ -142,6 +159,7 @@ fn opts_from_add_request(req: &ProjectAddRequest) -> Result<ProjectAddOptions> {
         execution_repo_name: req.execution_repo_name.clone(),
         execution_repos: req.execution_repos.clone().unwrap_or_default(),
         auto_merge: req.auto_merge,
+        phase_timeouts_secs: req.phase_timeouts_secs.clone().unwrap_or_default(),
     })
 }
 
@@ -177,10 +195,23 @@ pub fn project_show(project: Option<&str>) -> Result<ProjectShowView> {
     } else {
         None
     };
+    let mut phase_timeouts = BTreeMap::new();
+    for phase in crate::workflow::graph::canonical_phases() {
+        phase_timeouts.insert(
+            (*phase).to_string(),
+            PhaseTimeoutView {
+                secs: crate::workflow::timeout_for_phase(&rec, phase).as_secs(),
+                source: crate::workflow::timeout_source(&rec, phase)
+                    .as_str()
+                    .to_string(),
+            },
+        );
+    }
     Ok(ProjectShowView {
         project: rec,
         resolved,
         hint,
+        phase_timeouts,
     })
 }
 
@@ -211,6 +242,9 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         execution_repos: req.execution_repos,
         execution_repo_name: req.execution_repo_name,
         auto_merge: req.auto_merge,
+        phase_timeouts_secs: req.phase_timeouts_secs,
+        clear_phase_timeouts: req.clear_phase_timeouts.unwrap_or(false),
+        clear_phase_timeout: req.clear_phase_timeout.unwrap_or_default(),
     };
     project_set(req.project.as_deref(), opts)
 }
@@ -718,6 +752,77 @@ mod tests {
         .unwrap();
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
+        clear_home();
+    }
+
+    #[test]
+    fn project_set_phase_timeouts_round_trip() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+        let (_home, _proj, rec) = add_isolated_project();
+        let mut map = BTreeMap::new();
+        map.insert("plan".into(), 3600);
+        map.insert("implement".into(), 10800);
+        let updated = project_set(
+            Some(&rec.id),
+            ProjectSetOptions {
+                phase_timeouts_secs: Some(map),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.phase_timeouts_secs.get("plan"), Some(&3600));
+        assert_eq!(updated.phase_timeouts_secs.get("implement"), Some(&10800));
+        let loaded = load_registry()
+            .unwrap()
+            .find_by_id(&rec.id)
+            .unwrap()
+            .clone();
+        assert_eq!(loaded.phase_timeouts_secs.get("plan"), Some(&3600));
+        clear_home();
+    }
+
+    #[test]
+    fn project_show_sources_project_table_and_env() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+        let (_home, _proj, rec) = add_isolated_project();
+        let mut map = BTreeMap::new();
+        map.insert("plan".into(), 3600);
+        project_set(
+            Some(&rec.id),
+            ProjectSetOptions {
+                phase_timeouts_secs: Some(map),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let view = project_show(Some(&rec.id)).unwrap();
+        for phase in crate::workflow::graph::canonical_phases() {
+            assert!(
+                view.phase_timeouts.contains_key(*phase),
+                "show missing effective timeout for {phase}"
+            );
+        }
+        assert_eq!(view.phase_timeouts["plan"].secs, 3600);
+        assert_eq!(view.phase_timeouts["plan"].source, "project");
+        assert_eq!(view.phase_timeouts["implement"].secs, 7200);
+        assert_eq!(view.phase_timeouts["implement"].source, "table");
+        assert_eq!(view.project.phase_timeouts_secs.get("plan"), Some(&3600));
+        unsafe {
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "7");
+        }
+        let view = project_show(Some(&rec.id)).unwrap();
+        assert_eq!(view.phase_timeouts["plan"].secs, 7);
+        assert_eq!(view.phase_timeouts["plan"].source, "env");
+        assert_eq!(view.phase_timeouts["implement"].source, "env");
+        unsafe {
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
         clear_home();
     }
 }

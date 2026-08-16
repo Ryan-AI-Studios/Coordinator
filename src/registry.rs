@@ -29,6 +29,8 @@ pub struct ProjectAddOptions {
     pub execution_repos: BTreeMap<String, PathBuf>,
     /// Omit = default true (ADR-0019).
     pub auto_merge: Option<bool>,
+    /// Initial per-project phase wall clocks (seconds). Empty = table/machine.
+    pub phase_timeouts_secs: BTreeMap<String, u64>,
 }
 
 /// Fields mutatable via `project set` (workspace `path` is immutable this track).
@@ -46,6 +48,12 @@ pub struct ProjectSetOptions {
     pub execution_repo_name: Option<String>,
     /// Omit = leave unchanged.
     pub auto_merge: Option<bool>,
+    /// Overlay keys (None = no overlay). Merge; does not replace the map.
+    pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
+    /// Wipe the project timeout map before overlay.
+    pub clear_phase_timeouts: bool,
+    /// Drop these stored keys (repeatable) before overlay.
+    pub clear_phase_timeout: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +77,9 @@ pub struct ProjectRecord {
     /// Squash-merge when CI is green (ADR-0019). Missing field on old records = on.
     #[serde(default = "default_true")]
     pub auto_merge: bool,
+    /// Per-project phase wall clocks (seconds). Empty omits the key on save.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phase_timeouts_secs: BTreeMap<String, u64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -172,6 +183,8 @@ impl Registry {
             .map(|p| prefer_absolute_path(&p))
             .transpose()?;
 
+        crate::workflow::timeouts::validate_phase_timeout_map(&opts.phase_timeouts_secs)?;
+
         let record = ProjectRecord {
             id: Uuid::new_v4().to_string(),
             path: canonical,
@@ -182,6 +195,7 @@ impl Registry {
             execution_repos,
             state_dir,
             auto_merge: opts.auto_merge.unwrap_or(true),
+            phase_timeouts_secs: opts.phase_timeouts_secs,
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
@@ -195,6 +209,13 @@ impl Registry {
             .iter()
             .position(|p| p.id == id)
             .ok_or_else(|| CoordinatorError::ProjectNotFound(id.to_string()))?;
+
+        if let Some(ref map) = opts.phase_timeouts_secs {
+            crate::workflow::timeouts::validate_phase_timeout_map(map)?;
+        }
+        for phase in &opts.clear_phase_timeout {
+            crate::workflow::timeouts::validate_phase_timeout_key(phase)?;
+        }
 
         let rec = &mut self.projects[idx];
         if let Some(p) = opts.layout_profile {
@@ -232,6 +253,16 @@ impl Registry {
         }
         if let Some(v) = opts.auto_merge {
             rec.auto_merge = v;
+        }
+        // Clears first, then overlay so clear-all + plan=3600 leaves only plan.
+        if opts.clear_phase_timeouts {
+            rec.phase_timeouts_secs.clear();
+        }
+        for phase in &opts.clear_phase_timeout {
+            rec.phase_timeouts_secs.remove(phase);
+        }
+        if let Some(map) = opts.phase_timeouts_secs {
+            rec.phase_timeouts_secs.extend(map);
         }
         Ok(rec.clone())
     }
@@ -429,6 +460,23 @@ mod tests {
             loaded.projects[0].auto_merge,
             "missing auto_merge on old registry JSON defaults true"
         );
+        assert!(
+            loaded.projects[0].phase_timeouts_secs.is_empty(),
+            "missing phase_timeouts_secs on old registry JSON defaults empty"
+        );
+        let _guard = crate::config::test_env_lock();
+        let isolated = tempdir().unwrap();
+        unsafe {
+            std::env::remove_var(crate::workflow::timeouts::ENV_PHASE_TIMEOUT_SECS);
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, isolated.path());
+        }
+        assert_eq!(
+            crate::workflow::timeout_for_phase(&loaded.projects[0], "plan"),
+            std::time::Duration::from_secs(1800)
+        );
+        unsafe {
+            std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+        }
     }
 
     #[test]
@@ -546,5 +594,245 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn set_phase_timeouts_merge_and_second_project_stays_table() {
+        let _guard = crate::config::test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::remove_var(crate::workflow::timeouts::ENV_PHASE_TIMEOUT_SECS);
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        let p1 = tempdir().unwrap();
+        let p2 = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let a = reg.add(p1.path(), ProjectAddOptions::default()).unwrap();
+        let b = reg.add(p2.path(), ProjectAddOptions::default()).unwrap();
+        assert!(a.phase_timeouts_secs.is_empty());
+
+        let mut first = BTreeMap::new();
+        first.insert("plan".into(), 3600);
+        first.insert("implement".into(), 10800);
+        let updated = reg
+            .set(
+                &a.id,
+                ProjectSetOptions {
+                    phase_timeouts_secs: Some(first),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.phase_timeouts_secs.get("plan"), Some(&3600));
+        assert_eq!(updated.phase_timeouts_secs.get("implement"), Some(&10800));
+        assert_eq!(
+            crate::workflow::timeout_for_phase(&updated, "plan"),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(
+            crate::workflow::timeout_for_phase(&updated, "implement"),
+            std::time::Duration::from_secs(10800)
+        );
+
+        let other = reg.find_by_id(&b.id).unwrap();
+        assert!(other.phase_timeouts_secs.is_empty());
+        assert_eq!(
+            crate::workflow::timeout_for_phase(other, "plan"),
+            std::time::Duration::from_secs(1800)
+        );
+        assert_eq!(
+            crate::workflow::timeout_for_phase(other, "implement"),
+            std::time::Duration::from_secs(7200)
+        );
+
+        let json_path = home.path().join("registry.json");
+        reg.save(&json_path).unwrap();
+        let saved = std::fs::read_to_string(&json_path).unwrap();
+        assert!(saved.contains("phase_timeouts_secs"));
+        let loaded = Registry::load(&json_path).unwrap();
+        assert!(
+            loaded
+                .find_by_id(&b.id)
+                .unwrap()
+                .phase_timeouts_secs
+                .is_empty()
+        );
+        unsafe {
+            std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[test]
+    fn set_phase_timeouts_merges_across_calls() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let mut plan = BTreeMap::new();
+        plan.insert("plan".into(), 3600);
+        reg.set(
+            &rec.id,
+            ProjectSetOptions {
+                phase_timeouts_secs: Some(plan),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut implement = BTreeMap::new();
+        implement.insert("implement".into(), 10800);
+        let updated = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    phase_timeouts_secs: Some(implement),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.phase_timeouts_secs.get("plan"), Some(&3600));
+        assert_eq!(updated.phase_timeouts_secs.get("implement"), Some(&10800));
+    }
+
+    #[test]
+    fn set_rejects_zero_and_unknown_before_write() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let mut bad_zero = BTreeMap::new();
+        bad_zero.insert("plan".into(), 0);
+        let err = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    phase_timeouts_secs: Some(bad_zero),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("0"));
+        assert!(
+            reg.find_by_id(&rec.id)
+                .unwrap()
+                .phase_timeouts_secs
+                .is_empty()
+        );
+
+        let mut bad_key = BTreeMap::new();
+        bad_key.insert("planner".into(), 1);
+        let err = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    phase_timeouts_secs: Some(bad_key),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown phase"));
+        assert!(
+            reg.find_by_id(&rec.id)
+                .unwrap()
+                .phase_timeouts_secs
+                .is_empty()
+        );
+
+        let err = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    clear_phase_timeout: vec!["nope".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown phase"));
+        assert!(
+            reg.find_by_id(&rec.id)
+                .unwrap()
+                .phase_timeouts_secs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn set_clear_one_all_and_clear_all_then_overlay() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let mut both = BTreeMap::new();
+        both.insert("plan".into(), 3600);
+        both.insert("implement".into(), 10800);
+        reg.set(
+            &rec.id,
+            ProjectSetOptions {
+                phase_timeouts_secs: Some(both),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let after_one = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    clear_phase_timeout: vec!["plan".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!after_one.phase_timeouts_secs.contains_key("plan"));
+        assert_eq!(after_one.phase_timeouts_secs.get("implement"), Some(&10800));
+
+        let mut overlay = BTreeMap::new();
+        overlay.insert("plan".into(), 11);
+        let after_all_overlay = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    clear_phase_timeouts: true,
+                    phase_timeouts_secs: Some(overlay),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(after_all_overlay.phase_timeouts_secs.len(), 1);
+        assert_eq!(after_all_overlay.phase_timeouts_secs.get("plan"), Some(&11));
+
+        let cleared = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    clear_phase_timeouts: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(cleared.phase_timeouts_secs.is_empty());
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let json = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(
+            !json.contains("phase_timeouts_secs"),
+            "empty map must omit the key on save"
+        );
+    }
+
+    #[test]
+    fn add_validates_initial_phase_timeout_map() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let mut bad = BTreeMap::new();
+        bad.insert("plan".into(), 0);
+        let err = reg
+            .add(
+                proj.path(),
+                ProjectAddOptions {
+                    phase_timeouts_secs: bad,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("0"));
+        assert!(reg.projects.is_empty());
     }
 }

@@ -962,6 +962,7 @@ mod tests {
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);
@@ -1003,6 +1004,7 @@ mod tests {
             execution_repos: std::collections::BTreeMap::new(),
             state_dir: None,
             auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);

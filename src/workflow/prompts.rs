@@ -69,6 +69,7 @@ mod tests {
             execution_repos: BTreeMap::new(),
             state_dir: None,
             auto_merge: false,
+            phase_timeouts_secs: BTreeMap::new(),
             created_at: Utc::now(),
         }
     }
@@ -128,6 +129,7 @@ mod tests {
             execution_repos,
             state_dir: None,
             auto_merge: false,
+            phase_timeouts_secs: BTreeMap::new(),
             created_at: Utc::now(),
         }
     }

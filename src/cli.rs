@@ -12,6 +12,7 @@ use crate::error::CoordinatorError;
 use crate::layout::LayoutProfile;
 use crate::registry::{ProjectAddOptions, ProjectSetOptions};
 use crate::server;
+use crate::workflow::timeouts::parse_phase_timeout;
 
 fn parse_auto_merge(s: &str) -> std::result::Result<bool, String> {
     match s.trim() {
@@ -194,6 +195,9 @@ pub enum ProjectCommands {
         /// true | false (omit = default on)
         #[arg(long = "auto-merge", value_parser = parse_auto_merge)]
         auto_merge: Option<bool>,
+        /// Repeatable. Canonical phase id = seconds (>0).
+        #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
+        phase_timeouts: Vec<(String, u64)>,
     },
     /// List registered projects (JSON; includes profile + execution summary)
     List,
@@ -224,6 +228,15 @@ pub enum ProjectCommands {
         /// true | false (omit = leave unchanged)
         #[arg(long = "auto-merge", value_parser = parse_auto_merge)]
         auto_merge: Option<bool>,
+        /// Repeatable. Canonical phase id = seconds (>0).
+        #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
+        phase_timeouts: Vec<(String, u64)>,
+        /// Repeatable. Drop one stored project override.
+        #[arg(long = "clear-phase-timeout", value_name = "PHASE")]
+        clear_phase_timeout: Vec<String>,
+        /// Wipe the project phase-timeout map.
+        #[arg(long = "clear-phase-timeouts")]
+        clear_phase_timeouts: bool,
     },
     /// Scan roots for conductor/conductor.md markers
     Scan {
@@ -303,6 +316,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 display_name,
                 execution_repo_name,
                 auto_merge,
+                phase_timeouts,
             } => {
                 let layout_profile = LayoutProfile::parse(&profile)?;
                 let opts = ProjectAddOptions {
@@ -314,6 +328,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     execution_repo_name,
                     execution_repos: BTreeMap::new(),
                     auto_merge,
+                    phase_timeouts_secs: phase_timeouts.into_iter().collect(),
                 };
                 let rec = api::project_add(&path, opts)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
@@ -336,6 +351,9 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 execution_repos_json,
                 execution_repo_name,
                 auto_merge,
+                phase_timeouts,
+                clear_phase_timeout,
+                clear_phase_timeouts,
             } => {
                 let layout_profile = match profile {
                     Some(s) => Some(LayoutProfile::parse(&s)?),
@@ -344,6 +362,11 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 let execution_repos = match execution_repos_json {
                     Some(j) => Some(serde_json::from_str::<BTreeMap<String, PathBuf>>(&j)?),
                     None => None,
+                };
+                let phase_timeouts_secs = if phase_timeouts.is_empty() {
+                    None
+                } else {
+                    Some(phase_timeouts.into_iter().collect())
                 };
                 let opts = ProjectSetOptions {
                     layout_profile,
@@ -357,6 +380,9 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     execution_repos,
                     execution_repo_name,
                     auto_merge,
+                    phase_timeouts_secs,
+                    clear_phase_timeouts,
+                    clear_phase_timeout,
                 };
                 let rec = api::project_set(project.as_deref(), opts)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
@@ -607,6 +633,67 @@ mod tests {
         let cmd = Cli::command();
         let notify = cmd.find_subcommand("notify").expect("notify");
         assert!(notify.find_subcommand("hermes-test").is_some());
+    }
+
+    #[test]
+    fn project_set_and_add_have_phase_timeout_flags() {
+        let cmd = Cli::command();
+        let project = cmd.find_subcommand("project").expect("project");
+        let set = project.find_subcommand("set").expect("set");
+        let add = project.find_subcommand("add").expect("add");
+        assert!(
+            set.get_arguments().any(|a| a.get_id() == "phase_timeouts"),
+            "set --phase-timeout"
+        );
+        assert!(
+            set.get_arguments()
+                .any(|a| a.get_id() == "clear_phase_timeout"),
+            "set --clear-phase-timeout"
+        );
+        assert!(
+            set.get_arguments()
+                .any(|a| a.get_id() == "clear_phase_timeouts"),
+            "set --clear-phase-timeouts"
+        );
+        assert!(
+            add.get_arguments().any(|a| a.get_id() == "phase_timeouts"),
+            "add --phase-timeout"
+        );
+    }
+
+    #[test]
+    fn project_set_phase_timeout_last_flag_wins() {
+        let cli = Cli::try_parse_from([
+            "coordinator",
+            "project",
+            "set",
+            "--phase-timeout",
+            "plan=1",
+            "--phase-timeout",
+            "plan=3600",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Project {
+                action: ProjectCommands::Set { phase_timeouts, .. },
+            } => {
+                let map: BTreeMap<_, _> = phase_timeouts.into_iter().collect();
+                assert_eq!(map.get("plan"), Some(&3600));
+            }
+            other => panic!("expected project set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_set_phase_timeout_zero_and_unknown_fail_parse() {
+        assert!(
+            Cli::try_parse_from(["coordinator", "project", "set", "--phase-timeout", "plan=0"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["coordinator", "project", "set", "--phase-timeout", "nope=1"])
+                .is_err()
+        );
     }
 
     #[test]
