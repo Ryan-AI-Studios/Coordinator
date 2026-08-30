@@ -25,6 +25,7 @@ pub fn app() -> Router {
         .route("/v1/projects/set", post(set_project))
         .route("/v1/projects/scan", post(scan_projects))
         .route("/v1/status", get(get_status))
+        .route("/v1/doctor", get(get_doctor))
         .route("/v1/run", post(post_run))
         .route("/v1/pause", post(post_pause))
         .route("/v1/resume", post(post_resume))
@@ -88,8 +89,18 @@ async fn get_status(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, A
     }
 }
 
+async fn get_doctor(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
+    let report = api::cmd_doctor(q.project.as_deref())?;
+    Ok(Json(report))
+}
+
 async fn post_run(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_run(body.project.as_deref(), body.track, body.driver.as_deref())?;
+    let view = api::cmd_run(
+        body.project.as_deref(),
+        body.track,
+        body.driver.as_deref(),
+        body.skip_preflight,
+    )?;
     Ok(Json(view))
 }
 
@@ -257,6 +268,9 @@ impl From<CoordinatorError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let CoordinatorError::Preflight { report } = &self.0 {
+            return (StatusCode::CONFLICT, Json(report.as_ref().clone())).into_response();
+        }
         let status =
             StatusCode::from_u16(self.0.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = Json(json!({
@@ -317,7 +331,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let run_body = serde_json::to_vec(&json!({})).unwrap();
+        let run_body = serde_json::to_vec(&json!({ "driver": "stub" })).unwrap();
         let response = app()
             .oneshot(
                 axum::http::Request::builder()
@@ -582,7 +596,7 @@ mod tests {
                     .uri("/v1/run")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        serde_json::to_vec(&json!({})).unwrap(),
+                        serde_json::to_vec(&json!({ "driver": "stub" })).unwrap(),
                     ))
                     .unwrap(),
             )
@@ -659,7 +673,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let run_body = serde_json::to_vec(&json!({})).unwrap();
+        let run_body = serde_json::to_vec(&json!({ "driver": "stub" })).unwrap();
         let _ = app()
             .oneshot(
                 axum::http::Request::builder()
@@ -788,7 +802,7 @@ mod tests {
         let rec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let project_id = rec["id"].as_str().unwrap().to_string();
 
-        let run_body = serde_json::to_vec(&json!({})).unwrap();
+        let run_body = serde_json::to_vec(&json!({ "driver": "stub" })).unwrap();
         let _ = app()
             .oneshot(
                 axum::http::Request::builder()
@@ -858,6 +872,140 @@ mod tests {
 
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn doctor_http_get_returns_200() {
+        use crate::harness::preflight::{ScriptedProbe, install_test_probe};
+
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let grok_home = tempdir().unwrap();
+        let prev_grok = std::env::var_os("GROK_HOME");
+        let prev_xai = std::env::var_os("XAI_API_KEY");
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var("GROK_HOME", grok_home.path());
+            std::env::set_var("XAI_API_KEY", "test-not-a-real-key");
+        }
+        let probe = ScriptedProbe::ready();
+        let _pg = install_test_probe(probe);
+
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/doctor")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("ok").is_some(), "{v}");
+        assert!(v.get("rows").is_some(), "{v}");
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            match prev_grok {
+                Some(v) => std::env::set_var("GROK_HOME", v),
+                None => std::env::remove_var("GROK_HOME"),
+            }
+            match prev_xai {
+                Some(v) => std::env::set_var("XAI_API_KEY", v),
+                None => std::env::remove_var("XAI_API_KEY"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn preflight_http_run_409_doctor_report() {
+        use crate::harness::preflight::{ScriptedProbe, install_test_probe};
+
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let grok_home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        let prev_grok = std::env::var_os("GROK_HOME");
+        let prev_xai = std::env::var_os("XAI_API_KEY");
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var("GROK_HOME", grok_home.path());
+            std::env::remove_var("XAI_API_KEY");
+        }
+        let _rec =
+            api::project_add(proj.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        let probe = ScriptedProbe::ready();
+        let _pg = install_test_probe(probe);
+
+        let get = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/doctor")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let get_bytes = get.into_body().collect().await.unwrap().to_bytes();
+        let get_v: serde_json::Value = serde_json::from_slice(&get_bytes).unwrap();
+        assert_eq!(
+            get_v["ok"], false,
+            "logged-out grok must not flip GET to 4xx"
+        );
+
+        let run_body = serde_json::to_vec(&json!({ "driver": "adapter" })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(run_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("ok").is_some(), "409 body must be DoctorReport: {v}");
+        assert!(
+            v.get("rows").is_some(),
+            "409 body must be DoctorReport: {v}"
+        );
+        assert!(v.get("error").is_none(), "must not be {{error}}: {v}");
+        assert_eq!(v["ok"], false);
+
+        let skip_body = serde_json::to_vec(&json!({ "skip_preflight": true })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(skip_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            match prev_grok {
+                Some(v) => std::env::set_var("GROK_HOME", v),
+                None => std::env::remove_var("GROK_HOME"),
+            }
+            match prev_xai {
+                Some(v) => std::env::set_var("XAI_API_KEY", v),
+                None => std::env::remove_var("XAI_API_KEY"),
+            }
         }
     }
 

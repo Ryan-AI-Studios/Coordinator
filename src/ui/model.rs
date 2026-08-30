@@ -377,7 +377,7 @@ pub fn run_selected(project_id: &str, track: Option<String>) -> Result<StatusVie
             from: view.status.to_string(),
         });
     }
-    api::cmd_run(Some(project_id), track, None)
+    api::cmd_run(Some(project_id), track, None, false)
 }
 
 pub fn show_failure(project_id: &str) -> Result<Option<crate::notify::FailureShow>> {

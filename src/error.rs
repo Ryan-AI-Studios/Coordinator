@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::harness::preflight::DoctorReport;
+
 /// Control Plane error kinds shared by CLI and HTTP.
 #[derive(Debug, Error)]
 pub enum CoordinatorError {
@@ -26,6 +28,10 @@ pub enum CoordinatorError {
     /// CLI `run` / `wait` poll budget expired without an applied outcome (exit 2).
     #[error("wait budget expired without an applied outcome")]
     WaitBudgetExpired,
+
+    /// Adapter `run` / `doctor` required harness missing or logged out (exit 1, HTTP 409).
+    #[error("{}", report.preflight_message())]
+    Preflight { report: Box<DoctorReport> },
 }
 
 impl CoordinatorError {
@@ -39,7 +45,7 @@ impl CoordinatorError {
             Self::InvalidTransition { .. } => 2,
             Self::ProjectNotFound(_) => 3,
             Self::NonLoopbackBind(_) => 4,
-            Self::Message(_) | Self::Io(_) | Self::Json(_) => 1,
+            Self::Message(_) | Self::Io(_) | Self::Json(_) | Self::Preflight { .. } => 1,
         }
     }
 
@@ -47,7 +53,7 @@ impl CoordinatorError {
     pub fn http_status(&self) -> u16 {
         match self {
             Self::WaitBudgetExpired => 408,
-            Self::InvalidTransition { .. } => 409,
+            Self::InvalidTransition { .. } | Self::Preflight { .. } => 409,
             Self::ProjectNotFound(_) => 404,
             Self::NonLoopbackBind(_) => 400,
             Self::Message(_) => 400,

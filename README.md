@@ -474,7 +474,8 @@ coordinator project set [--project …]
     [--clear-phase-timeouts]
 coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]
 coordinator status [--project <path|id>]
-coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait|stub] [--detach] [--timeout-secs N] [--serve-port N]
+coordinator doctor [--project <path|id>]
+coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait|stub] [--detach] [--timeout-secs N] [--serve-port N] [--skip-preflight]
 coordinator pause [--project <path|id>]
 coordinator resume [--project <path|id>]
 coordinator stop [--project <path|id>]
@@ -493,7 +494,20 @@ coordinator harness grok shutdown [--project …]
 coordinator serve [--port <u16>] [--check]   # default 7420, 127.0.0.1 only
 ```
 
-HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver`), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), `ci` (watch object or `null`), `failure_artifact` (path or `null`), optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists, and additive `ticker` (`owner` `serve` + `port`, or `owner` `none`).
+HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver` and `skip_preflight`), `GET /v1/doctor` (200 `DoctorReport` even when `ok` is false), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Adapter `POST /v1/run` without `skip_preflight` returns **409** + `DoctorReport` JSON when a required harness is `missing` or `auth` (not `{"error": …}`). `stub` / `file_wait` skip preflight. `--skip-preflight` is the adapter escape. Preflight does **not** write run-state, `FAILURE.md`, or a toast.
+
+**Harness preflight (`doctor`):** probes each Role Binding row plus synthetic `ci`/`gh`. Env pin (`COORDINATOR_*_BIN`) wins when trim-nonempty. Never `grok --help`, never `gh auth status --show-token`. Tokens are never stored or printed. Login commands are printed only — Coordinator does not exec a login TUI.
+
+| Harness | PATH | Auth / ready | Login (print only) |
+|---------|------|----------------|--------------------|
+| grok | `--version` | nonempty `XAI_API_KEY` **or** `%USERPROFILE%\.grok\auth.json` exists (unread; `GROK_HOME` when set) | `grok login` |
+| agy | `--version` | PATH only (no auth CLI) | `agy` |
+| opencode | `--version` | `auth list` (any credential line) | `opencode auth login` |
+| codex | `--version` | `login status` exit 0 | `codex login` |
+| claude | `--version` | `auth status --json` `loggedIn: true` | `claude auth login` |
+| gh | `--version` | `auth status --active --hostname github.com` | `gh auth login` |
+
+Required rows (`planner`, `implementor`, `plan_reviewer_agy`, `plan_reviewer_opencode`, `cross_model_primary`, `ci`) with `missing`/`auth` refuse adapter `run`. `unknown` does not. Warn-only: `cross_model_secondary` / `cross_model_tertiary` (and optional `fold` / `next`). CLI `doctor` omit `--project` works with 0 or N projects. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), `ci` (watch object or `null`), `failure_artifact` (path or `null`), optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists, and additive `ticker` (`owner` `serve` + `port`, or `owner` `none`).
 
 ### Phase Outcome schema v1
 

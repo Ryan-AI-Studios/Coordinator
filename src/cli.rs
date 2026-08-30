@@ -45,6 +45,11 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Probe bound harnesses (PATH + cheap auth). Pretty JSON; exit 1 if a required row is missing or logged out.
+    Doctor {
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Start the canonical workflow at `plan` and tick until Idle/Stopped
     ///
     /// Skips wait when serve answers (lease then 7420). `--serve-port N` probes N only.
@@ -65,6 +70,9 @@ pub enum Commands {
         /// Probe this port only for an already-on serve (conflicts with --detach).
         #[arg(long, conflicts_with = "detach")]
         serve_port: Option<u16>,
+        /// Skip harness preflight (adapter still starts). Does not conflict with --detach.
+        #[arg(long)]
+        skip_preflight: bool,
     },
     /// Pause a running workflow
     Pause {
@@ -309,6 +317,11 @@ pub fn run() -> ExitCode {
     match dispatch(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            if let CoordinatorError::Preflight { report } = &e
+                && let Ok(json) = serde_json::to_string_pretty(report.as_ref())
+            {
+                println!("{json}");
+            }
             eprintln!("error: {e}");
             ExitCode::from(e.exit_code() as u8)
         }
@@ -424,6 +437,16 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             let view = api::status(project.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
+        Commands::Doctor { project } => {
+            let report = api::cmd_doctor(project.as_deref())?;
+            if report.ok {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                return Err(CoordinatorError::Preflight {
+                    report: Box::new(report),
+                });
+            }
+        }
         Commands::Run {
             project,
             track,
@@ -431,6 +454,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             detach,
             timeout_secs,
             serve_port,
+            skip_preflight,
         } => {
             let probe = if detach {
                 api::ServeProbe::Skip
@@ -447,6 +471,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     detach,
                     timeout_secs,
                     probe,
+                    skip_preflight,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&view)?);
@@ -650,6 +675,10 @@ mod tests {
             run.get_arguments().any(|a| a.get_id() == "serve_port"),
             "run --serve-port"
         );
+        assert!(
+            run.get_arguments().any(|a| a.get_id() == "skip_preflight"),
+            "run --skip-preflight"
+        );
         let about = run.get_about().map(|s| s.to_string()).unwrap_or_default();
         assert!(
             about.contains("Idle/Stopped"),
@@ -660,6 +689,44 @@ mod tests {
         assert!(
             help.contains("--serve-port"),
             "run --help should mention --serve-port: {help}"
+        );
+    }
+
+    #[test]
+    fn doctor_subcommand_in_help() {
+        let cmd = Cli::command();
+        let doctor = cmd.find_subcommand("doctor").expect("doctor");
+        assert!(
+            doctor.get_arguments().any(|a| a.get_id() == "project"),
+            "doctor --project"
+        );
+        let parsed = Cli::try_parse_from(["coordinator", "doctor"]).unwrap();
+        match parsed.command {
+            Commands::Doctor { project } => assert!(project.is_none()),
+            other => panic!("expected doctor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_skip_preflight_does_not_conflict_with_detach() {
+        let parsed = Cli::try_parse_from(["coordinator", "run", "--detach", "--skip-preflight"]);
+        assert!(parsed.is_ok(), "{parsed:?}");
+        match parsed.unwrap().command {
+            Commands::Run {
+                detach,
+                skip_preflight,
+                ..
+            } => {
+                assert!(detach);
+                assert!(skip_preflight);
+            }
+            other => panic!("expected run, got {other:?}"),
+        }
+        let mut run = Cli::command().find_subcommand("run").unwrap().clone();
+        let help = run.render_long_help().to_string();
+        assert!(
+            help.contains("--skip-preflight"),
+            "run --help should mention --skip-preflight: {help}"
         );
     }
 
