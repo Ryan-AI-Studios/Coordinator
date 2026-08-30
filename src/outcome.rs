@@ -435,6 +435,7 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
 
     let mut state = base.clone();
     let canonical = crate::workflow::is_canonical(&outcome.phase);
+    let mut bounced = false;
     match outcome.status {
         OutcomeStatus::Success => {
             if canonical {
@@ -470,14 +471,30 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
         }
         OutcomeStatus::Failure => {
             let class = outcome.failure_class.expect("validated");
-            state.status = RunStatus::Stopped;
-            if !canonical {
-                state.phase = STUB_PHASE_FAILED.into();
+            bounced = crate::workflow::should_bounce_gate_fail(&state, &outcome);
+            if bounced {
+                crate::workflow::on_gate_retry(record, &mut state, &outcome);
+            } else {
+                state.status = RunStatus::Stopped;
+                if !canonical {
+                    state.phase = STUB_PHASE_FAILED.into();
+                }
+                state.failure_class = Some(class);
+                state.last_event = format_failure_event(&outcome, class);
+                if outcome.phase == crate::workflow::graph::PHASE_CROSS_MODEL
+                    && class == FailureClass::Difficulty
+                    && state.address_findings_attempts
+                        >= crate::workflow::graph::ADDRESS_FINDINGS_CAP
+                {
+                    let cap = crate::workflow::graph::ADDRESS_FINDINGS_CAP;
+                    state.last_event = format!(
+                        "{}; address-findings exhausted ({cap}/{cap})",
+                        state.last_event
+                    );
+                }
+                state.phase_started_at = None;
+                state.pause_started_at = None;
             }
-            state.failure_class = Some(class);
-            state.last_event = format_failure_event(&outcome, class);
-            state.phase_started_at = None;
-            state.pause_started_at = None;
         }
     }
 
@@ -515,17 +532,11 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
 
     save_run_state(record, &state)?;
     let track = state.track_id.as_deref().unwrap_or("-");
-    let kind = match outcome.status {
+    let mut kind = match outcome.status {
         OutcomeStatus::Success => "end",
         OutcomeStatus::Failure => "fail",
     };
-    crate::progress_log::append(
-        record,
-        kind,
-        &format!("track={track} phase={}  {}", state.phase, state.last_event),
-    );
-
-    let notify = match outcome.status {
+    let mut notify = match outcome.status {
         OutcomeStatus::Failure => outcome.failure_class.map(|class| {
             let artifact_path = crate::notify::artifact::path(record)
                 .unwrap_or_else(|_| record.path.join(".coordinator").join("FAILURE.md"));
@@ -543,6 +554,15 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
         }),
         OutcomeStatus::Success => None,
     };
+    if bounced {
+        kind = "end";
+        notify = None;
+    }
+    crate::progress_log::append(
+        record,
+        kind,
+        &format!("track={track} phase={}  {}", state.phase, state.last_event),
+    );
     Ok(ApplyCommit {
         view: StatusView::from_record(record, &state),
         notify,

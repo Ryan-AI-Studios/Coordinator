@@ -8,7 +8,8 @@ pub use crate::config::{RoleBinding, default_role_bindings, load_machine_config}
 use crate::error::{CoordinatorError, Result};
 use crate::harness::grok::{ENV_GROK_BIN, reject_or_replace_ps1, resolve_command};
 use crate::workflow::graph::{
-    PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT, PHASE_PLAN, ROLE_IMPLEMENTOR, ROLE_PLANNER,
+    PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT, PHASE_PLAN,
+    ROLE_IMPLEMENTOR, ROLE_PLANNER,
 };
 
 /// Optional Role Binding key for `fold`. Not inserted by defaults / merge.
@@ -47,7 +48,7 @@ pub fn resolve_grok_command() -> Result<String> {
 pub fn phase_role_key(phase: &str) -> Option<&'static str> {
     match phase {
         PHASE_PLAN | PHASE_FOLD | PHASE_ADVANCE => Some(ROLE_PLANNER),
-        PHASE_IMPLEMENT => Some(ROLE_IMPLEMENTOR),
+        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS => Some(ROLE_IMPLEMENTOR),
         _ => None,
     }
 }
@@ -66,7 +67,7 @@ pub fn resolve_phase_role_key(
 ) -> Option<String> {
     match phase {
         PHASE_PLAN => Some(ROLE_PLANNER.to_string()),
-        PHASE_IMPLEMENT => Some(ROLE_IMPLEMENTOR.to_string()),
+        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS => Some(ROLE_IMPLEMENTOR.to_string()),
         PHASE_FOLD => {
             if command_nonempty(bindings, ROLE_FOLD) {
                 Some(ROLE_FOLD.to_string())
@@ -212,11 +213,12 @@ mod tests {
     }
 
     #[test]
-    fn is_grok_bound_stays_static_four_phase() {
+    fn is_grok_bound_stays_static_five_phase() {
         assert!(is_grok_bound(PHASE_PLAN));
         assert!(is_grok_bound(PHASE_FOLD));
         assert!(is_grok_bound(PHASE_IMPLEMENT));
         assert!(is_grok_bound(PHASE_ADVANCE));
+        assert!(is_grok_bound(PHASE_ADDRESS_FINDINGS));
         assert!(!is_grok_bound(PHASE_PLAN_REVIEW));
         assert!(!is_grok_bound(PHASE_CI_WAIT));
         assert!(!is_grok_bound(PHASE_CROSS_MODEL));
@@ -224,6 +226,10 @@ mod tests {
         assert_eq!(phase_role_key(PHASE_FOLD), Some(ROLE_PLANNER));
         assert_eq!(phase_role_key(PHASE_ADVANCE), Some(ROLE_PLANNER));
         assert_eq!(phase_role_key(PHASE_IMPLEMENT), Some(ROLE_IMPLEMENTOR));
+        assert_eq!(
+            phase_role_key(PHASE_ADDRESS_FINDINGS),
+            Some(ROLE_IMPLEMENTOR)
+        );
         assert!(phase_role_key(PHASE_PLAN_REVIEW).is_none());
     }
 
@@ -246,6 +252,25 @@ mod tests {
             resolve_phase_role_key(PHASE_IMPLEMENT, &load_role_bindings().unwrap()).as_deref(),
             Some(ROLE_IMPLEMENTOR)
         );
+        assert_eq!(
+            phase_role_key(PHASE_ADDRESS_FINDINGS),
+            phase_role_key(PHASE_IMPLEMENT)
+        );
+        assert_eq!(
+            resolve_phase_role_key(PHASE_ADDRESS_FINDINGS, &load_role_bindings().unwrap())
+                .as_deref(),
+            Some(ROLE_IMPLEMENTOR)
+        );
+        let af_b = resolve_phase_binding(PHASE_ADDRESS_FINDINGS).unwrap();
+        assert_eq!(af_b.harness, impl_b.harness);
+        assert_eq!(af_b.command, impl_b.command);
+        let impl_bin = resolve_phase_binary(PHASE_IMPLEMENT);
+        let af_bin = resolve_phase_binary(PHASE_ADDRESS_FINDINGS);
+        match (impl_bin, af_bin) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b),
+            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+            other => panic!("implement vs address-findings binary class mismatch: {other:?}"),
+        }
     }
 
     #[test]

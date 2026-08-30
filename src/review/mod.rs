@@ -600,7 +600,8 @@ mod tests {
     fn gate_fail_no_fallback() {
         let (_home, _g) = adapter_env();
         let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("conductor").join("0011-Example")).unwrap();
+        let track = dir.path().join("conductor").join("0011-Example");
+        std::fs::create_dir_all(&track).unwrap();
         let r = rec(dir.path());
         jump_cross_model(&r, WorkflowDriver::Adapter);
         let scripted = ScriptedBackend::new()
@@ -608,25 +609,206 @@ mod tests {
             .push_ok(pass_text());
         let (_hook, counts) = hook(scripted);
         let view = crate::workflow::tick(&r).unwrap().expect("fail");
-        assert_eq!(view.status, RunStatus::Stopped);
-        assert_eq!(view.failure_class, Some(FailureClass::Difficulty));
-        assert!(view.last_event.contains("cross-model: gate failed (codex)"));
-        assert_eq!(counts.n(), 1);
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert!(view.failure_class.is_none());
         assert!(
-            dir.path()
-                .join("conductor")
-                .join("0011-Example")
-                .join("review.codex.md")
-                .is_file()
+            view.last_event.contains("address-findings 1/2"),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(counts.n(), 1);
+        assert!(track.join("review.codex.gate1.md").is_file());
+        assert!(!track.join("review.codex.md").exists());
+        assert!(!track.join("review.md").exists());
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        clear_env();
+    }
+
+    #[test]
+    fn gate_fail_then_address_success_fresh_pass() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0011-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let token = "UNIQUE_TOKEN_fresh_gate_body";
+        let mut fail = fail_text();
+        fail.last_message = format!("## Verdict: FAIL\n\n{token}\n");
+        let mut pass = pass_text();
+        pass.last_message = "## Verdict: PASS\n\nsecond gate body\n".into();
+        let scripted = ScriptedBackend::new().push_ok(fail).push_ok(pass);
+        let (_hook, counts) = hook(scripted);
+        let bounce = crate::workflow::tick(&r).unwrap().expect("bounce");
+        assert_eq!(bounce.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert_eq!(counts.n(), 1);
+        let reviews = crate::state::resolve_state_dir(&r).unwrap().join("reviews");
+        let gate_track = std::fs::read_to_string(track.join("review.codex.gate1.md")).unwrap();
+        let gate_state =
+            std::fs::read_to_string(reviews.join("cross-model-codex.gate1.md")).unwrap();
+        assert!(gate_track.contains(token), "track archive={gate_track}");
+        assert!(gate_state.contains(token), "state archive={gate_state}");
+        assert!(!track.join("review.codex.md").exists());
+        assert!(!reviews.join("cross-model-codex.md").exists());
+        let success = PhaseOutcome::success(
+            graph::PHASE_ADDRESS_FINDINGS,
+            OutcomeSource::Test,
+            Some("addressed".into()),
+            None,
+            None,
+        );
+        let after = write_and_apply(&r, success).unwrap();
+        assert_eq!(after.phase, graph::PHASE_CROSS_MODEL);
+        assert!(load_run_state(&r).unwrap().review.is_none());
+        let view = crate::workflow::tick(&r).unwrap().expect("fresh pass");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(counts.n() >= 2, "second gate must spawn, n={}", counts.n());
+        let live = std::fs::read_to_string(track.join("review.codex.md")).unwrap();
+        assert!(
+            !live.contains(token),
+            "fresh live report leaked token: {live}"
         );
         assert!(
-            !dir.path()
-                .join("conductor")
-                .join("0011-Example")
-                .join("review.md")
-                .exists()
+            std::fs::read_to_string(track.join("review.codex.gate1.md"))
+                .unwrap()
+                .contains(token)
         );
         clear_env();
+    }
+
+    #[test]
+    fn gate_fail_cap_stops() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conductor").join("0011-Example")).unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new()
+            .push_ok(fail_text())
+            .push_ok(fail_text())
+            .push_ok(fail_text())
+            .push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        crate::workflow::tick(&r).unwrap().expect("bounce1");
+        write_and_apply(
+            &r,
+            PhaseOutcome::success(
+                graph::PHASE_ADDRESS_FINDINGS,
+                OutcomeSource::Test,
+                None,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        crate::workflow::tick(&r).unwrap().expect("bounce2");
+        write_and_apply(
+            &r,
+            PhaseOutcome::success(
+                graph::PHASE_ADDRESS_FINDINGS,
+                OutcomeSource::Test,
+                None,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        let view = crate::workflow::tick(&r).unwrap().expect("cap");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Difficulty));
+        assert!(
+            view.last_event.contains("address-findings exhausted"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+        assert_eq!(counts.n(), 3);
+        let none = crate::workflow::tick(&r).unwrap();
+        assert!(none.is_none());
+        assert_eq!(counts.n(), 3);
+        clear_env();
+    }
+
+    #[test]
+    fn gate_fail_at_cap_stops_fast_path() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conductor").join("0011-Example")).unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let mut s = load_run_state(&r).unwrap();
+        s.address_findings_attempts = graph::ADDRESS_FINDINGS_CAP;
+        save_run_state(&r, &s).unwrap();
+        let scripted = ScriptedBackend::new()
+            .push_ok(fail_text())
+            .push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("cap");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Difficulty));
+        assert!(view.last_event.contains("address-findings exhausted"));
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+        assert_eq!(counts.n(), 1);
+        clear_env();
+    }
+
+    #[test]
+    fn pause_then_gate_fail_holds_at_address_findings() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conductor").join("0011-Example")).unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        run::pause(&r).unwrap();
+        let scripted = ScriptedBackend::new().push_ok(fail_text());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("bounce");
+        assert_eq!(view.status, RunStatus::Paused);
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert_eq!(counts.n(), 1);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        clear_env();
+    }
+
+    #[test]
+    fn address_findings_difficulty_stops() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0011".into()), WorkflowDriver::FileWait).unwrap();
+        let mut s = load_run_state(&r).unwrap();
+        s.phase = graph::PHASE_ADDRESS_FINDINGS.into();
+        s.address_findings_attempts = 1;
+        save_run_state(&r, &s).unwrap();
+        let view = write_and_apply(
+            &r,
+            PhaseOutcome::failure(
+                graph::PHASE_ADDRESS_FINDINGS,
+                FailureClass::Difficulty,
+                OutcomeSource::File,
+                Some("still stuck".into()),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert_eq!(view.failure_class, Some(FailureClass::Difficulty));
+        assert_eq!(load_run_state(&r).unwrap().address_findings_attempts, 1);
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+    }
+
+    #[test]
+    fn fresh_run_clears_address_attempts() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, None, WorkflowDriver::FileWait).unwrap();
+        let mut s = load_run_state(&r).unwrap();
+        s.address_findings_attempts = 2;
+        save_run_state(&r, &s).unwrap();
+        run::stop(&r).unwrap();
+        run_with_driver(&r, None, WorkflowDriver::FileWait).unwrap();
+        assert_eq!(load_run_state(&r).unwrap().address_findings_attempts, 0);
     }
 
     #[test]
