@@ -35,8 +35,12 @@ pub fn grok_cwd(record: &ProjectRecord) -> PathBuf {
 }
 
 /// Start (or reuse) a Grok session for the project.
-pub async fn start(project: Option<&str>, in_process: bool) -> Result<GrokHarnessStatus> {
-    pool::start(project, in_process).await
+pub async fn start(
+    project: Option<&str>,
+    in_process: bool,
+    infer_cwd: bool,
+) -> Result<GrokHarnessStatus> {
+    pool::start(project, in_process, infer_cwd).await
 }
 
 /// Start a new session with a phase-resolved binary and optional model.
@@ -45,24 +49,29 @@ pub async fn start_with_bin(
     in_process: bool,
     bin: PathBuf,
     model: Option<String>,
+    infer_cwd: bool,
 ) -> Result<GrokHarnessStatus> {
-    pool::start_with_bin(project, in_process, bin, model).await
+    pool::start_with_bin(project, in_process, bin, model, infer_cwd).await
 }
 
-pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPromptView> {
-    pool::prompt(project, text).await
+pub async fn prompt(
+    project: Option<&str>,
+    text: String,
+    infer_cwd: bool,
+) -> Result<HarnessPromptView> {
+    pool::prompt(project, text, infer_cwd).await
 }
 
-pub async fn compact(project: Option<&str>) -> Result<HarnessPromptView> {
-    pool::compact(project).await
+pub async fn compact(project: Option<&str>, infer_cwd: bool) -> Result<HarnessPromptView> {
+    pool::compact(project, infer_cwd).await
 }
 
-pub async fn grok_status(project: Option<&str>) -> Result<GrokHarnessStatus> {
-    pool::status(project).await
+pub async fn grok_status(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarnessStatus> {
+    pool::status(project, infer_cwd).await
 }
 
-pub async fn shutdown(project: Option<&str>) -> Result<GrokHarnessStatus> {
-    pool::shutdown(project).await
+pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarnessStatus> {
+    pool::shutdown(project, infer_cwd).await
 }
 
 /// Detached ACP holder loop (hidden CLI).

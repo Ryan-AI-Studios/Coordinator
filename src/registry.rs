@@ -1,7 +1,7 @@
 //! Machine-local Project Registry (`{COORDINATOR_HOME}/registry.json`).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -287,7 +287,24 @@ impl Registry {
     }
 
     /// Resolve `--project` as id or path; single-project default when omitted.
+    ///
+    /// Does **not** read process cwd or last-used (track **0029** test wrapper).
     pub fn resolve_project(&self, project: Option<&str>) -> Result<&ProjectRecord> {
+        self.resolve_project_in(project, None, None)
+    }
+
+    /// Resolve a selector with optional injected cwd and last-used id.
+    ///
+    /// Order when `project` is omitted and `projects.len() > 1`: unique cwd
+    /// containment, else last-used if still registered, else error. Ambiguous
+    /// cwd does **not** fall through to last-used. `cwd == None` skips
+    /// containment (HTTP omit / this wrapper).
+    pub fn resolve_project_in(
+        &self,
+        project: Option<&str>,
+        cwd: Option<&Path>,
+        last_used: Option<&str>,
+    ) -> Result<&ProjectRecord> {
         match project {
             Some(spec) => {
                 if let Some(p) = self.find_by_id(spec) {
@@ -314,12 +331,76 @@ impl Registry {
                         "no projects registered; run `coordinator project add <path>`".into(),
                     ))
                 } else {
-                    Err(CoordinatorError::Message(
-                        "multiple projects registered; pass --project <path|id>".into(),
-                    ))
+                    match unique_cwd_match(self, cwd) {
+                        CwdMatch::Unique(rec) => Ok(rec),
+                        CwdMatch::Ambiguous(ids) => Err(CoordinatorError::Message(format!(
+                            "cwd matches multiple projects ({}); pass --project <path|id>",
+                            ids.join(", ")
+                        ))),
+                        CwdMatch::None => {
+                            if let Some(id) = last_used.filter(|s| !s.is_empty())
+                                && let Some(p) = self.find_by_id(id)
+                            {
+                                return Ok(p);
+                            }
+                            Err(CoordinatorError::Message(
+                                "multiple projects registered; cwd is not inside a registered \
+                                 workspace or execution repo; pass --project <path|id>"
+                                    .into(),
+                            ))
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+enum CwdMatch<'a> {
+    None,
+    Unique(&'a ProjectRecord),
+    Ambiguous(Vec<String>),
+}
+
+fn match_roots(rec: &ProjectRecord) -> impl Iterator<Item = &Path> {
+    std::iter::once(rec.path.as_path())
+        .chain(rec.execution_repo.as_deref())
+        .chain(rec.execution_repos.values().map(|p| p.as_path()))
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+fn unique_cwd_match<'a>(reg: &'a Registry, cwd: Option<&Path>) -> CwdMatch<'a> {
+    let Some(cwd) = cwd else {
+        return CwdMatch::None;
+    };
+    let mut scored: Vec<(&ProjectRecord, usize)> = Vec::new();
+    for rec in &reg.projects {
+        let mut best: Option<usize> = None;
+        for root in match_roots(rec) {
+            if path_contains_cwd(root, cwd) {
+                let len = normalize_for_containment(root).components().count();
+                best = Some(best.map_or(len, |b| b.max(len)));
+            }
+        }
+        if let Some(len) = best {
+            scored.push((rec, len));
+        }
+    }
+    if scored.is_empty() {
+        return CwdMatch::None;
+    }
+    let max_len = scored.iter().map(|(_, l)| *l).max().unwrap_or(0);
+    let mut winners: Vec<&ProjectRecord> = scored
+        .into_iter()
+        .filter(|(_, l)| *l == max_len)
+        .map(|(r, _)| r)
+        .collect();
+    if winners.len() == 1 {
+        CwdMatch::Unique(winners.remove(0))
+    } else {
+        let mut ids: Vec<String> = winners.into_iter().map(|p| p.id.clone()).collect();
+        ids.sort();
+        CwdMatch::Ambiguous(ids)
     }
 }
 
@@ -362,6 +443,62 @@ pub fn paths_equal(a: &Path, b: &Path) -> bool {
     {
         a == b
     }
+}
+
+fn normalize_for_containment(path: &Path) -> PathBuf {
+    if path.exists() {
+        return canonicalize_path(path).unwrap_or_else(|_| path.to_path_buf());
+    }
+    // Missing tail (lexical fallback): canonicalize the longest existing
+    // ancestor so Windows 8.3 / junction parents still match stored roots.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    while let Some(name) = cur.file_name() {
+        tail.push(name.to_os_string());
+        if !cur.pop() {
+            break;
+        }
+        if cur.exists() {
+            let mut base = canonicalize_path(&cur).unwrap_or(cur);
+            for c in tail.iter().rev() {
+                base.push(c);
+            }
+            return base;
+        }
+    }
+    path.to_path_buf()
+}
+
+fn components_eq(a: Component<'_>, b: Component<'_>) -> bool {
+    #[cfg(windows)]
+    {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+/// True when `cwd` is `root` or a descendant, matching whole path components
+/// (not string prefixes). Windows compares components with
+/// `eq_ignore_ascii_case`. Canonicalize when the path exists; on failure use
+/// lexical components. Do **not** use `Path::starts_with` (case-sensitive on
+/// Windows) and do **not** unify with `harness/grok.rs` `path_is_under`.
+pub fn path_contains_cwd(root: &Path, cwd: &Path) -> bool {
+    let root_n = normalize_for_containment(root);
+    let cwd_n = normalize_for_containment(cwd);
+    let root_cs: Vec<Component<'_>> = root_n.components().collect();
+    let cwd_cs: Vec<Component<'_>> = cwd_n.components().collect();
+    if root_cs.len() > cwd_cs.len() {
+        return false;
+    }
+    root_cs
+        .iter()
+        .zip(cwd_cs.iter())
+        .all(|(r, c)| components_eq(*r, *c))
 }
 
 #[cfg(test)]
@@ -834,5 +971,253 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("0"));
         assert!(reg.projects.is_empty());
+    }
+
+    fn two_projects() -> (tempfile::TempDir, tempfile::TempDir, Registry) {
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        let mut reg = Registry::default();
+        reg.add(a.path(), ProjectAddOptions::default()).unwrap();
+        reg.add(b.path(), ProjectAddOptions::default()).unwrap();
+        (a, b, reg)
+    }
+
+    #[test]
+    fn resolve_cwd_under_b_workspace() {
+        let (_a, b, reg) = two_projects();
+        let id_b = reg.projects[1].id.clone();
+        let resolved = reg.resolve_project_in(None, Some(b.path()), None).unwrap();
+        assert_eq!(resolved.id, id_b);
+    }
+
+    #[test]
+    fn resolve_cwd_under_b_nested_execution() {
+        let a = tempdir().unwrap();
+        let b_ws = tempdir().unwrap();
+        let hands = b_ws.path().join("hands");
+        std::fs::create_dir_all(&hands).unwrap();
+        let mut reg = Registry::default();
+        reg.add(a.path(), ProjectAddOptions::default()).unwrap();
+        let rec_b = reg
+            .add(
+                b_ws.path(),
+                ProjectAddOptions {
+                    execution_repo: Some(hands.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let from_ws = reg
+            .resolve_project_in(None, Some(b_ws.path()), None)
+            .unwrap();
+        assert_eq!(from_ws.id, rec_b.id);
+        let from_exec = reg.resolve_project_in(None, Some(&hands), None).unwrap();
+        assert_eq!(from_exec.id, rec_b.id);
+        let child = hands.join("src");
+        std::fs::create_dir_all(&child).unwrap();
+        let from_child = reg.resolve_project_in(None, Some(&child), None).unwrap();
+        assert_eq!(from_child.id, rec_b.id);
+    }
+
+    #[test]
+    fn resolve_last_used_when_cwd_matches_neither() {
+        let (_a, _b, reg) = two_projects();
+        let id_b = reg.projects[1].id.clone();
+        let elsewhere = tempdir().unwrap();
+        let resolved = reg
+            .resolve_project_in(None, Some(elsewhere.path()), Some(&id_b))
+            .unwrap();
+        assert_eq!(resolved.id, id_b);
+    }
+
+    #[test]
+    fn resolve_no_cwd_no_last_used_errors_with_new_message() {
+        let (_a, _b, reg) = two_projects();
+        let err = reg.resolve_project(None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cwd is not inside a registered workspace or execution repo"),
+            "{msg}"
+        );
+        assert!(msg.contains("pass --project"), "{msg}");
+        let elsewhere = tempdir().unwrap();
+        let stale = reg
+            .resolve_project_in(None, Some(elsewhere.path()), Some("missing-id"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            stale.contains("cwd is not inside a registered workspace or execution repo"),
+            "{stale}"
+        );
+    }
+
+    #[test]
+    fn resolve_longest_prefix_nested_workspaces() {
+        let parent = tempdir().unwrap();
+        let child = parent.path().join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let mut reg = Registry::default();
+        let rec_parent = reg
+            .add(
+                parent.path(),
+                ProjectAddOptions {
+                    layout_profile: LayoutProfile::SingleRoot,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let rec_child = reg
+            .add(
+                &child,
+                ProjectAddOptions {
+                    layout_profile: LayoutProfile::SingleRoot,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let nested = child.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let resolved = reg.resolve_project_in(None, Some(&nested), None).unwrap();
+        assert_eq!(resolved.id, rec_child.id);
+        let at_parent = reg
+            .resolve_project_in(None, Some(parent.path()), None)
+            .unwrap();
+        assert_eq!(at_parent.id, rec_parent.id);
+    }
+
+    #[test]
+    fn resolve_equal_component_length_is_ambiguous_even_with_last_used() {
+        let shared = tempdir().unwrap();
+        let a_ws = tempdir().unwrap();
+        let b_ws = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec_a = reg
+            .add(
+                a_ws.path(),
+                ProjectAddOptions {
+                    execution_repo: Some(shared.path().to_path_buf()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let rec_b = reg
+            .add(
+                b_ws.path(),
+                ProjectAddOptions {
+                    execution_repo: Some(shared.path().to_path_buf()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let err = reg
+            .resolve_project_in(None, Some(shared.path()), Some(&rec_a.id))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cwd matches multiple projects"), "{err}");
+        assert!(err.contains(&rec_a.id), "{err}");
+        assert!(err.contains(&rec_b.id), "{err}");
+        let pos_a = err.find(&rec_a.id).unwrap();
+        let pos_b = err.find(&rec_b.id).unwrap();
+        if rec_a.id < rec_b.id {
+            assert!(pos_a < pos_b, "ids must be sorted: {err}");
+        } else {
+            assert!(pos_b < pos_a, "ids must be sorted: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_explicit_wins_over_cwd() {
+        let (a, b, reg) = two_projects();
+        let id_a = reg.projects[0].id.clone();
+        let resolved = reg
+            .resolve_project_in(Some(&id_a), Some(b.path()), None)
+            .unwrap();
+        assert_eq!(resolved.id, id_a);
+        let _ = a;
+    }
+
+    #[test]
+    fn resolve_single_project_ignores_cwd_elsewhere() {
+        let proj = tempdir().unwrap();
+        let elsewhere = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let resolved = reg
+            .resolve_project_in(None, Some(elsewhere.path()), None)
+            .unwrap();
+        assert_eq!(resolved.id, rec.id);
+    }
+
+    #[test]
+    fn path_contains_cwd_mixed_case_windows() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("src");
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert!(path_contains_cwd(root.path(), &cwd));
+        #[cfg(windows)]
+        {
+            let mixed = PathBuf::from(cwd.to_string_lossy().to_uppercase());
+            assert!(
+                path_contains_cwd(root.path(), &mixed),
+                "mixed-case cwd must match: {}",
+                mixed.display()
+            );
+        }
+    }
+
+    #[test]
+    fn path_contains_cwd_rejects_string_prefix() {
+        let parent = tempdir().unwrap();
+        let orca = parent.path().join("Orca");
+        let extra = parent.path().join("Orca-extra");
+        std::fs::create_dir_all(&orca).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        assert!(path_contains_cwd(&orca, &orca));
+        assert!(!path_contains_cwd(&orca, &extra));
+        let mut reg = Registry::default();
+        let rec_orca = reg.add(&orca, ProjectAddOptions::default()).unwrap();
+        let rec_extra = reg.add(&extra, ProjectAddOptions::default()).unwrap();
+        let got = reg.resolve_project_in(None, Some(&extra), None).unwrap();
+        assert_eq!(got.id, rec_extra.id);
+        assert_ne!(got.id, rec_orca.id);
+    }
+
+    #[test]
+    fn resolve_multi_sibling_execution_repos_outside_hub() {
+        let hub = tempdir().unwrap();
+        let sibling = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("ledgerful".into(), sibling.path().to_path_buf());
+        let mut reg = Registry::default();
+        let rec_hub = reg
+            .add(
+                hub.path(),
+                ProjectAddOptions {
+                    layout_profile: LayoutProfile::MultiSibling,
+                    execution_repos: map,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        reg.add(other.path(), ProjectAddOptions::default()).unwrap();
+        let resolved = reg
+            .resolve_project_in(None, Some(sibling.path()), None)
+            .unwrap();
+        assert_eq!(resolved.id, rec_hub.id);
+        let at_hub = reg
+            .resolve_project_in(None, Some(hub.path()), None)
+            .unwrap();
+        assert_eq!(at_hub.id, rec_hub.id);
+    }
+
+    #[test]
+    fn resolve_lexical_fallback_when_cwd_does_not_exist() {
+        let (_a, b, reg) = two_projects();
+        let id_b = reg.projects[1].id.clone();
+        let missing = b.path().join("not-created-yet");
+        assert!(!missing.exists());
+        let resolved = reg.resolve_project_in(None, Some(&missing), None).unwrap();
+        assert_eq!(resolved.id, id_b);
     }
 }

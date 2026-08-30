@@ -850,8 +850,14 @@ mod tests {
         let probe = ScriptedProbe::ready();
         let _g = install_test_probe(probe);
         let (_proj, rec) = iso.add_project();
-        let err =
-            api::cmd_run(Some(&rec.id), Some("0028".into()), Some("adapter"), false).unwrap_err();
+        let err = api::cmd_run(
+            Some(&rec.id),
+            Some("0028".into()),
+            Some("adapter"),
+            false,
+            false,
+        )
+        .unwrap_err();
         let msg = err.to_string();
         match err {
             CoordinatorError::Preflight { report } => {
@@ -863,7 +869,7 @@ mod tests {
         }
         let path = crate::state::run_state_path(&rec).unwrap();
         assert!(!path.exists(), "run-state must not be written");
-        let view = api::status(Some(&rec.id)).unwrap();
+        let view = api::status(Some(&rec.id), false).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         assert!(crate::notify::artifact::existing_path(&rec).is_none());
         assert!(msg.contains("grok login"), "Display must name login: {msg}");
@@ -895,8 +901,14 @@ mod tests {
         let probe = ScriptedProbe::ready();
         let _g = install_test_probe(probe);
         let (_proj, rec) = iso.add_project();
-        let err =
-            api::cmd_run(Some(&rec.id), Some("0028".into()), Some("adapter"), false).unwrap_err();
+        let err = api::cmd_run(
+            Some(&rec.id),
+            Some("0028".into()),
+            Some("adapter"),
+            false,
+            false,
+        )
+        .unwrap_err();
         match &err {
             CoordinatorError::Preflight { report } => {
                 assert_eq!(row(report, "planner").status, RowStatus::Missing);
@@ -905,7 +917,10 @@ mod tests {
             other => panic!("expected Preflight, got {other}"),
         }
         assert!(!crate::state::run_state_path(&rec).unwrap().exists());
-        assert_eq!(api::status(Some(&rec.id)).unwrap().status, RunStatus::Idle);
+        assert_eq!(
+            api::status(Some(&rec.id), false).unwrap().status,
+            RunStatus::Idle
+        );
     }
 
     #[test]
@@ -916,7 +931,13 @@ mod tests {
         let probe = ScriptedProbe::ready().with_version("codex", 124, true);
         let _g = install_test_probe(probe);
         let (_proj, rec) = iso.add_project();
-        let result = api::cmd_run(Some(&rec.id), Some("0028".into()), Some("adapter"), false);
+        let result = api::cmd_run(
+            Some(&rec.id),
+            Some("0028".into()),
+            Some("adapter"),
+            false,
+            false,
+        );
         match result {
             Err(CoordinatorError::Preflight { report }) => {
                 panic!("unknown must not refuse: {report:?}")
@@ -941,7 +962,14 @@ mod tests {
         let probe = ScriptedProbe::ready();
         let _g = install_test_probe(probe.clone());
         let (_proj, rec) = iso.add_project();
-        let view = api::cmd_run(Some(&rec.id), Some("0028".into()), Some("adapter"), true).unwrap();
+        let view = api::cmd_run(
+            Some(&rec.id),
+            Some("0028".into()),
+            Some("adapter"),
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(view.status, RunStatus::Running);
         assert!(probe.calls().is_empty(), "skip must not probe");
     }
@@ -953,13 +981,21 @@ mod tests {
         let probe = ScriptedProbe::ready();
         let _g = install_test_probe(probe.clone());
         let (_proj, rec) = iso.add_project();
-        api::cmd_run(Some(&rec.id), Some("0028".into()), Some("stub"), false).unwrap();
+        api::cmd_run(
+            Some(&rec.id),
+            Some("0028".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
         assert!(probe.calls().is_empty(), "stub must not probe");
         let (_proj2, rec2) = iso.add_project();
         api::cmd_run(
             Some(&rec2.id),
             Some("0028".into()),
             Some("file_wait"),
+            false,
             false,
         )
         .unwrap();

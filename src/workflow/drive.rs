@@ -114,7 +114,7 @@ enum CompactAttempt {
 
 fn try_compact(record: &ProjectRecord) -> CompactAttempt {
     let selector = record.path.to_string_lossy().to_string();
-    match block_on_async(crate::harness::compact(Some(&selector))) {
+    match block_on_async(crate::harness::compact(Some(&selector), false)) {
         Ok(view) => {
             if let Some(err) = view.error {
                 CompactAttempt::Skipped(Some(err))
@@ -263,12 +263,13 @@ fn drive_adapter(
                         ADAPTER_START_IN_PROCESS,
                         bin,
                         model,
+                        false,
                     )
                     .await?;
                 } else {
-                    crate::harness::start(Some(&selector), ADAPTER_START_IN_PROCESS).await?;
+                    crate::harness::start(Some(&selector), ADAPTER_START_IN_PROCESS, false).await?;
                 }
-                crate::harness::prompt(Some(&selector), prompt).await
+                crate::harness::prompt(Some(&selector), prompt, false).await
             });
             match result {
                 Ok(view) => {

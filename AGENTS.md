@@ -87,7 +87,7 @@ Adapter injects name the phase skill as `{workspace|execution}/.agents/skills/<p
 - Planning files staged into product  
 - Autonomy safety (timeouts, stop/pause, failure classes) when touching orchestration core  
 
-**Two-project CLI:** after more than one registry project, every command that takes `--project` must pass it (`run` / `wait` / `status` / `stop` / `pause` / `show` / `resume`). Omitting `--project` is an error.
+**Two-project CLI:** after more than one registry project, omit `--project` when cwd uniquely matches a registered workspace or execution repo; else last-used (`{COORDINATOR_HOME}/last-used.json`) if still registered; else error. `--project` is required when cwd is outside and last-used is unset/stale. Ambiguous cwd does not fall through to last-used. HTTP omit never uses serve cwd. `doctor` omit remains valid (machine-wide; does not infer).
 
 **Scan footgun:** never `project scan --root C:\dev --add` — `C:\dev` has many conductor markers (Orca, coordinator, coordinated, …). Scan a single workspace (`--root C:\dev\Orca`) or add one project at a time.
 

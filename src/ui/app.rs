@@ -790,7 +790,7 @@ fn project_card(
                             title: "Pause: finish current phase, hold next until Resume",
                             onclick: move |evt| {
                                 evt.stop_propagation();
-                                match crate::api::cmd_pause(Some(&id_pause)) {
+                                match crate::api::cmd_pause(Some(&id_pause), false) {
                                     Ok(_) => {
                                         banner.set(None);
                                         refresh(&mut fleet);
