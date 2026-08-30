@@ -11,6 +11,7 @@
 //! Coordinated multi-sibling dogfood (named-map prompt): track **0016**.
 //! Harness progress watchdog (detect + surface stall): track **0026**.
 //! Abort stuck Prompt + refuse wedged-session reuse: track **0027**.
+//! Harness preflight (`doctor` + adapter `run` refuse missing/auth): track **0028**.
 //! Plan-review Antigravity one-shot (`agy --print`): track **0017**.
 //! Plan-review OpenCode one-shot (`opencode run`): track **0018**.
 //! Role-bound plan/fold/implement/advance drive: track **0019**.

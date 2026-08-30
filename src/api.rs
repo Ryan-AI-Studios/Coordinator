@@ -85,6 +85,9 @@ pub struct ProjectRefBody {
     pub track: Option<String>,
     #[serde(default)]
     pub driver: Option<String>,
+    /// Skip harness preflight on adapter `run`. Serde default false.
+    #[serde(default)]
+    pub skip_preflight: bool,
 }
 
 /// Effective phase wall clock for `project show`.
@@ -314,11 +317,28 @@ pub fn cmd_run(
     project: Option<&str>,
     track: Option<String>,
     driver: Option<&str>,
+    skip_preflight: bool,
 ) -> Result<StatusView> {
     let reg = load_registry()?;
     let rec = reg.resolve_project(project)?.clone();
     let driver = crate::workflow::resolve_driver(driver)?;
+    if driver == crate::workflow::WorkflowDriver::Adapter && !skip_preflight {
+        let report = crate::harness::preflight::probe_machine()?;
+        if !report.ok {
+            return Err(CoordinatorError::Preflight {
+                report: Box::new(report),
+            });
+        }
+    }
     run::run_with_driver(&rec, track, driver)
+}
+
+/// Probe machine Role Bindings + `gh`. Optional `--project` only validates the selector.
+pub fn cmd_doctor(project: Option<&str>) -> Result<crate::harness::preflight::DoctorReport> {
+    if let Some(p) = project {
+        let _ = load_registry()?.resolve_project(Some(p))?;
+    }
+    crate::harness::preflight::probe_machine()
 }
 
 pub fn cmd_pause(project: Option<&str>) -> Result<StatusView> {
@@ -434,6 +454,7 @@ pub struct RunCliOpts {
     pub detach: bool,
     pub timeout_secs: Option<u64>,
     pub probe: ServeProbe,
+    pub skip_preflight: bool,
 }
 
 /// Start a run, then tick until Idle/Stopped unless detached or serve owns the loop.
@@ -448,7 +469,7 @@ pub fn cmd_run_cli(
             "timeout-secs must be > 0; omit the flag to tick until Idle/Stopped".into(),
         ));
     }
-    let view = cmd_run(project, track, driver)?;
+    let view = cmd_run(project, track, driver, opts.skip_preflight)?;
     if opts.detach {
         return Ok(attach_ticker(view));
     }
@@ -610,6 +631,7 @@ mod tests {
                 detach: false,
                 timeout_secs: None,
                 probe: ServeProbe::Skip,
+                skip_preflight: false,
             },
         )
         .unwrap();
@@ -633,6 +655,7 @@ mod tests {
                 detach: true,
                 timeout_secs: None,
                 probe: ServeProbe::Skip,
+                skip_preflight: false,
             },
         )
         .unwrap();
@@ -658,6 +681,7 @@ mod tests {
                 detach: false,
                 timeout_secs: Some(1),
                 probe: ServeProbe::Skip,
+                skip_preflight: false,
             },
         )
         .unwrap_err();
@@ -689,6 +713,7 @@ mod tests {
                 detach: false,
                 timeout_secs: Some(0),
                 probe: ServeProbe::Skip,
+                skip_preflight: false,
             },
         )
         .unwrap_err();
@@ -714,6 +739,7 @@ mod tests {
                 detach: false,
                 timeout_secs: Some(1),
                 probe: ServeProbe::Port(port),
+                skip_preflight: false,
             },
         )
         .unwrap();
@@ -743,6 +769,7 @@ mod tests {
                 detach: false,
                 timeout_secs: None,
                 probe: ServeProbe::Port(port),
+                skip_preflight: false,
             },
         )
         .unwrap();
@@ -766,6 +793,7 @@ mod tests {
                 detach: true,
                 timeout_secs: None,
                 probe: ServeProbe::Skip,
+                skip_preflight: false,
             },
         )
         .unwrap();
@@ -788,6 +816,7 @@ mod tests {
                 detach: false,
                 timeout_secs: Some(1),
                 probe: ServeProbe::Auto,
+                skip_preflight: false,
             },
         )
         .unwrap();
@@ -827,6 +856,7 @@ mod tests {
                 detach: false,
                 timeout_secs: None,
                 probe: ServeProbe::Auto,
+                skip_preflight: false,
             },
         )
         .unwrap();
@@ -857,6 +887,7 @@ mod tests {
                 detach: false,
                 timeout_secs: None,
                 probe: ServeProbe::Port(other),
+                skip_preflight: false,
             },
         )
         .unwrap();

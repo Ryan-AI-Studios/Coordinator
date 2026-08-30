@@ -1,9 +1,11 @@
 //! Grok harness adapter, session pool, and role-binding helpers (track **0007**).
 //! Abort/recycle of a wedged ACP Prompt: track **0027**.
+//! Harness preflight (`doctor`): track **0028**.
 
 pub mod abort;
 pub mod grok;
 pub mod pool;
+pub mod preflight;
 pub mod roles;
 pub mod terminal;
 
