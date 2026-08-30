@@ -447,10 +447,26 @@ pub fn paths_equal(a: &Path, b: &Path) -> bool {
 
 fn normalize_for_containment(path: &Path) -> PathBuf {
     if path.exists() {
-        canonicalize_path(path).unwrap_or_else(|_| path.to_path_buf())
-    } else {
-        path.to_path_buf()
+        return canonicalize_path(path).unwrap_or_else(|_| path.to_path_buf());
     }
+    // Missing tail (lexical fallback): canonicalize the longest existing
+    // ancestor so Windows 8.3 / junction parents still match stored roots.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    while let Some(name) = cur.file_name() {
+        tail.push(name.to_os_string());
+        if !cur.pop() {
+            break;
+        }
+        if cur.exists() {
+            let mut base = canonicalize_path(&cur).unwrap_or(cur);
+            for c in tail.iter().rev() {
+                base.push(c);
+            }
+            return base;
+        }
+    }
+    path.to_path_buf()
 }
 
 fn components_eq(a: Component<'_>, b: Component<'_>) -> bool {
