@@ -21,10 +21,22 @@ pub fn run(record: &ProjectRecord, track_id: Option<String>) -> Result<StatusVie
 }
 
 /// Start the canonical workflow with an explicit driver.
+///
+/// Public primitive: omit `track_id` still **retains**. Pick lives in `api::cmd_run`.
 pub fn run_with_driver(
     record: &ProjectRecord,
     track_id: Option<String>,
     driver: WorkflowDriver,
+) -> Result<StatusView> {
+    run_with_origin(record, track_id, driver, false)
+}
+
+/// Inner start used by `cmd_run`. `picked` tags `last_event` `(next Ready)` in the same lock.
+pub(crate) fn run_with_origin(
+    record: &ProjectRecord,
+    track_id: Option<String>,
+    driver: WorkflowDriver,
+    picked: bool,
 ) -> Result<StatusView> {
     with_run_state_lock(record, || {
         ensure_state_dir(record)?;
@@ -54,7 +66,13 @@ pub fn run_with_driver(
                 state.stall_recycles = 0;
                 state.aborted_session_id = None;
                 state.plan_review_spawned.clear();
-                state.last_event = format!("run: started {WORKFLOW_ID}");
+                if picked {
+                    let id = state.track_id.as_deref().unwrap_or("-");
+                    state.last_event =
+                        format!("run: started {WORKFLOW_ID} track={id} (next Ready)");
+                } else {
+                    state.last_event = format!("run: started {WORKFLOW_ID}");
+                }
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);
                 crate::workflow::drive::clear_plan_review_artifacts(record);

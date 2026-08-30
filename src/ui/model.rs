@@ -415,18 +415,26 @@ pub fn stop_copy() -> &'static str {
     STOP_LAST_EVENT
 }
 
-/// Primary card button. Idle/Stopped (including hard-fail) → Run, never Pause.
+/// Primary card button. Idle/Stopped (including hard-fail) → Run or Start next Ready, never Pause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardPrimaryAction {
     Pause,
     Resume,
     Run,
+    StartNextReady,
 }
 
 pub fn card_primary_action(view: &StatusView) -> CardPrimaryAction {
     match view.status {
         RunStatus::Paused => CardPrimaryAction::Resume,
-        RunStatus::Idle | RunStatus::Stopped => CardPrimaryAction::Run,
+        RunStatus::Idle | RunStatus::Stopped => {
+            if crate::workflow::should_pick_next_ready(&crate::workflow::ReadyPickState::from(view))
+            {
+                CardPrimaryAction::StartNextReady
+            } else {
+                CardPrimaryAction::Run
+            }
+        }
         RunStatus::Running => CardPrimaryAction::Pause,
     }
 }
@@ -792,6 +800,30 @@ mod tests {
         assert_eq!(
             card_primary_action(&view(RunStatus::Idle, STUB_PHASE_IDLE, None, None)),
             CardPrimaryAction::Run
+        );
+        let mut unset = view(RunStatus::Idle, STUB_PHASE_IDLE, None, None);
+        unset.track_id = None;
+        assert_eq!(
+            card_primary_action(&unset),
+            CardPrimaryAction::StartNextReady
+        );
+        let mut stopped = view(RunStatus::Stopped, "stub:stopped", None, None);
+        stopped.track_id = Some("0020".into());
+        assert_eq!(card_primary_action(&stopped), CardPrimaryAction::Run);
+        let mut failed_idle = view(
+            RunStatus::Idle,
+            STUB_PHASE_IDLE,
+            Some(FailureClass::Timeout),
+            None,
+        );
+        failed_idle.track_id = Some("0020".into());
+        assert_eq!(card_primary_action(&failed_idle), CardPrimaryAction::Run);
+        let mut backlog = view(RunStatus::Idle, STUB_PHASE_IDLE, None, None);
+        backlog.track_id = Some("0020".into());
+        backlog.last_event = crate::workflow::LAST_EVENT_BACKLOG_CLEAR.into();
+        assert_eq!(
+            card_primary_action(&backlog),
+            CardPrimaryAction::StartNextReady
         );
     }
 

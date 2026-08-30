@@ -89,6 +89,8 @@ Adapter injects name the phase skill as `{workspace|execution}/.agents/skills/<p
 
 **Two-project CLI:** after more than one registry project, omit `--project` when cwd uniquely matches a registered workspace or execution repo; else last-used (`{COORDINATOR_HOME}/last-used.json`) if still registered; else error. `--project` is required when cwd is outside and last-used is unset/stale. Ambiguous cwd does not fall through to last-used. HTTP omit never uses serve cwd. `doctor` omit remains valid (machine-wide; does not infer).
 
+**Omit `--track`:** starts the first exact `Ready — not started` row when `track_id` is unset or Idle after `workflow: backlog clear`; else retain. Never Proposed/HITL/trailing notes. Fail closed → `--track`. Live autonomous walk still names `--track 0099` for Helping Hands (HH has no exact Ready today; omit would error).
+
 **Scan footgun:** never `project scan --root C:\dev --add` — `C:\dev` has many conductor markers (Orca, coordinator, coordinated, …). Scan a single workspace (`--root C:\dev\Orca`) or add one project at a time.
 
 **Scan footgun (coordinated):** `project scan --add` of `C:\dev\coordinated` would register **`nested`** (scan never returns `multi_sibling`; the hub has no nested product children). Use explicit `project add --profile multi_sibling`.
