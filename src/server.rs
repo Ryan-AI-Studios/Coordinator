@@ -76,7 +76,7 @@ struct StatusQuery {
 
 async fn get_status(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
     if q.project.is_some() {
-        let view = api::status(q.project.as_deref())?;
+        let view = api::status(q.project.as_deref(), false)?;
         Ok(Json(json!(view)))
     } else {
         // Single project → object; multiple → array under `projects`
@@ -100,22 +100,23 @@ async fn post_run(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse,
         body.track,
         body.driver.as_deref(),
         body.skip_preflight,
+        false,
     )?;
     Ok(Json(view))
 }
 
 async fn post_pause(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_pause(body.project.as_deref())?;
+    let view = api::cmd_pause(body.project.as_deref(), false)?;
     Ok(Json(view))
 }
 
 async fn post_resume(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_resume(body.project.as_deref())?;
+    let view = api::cmd_resume(body.project.as_deref(), false)?;
     Ok(Json(view))
 }
 
 async fn post_stop(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_stop(body.project.as_deref())?;
+    let view = api::cmd_stop(body.project.as_deref(), false)?;
     Ok(Json(view))
 }
 
@@ -125,7 +126,7 @@ async fn post_outcome(Json(body): Json<OutcomeWriteBody>) -> Result<impl IntoRes
 }
 
 async fn post_grok_start(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_harness_grok_start(body.project.as_deref(), false).await?;
+    let view = api::cmd_harness_grok_start(body.project.as_deref(), false, false).await?;
     Ok(Json(view))
 }
 
@@ -139,24 +140,24 @@ async fn post_grok_prompt(
 async fn post_grok_compact(
     Json(body): Json<ProjectRefBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_harness_grok_compact(body.project.as_deref()).await?;
+    let view = api::cmd_harness_grok_compact(body.project.as_deref(), false).await?;
     Ok(Json(view))
 }
 
 async fn get_grok_status(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_harness_grok_status(q.project.as_deref()).await?;
+    let view = api::cmd_harness_grok_status(q.project.as_deref(), false).await?;
     Ok(Json(view))
 }
 
 async fn post_grok_shutdown(
     Json(body): Json<ProjectRefBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_harness_grok_shutdown(body.project.as_deref()).await?;
+    let view = api::cmd_harness_grok_shutdown(body.project.as_deref(), false).await?;
     Ok(Json(view))
 }
 
 async fn get_failure(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
-    match api::cmd_failure_show(q.project.as_deref())? {
+    match api::cmd_failure_show(q.project.as_deref(), false)? {
         Some(v) => Ok(Json(v).into_response()),
         None => Ok((
             StatusCode::NOT_FOUND,
@@ -167,7 +168,7 @@ async fn get_failure(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, 
 }
 
 async fn get_outcome(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
-    match api::cmd_outcome_show(q.project.as_deref())? {
+    match api::cmd_outcome_show(q.project.as_deref(), false)? {
         Some(o) => Ok(Json(json!(o)).into_response()),
         None => Ok((
             StatusCode::NOT_FOUND,
@@ -995,6 +996,196 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            match prev_grok {
+                Some(v) => std::env::set_var("GROK_HOME", v),
+                None => std::env::remove_var("GROK_HOME"),
+            }
+            match prev_xai {
+                Some(v) => std::env::set_var("XAI_API_KEY", v),
+                None => std::env::remove_var("XAI_API_KEY"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn status_omit_two_projects_is_fleet() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        api::project_add(a.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        api::project_add(b.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let projects = v["projects"]
+            .as_array()
+            .expect("fleet array, not inferred object");
+        assert_eq!(projects.len(), 2, "{v}");
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_http_omit_does_not_use_serve_cwd() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        api::project_add(a.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        api::project_add(b.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(b.path()).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let err = v["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("cwd is not inside a registered workspace or execution repo"),
+            "{v}"
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn grok_http_omit_does_not_use_serve_cwd() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        api::project_add(a.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        api::project_add(b.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(b.path()).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/harness/grok/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_http_omit_uses_last_used_stub() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        api::project_add(a.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        let rec_b =
+            api::project_add(b.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        crate::config::save_last_used_id(&rec_b.id).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({ "driver": "stub" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["project_id"], rec_b.id);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn doctor_http_omit_two_projects_still_200() {
+        use crate::harness::preflight::{ScriptedProbe, install_test_probe};
+
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let grok_home = tempdir().unwrap();
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        let prev_grok = std::env::var_os("GROK_HOME");
+        let prev_xai = std::env::var_os("XAI_API_KEY");
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var("GROK_HOME", grok_home.path());
+            std::env::set_var("XAI_API_KEY", "test-not-a-real-key");
+        }
+        api::project_add(a.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        api::project_add(b.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        let probe = ScriptedProbe::ready();
+        let _pg = install_test_probe(probe);
+
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/doctor")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("ok").is_some(), "{v}");
+        assert!(v.get("rows").is_some(), "{v}");
 
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);

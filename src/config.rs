@@ -127,6 +127,50 @@ pub fn ensure_machine_home() -> Result<PathBuf> {
     Ok(home)
 }
 
+/// Schema version for `{COORDINATOR_HOME}/last-used.json` (track **0029**).
+pub const LAST_USED_VERSION: u32 = 1;
+
+/// Last successfully resolved project id. Not a secret; not `config.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LastUsedFile {
+    pub version: u32,
+    pub project_id: String,
+}
+
+/// `{COORDINATOR_HOME}/last-used.json`.
+pub fn last_used_path() -> Result<PathBuf> {
+    Ok(machine_home()?.join("last-used.json"))
+}
+
+/// Missing / corrupt / bad version / empty id → `None` (never `Err`).
+pub fn load_last_used_id() -> Option<String> {
+    let path = last_used_path().ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let parsed: LastUsedFile = serde_json::from_str(&text).ok()?;
+    if parsed.version != LAST_USED_VERSION {
+        return None;
+    }
+    let id = parsed.project_id.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+/// Atomically write last-used. Callers treat I/O errors as best-effort.
+pub fn save_last_used_id(id: &str) -> Result<()> {
+    let home = ensure_machine_home()?;
+    let path = home.join("last-used.json");
+    atomic_write_json(
+        &path,
+        &LastUsedFile {
+            version: LAST_USED_VERSION,
+            project_id: id.to_string(),
+        },
+    )
+}
+
 /// Path to `{home}/registry.json`.
 pub fn registry_path() -> Result<PathBuf> {
     Ok(ensure_machine_home()?.join("registry.json"))
@@ -368,6 +412,7 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_AGY_BIN`, `COORDINATOR_OPENCODE_BIN`, or
 /// `COORDINATOR_GROK_BIN` must
 /// hold this (survives poison so one failure does not cascade).
+/// Last-used persist tests (`last-used.json`) also isolate `COORDINATOR_HOME`.
 #[cfg(test)]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::{Mutex, OnceLock};
@@ -607,5 +652,34 @@ mod tests {
             loaded.hermes.webhook_url.as_deref(),
             Some("http://127.0.0.1:8644/webhooks/coordinator-failure")
         );
+    }
+
+    #[test]
+    fn last_used_round_trip_and_corrupt_ignored() {
+        let _guard = test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        assert!(load_last_used_id().is_none(), "missing file is unset");
+        save_last_used_id("proj-b").unwrap();
+        assert_eq!(load_last_used_id().as_deref(), Some("proj-b"));
+        std::fs::write(home.path().join("last-used.json"), "{not-json").unwrap();
+        assert!(load_last_used_id().is_none(), "corrupt JSON is unset");
+        std::fs::write(
+            home.path().join("last-used.json"),
+            r#"{"version":99,"project_id":"x"}"#,
+        )
+        .unwrap();
+        assert!(load_last_used_id().is_none(), "bad version is unset");
+        std::fs::write(
+            home.path().join("last-used.json"),
+            r#"{"version":1,"project_id":"  "}"#,
+        )
+        .unwrap();
+        assert!(load_last_used_id().is_none(), "empty id is unset");
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
     }
 }

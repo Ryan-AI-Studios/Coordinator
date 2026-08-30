@@ -362,7 +362,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 println!("{}", serde_json::to_string_pretty(&list)?);
             }
             ProjectCommands::Show { project } => {
-                let view = api::project_show(project.as_deref())?;
+                let view = api::project_show(project.as_deref(), true)?;
                 println!("{}", serde_json::to_string_pretty(&view)?);
             }
             ProjectCommands::Set {
@@ -408,7 +408,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     clear_phase_timeouts,
                     clear_phase_timeout,
                 };
-                let rec = api::project_set(project.as_deref(), opts)?;
+                let rec = api::project_set(project.as_deref(), opts, true)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
             }
             ProjectCommands::Scan {
@@ -434,7 +434,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             }
         },
         Commands::Status { project } => {
-            let view = api::status(project.as_deref())?;
+            let view = api::status(project.as_deref(), true)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Doctor { project } => {
@@ -477,15 +477,15 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Pause { project } => {
-            let view = api::cmd_pause(project.as_deref())?;
+            let view = api::cmd_pause(project.as_deref(), true)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Resume { project } => {
-            let view = api::cmd_resume(project.as_deref())?;
+            let view = api::cmd_resume(project.as_deref(), true)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Stop { project } => {
-            let view = api::cmd_stop(project.as_deref())?;
+            let view = api::cmd_stop(project.as_deref(), true)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Outcome { action } => match action {
@@ -506,29 +506,34 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     message,
                     next_track,
                     Some(&source),
+                    true,
                 )?;
                 println!("{}", serde_json::to_string_pretty(&view)?);
             }
-            OutcomeCommands::Show { project } => match api::cmd_outcome_show(project.as_deref())? {
-                Some(o) => println!("{}", serde_json::to_string_pretty(&o)?),
-                None => {
-                    println!("null");
+            OutcomeCommands::Show { project } => {
+                match api::cmd_outcome_show(project.as_deref(), true)? {
+                    Some(o) => println!("{}", serde_json::to_string_pretty(&o)?),
+                    None => {
+                        println!("null");
+                    }
                 }
-            },
+            }
         },
         Commands::Failure { action } => match action {
-            FailureCommands::Show { project } => match api::cmd_failure_show(project.as_deref())? {
-                Some(v) => print!("{}", v.body),
-                None => {
-                    return Err(CoordinatorError::Message("no failure artifact".into()));
+            FailureCommands::Show { project } => {
+                match api::cmd_failure_show(project.as_deref(), true)? {
+                    Some(v) => print!("{}", v.body),
+                    None => {
+                        return Err(CoordinatorError::Message("no failure artifact".into()));
+                    }
                 }
-            },
+            }
         },
         Commands::Wait {
             project,
             timeout_secs,
         } => {
-            let view = api::cmd_wait(project.as_deref(), timeout_secs)?;
+            let view = api::cmd_wait(project.as_deref(), timeout_secs, true)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Serve { port, check } => {
@@ -544,7 +549,8 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
         Commands::Harness { action } => match action {
             HarnessCommands::Grok { action } => match action {
                 GrokCommands::Start { project } => {
-                    let view = block_on(api::cmd_harness_grok_start(project.as_deref(), false))?;
+                    let view =
+                        block_on(api::cmd_harness_grok_start(project.as_deref(), false, true))?;
                     println!("{}", serde_json::to_string_pretty(&view)?);
                 }
                 GrokCommands::Prompt {
@@ -553,19 +559,20 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     file,
                 } => {
                     let body = read_prompt_text(text, file)?;
-                    let view = block_on(api::cmd_harness_grok_prompt(project.as_deref(), body))?;
+                    let view =
+                        block_on(api::cmd_harness_grok_prompt(project.as_deref(), body, true))?;
                     println!("{}", serde_json::to_string_pretty(&view)?);
                 }
                 GrokCommands::Compact { project } => {
-                    let view = block_on(api::cmd_harness_grok_compact(project.as_deref()))?;
+                    let view = block_on(api::cmd_harness_grok_compact(project.as_deref(), true))?;
                     println!("{}", serde_json::to_string_pretty(&view)?);
                 }
                 GrokCommands::Status { project } => {
-                    let view = block_on(api::cmd_harness_grok_status(project.as_deref()))?;
+                    let view = block_on(api::cmd_harness_grok_status(project.as_deref(), true))?;
                     println!("{}", serde_json::to_string_pretty(&view)?);
                 }
                 GrokCommands::Shutdown { project } => {
-                    let view = block_on(api::cmd_harness_grok_shutdown(project.as_deref()))?;
+                    let view = block_on(api::cmd_harness_grok_shutdown(project.as_deref(), true))?;
                     println!("{}", serde_json::to_string_pretty(&view)?);
                 }
                 GrokCommands::Hold { project } => {
@@ -576,7 +583,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
         Commands::Notify { action } => match action {
             NotifyCommands::HermesTest { project } => {
                 let project_id = match project {
-                    Some(p) => api::load_registry()?.resolve_project(Some(&p))?.id.clone(),
+                    Some(p) => api::resolve_selected(Some(&p), true)?.id,
                     None => "hermes-test".into(),
                 };
                 let event = crate::notify::hermes::synthetic_event(project_id);

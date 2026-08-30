@@ -247,7 +247,7 @@ pub fn session_rows(view: &StatusView) -> Vec<SessionRow> {
 }
 
 pub fn failure_panel(view: &StatusView) -> Option<FailurePanel> {
-    if let Ok(Some(shown)) = api::cmd_failure_show(Some(&view.project_id)) {
+    if let Ok(Some(shown)) = api::cmd_failure_show(Some(&view.project_id), false) {
         return Some(FailurePanel {
             path: shown.path,
             body: shown.body,
@@ -308,15 +308,24 @@ pub fn ticker_label(ticker: Option<&TickerView>) -> String {
     }
 }
 
+fn fleet_selected(views: &[StatusView], selected: Option<&str>) -> Option<String> {
+    match selected {
+        Some(id) if views.iter().any(|v| v.project_id == id) => Some(id.to_string()),
+        _ => crate::config::load_last_used_id()
+            .filter(|id| views.iter().any(|v| v.project_id == *id)),
+    }
+}
+
 /// Poll Control Plane (same functions as CLI). Never a WebView `fetch`.
 pub fn load_fleet(selected: Option<&str>) -> Result<FleetSnapshot> {
     let views = api::status_all()?;
-    Ok(build_fleet(views, selected))
+    let selected = fleet_selected(&views, selected);
+    Ok(build_fleet(views, selected.as_deref()))
 }
 
 /// Pause every Running project. `InvalidTransition` is skip, not a hard UI error.
 pub fn pause_all() -> Result<Vec<StatusView>> {
-    pause_listed(api::status_all()?, |id| api::cmd_pause(Some(id)))
+    pause_listed(api::status_all()?, |id| api::cmd_pause(Some(id), false))
 }
 
 /// Testable pause-all core (no process-wide registry).
@@ -340,11 +349,11 @@ pub fn pause_listed(
 
 /// Stop selected. Does not call harness shutdown and does not write `FAILURE.md`.
 pub fn stop_selected(project_id: &str) -> Result<StatusView> {
-    api::cmd_stop(Some(project_id))
+    api::cmd_stop(Some(project_id), false)
 }
 
 pub fn resume_selected(project_id: &str) -> Result<StatusView> {
-    api::cmd_resume(Some(project_id))
+    api::cmd_resume(Some(project_id), false)
 }
 
 /// Explicit absolute path only. Never `project scan --add`.
@@ -370,18 +379,18 @@ pub fn run_allowed(status: RunStatus) -> bool {
 }
 
 pub fn run_selected(project_id: &str, track: Option<String>) -> Result<StatusView> {
-    let view = api::status(Some(project_id))?;
+    let view = api::status(Some(project_id), false)?;
     if !run_allowed(view.status) {
         return Err(CoordinatorError::InvalidTransition {
             action: "run",
             from: view.status.to_string(),
         });
     }
-    api::cmd_run(Some(project_id), track, None, false)
+    api::cmd_run(Some(project_id), track, None, false, false)
 }
 
 pub fn show_failure(project_id: &str) -> Result<Option<crate::notify::FailureShow>> {
-    api::cmd_failure_show(Some(project_id))
+    api::cmd_failure_show(Some(project_id), false)
 }
 
 /// Display title for a card (display_name, else last path component, else id).
@@ -657,6 +666,28 @@ mod tests {
         assert_eq!(panel.path, path);
         assert!(panel.body.contains("quota exhausted"));
         assert_eq!(snap.cards[0].card_state, CardState::HardFailure);
+    }
+
+    #[test]
+    fn fleet_selected_uses_last_used_when_present() {
+        let _guard = crate::config::test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        crate::config::save_last_used_id("p2").unwrap();
+        let mut v1 = view(RunStatus::Idle, STUB_PHASE_IDLE, None, None);
+        v1.project_id = "p1".into();
+        let mut v2 = view(RunStatus::Idle, STUB_PHASE_IDLE, None, None);
+        v2.project_id = "p2".into();
+        let views = vec![v1, v2];
+        assert_eq!(fleet_selected(&views, None).as_deref(), Some("p2"));
+        assert_eq!(fleet_selected(&views, Some("p1")).as_deref(), Some("p1"));
+        crate::config::save_last_used_id("missing").unwrap();
+        assert!(fleet_selected(&views, None).is_none());
+        unsafe {
+            std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+        }
     }
 
     #[test]

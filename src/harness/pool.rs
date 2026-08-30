@@ -273,9 +273,8 @@ pub fn status_bundle_sync(record: &ProjectRecord) -> Option<HarnessStatusBundle>
     }
 }
 
-fn resolve_record(project: Option<&str>) -> Result<ProjectRecord> {
-    let reg = crate::api::load_registry()?;
-    Ok(reg.resolve_project(project)?.clone())
+fn resolve_record(project: Option<&str>, infer_cwd: bool) -> Result<ProjectRecord> {
+    crate::api::resolve_selected(project, infer_cwd)
 }
 
 fn prompt_timeout_for(record: &ProjectRecord) -> Duration {
@@ -420,8 +419,12 @@ async fn spawn_in_process(
     Ok(status)
 }
 
-pub async fn start(project: Option<&str>, in_process: bool) -> Result<GrokHarnessStatus> {
-    start_inner(project, in_process, None, None).await
+pub async fn start(
+    project: Option<&str>,
+    in_process: bool,
+    infer_cwd: bool,
+) -> Result<GrokHarnessStatus> {
+    start_inner(project, in_process, None, None, infer_cwd).await
 }
 
 /// Adapter ticks pass the already-resolved phase bin / model. CLI start does not.
@@ -430,8 +433,9 @@ pub async fn start_with_bin(
     in_process: bool,
     bin: PathBuf,
     model: Option<String>,
+    infer_cwd: bool,
 ) -> Result<GrokHarnessStatus> {
-    start_inner(project, in_process, Some(bin), model).await
+    start_inner(project, in_process, Some(bin), model, infer_cwd).await
 }
 
 async fn start_inner(
@@ -439,8 +443,9 @@ async fn start_inner(
     in_process: bool,
     bin: Option<PathBuf>,
     model: Option<String>,
+    infer_cwd: bool,
 ) -> Result<GrokHarnessStatus> {
-    let rec = resolve_record(project)?;
+    let rec = resolve_record(project, infer_cwd)?;
     let refuse = crate::harness::abort::should_refuse_reuse(&rec);
     {
         let mut pool = global_pool().lock().await;
@@ -632,7 +637,7 @@ fn spawn_holder_process(
 }
 
 pub async fn hold_loop(project: Option<&str>) -> Result<()> {
-    let rec = match resolve_record(project) {
+    let rec = match resolve_record(project, false) {
         Ok(r) => r,
         Err(e) => return Err(e),
     };
@@ -1004,8 +1009,12 @@ fn hold_view(resp: HoldResponse) -> Result<HarnessPromptView> {
     })
 }
 
-pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPromptView> {
-    let rec = resolve_record(project)?;
+pub async fn prompt(
+    project: Option<&str>,
+    text: String,
+    infer_cwd: bool,
+) -> Result<HarnessPromptView> {
+    let rec = resolve_record(project, infer_cwd)?;
     refuse_if_paused(&rec)?;
     if let Some(h) = load_persist(&rec)?
         && h.alive
@@ -1047,8 +1056,8 @@ pub async fn prompt(project: Option<&str>, text: String) -> Result<HarnessPrompt
     apply_turn(&rec, turn, harness, &injected_phase).await
 }
 
-pub async fn compact(project: Option<&str>) -> Result<HarnessPromptView> {
-    let rec = resolve_record(project)?;
+pub async fn compact(project: Option<&str>, infer_cwd: bool) -> Result<HarnessPromptView> {
+    let rec = resolve_record(project, infer_cwd)?;
     refuse_if_paused(&rec)?;
     if let Some(h) = load_persist(&rec)?
         && h.alive
@@ -1101,8 +1110,8 @@ pub async fn compact(project: Option<&str>) -> Result<HarnessPromptView> {
     }
 }
 
-pub async fn status(project: Option<&str>) -> Result<GrokHarnessStatus> {
-    let rec = resolve_record(project)?;
+pub async fn status(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarnessStatus> {
+    let rec = resolve_record(project, infer_cwd)?;
     Ok(current_status(&rec).await)
 }
 
@@ -1148,8 +1157,8 @@ pub(crate) async fn recycle_without_pool_lock(record: &ProjectRecord) -> Result<
 /// How long the CLI will wait for a holder `Shutdown` RPC before falling back to pid-kill.
 const HOLDER_SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_millis(750);
 
-pub async fn shutdown(project: Option<&str>) -> Result<GrokHarnessStatus> {
-    let rec = resolve_record(project)?;
+pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarnessStatus> {
+    let rec = resolve_record(project, infer_cwd)?;
     if let Some(mut session) = global_pool().lock().await.remove(&rec.id) {
         crate::harness::abort::unregister_cancel_handle(&rec.id);
         let _ = session.shutdown().await;
@@ -1316,7 +1325,7 @@ mod tests {
         .unwrap();
         insert_test_session(rec.id.clone(), session).await;
 
-        let view = prompt(Some(&rec.id), "hello".into()).await.unwrap();
+        let view = prompt(Some(&rec.id), "hello".into(), false).await.unwrap();
         assert_eq!(view.text.as_deref(), Some("ok"));
         assert!(view.applied);
         assert_eq!(view.status.as_ref().unwrap().phase, STUB_PHASE_COMPLETED);
@@ -1343,11 +1352,11 @@ mod tests {
 
         let stopped = run::stop(&rec).unwrap();
         assert_eq!(stopped.phase, STUB_PHASE_STOPPED);
-        let st = status(Some(&rec.id)).await.unwrap();
+        let st = status(Some(&rec.id), false).await.unwrap();
         assert!(st.alive, "stop must leave Grok session in the pool");
         assert_eq!(st.session_id.as_deref(), Some("sess-alive"));
 
-        let down = shutdown(Some(&rec.id)).await.unwrap();
+        let down = shutdown(Some(&rec.id), false).await.unwrap();
         assert!(!down.alive);
         assert!(!global_pool().lock().await.contains(&rec.id));
 
@@ -1380,7 +1389,9 @@ mod tests {
         .unwrap();
         insert_test_session(rec.id.clone(), session).await;
 
-        let err = prompt(Some(&rec.id), "nope".into()).await.unwrap_err();
+        let err = prompt(Some(&rec.id), "nope".into(), false)
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             CoordinatorError::InvalidTransition {
@@ -1390,7 +1401,7 @@ mod tests {
         ));
         // Session still in pool
         assert!(global_pool().lock().await.contains(&rec.id));
-        let _ = shutdown(Some(&rec.id)).await;
+        let _ = shutdown(Some(&rec.id), false).await;
 
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
@@ -1420,10 +1431,10 @@ mod tests {
         session.set_supports_compact(false);
         insert_test_session(rec.id.clone(), session).await;
 
-        let view = compact(Some(&rec.id)).await.unwrap();
+        let view = compact(Some(&rec.id), false).await.unwrap();
         assert_eq!(view.skipped, Some(true));
         assert!(!view.applied);
-        let _ = shutdown(Some(&rec.id)).await;
+        let _ = shutdown(Some(&rec.id), false).await;
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
@@ -1454,12 +1465,12 @@ mod tests {
         .unwrap();
         insert_test_session(rec.id.clone(), session).await;
 
-        let view = compact(Some(&rec.id)).await.unwrap();
+        let view = compact(Some(&rec.id), false).await.unwrap();
         assert!(!view.applied);
         let st = run::status(&rec).unwrap();
         assert_eq!(st.status, crate::state::RunStatus::Running);
         assert_eq!(st.phase, STUB_PHASE_ACTIVE);
-        let _ = shutdown(Some(&rec.id)).await;
+        let _ = shutdown(Some(&rec.id), false).await;
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
@@ -1490,14 +1501,14 @@ mod tests {
         .unwrap();
         insert_test_session(rec.id.clone(), session).await;
 
-        let view = prompt(Some(&rec.id), "x".into()).await.unwrap();
+        let view = prompt(Some(&rec.id), "x".into(), false).await.unwrap();
         assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
         assert!(view.applied);
         assert_eq!(
             view.status.as_ref().unwrap().failure_class,
             Some(FailureClass::HarnessCrash)
         );
-        let _ = shutdown(Some(&rec.id)).await;
+        let _ = shutdown(Some(&rec.id), false).await;
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
@@ -1731,7 +1742,7 @@ mod tests {
             "pool must be empty so shutdown uses persist pid-kill"
         );
 
-        let st = shutdown(Some(&rec.id)).await.unwrap();
+        let st = shutdown(Some(&rec.id), false).await.unwrap();
         let persist = load_persist(&rec).unwrap().expect("persist written");
         assert!(!persist.alive, "persist must be written dead");
         assert!(!st.alive, "status must match persist");
@@ -1861,14 +1872,14 @@ mod tests {
         .unwrap();
         insert_test_session(rec.id.clone(), session).await;
 
-        let view = prompt(Some(&rec.id), "x".into()).await.unwrap();
+        let view = prompt(Some(&rec.id), "x".into(), false).await.unwrap();
         assert!(!view.applied, "cancelled must not apply");
         assert_eq!(view.skipped, Some(true));
         let st = run::status(&rec).unwrap();
         assert_eq!(st.status, crate::state::RunStatus::Running);
         assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN);
         assert!(crate::notify::artifact::existing_path(&rec).is_none());
-        let _ = shutdown(Some(&rec.id)).await;
+        let _ = shutdown(Some(&rec.id), false).await;
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
             std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
@@ -1913,13 +1924,13 @@ mod tests {
         .unwrap();
         insert_test_session(rec.id.clone(), session).await;
 
-        let view = prompt(Some(&rec.id), "x".into()).await.unwrap();
+        let view = prompt(Some(&rec.id), "x".into(), false).await.unwrap();
         assert!(!view.applied);
         let st = run::status(&rec).unwrap();
         assert_eq!(st.status, crate::state::RunStatus::Running);
         assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN);
         assert!(crate::notify::artifact::existing_path(&rec).is_none());
-        let _ = shutdown(Some(&rec.id)).await;
+        let _ = shutdown(Some(&rec.id), false).await;
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
             std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
@@ -2093,13 +2104,13 @@ mod tests {
         .unwrap();
         insert_test_session(rec.id.clone(), session).await;
 
-        let view = prompt(Some(&rec.id), "x".into()).await.unwrap();
+        let view = prompt(Some(&rec.id), "x".into(), false).await.unwrap();
         assert!(!view.applied);
         assert_eq!(view.skipped, Some(true));
         let st = run::status(&rec).unwrap();
         assert_eq!(st.status, crate::state::RunStatus::Running);
         assert!(crate::notify::artifact::existing_path(&rec).is_none());
-        let _ = shutdown(Some(&rec.id)).await;
+        let _ = shutdown(Some(&rec.id), false).await;
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
             std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);

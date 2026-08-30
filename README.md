@@ -140,7 +140,7 @@ Second live Project is **`C:\dev\coordinated`** (planning hub) + named siblings 
 
 **Never** `project scan --root C:\dev --add`. **Never** `project scan --root C:\dev\coordinated --add` — scan detect returns **`nested`** + null exec (the hub has no nested product children). Always `project add --profile multi_sibling`.
 
-After this add, the machine has two projects (Orca + coordinated). Every `run` / `wait` / `status` / `stop` / `pause` / `show` **must** pass `--project`.
+After this add, the machine has two projects (Orca + coordinated). Omit `--project` when the process cwd is uniquely inside a registered workspace or execution repo; otherwise Coordinator uses last-used (`{COORDINATOR_HOME}/last-used.json`) if that id is still registered. Pass `--project` when cwd is outside every registered root and last-used is missing or stale. Ambiguous cwd (two projects at the same path-component depth) does **not** silently target Orca.
 
 `project set --execution-repos-json` **replaces** the map — include `ledgerful` again.
 
@@ -167,7 +167,7 @@ cargo run -- status --project C:\dev\coordinated
 
 Status JSON still exposes only the **primary** `execution_repo` + `layout_profile`. The named map is proven via `project show` (`project.execution_repos` + `resolved.execution_repos`).
 
-When more than one project is registered, omit `--project` and the CLI errors (it does not silently target Orca).
+When more than one project is registered, omit `--project` is OK from a unique registered workspace or execution cwd (else last-used; else error). Ambiguous cwd still errors (it does not silently target Orca). HTTP omit never uses the serve process cwd. `GET /v1/status` omit stays fleet; `doctor` omit stays machine-wide.
 
 **Local-only:** `coordinator serve` binds **`127.0.0.1` only** (default port **7420**, avoids Impeccable live 5500/8400). Non-loopback bind is rejected.
 
@@ -493,6 +493,8 @@ coordinator harness grok status [--project …]
 coordinator harness grok shutdown [--project …]
 coordinator serve [--port <u16>] [--check]   # default 7420, 127.0.0.1 only
 ```
+
+`--project` stays optional. With more than one registered project, CLI omit infers unique cwd containment then last-used (`{COORDINATOR_HOME}/last-used.json`, not a secret, not `config.json`). HTTP never infers from the serve cwd.
 
 HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver` and `skip_preflight`), `GET /v1/doctor` (200 `DoctorReport` even when `ok` is false), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Adapter `POST /v1/run` without `skip_preflight` returns **409** + `DoctorReport` JSON when a required harness is `missing` or `auth` (not `{"error": …}`). `stub` / `file_wait` skip preflight. `--skip-preflight` is the adapter escape. Preflight does **not** write run-state, `FAILURE.md`, or a toast.
 

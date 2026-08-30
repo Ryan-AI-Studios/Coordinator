@@ -144,6 +144,25 @@ fn save_registry(reg: &Registry) -> Result<()> {
     reg.save(&path)
 }
 
+/// Operator selector: explicit spec wins; else unique cwd (when `infer_cwd`);
+/// else last-used; else error. Persist last-used on success when the id changed
+/// (best-effort). HTTP callers pass `infer_cwd = false`.
+pub fn resolve_selected(project: Option<&str>, infer_cwd: bool) -> Result<ProjectRecord> {
+    let last = config::load_last_used_id();
+    let cwd = if infer_cwd {
+        std::env::current_dir().ok()
+    } else {
+        None
+    };
+    let rec = load_registry()?
+        .resolve_project_in(project, cwd.as_deref(), last.as_deref())?
+        .clone();
+    if last.as_deref() != Some(rec.id.as_str()) {
+        let _ = config::save_last_used_id(&rec.id);
+    }
+    Ok(rec)
+}
+
 fn parse_optional_path(s: Option<String>) -> Option<PathBuf> {
     s.filter(|p| !p.is_empty()).map(PathBuf::from)
 }
@@ -186,9 +205,8 @@ pub fn project_list() -> Result<Vec<ProjectRecord>> {
 }
 
 /// `project show` — raw + resolved + nested null hint.
-pub fn project_show(project: Option<&str>) -> Result<ProjectShowView> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?.clone();
+pub fn project_show(project: Option<&str>, infer_cwd: bool) -> Result<ProjectShowView> {
+    let rec = resolve_selected(project, infer_cwd)?;
     let resolved = layout::resolve(&rec);
     let hint = if rec.layout_profile == LayoutProfile::Nested && rec.execution_repo.is_none() {
         let spec = project
@@ -219,9 +237,13 @@ pub fn project_show(project: Option<&str>) -> Result<ProjectShowView> {
 }
 
 /// `project set` — mutate bindings; workspace path immutable.
-pub fn project_set(project: Option<&str>, opts: ProjectSetOptions) -> Result<ProjectRecord> {
+pub fn project_set(
+    project: Option<&str>,
+    opts: ProjectSetOptions,
+    infer_cwd: bool,
+) -> Result<ProjectRecord> {
+    let id = resolve_selected(project, infer_cwd)?.id;
     let mut reg = load_registry()?;
-    let id = reg.resolve_project(project)?.id.clone();
     let rec = reg.set(&id, opts)?;
     save_registry(&reg)?;
     Ok(rec)
@@ -249,7 +271,7 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         clear_phase_timeouts: req.clear_phase_timeouts.unwrap_or(false),
         clear_phase_timeout: req.clear_phase_timeout.unwrap_or_default(),
     };
-    project_set(req.project.as_deref(), opts)
+    project_set(req.project.as_deref(), opts, false)
 }
 
 /// `project scan` — dry-run by default; `--add` registers new candidates.
@@ -294,10 +316,9 @@ fn attach_ticker(mut view: StatusView) -> StatusView {
 }
 
 /// Resolve project selector then return status view.
-pub fn status(project: Option<&str>) -> Result<StatusView> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?;
-    Ok(attach_ticker(run::status(rec)?))
+pub fn status(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+    let rec = resolve_selected(project, infer_cwd)?;
+    Ok(attach_ticker(run::status(&rec)?))
 }
 
 /// Status for all projects (aggregate). One health probe; ticker cloned onto every view.
@@ -318,9 +339,9 @@ pub fn cmd_run(
     track: Option<String>,
     driver: Option<&str>,
     skip_preflight: bool,
+    infer_cwd: bool,
 ) -> Result<StatusView> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?.clone();
+    let rec = resolve_selected(project, infer_cwd)?;
     let driver = crate::workflow::resolve_driver(driver)?;
     if driver == crate::workflow::WorkflowDriver::Adapter && !skip_preflight {
         let report = crate::harness::preflight::probe_machine()?;
@@ -341,25 +362,23 @@ pub fn cmd_doctor(project: Option<&str>) -> Result<crate::harness::preflight::Do
     crate::harness::preflight::probe_machine()
 }
 
-pub fn cmd_pause(project: Option<&str>) -> Result<StatusView> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?.clone();
+pub fn cmd_pause(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+    let rec = resolve_selected(project, infer_cwd)?;
     run::pause(&rec)
 }
 
-pub fn cmd_resume(project: Option<&str>) -> Result<StatusView> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?.clone();
+pub fn cmd_resume(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+    let rec = resolve_selected(project, infer_cwd)?;
     run::resume(&rec)
 }
 
-pub fn cmd_stop(project: Option<&str>) -> Result<StatusView> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?.clone();
+pub fn cmd_stop(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+    let rec = resolve_selected(project, infer_cwd)?;
     run::stop(&rec)
 }
 
 /// CLI/HTTP: write Phase Outcome and apply via the single apply path.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_outcome_write(
     project: Option<&str>,
     phase: String,
@@ -368,9 +387,9 @@ pub fn cmd_outcome_write(
     message: Option<String>,
     next_track: Option<String>,
     source: Option<&str>,
+    infer_cwd: bool,
 ) -> Result<StatusView> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?.clone();
+    let rec = resolve_selected(project, infer_cwd)?;
     let status = parse_outcome_status(status)?;
     let source = match source {
         Some(s) => OutcomeSource::parse(s)?,
@@ -400,8 +419,7 @@ pub fn cmd_outcome_write(
 
 /// Build outcome from HTTP body and apply.
 pub fn cmd_outcome_post(body: OutcomeWriteBody) -> Result<StatusView> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(body.project.as_deref())?.clone();
+    let rec = resolve_selected(body.project.as_deref(), false)?;
     let mut metadata = body.metadata.unwrap_or_default();
     if let Some(nt) = body.next_track {
         metadata.next_track = Some(nt);
@@ -426,23 +444,23 @@ pub fn cmd_outcome_post(body: OutcomeWriteBody) -> Result<StatusView> {
 }
 
 /// Show current.json if present (CLI / GET).
-pub fn cmd_outcome_show(project: Option<&str>) -> Result<Option<PhaseOutcome>> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?;
-    load_current_outcome(rec)
+pub fn cmd_outcome_show(project: Option<&str>, infer_cwd: bool) -> Result<Option<PhaseOutcome>> {
+    let rec = resolve_selected(project, infer_cwd)?;
+    load_current_outcome(&rec)
 }
 
 /// Show `{state_dir}/FAILURE.md` if present (CLI / GET /v1/failure).
-pub fn cmd_failure_show(project: Option<&str>) -> Result<Option<crate::notify::FailureShow>> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?;
-    crate::notify::artifact::read(rec)
+pub fn cmd_failure_show(
+    project: Option<&str>,
+    infer_cwd: bool,
+) -> Result<Option<crate::notify::FailureShow>> {
+    let rec = resolve_selected(project, infer_cwd)?;
+    crate::notify::artifact::read(&rec)
 }
 
 /// Block until outcome applied or wait budget expires.
-pub fn cmd_wait(project: Option<&str>, timeout_secs: u64) -> Result<StatusView> {
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?.clone();
+pub fn cmd_wait(project: Option<&str>, timeout_secs: u64, infer_cwd: bool) -> Result<StatusView> {
+    let rec = resolve_selected(project, infer_cwd)?;
     watch::wait_for_outcome(&rec, Some(timeout_secs))
 }
 
@@ -469,7 +487,7 @@ pub fn cmd_run_cli(
             "timeout-secs must be > 0; omit the flag to tick until Idle/Stopped".into(),
         ));
     }
-    let view = cmd_run(project, track, driver, opts.skip_preflight)?;
+    let view = cmd_run(project, track, driver, opts.skip_preflight, true)?;
     if opts.detach {
         return Ok(attach_ticker(view));
     }
@@ -482,8 +500,10 @@ pub fn cmd_run_cli(
         });
         return Ok(view);
     }
-    let reg = load_registry()?;
-    let rec = reg.resolve_project(project)?.clone();
+    let rec = load_registry()?
+        .find_by_id(&view.project_id)
+        .cloned()
+        .ok_or_else(|| CoordinatorError::ProjectNotFound(view.project_id.clone()))?;
     Ok(attach_ticker(watch::wait_for_outcome(
         &rec,
         opts.timeout_secs,
@@ -504,15 +524,17 @@ pub struct HarnessPromptBody {
 pub async fn cmd_harness_grok_start(
     project: Option<&str>,
     in_process: bool,
+    infer_cwd: bool,
 ) -> Result<crate::harness::GrokHarnessStatus> {
-    crate::harness::start(project, in_process).await
+    crate::harness::start(project, in_process, infer_cwd).await
 }
 
 pub async fn cmd_harness_grok_prompt(
     project: Option<&str>,
     text: String,
+    infer_cwd: bool,
 ) -> Result<crate::harness::HarnessPromptView> {
-    crate::harness::prompt(project, text).await
+    crate::harness::prompt(project, text, infer_cwd).await
 }
 
 pub async fn cmd_harness_grok_prompt_body(
@@ -532,25 +554,28 @@ pub async fn cmd_harness_grok_prompt_body(
             ));
         }
     };
-    crate::harness::prompt(body.project.as_deref(), text).await
+    crate::harness::prompt(body.project.as_deref(), text, false).await
 }
 
 pub async fn cmd_harness_grok_compact(
     project: Option<&str>,
+    infer_cwd: bool,
 ) -> Result<crate::harness::HarnessPromptView> {
-    crate::harness::compact(project).await
+    crate::harness::compact(project, infer_cwd).await
 }
 
 pub async fn cmd_harness_grok_status(
     project: Option<&str>,
+    infer_cwd: bool,
 ) -> Result<crate::harness::GrokHarnessStatus> {
-    crate::harness::grok_status(project).await
+    crate::harness::grok_status(project, infer_cwd).await
 }
 
 pub async fn cmd_harness_grok_shutdown(
     project: Option<&str>,
+    infer_cwd: bool,
 ) -> Result<crate::harness::GrokHarnessStatus> {
-    crate::harness::shutdown(project).await
+    crate::harness::shutdown(project, infer_cwd).await
 }
 
 pub async fn cmd_harness_grok_hold(project: Option<&str>) -> Result<()> {
@@ -689,7 +714,7 @@ mod tests {
             matches!(err, CoordinatorError::WaitBudgetExpired),
             "err={err}"
         );
-        let s = status(Some(&rec.id)).unwrap();
+        let s = status(Some(&rec.id), false).unwrap();
         assert_eq!(s.status, RunStatus::Running);
         assert!(s.failure_class.is_none());
         assert!(artifact::existing_path(&rec).is_none());
@@ -721,7 +746,7 @@ mod tests {
             err.to_string().contains("timeout-secs must be > 0"),
             "err={err}"
         );
-        let s = status(Some(&rec.id)).unwrap();
+        let s = status(Some(&rec.id), false).unwrap();
         assert_eq!(s.status, RunStatus::Idle);
         clear_home();
     }
@@ -904,14 +929,14 @@ mod tests {
         let _guard = test_env_lock();
         let (_home, _proj, rec) = add_isolated_project();
         if !watch::coordinator_serve_listening(crate::config::DEFAULT_SERVE_PORT) {
-            let view = status(Some(&rec.id)).unwrap();
+            let view = status(Some(&rec.id), false).unwrap();
             let ticker = view.ticker.expect("ticker");
             assert_eq!(ticker.owner, "none");
             assert!(ticker.port.is_none());
         }
         let hold = watch::spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
         crate::serve_lease::write_serve_lease(hold.port).unwrap();
-        let view = status(Some(&rec.id)).unwrap();
+        let view = status(Some(&rec.id), false).unwrap();
         let ticker = view.ticker.expect("ticker");
         assert_eq!(ticker.owner, "serve");
         assert_eq!(ticker.port, Some(hold.port));
@@ -966,6 +991,7 @@ mod tests {
                 phase_timeouts_secs: Some(map),
                 ..Default::default()
             },
+            false,
         )
         .unwrap();
         assert_eq!(updated.phase_timeouts_secs.get("plan"), Some(&3600));
@@ -994,9 +1020,10 @@ mod tests {
                 phase_timeouts_secs: Some(map),
                 ..Default::default()
             },
+            false,
         )
         .unwrap();
-        let view = project_show(Some(&rec.id)).unwrap();
+        let view = project_show(Some(&rec.id), false).unwrap();
         for phase in crate::workflow::graph::canonical_phases() {
             assert!(
                 view.phase_timeouts.contains_key(*phase),
@@ -1011,11 +1038,91 @@ mod tests {
         unsafe {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "7");
         }
-        let view = project_show(Some(&rec.id)).unwrap();
+        let view = project_show(Some(&rec.id), false).unwrap();
         assert_eq!(view.phase_timeouts["plan"].secs, 7);
         assert_eq!(view.phase_timeouts["plan"].source, "env");
         assert_eq!(view.phase_timeouts["implement"].source, "env");
         unsafe {
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+        clear_home();
+    }
+
+    #[test]
+    fn resolve_selected_persists_explicit_and_ignores_stale() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let rec_a = project_add(a.path(), ProjectAddOptions::default()).unwrap();
+        let rec_b = project_add(b.path(), ProjectAddOptions::default()).unwrap();
+        let got = resolve_selected(Some(&rec_b.id), false).unwrap();
+        assert_eq!(got.id, rec_b.id);
+        assert_eq!(
+            crate::config::load_last_used_id().as_deref(),
+            Some(rec_b.id.as_str())
+        );
+        let path = home.path().join("last-used.json");
+        let before = std::fs::read(&path).unwrap();
+        let again = resolve_selected(Some(&rec_b.id), false).unwrap();
+        assert_eq!(again.id, rec_b.id);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "same-id explicit resolve must not rewrite last-used.json"
+        );
+        let via_last = resolve_selected(None, false).unwrap();
+        assert_eq!(via_last.id, rec_b.id);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "last-used-only hit must not rewrite last-used.json"
+        );
+        crate::config::save_last_used_id("not-registered").unwrap();
+        let err = resolve_selected(None, false).unwrap_err().to_string();
+        assert!(
+            err.contains("cwd is not inside a registered workspace or execution repo"),
+            "{err}"
+        );
+        let _ = rec_a;
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_omit_unique_cwd_wait_attach_uses_view_id() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "10");
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
+        }
+        project_add(a.path(), ProjectAddOptions::default()).unwrap();
+        let rec_b = project_add(b.path(), ProjectAddOptions::default()).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(b.path()).unwrap();
+        let view = cmd_run_cli(
+            None,
+            Some("0029".into()),
+            Some("stub"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: None,
+                probe: ServeProbe::Skip,
+                skip_preflight: false,
+            },
+        );
+        std::env::set_current_dir(prev).unwrap();
+        let view = view.expect("omit run with unique cwd must wait-attach");
+        assert_eq!(view.project_id, rec_b.id);
+        assert_eq!(view.status, RunStatus::Idle);
+        unsafe {
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
             std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
         }
         clear_home();

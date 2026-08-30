@@ -702,7 +702,7 @@ mod tests {
 
         // Let the hang mock hit the 2s ACP timeout so it drops the pool lock.
         tokio::time::sleep(Duration::from_millis(2500)).await;
-        let _ = crate::harness::shutdown(Some(&r.id)).await;
+        let _ = crate::harness::shutdown(Some(&r.id), false).await;
 
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
