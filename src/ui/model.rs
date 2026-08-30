@@ -8,8 +8,8 @@ use crate::layout::LayoutProfile;
 use crate::registry::{ProjectAddOptions, ProjectRecord};
 use crate::state::{RunStatus, STOP_LAST_EVENT, StatusView, TickerView};
 use crate::workflow::graph::{
-    PHASE_CI_WAIT, PHASE_PLAN_REVIEW, REVIEW_SLUG_AGY, REVIEW_SLUG_OPENCODE, canonical_phases,
-    is_canonical, is_stub_phase,
+    PHASE_ADDRESS_FINDINGS, PHASE_CI_WAIT, PHASE_IMPLEMENT, PHASE_PLAN_REVIEW, REVIEW_SLUG_AGY,
+    REVIEW_SLUG_OPENCODE, canonical_phases, is_canonical, is_stub_phase,
 };
 
 /// Mock `article[data-state]` values (0003 visual contract).
@@ -134,13 +134,33 @@ pub fn header_counts(views: &[StatusView]) -> HeaderCounts {
 /// Canonical DAG uses `canonical_phases()`. Stub / unknown leftover phases are a
 /// single current chip — do not invent fake DAG progress.
 pub fn phase_chips(view: &StatusView) -> Vec<PhaseChip> {
-    if !is_canonical(&view.phase) {
+    let current = view.phase.as_str();
+    if current == PHASE_ADDRESS_FINDINGS {
+        let idx = canonical_phases()
+            .iter()
+            .position(|p| *p == PHASE_IMPLEMENT)
+            .expect("implement is a canonical phase");
+        return canonical_phases()
+            .iter()
+            .enumerate()
+            .map(|(i, phase)| {
+                let (label, kind) = if i < idx {
+                    ((*phase).to_string(), ChipKind::Done)
+                } else if i == idx {
+                    (PHASE_ADDRESS_FINDINGS.to_string(), ChipKind::Current)
+                } else {
+                    ((*phase).to_string(), ChipKind::Next)
+                };
+                PhaseChip { label, kind }
+            })
+            .collect();
+    }
+    if !is_canonical(current) {
         return vec![PhaseChip {
             label: view.phase.clone(),
             kind: ChipKind::Current,
         }];
     }
-    let current = view.phase.as_str();
     let idx = canonical_phases()
         .iter()
         .position(|p| *p == current)
@@ -604,6 +624,35 @@ mod tests {
     }
 
     #[test]
+    fn address_findings_occupies_implement_chip() {
+        let chips = phase_chips(&view(
+            RunStatus::Running,
+            PHASE_ADDRESS_FINDINGS,
+            None,
+            None,
+        ));
+        assert_eq!(chips.len(), canonical_phases().len());
+        let impl_idx = canonical_phases()
+            .iter()
+            .position(|p| *p == PHASE_IMPLEMENT)
+            .unwrap();
+        let plan_idx = 0;
+        let xmodel_idx = canonical_phases()
+            .iter()
+            .position(|p| *p == crate::workflow::graph::PHASE_CROSS_MODEL)
+            .unwrap();
+        assert_eq!(chips[impl_idx].label, PHASE_ADDRESS_FINDINGS);
+        assert_eq!(chips[impl_idx].kind, ChipKind::Current);
+        assert_eq!(chips[plan_idx].kind, ChipKind::Done);
+        assert_eq!(chips[plan_idx].label, crate::workflow::graph::PHASE_PLAN);
+        assert_eq!(chips[xmodel_idx].kind, ChipKind::Next);
+        assert_eq!(
+            chips[xmodel_idx].label,
+            crate::workflow::graph::PHASE_CROSS_MODEL
+        );
+    }
+
+    #[test]
     fn missing_grok_is_no_session_row() {
         let rows = session_rows(&view(RunStatus::Idle, STUB_PHASE_IDLE, None, None));
         assert_eq!(rows.len(), 1);
@@ -618,6 +667,7 @@ mod tests {
             id: Some("canonical_v1".into()),
             driver: "file_wait".into(),
             pending_roles: vec![REVIEW_SLUG_AGY.into()],
+            address_findings_attempts: 0,
         });
         v.harness = Some(HarnessStatusBundle {
             grok: Some(GrokHarnessStatus {

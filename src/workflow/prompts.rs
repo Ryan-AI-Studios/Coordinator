@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::registry::ProjectRecord;
-use crate::workflow::graph::{PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT, PHASE_PLAN};
+use crate::workflow::graph::{
+    PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT, PHASE_PLAN,
+};
 
 use super::graph::resolve_track_dir;
 
@@ -78,6 +80,61 @@ fn honor_skill(name: &str, path: &str) -> String {
     format!("Honor project skills. This phase loads the `{name}` skill from {path}.")
 }
 
+fn this_run_gate_slug<'a>(name: &'a str, prefix: &str, attempts: u32) -> Option<&'a str> {
+    if attempts == 0 {
+        return None;
+    }
+    let rest = name.strip_prefix(prefix)?;
+    (1..=attempts).find_map(|n| {
+        rest.strip_suffix(&format!(".gate{n}.md"))
+            .filter(|slug| !slug.is_empty() && !slug.contains('.'))
+    })
+}
+
+fn list_gate_archives(
+    record: &ProjectRecord,
+    track_id: Option<&str>,
+    attempts: u32,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let state_dir = super::bundle::reviews_dir(record).ok();
+    if let Some(ref dir) = state_dir
+        && let Ok(rd) = std::fs::read_dir(dir)
+    {
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if this_run_gate_slug(&name, "cross-model-", attempts).is_some() {
+                out.push(ent.path());
+            }
+        }
+    }
+    // Track-dir `*.gate{n}.md` may remain across runs; list only when the
+    // matching state-dir archive exists (fresh `run` wipes `{state_dir}/reviews/`).
+    if let Some(id) = track_id
+        && let Some(track_dir) = resolve_track_dir(record, id)
+        && let Some(ref state_dir) = state_dir
+        && let Ok(rd) = std::fs::read_dir(&track_dir)
+    {
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if let Some(slug) = this_run_gate_slug(&name, "review.", attempts) {
+                let any_pair = (1..=attempts).any(|n| {
+                    state_dir
+                        .join(format!("cross-model-{slug}.gate{n}.md"))
+                        .is_file()
+                });
+                if any_pair {
+                    out.push(ent.path());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Injected into Grok-bound phases (plan / fold / implement / advance).
 pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>) -> String {
     let track = track_id.unwrap_or("(none)");
@@ -119,6 +176,37 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                  evidence.md there. Do not edit the execution repo and do not run \
                  cargo, ledgerful, or ai-brains there.\n\
                  {RESEARCH}\n\
+                 {END_TURN}\n"
+            )
+        }
+        PHASE_ADDRESS_FINDINGS => {
+            let implement = execution_skill(record, "implement");
+            let onboarding = execution_skill(record, "onboarding");
+            let attempts = crate::state::load_run_state(record)
+                .map(|s| s.address_findings_attempts)
+                .unwrap_or(0);
+            let archives = list_gate_archives(record, track_id, attempts);
+            let mut archive_lines = String::from(
+                "Honor archived gate reports under the track dir (and state reviews dir).\n",
+            );
+            if archives.is_empty() {
+                archive_lines.push_str(
+                    "No `review.*.gate*.md` or `cross-model-*.gate*.md` listed yet; still honor \
+                     any such files under the track folder.\n",
+                );
+            } else {
+                for p in archives {
+                    archive_lines.push_str(&format!("- {}\n", p.display()));
+                }
+            }
+            format!(
+                "Honor project skills. This phase loads the `implement` skill from {implement} \
+                 and the `onboarding` skill from {onboarding}.\n\
+                 Honor the track spec execution path.\n\
+                 {RESEARCH}\n\
+                 Address every finding above low; lows may go to `deferred.md`. \
+                 Do not plan, fold, or advance. Do not emit `next_track:`.\n\
+                 {archive_lines}\
                  {END_TURN}\n"
             )
         }
@@ -413,6 +501,87 @@ mod tests {
         assert!(n.contains("C:/dev/Orca/.agents/skills/implement/SKILL.md"));
         assert!(n.contains("C:/dev/Orca/.agents/skills/onboarding/SKILL.md"));
         assert!(!n.contains("OrcaSlicer-ZR/.agents/skills/"));
+    }
+
+    #[test]
+    fn address_findings_contract_names_skills_research_and_forbids_next_track() {
+        let rec = nested_record();
+        let text = phase_prompt(&rec, "address-findings", Some("0031"));
+        assert!(text.contains("address-findings"));
+        assert!(!text.contains("Unknown phase"));
+        assert!(text.contains("Honor project skills"));
+        assert!(
+            contains_skill(&text, "implement") || text.contains("implement"),
+            "names implement skill: {text}"
+        );
+        assert!(text.contains("onboarding"));
+        assert!(text.contains("Knowledge is stale") || text.contains("primary sources"));
+        assert!(text.contains("Do not") && text.contains("outcome write"));
+        assert!(
+            text.contains("do not emit `next_track:`")
+                || text.contains("Do not emit `next_track:`")
+        );
+        assert!(text.contains("gate reports") || text.contains("gate"));
+        assert!(text.contains("end this turn") || text.contains("end the turn"));
+        let n = text.replace('\\', "/");
+        assert!(n.contains("OrcaSlicer-ZR/.agents/skills/implement/SKILL.md"));
+        assert!(n.contains("OrcaSlicer-ZR/.agents/skills/onboarding/SKILL.md"));
+    }
+
+    #[test]
+    fn address_findings_prompt_lists_this_run_gates_not_leftover() {
+        use crate::config::test_env_lock;
+        use crate::run::run_with_driver;
+        use crate::state::{load_run_state, save_run_state};
+        use crate::workflow::WorkflowDriver;
+        use tempfile::tempdir;
+        use uuid::Uuid;
+
+        let _g = test_env_lock();
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0031-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        let rec = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: Some(dir.path().to_path_buf()),
+            execution_repos: BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: BTreeMap::new(),
+            created_at: Utc::now(),
+        };
+        run_with_driver(&rec, Some("0031".into()), WorkflowDriver::FileWait).unwrap();
+        let mut s = load_run_state(&rec).unwrap();
+        s.address_findings_attempts = 1;
+        save_run_state(&rec, &s).unwrap();
+        std::fs::write(track.join("review.codex.gate1.md"), "this run").unwrap();
+        std::fs::write(track.join("review.codex.gate2.md"), "leftover").unwrap();
+        std::fs::write(track.join("review.codex.fail.md"), "prior fail audit").unwrap();
+        std::fs::write(track.join("review.codex.fail.gate1.md"), "mis-archive").unwrap();
+        std::fs::write(track.join("review.claude.gate1.md"), "prior run leftover").unwrap();
+        let reviews = crate::state::resolve_state_dir(&rec)
+            .unwrap()
+            .join("reviews");
+        std::fs::create_dir_all(&reviews).unwrap();
+        std::fs::write(reviews.join("cross-model-codex.gate1.md"), "this run").unwrap();
+        std::fs::write(reviews.join("cross-model-codex.gate2.md"), "leftover").unwrap();
+        let text = phase_prompt(&rec, "address-findings", Some("0031"));
+        let n = text.replace('\\', "/");
+        assert!(n.contains("review.codex.gate1.md"), "{text}");
+        assert!(n.contains("cross-model-codex.gate1.md"), "{text}");
+        assert!(!n.contains("gate2.md"), "stale leftover listed: {text}");
+        assert!(
+            !n.contains("review.codex.fail"),
+            "prior fail audit listed: {text}"
+        );
+        assert!(
+            !n.contains("review.claude.gate1"),
+            "prior-run leftover listed: {text}"
+        );
     }
 
     #[test]

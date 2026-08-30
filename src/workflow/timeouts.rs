@@ -46,6 +46,7 @@ pub fn default_timeout_secs(phase: &str) -> u64 {
         graph::PHASE_CI_WAIT => 3600,
         graph::PHASE_COMPACT => 600,
         graph::PHASE_ADVANCE => 900,
+        graph::PHASE_ADDRESS_FINDINGS => 3600,
         _ => 300,
     }
 }
@@ -66,7 +67,7 @@ pub fn parse_phase_timeout(s: &str) -> Result<(String, u64)> {
     }
     if !is_canonical(key) {
         return Err(CoordinatorError::Message(format!(
-            "unknown phase '{key}'; expected a canonical phase id (plan, plan-review, fold, implement, cross-model-review, ci-wait, compact, advance)"
+            "unknown phase '{key}'; expected a canonical phase id (plan, plan-review, fold, implement, cross-model-review, ci-wait, compact, advance, address-findings)"
         )));
     }
     let secs = val.parse::<u64>().map_err(|_| {
@@ -105,7 +106,7 @@ pub fn validate_phase_timeout_key(phase: &str) -> Result<()> {
     }
     if !is_canonical(phase) {
         return Err(CoordinatorError::Message(format!(
-            "unknown phase '{phase}'; expected a canonical phase id (plan, plan-review, fold, implement, cross-model-review, ci-wait, compact, advance)"
+            "unknown phase '{phase}'; expected a canonical phase id (plan, plan-review, fold, implement, cross-model-review, ci-wait, compact, advance, address-findings)"
         )));
     }
     Ok(())
@@ -193,6 +194,8 @@ mod tests {
         assert_ne!(default_timeout_secs(graph::PHASE_PLAN), 300);
         assert_eq!(default_timeout_secs(graph::PHASE_IMPLEMENT), 7200);
         assert_eq!(default_timeout_secs(graph::PHASE_COMPACT), 600);
+        assert_eq!(default_timeout_secs(graph::PHASE_ADDRESS_FINDINGS), 3600);
+        assert_ne!(default_timeout_secs(graph::PHASE_ADDRESS_FINDINGS), 300);
     }
 
     #[test]
@@ -322,12 +325,25 @@ mod tests {
             parse_phase_timeout(" plan = 3600 ").unwrap(),
             ("plan".into(), 3600)
         );
+        assert_eq!(
+            parse_phase_timeout("address-findings=3600").unwrap(),
+            ("address-findings".into(), 3600)
+        );
     }
 
     #[test]
     fn parse_phase_timeout_rejects_zero_unknown_and_malformed() {
         assert!(parse_phase_timeout("plan=0").is_err());
-        assert!(parse_phase_timeout("nope=1").is_err());
+        let unknown = parse_phase_timeout("nope=1").unwrap_err().to_string();
+        assert!(
+            unknown.contains("address-findings"),
+            "parse error={unknown}"
+        );
+        let unknown_key = validate_phase_timeout_key("nope").unwrap_err().to_string();
+        assert!(
+            unknown_key.contains("address-findings"),
+            "validate error={unknown_key}"
+        );
         assert!(parse_phase_timeout("planner=1").is_err());
         assert!(parse_phase_timeout("xmodel=1").is_err());
         assert!(parse_phase_timeout("plan").is_err());

@@ -91,6 +91,8 @@ Adapter injects name the phase skill as `{workspace|execution}/.agents/skills/<p
 
 **Omit `--track`:** starts the first exact `Ready — not started` row when `track_id` is unset or Idle after `workflow: backlog clear`; else retain. Never Proposed/HITL/trailing notes. Fail closed → `--track`. Live autonomous walk still names `--track 0099` for Helping Hands (HH has no exact Ready today; omit would error).
 
+**`address-findings`:** after a cross-model GateFail, adapter injects this named phase (implementor Role Binding + implement/onboarding skill paths), then a fresh gate; cap 2 then `difficulty` Stop.
+
 **Scan footgun:** never `project scan --root C:\dev --add` — `C:\dev` has many conductor markers (Orca, coordinator, coordinated, …). Scan a single workspace (`--root C:\dev\Orca`) or add one project at a time.
 
 **Scan footgun (coordinated):** `project scan --add` of `C:\dev\coordinated` would register **`nested`** (scan never returns `multi_sibling`; the hub has no nested product children). Use explicit `project add --profile multi_sibling`.

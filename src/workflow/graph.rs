@@ -10,6 +10,10 @@ pub const PHASE_CROSS_MODEL: &str = "cross-model-review";
 pub const PHASE_CI_WAIT: &str = "ci-wait";
 pub const PHASE_COMPACT: &str = "compact";
 pub const PHASE_ADVANCE: &str = "advance";
+/// Apply-path side loop after GateFail (0031). Not in [`canonical_phases`].
+pub const PHASE_ADDRESS_FINDINGS: &str = "address-findings";
+/// Max entries into `address-findings` this `run_epoch`. No operator env.
+pub const ADDRESS_FINDINGS_CAP: u32 = 2;
 
 pub const REVIEW_SLUG_AGY: &str = "agy";
 pub const REVIEW_SLUG_OPENCODE: &str = "opencode";
@@ -36,8 +40,23 @@ pub fn canonical_phases() -> &'static [&'static str] {
     ]
 }
 
+/// Happy-path ids plus the `address-findings` side loop.
+pub fn all_phase_ids() -> &'static [&'static str] {
+    &[
+        PHASE_PLAN,
+        PHASE_PLAN_REVIEW,
+        PHASE_FOLD,
+        PHASE_IMPLEMENT,
+        PHASE_CROSS_MODEL,
+        PHASE_CI_WAIT,
+        PHASE_COMPACT,
+        PHASE_ADVANCE,
+        PHASE_ADDRESS_FINDINGS,
+    ]
+}
+
 pub fn is_canonical(phase: &str) -> bool {
-    canonical_phases().contains(&phase)
+    all_phase_ids().contains(&phase)
 }
 
 pub fn is_stub_phase(phase: &str) -> bool {
@@ -54,6 +73,7 @@ pub fn successor(phase: &str) -> Option<&'static str> {
         PHASE_CI_WAIT => Some(PHASE_COMPACT),
         PHASE_COMPACT => Some(PHASE_ADVANCE),
         PHASE_ADVANCE => None,
+        PHASE_ADDRESS_FINDINGS => Some(PHASE_CROSS_MODEL),
         _ => None,
     }
 }
@@ -80,7 +100,7 @@ pub fn cross_model_roles() -> &'static [&'static str] {
 pub fn is_grok_bound(phase: &str) -> bool {
     matches!(
         phase,
-        PHASE_PLAN | PHASE_FOLD | PHASE_IMPLEMENT | PHASE_ADVANCE
+        PHASE_PLAN | PHASE_FOLD | PHASE_IMPLEMENT | PHASE_ADVANCE | PHASE_ADDRESS_FINDINGS
     )
 }
 
@@ -185,5 +205,16 @@ mod tests {
         assert!(!is_canonical("stub:active"));
         assert!(is_stub_phase("stub:failed"));
         assert!(!is_stub_phase(PHASE_PLAN));
+    }
+
+    #[test]
+    fn address_findings_is_canonical_side_loop() {
+        assert!(is_canonical(PHASE_ADDRESS_FINDINGS));
+        assert_eq!(successor(PHASE_ADDRESS_FINDINGS), Some(PHASE_CROSS_MODEL));
+        assert!(is_grok_bound(PHASE_ADDRESS_FINDINGS));
+        assert!(!canonical_phases().contains(&PHASE_ADDRESS_FINDINGS));
+        assert_eq!(ADDRESS_FINDINGS_CAP, 2);
+        assert!(all_phase_ids().contains(&PHASE_ADDRESS_FINDINGS));
+        assert_eq!(all_phase_ids().len(), canonical_phases().len() + 1);
     }
 }

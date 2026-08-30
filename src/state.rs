@@ -121,6 +121,9 @@ pub struct RunState {
     /// Plan-review one-shot slots already launched this phase (0017). Additive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan_review_spawned: Vec<String>,
+    /// Address-findings entries this `run_epoch` (0031). Cap 2. Always serialized on disk.
+    #[serde(default)]
+    pub address_findings_attempts: u32,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -196,6 +199,7 @@ impl RunState {
             stall_recycles: 0,
             aborted_session_id: None,
             plan_review_spawned: Vec::new(),
+            address_findings_attempts: 0,
         }
     }
 
@@ -315,6 +319,10 @@ pub struct CiStatusView {
     pub merge: Option<String>,
 }
 
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 /// Status JSON `workflow` object (0008).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowView {
@@ -323,6 +331,9 @@ pub struct WorkflowView {
     pub driver: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_roles: Vec<String>,
+    /// Omitted on happy-path JSON when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub address_findings_attempts: u32,
 }
 
 impl StatusView {
@@ -348,6 +359,7 @@ impl StatusView {
                 id: state.workflow.clone(),
                 driver: state.driver.as_str().to_string(),
                 pending_roles: state.pending_roles.clone(),
+                address_findings_attempts: state.address_findings_attempts,
             }),
             failure_artifact: crate::notify::artifact::existing_path(record),
             ci: ci_status_view(record, state),

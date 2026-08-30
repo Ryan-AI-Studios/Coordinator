@@ -66,6 +66,7 @@ pub(crate) fn run_with_origin(
                 state.stall_recycles = 0;
                 state.aborted_session_id = None;
                 state.plan_review_spawned.clear();
+                state.address_findings_attempts = 0;
                 if picked {
                     let id = state.track_id.as_deref().unwrap_or("-");
                     state.last_event =

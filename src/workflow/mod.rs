@@ -12,7 +12,7 @@ pub mod watchdog;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoordinatorError, Result};
-use crate::outcome::PhaseOutcome;
+use crate::outcome::{FailureClass, LAST_EVENT_MESSAGE_CAP, PhaseOutcome};
 use crate::registry::ProjectRecord;
 use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock};
 
@@ -117,6 +117,9 @@ pub fn on_success(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseO
         } else {
             state.pending_roles.clear();
         }
+        if next == graph::PHASE_CROSS_MODEL {
+            state.review = None;
+        }
         if let Some(ref m) = outcome.message {
             if m.starts_with("skip:")
                 || m.starts_with("compact:")
@@ -204,6 +207,132 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
     }
 }
 
+/// Bounce only GateFail (`difficulty`) from `cross-model-review` under the cap.
+pub fn should_bounce_gate_fail(state: &RunState, outcome: &PhaseOutcome) -> bool {
+    graph::is_canonical(&outcome.phase)
+        && outcome.phase == graph::PHASE_CROSS_MODEL
+        && matches!(outcome.failure_class, Some(FailureClass::Difficulty))
+        && state.address_findings_attempts < graph::ADDRESS_FINDINGS_CAP
+}
+
+/// Best-effort archive of live gate reports to `*.gate{n}.md`, then delete live names.
+///
+/// Track-dir half is skipped when `resolve_track_dir` is None. IO errors do not abort.
+pub fn archive_gate_reports(record: &ProjectRecord, state: &RunState, n: u32) {
+    let mut slugs: std::collections::BTreeSet<String> = state
+        .review
+        .as_ref()
+        .map(|rv| rv.attempted.iter().cloned().collect())
+        .unwrap_or_default();
+
+    let track_dir = state
+        .track_id
+        .as_deref()
+        .and_then(|id| graph::resolve_track_dir(record, id));
+    // State-dir `reviews/` is wiped on fresh `run`, so live files there are this run.
+    let state_reviews = bundle::reviews_dir(record).ok();
+    if let Some(ref dir) = state_reviews
+        && let Ok(rd) = std::fs::read_dir(dir)
+    {
+        for ent in rd.flatten() {
+            if let Some(slug) = live_state_review_slug(&ent.file_name().to_string_lossy()) {
+                slugs.insert(slug);
+            }
+        }
+    }
+    // Track-dir leftovers may remain; only pair with a this-run state-dir live copy.
+    if let Some(ref dir) = track_dir
+        && let Some(ref state_dir) = state_reviews
+        && let Ok(rd) = std::fs::read_dir(dir)
+    {
+        for ent in rd.flatten() {
+            if let Some(slug) = live_track_review_slug(&ent.file_name().to_string_lossy()) {
+                let paired = state_dir.join(format!("cross-model-{slug}.md"));
+                if paired.is_file() {
+                    slugs.insert(slug);
+                }
+            }
+        }
+    }
+
+    for slug in slugs {
+        if let Some(ref dir) = track_dir {
+            let live = dir.join(format!("review.{slug}.md"));
+            let dest = dir.join(format!("review.{slug}.gate{n}.md"));
+            archive_one(&live, &dest);
+        }
+        if let Ok(dir) = bundle::reviews_dir(record) {
+            let live = dir.join(format!("cross-model-{slug}.md"));
+            let dest = dir.join(format!("cross-model-{slug}.gate{n}.md"));
+            archive_one(&live, &dest);
+        }
+    }
+}
+
+fn live_track_review_slug(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("review.")?;
+    let stem = rest.strip_suffix(".md")?;
+    // Live names are `review.{slug}.md` (slug has no extra dots).
+    // Reject `review.codex.fail.md`, `review.codex.gate1.md`, `review.md`.
+    if stem.is_empty() || stem.contains('.') {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+fn live_state_review_slug(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("cross-model-")?;
+    let stem = rest.strip_suffix(".md")?;
+    if stem.is_empty() || stem.contains('.') {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+fn archive_one(live: &std::path::Path, dest: &std::path::Path) {
+    if !live.is_file() {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(live) else {
+        return;
+    };
+    if crate::persist::atomic_write(dest, &bytes).is_ok() {
+        let _ = std::fs::remove_file(live);
+    }
+}
+
+fn truncate_event_msg(msg: &str) -> String {
+    if msg.chars().count() <= LAST_EVENT_MESSAGE_CAP {
+        return msg.to_string();
+    }
+    let cut: String = msg.chars().take(LAST_EVENT_MESSAGE_CAP).collect();
+    format!("{cut}…")
+}
+
+/// Stay Running/Paused at `address-findings`; archive live reports; clear review.
+pub fn on_gate_retry(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseOutcome) {
+    state.address_findings_attempts = state.address_findings_attempts.saturating_add(1);
+    let n = state.address_findings_attempts;
+    archive_gate_reports(record, state, n);
+    state.review = None;
+    state.last_driven_phase = None;
+    state.failure_class = None;
+    state.pending_roles.clear();
+    state.phase = graph::PHASE_ADDRESS_FINDINGS.into();
+    reset_phase_clock(state);
+    let msg = outcome
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(truncate_event_msg)
+        .unwrap_or_else(|| "cross-model: gate failed".into());
+    state.last_event = format!(
+        "{msg}; address-findings {n}/{}",
+        graph::ADDRESS_FINDINGS_CAP
+    );
+}
+
 pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.run_epoch = state.run_epoch.saturating_add(1);
     state.track_id = Some(track_id.to_string());
@@ -218,6 +347,7 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.ci = None;
     state.review = None;
     state.stalled_at = None;
+    state.address_findings_attempts = 0;
     reset_phase_clock(state);
     state.last_event = format!("workflow: auto-start {track_id}");
 }
@@ -399,6 +529,231 @@ mod tests {
         assert_eq!(view.failure_class, Some(FailureClass::Difficulty));
     }
 
+    fn jump_cross_model_file_wait(r: &crate::registry::ProjectRecord, track: &str) {
+        run_with_driver(r, Some(track.into()), WorkflowDriver::FileWait).unwrap();
+        let mut s = load_run_state(r).unwrap();
+        s.phase = graph::PHASE_CROSS_MODEL.into();
+        save_run_state(r, &s).unwrap();
+    }
+
+    #[test]
+    fn file_wait_cross_model_difficulty_bounces_to_address_findings() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conductor").join("0031-Example")).unwrap();
+        let r = rec(dir.path());
+        jump_cross_model_file_wait(&r, "0031");
+        let o = PhaseOutcome::failure(
+            graph::PHASE_CROSS_MODEL,
+            FailureClass::Difficulty,
+            OutcomeSource::File,
+            Some("cross-model: gate failed (codex)".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert_eq!(view.failure_class, None);
+        assert_eq!(
+            view.workflow.as_ref().map(|w| w.address_findings_attempts),
+            Some(1)
+        );
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        let st = load_run_state(&r).unwrap();
+        assert!(st.review.is_none());
+        let json = serde_json::to_string(&view.workflow).unwrap();
+        assert!(
+            json.contains("\"address_findings_attempts\":1"),
+            "workflow json={json}"
+        );
+        run::stop(&r).unwrap();
+        let fresh = run_with_driver(&r, None, WorkflowDriver::FileWait).unwrap();
+        let fresh_json = serde_json::to_string(&fresh.workflow).unwrap();
+        assert!(
+            !fresh_json.contains("address_findings_attempts"),
+            "fresh workflow json={fresh_json}"
+        );
+        assert_eq!(load_run_state(&r).unwrap().address_findings_attempts, 0);
+    }
+
+    #[test]
+    fn bounce_archives_both_live_copies_and_deletes_live_names() {
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0031-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        let r = rec(dir.path());
+        jump_cross_model_file_wait(&r, "0031");
+        let token = "UNIQUE_TOKEN_gate1_archive";
+        let live_track = track.join("review.codex.md");
+        std::fs::write(&live_track, token).unwrap();
+        let reviews = crate::state::resolve_state_dir(&r).unwrap().join("reviews");
+        std::fs::create_dir_all(&reviews).unwrap();
+        let live_state = reviews.join("cross-model-codex.md");
+        std::fs::write(&live_state, token).unwrap();
+        let o = PhaseOutcome::failure(
+            graph::PHASE_CROSS_MODEL,
+            FailureClass::Difficulty,
+            OutcomeSource::File,
+            Some("gate failed".into()),
+            None,
+        );
+        write_and_apply(&r, o).unwrap();
+        let gate_track = track.join("review.codex.gate1.md");
+        let gate_state = reviews.join("cross-model-codex.gate1.md");
+        assert_eq!(std::fs::read_to_string(&gate_track).unwrap(), token);
+        assert_eq!(std::fs::read_to_string(&gate_state).unwrap(), token);
+        assert!(!live_track.exists());
+        assert!(!live_state.exists());
+        assert!(!track.join("review.md").exists());
+    }
+
+    #[test]
+    fn bounce_does_not_archive_review_codex_fail_md() {
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0031-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        let r = rec(dir.path());
+        jump_cross_model_file_wait(&r, "0031");
+        let fail_copy = track.join("review.codex.fail.md");
+        std::fs::write(&fail_copy, "prior FAIL audit").unwrap();
+        std::fs::write(track.join("review.codex.md"), "this run gate").unwrap();
+        let reviews = crate::state::resolve_state_dir(&r).unwrap().join("reviews");
+        std::fs::create_dir_all(&reviews).unwrap();
+        std::fs::write(reviews.join("cross-model-codex.md"), "this run gate").unwrap();
+        let o = PhaseOutcome::failure(
+            graph::PHASE_CROSS_MODEL,
+            FailureClass::Difficulty,
+            OutcomeSource::File,
+            Some("gate failed".into()),
+            None,
+        );
+        write_and_apply(&r, o).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&fail_copy).unwrap(),
+            "prior FAIL audit"
+        );
+        assert!(!track.join("review.codex.fail.gate1.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(track.join("review.codex.gate1.md")).unwrap(),
+            "this run gate"
+        );
+        assert!(!track.join("review.codex.md").exists());
+    }
+
+    #[test]
+    fn bounce_ignores_leftover_track_dir_review_without_state_pair() {
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0031-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        let r = rec(dir.path());
+        jump_cross_model_file_wait(&r, "0031");
+        std::fs::write(track.join("review.claude.md"), "prior run leftover live").unwrap();
+        std::fs::write(
+            track.join("review.claude.gate1.md"),
+            "prior run leftover gate",
+        )
+        .unwrap();
+        std::fs::write(track.join("review.codex.md"), "this run").unwrap();
+        let reviews = crate::state::resolve_state_dir(&r).unwrap().join("reviews");
+        std::fs::create_dir_all(&reviews).unwrap();
+        std::fs::write(reviews.join("cross-model-codex.md"), "this run").unwrap();
+        let o = PhaseOutcome::failure(
+            graph::PHASE_CROSS_MODEL,
+            FailureClass::Difficulty,
+            OutcomeSource::File,
+            Some("gate failed".into()),
+            None,
+        );
+        write_and_apply(&r, o).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(track.join("review.claude.md")).unwrap(),
+            "prior run leftover live"
+        );
+        assert_eq!(
+            std::fs::read_to_string(track.join("review.claude.gate1.md")).unwrap(),
+            "prior run leftover gate"
+        );
+        assert_eq!(
+            std::fs::read_to_string(track.join("review.codex.gate1.md")).unwrap(),
+            "this run"
+        );
+        assert!(!track.join("review.codex.md").exists());
+        assert!(!reviews.join("cross-model-claude.gate1.md").exists());
+    }
+
+    #[test]
+    fn bounce_without_track_dir_still_archives_state_dir() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model_file_wait(&r, "0031");
+        let token = "UNIQUE_TOKEN_no_track_dir";
+        let reviews = crate::state::resolve_state_dir(&r).unwrap().join("reviews");
+        std::fs::create_dir_all(&reviews).unwrap();
+        let live_state = reviews.join("cross-model-codex.md");
+        std::fs::write(&live_state, token).unwrap();
+        let o = PhaseOutcome::failure(
+            graph::PHASE_CROSS_MODEL,
+            FailureClass::Difficulty,
+            OutcomeSource::File,
+            Some("gate failed".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert_eq!(
+            std::fs::read_to_string(reviews.join("cross-model-codex.gate1.md")).unwrap(),
+            token
+        );
+        assert!(!live_state.exists());
+    }
+
+    #[test]
+    fn cap_exhaust_stops_with_artifact() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model_file_wait(&r, "0031");
+        let mut s = load_run_state(&r).unwrap();
+        s.address_findings_attempts = graph::ADDRESS_FINDINGS_CAP;
+        save_run_state(&r, &s).unwrap();
+        let o = PhaseOutcome::failure(
+            graph::PHASE_CROSS_MODEL,
+            FailureClass::Difficulty,
+            OutcomeSource::File,
+            Some("cross-model: gate failed (codex)".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.phase, graph::PHASE_CROSS_MODEL);
+        assert_eq!(view.failure_class, Some(FailureClass::Difficulty));
+        assert!(
+            view.last_event.contains("address-findings exhausted"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+    }
+
+    #[test]
+    fn cross_model_timeout_does_not_bounce() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model_file_wait(&r, "0031");
+        let o = PhaseOutcome::failure(
+            graph::PHASE_CROSS_MODEL,
+            FailureClass::Timeout,
+            OutcomeSource::Timeout,
+            Some("timed out".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.phase, graph::PHASE_CROSS_MODEL);
+        assert_eq!(view.failure_class, Some(FailureClass::Timeout));
+        assert_eq!(view.phase, graph::PHASE_CROSS_MODEL);
+        assert_ne!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+    }
+
     #[test]
     fn stop_during_plan_sets_stub_stopped() {
         let dir = tempdir().unwrap();
@@ -487,6 +842,14 @@ mod tests {
         assert!(view.last_event.contains("auto-start"));
         assert!(view.next_track.is_none());
         assert!(view.run_epoch >= 2);
+        assert_eq!(
+            view.workflow
+                .as_ref()
+                .map(|w| w.address_findings_attempts)
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(load_run_state(&r).unwrap().address_findings_attempts, 0);
     }
 
     #[test]

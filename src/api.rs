@@ -217,7 +217,7 @@ pub fn project_show(project: Option<&str>, infer_cwd: bool) -> Result<ProjectSho
         None
     };
     let mut phase_timeouts = BTreeMap::new();
-    for phase in crate::workflow::graph::canonical_phases() {
+    for phase in crate::workflow::graph::all_phase_ids() {
         phase_timeouts.insert(
             (*phase).to_string(),
             PhaseTimeoutView {
@@ -1045,12 +1045,14 @@ mod tests {
         )
         .unwrap();
         let view = project_show(Some(&rec.id), false).unwrap();
-        for phase in crate::workflow::graph::canonical_phases() {
+        for phase in crate::workflow::graph::all_phase_ids() {
             assert!(
                 view.phase_timeouts.contains_key(*phase),
                 "show missing effective timeout for {phase}"
             );
         }
+        assert_eq!(view.phase_timeouts["address-findings"].secs, 3600);
+        assert_eq!(view.phase_timeouts["address-findings"].source, "table");
         assert_eq!(view.phase_timeouts["plan"].secs, 3600);
         assert_eq!(view.phase_timeouts["plan"].source, "project");
         assert_eq!(view.phase_timeouts["implement"].secs, 7200);
