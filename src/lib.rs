@@ -13,6 +13,7 @@
 //! Abort stuck Prompt + refuse wedged-session reuse: track **0027**.
 //! Harness preflight (`doctor` + adapter `run` refuse missing/auth): track **0028**.
 //! Infer `--project` from unique cwd containment else last-used: track **0029**.
+//! Omit `--track` starts first exact Ready — not started row when unset or backlog-clear: track **0030**.
 //! Plan-review Antigravity one-shot (`agy --print`): track **0017**.
 //! Plan-review OpenCode one-shot (`opencode run`): track **0018**.
 //! Role-bound plan/fold/implement/advance drive: track **0019**.

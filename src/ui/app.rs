@@ -725,6 +725,16 @@ fn project_card(
     let layout = card.view.layout_profile.as_str().to_string();
     let (pill_class, pill_label) = status_pill(card.card_state);
     let primary = card_primary_action(&card.view);
+    let run_label = if primary == CardPrimaryAction::StartNextReady {
+        "Start next Ready"
+    } else {
+        "Run"
+    };
+    let run_title = if primary == CardPrimaryAction::StartNextReady {
+        "Start the first Ready — not started track (omit --track pick)"
+    } else {
+        "Start the canonical workflow (CLI remains the automation entry)"
+    };
     let sessions = card.sessions.clone();
     let note = note_for(card);
     let failure = if selected {
@@ -768,10 +778,12 @@ fn project_card(
                             },
                             "Resume"
                         }
-                    } else if primary == CardPrimaryAction::Run {
+                    } else if primary == CardPrimaryAction::Run
+                        || primary == CardPrimaryAction::StartNextReady
+                    {
                         button {
                             class: "primary",
-                            title: "Start the canonical workflow (CLI remains the automation entry)",
+                            title: "{run_title}",
                             onclick: move |evt| {
                                 evt.stop_propagation();
                                 match run_selected(&id_run, None) {
@@ -782,7 +794,7 @@ fn project_card(
                                     Err(e) => banner.set(Some(e.to_string())),
                                 }
                             },
-                            "Run"
+                            "{run_label}"
                         }
                     } else {
                         button {

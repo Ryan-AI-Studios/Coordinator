@@ -1,6 +1,7 @@
 //! Built-in canonical conductor-track workflow (`canonical_v1`).
 
 pub mod bundle;
+pub mod conductor_md;
 pub mod drive;
 pub mod graph;
 pub mod plan_review;
@@ -15,9 +16,13 @@ use crate::outcome::PhaseOutcome;
 use crate::registry::ProjectRecord;
 use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock};
 
+pub use conductor_md::{ReadyPickState, pick_next_ready, should_pick_next_ready};
 pub use drive::tick;
 pub use graph::{WORKFLOW_ID, is_canonical, is_stub_phase, resolve_track_dir, successor};
 pub use timeouts::{ENV_PHASE_TIMEOUT_SECS, TimeoutSource, timeout_for_phase, timeout_source};
+
+/// `finish_advance` null/`next_track` Idle last_event (0030 pick trigger).
+pub const LAST_EVENT_BACKLOG_CLEAR: &str = "workflow: backlog clear";
 
 /// Env fallback when CLI/HTTP omit `--driver`.
 pub const ENV_WORKFLOW_DRIVER: &str = "COORDINATOR_WORKFLOW_DRIVER";
@@ -177,7 +182,7 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
     {
         None => {
             state.status = RunStatus::Idle;
-            state.last_event = "workflow: backlog clear".into();
+            state.last_event = LAST_EVENT_BACKLOG_CLEAR.into();
             state.phase_started_at = None;
             state.pause_started_at = None;
         }

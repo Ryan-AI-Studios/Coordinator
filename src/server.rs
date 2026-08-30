@@ -332,7 +332,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let run_body = serde_json::to_vec(&json!({ "driver": "stub" })).unwrap();
+        let run_body = serde_json::to_vec(&json!({ "driver": "stub", "track": "t" })).unwrap();
         let response = app()
             .oneshot(
                 axum::http::Request::builder()
@@ -597,7 +597,7 @@ mod tests {
                     .uri("/v1/run")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        serde_json::to_vec(&json!({ "driver": "stub" })).unwrap(),
+                        serde_json::to_vec(&json!({ "driver": "stub", "track": "t" })).unwrap(),
                     ))
                     .unwrap(),
             )
@@ -674,7 +674,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let run_body = serde_json::to_vec(&json!({ "driver": "stub" })).unwrap();
+        let run_body = serde_json::to_vec(&json!({ "driver": "stub", "track": "t" })).unwrap();
         let _ = app()
             .oneshot(
                 axum::http::Request::builder()
@@ -803,7 +803,7 @@ mod tests {
         let rec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let project_id = rec["id"].as_str().unwrap().to_string();
 
-        let run_body = serde_json::to_vec(&json!({ "driver": "stub" })).unwrap();
+        let run_body = serde_json::to_vec(&json!({ "driver": "stub", "track": "t" })).unwrap();
         let _ = app()
             .oneshot(
                 axum::http::Request::builder()
@@ -960,7 +960,7 @@ mod tests {
             "logged-out grok must not flip GET to 4xx"
         );
 
-        let run_body = serde_json::to_vec(&json!({ "driver": "adapter" })).unwrap();
+        let run_body = serde_json::to_vec(&json!({ "driver": "adapter", "track": "t" })).unwrap();
         let response = app()
             .oneshot(
                 axum::http::Request::builder()
@@ -983,7 +983,8 @@ mod tests {
         assert!(v.get("error").is_none(), "must not be {{error}}: {v}");
         assert_eq!(v["ok"], false);
 
-        let skip_body = serde_json::to_vec(&json!({ "skip_preflight": true })).unwrap();
+        let skip_body =
+            serde_json::to_vec(&json!({ "skip_preflight": true, "track": "t" })).unwrap();
         let response = app()
             .oneshot(
                 axum::http::Request::builder()
@@ -1135,6 +1136,43 @@ mod tests {
                     .uri("/v1/run")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({ "driver": "stub", "track": "t" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["project_id"], rec_b.id);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_http_omit_track_picks_ready_with_last_used() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        api::project_add(a.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        let rec_b =
+            api::project_add(b.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        crate::workflow::conductor_md::write_ready_fixture(b.path(), "0030").unwrap();
+        crate::config::save_last_used_id(&rec_b.id).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
                         serde_json::to_vec(&json!({ "driver": "stub" })).unwrap(),
                     ))
                     .unwrap(),
@@ -1145,6 +1183,9 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["project_id"], rec_b.id);
+        assert_eq!(v["track_id"], "0030");
+        let ev = v["last_event"].as_str().unwrap_or("");
+        assert!(ev.contains("(next Ready)"), "{v}");
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }

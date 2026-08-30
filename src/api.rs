@@ -343,6 +343,7 @@ pub fn cmd_run(
 ) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
     let driver = crate::workflow::resolve_driver(driver)?;
+    let (track, picked) = resolve_run_track(&rec, track)?;
     if driver == crate::workflow::WorkflowDriver::Adapter && !skip_preflight {
         let report = crate::harness::preflight::probe_machine()?;
         if !report.ok {
@@ -351,7 +352,27 @@ pub fn cmd_run(
             });
         }
     }
-    run::run_with_driver(&rec, track, driver)
+    run::run_with_origin(&rec, track, driver, picked)
+}
+
+/// Explicit nonempty `--track` wins (no Ready check). Else pick when
+/// [`crate::workflow::should_pick_next_ready`]; otherwise retain (`None`).
+pub fn resolve_run_track(
+    record: &crate::registry::ProjectRecord,
+    explicit: Option<String>,
+) -> Result<(Option<String>, bool)> {
+    let trimmed = explicit
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(t) = trimmed {
+        return Ok((Some(t), false));
+    }
+    let state = crate::state::load_run_state(record)?;
+    let pick = crate::workflow::ReadyPickState::from(&state);
+    if !crate::workflow::should_pick_next_ready(&pick) {
+        return Ok((None, false));
+    }
+    Ok((Some(crate::workflow::pick_next_ready(record)?), true))
 }
 
 /// Probe machine Role Bindings + `gh`. Optional `--project` only validates the selector.
@@ -1121,6 +1142,191 @@ mod tests {
         let view = view.expect("omit run with unique cwd must wait-attach");
         assert_eq!(view.project_id, rec_b.id);
         assert_eq!(view.status, RunStatus::Idle);
+        unsafe {
+            std::env::remove_var(ENV_OUTCOME_POLL_MS);
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_running_empty_track_is_invalid_transition_not_pick() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        crate::workflow::conductor_md::write_ready_fixture(proj.path(), "0030").unwrap();
+        cmd_run(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.track_id = None;
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let err = cmd_run(Some(&rec.id), None, Some("stub"), false, false).unwrap_err();
+        match err {
+            CoordinatorError::InvalidTransition { action, from } => {
+                assert_eq!(action, "run");
+                assert_eq!(from, "Running");
+            }
+            other => panic!("expected InvalidTransition, got {other}"),
+        }
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_omit_picks_ready_and_tags_last_event() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        crate::workflow::conductor_md::write_ready_fixture(proj.path(), "0030").unwrap();
+        let view = cmd_run(Some(&rec.id), None, Some("stub"), false, false).unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0030"));
+        assert!(
+            view.last_event.contains("(next Ready)"),
+            "{}",
+            view.last_event
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_proposed_only_fail_closed() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        let cond = proj.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0044-Later")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0044-Later | `.` | **Proposed — placeholder, needs full spec/plan pass** | no |\n",
+        )
+        .unwrap();
+        let err = cmd_run(Some(&rec.id), None, Some("stub"), false, false).unwrap_err();
+        assert!(err.to_string().contains("no Ready"), "{err}");
+        let st = run::status(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Idle);
+        assert!(st.track_id.is_none());
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_explicit_proposed_still_starts() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        let cond = proj.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0044-Later")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0044-Later | `.` | **Proposed — placeholder, needs full spec/plan pass** | no |\n",
+        )
+        .unwrap();
+        let view = cmd_run(
+            Some(&rec.id),
+            Some("0044".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0044"));
+        assert!(
+            !view.last_event.contains("(next Ready)"),
+            "{}",
+            view.last_event
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_stopped_omit_retains_despite_other_ready() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        crate::workflow::conductor_md::write_ready_fixture(proj.path(), "0030").unwrap();
+        cmd_run(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
+        cmd_stop(Some(&rec.id), false).unwrap();
+        let view = cmd_run(Some(&rec.id), None, Some("stub"), false, false).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0020"));
+        assert!(
+            !view.last_event.contains("(next Ready)"),
+            "{}",
+            view.last_event
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_idle_failure_omit_retains() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        crate::workflow::conductor_md::write_ready_fixture(proj.path(), "0030").unwrap();
+        cmd_run(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.status = RunStatus::Idle;
+        state.failure_class = Some(crate::outcome::FailureClass::Timeout);
+        state.last_event = "failure".into();
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let view = cmd_run(Some(&rec.id), None, Some("stub"), false, false).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0020"));
+        assert!(
+            !view.last_event.contains("(next Ready)"),
+            "{}",
+            view.last_event
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_backlog_clear_omit_picks_next_ready() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "10");
+            std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
+        }
+        let (_home, proj, rec) = add_isolated_project();
+        crate::workflow::conductor_md::write_ready_fixture(proj.path(), "0030").unwrap();
+        let idle = cmd_run_cli(
+            Some(&rec.id),
+            Some("0020".into()),
+            Some("stub"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: None,
+                probe: ServeProbe::Skip,
+                skip_preflight: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(idle.status, RunStatus::Idle);
+        assert_eq!(idle.last_event, crate::workflow::LAST_EVENT_BACKLOG_CLEAR);
+        assert_eq!(idle.track_id.as_deref(), Some("0020"));
+        let view = cmd_run(Some(&rec.id), None, Some("stub"), false, false).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0030"));
+        assert!(
+            view.last_event.contains("(next Ready)"),
+            "{}",
+            view.last_event
+        );
         unsafe {
             std::env::remove_var(ENV_OUTCOME_POLL_MS);
             std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
