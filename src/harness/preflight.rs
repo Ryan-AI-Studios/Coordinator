@@ -1008,6 +1008,22 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_grok_bin_is_unset_for_preflight_and_resolve() {
+        let iso = IsolatedDoctor::enter();
+        let bins = iso.point_all_to_dummies();
+        iso.grok_ready_via_key();
+        unsafe {
+            std::env::set_var(ENV_GROK_BIN, "   ");
+        }
+        let probe = ScriptedProbe::ready();
+        let _g = install_test_probe(probe);
+        let report = probe_machine().unwrap();
+        assert_eq!(row(&report, "planner").status, RowStatus::Ready);
+        let resolved = crate::harness::resolve_grok_binary().unwrap();
+        assert_eq!(resolved, bins["grok"]);
+    }
+
+    #[test]
     fn empty_env_pin_does_not_override() {
         let iso = IsolatedDoctor::enter();
         iso.point_all_to_dummies();

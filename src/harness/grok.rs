@@ -787,9 +787,9 @@ pub fn grok_agent_argv(model: Option<&str>) -> Vec<String> {
 /// Resolve `COORDINATOR_GROK_BIN` or the role-binding `grok` command on PATH.
 pub fn resolve_grok_binary() -> Result<PathBuf> {
     if let Ok(over) = std::env::var(ENV_GROK_BIN)
-        && !over.is_empty()
+        && !over.trim().is_empty()
     {
-        return resolve_command(&over);
+        return resolve_command(over.trim());
     }
     let cmd = crate::harness::roles::resolve_grok_command()?;
     resolve_command(&cmd)

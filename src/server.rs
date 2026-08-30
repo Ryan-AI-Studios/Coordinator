@@ -596,7 +596,7 @@ mod tests {
                     .uri("/v1/run")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        serde_json::to_vec(&json!({})).unwrap(),
+                        serde_json::to_vec(&json!({ "driver": "stub" })).unwrap(),
                     ))
                     .unwrap(),
             )
