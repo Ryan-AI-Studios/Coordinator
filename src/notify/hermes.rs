@@ -857,6 +857,7 @@ mod tests {
                 progress: false,
             },
             progress_stall_secs: None,
+            journal_keep: None,
         };
         save_machine_config(&cfg).unwrap();
     }

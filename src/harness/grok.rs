@@ -306,8 +306,10 @@ impl GrokSession {
         self.terminals.spawn_tally()
     }
 
-    /// Bind this session to a project so ACP `session/update` writes the progress sidecar.
+    /// Bind this session to a project so ACP `session/update` writes the progress sidecar
+    /// and TerminalHub journals child commands (track 0034).
     pub fn set_progress_record(&mut self, record: ProjectRecord) {
+        self.terminals.bind_record(record.clone());
         self.progress_record = Some(record);
     }
 

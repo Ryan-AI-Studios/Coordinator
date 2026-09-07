@@ -421,6 +421,8 @@ Long-lived **Grok Build** sessions use `grok agent stdio` (JSON-RPC 2.0, line-de
 | Pool | One Grok ACP session per `project_id`. CLI `start`, HTTP `POST /v1/harness/grok/start`, and adapter ticks from `run` / `wait` / `serve` detach a localhost holder so a later `prompt` does not pin the poll loop. In-process spawn is for tests / `insert_test_session`. |
 | Persist | `{state_dir}/harness-grok.json` (session id / pid / holder pid / control addr / alive) — not a transcript |
 
+**Command journal (0034):** each TerminalHub child completion (and spawn failure) appends one JSON line to `{state_dir}/journal/{track}-{epoch}.jsonl` (`track` is `-` if unset). Fields: `ts`, `phase`, `harness`, `argv_head` (secrets redacted, then ≤120 chars), `exit`, `dur_ms`, `ok`, optional `signal`. No env or stdout. The host shell probe is not journaled. A second identical failing argv in one phase appends `loop_suspect` to `{workspace}/status.md` (kills do not count; a third fail does not add another line). Default on when the hub is bound; `COORDINATOR_JOURNAL=off` skips writes and `loop_suspect`. Retention keeps the newest `journal_keep` files (missing → **20**; `0` → no GC). This is **not** a fourth clock and does not change stall recycle.
+
 Optional project hooks (`Stop`, `SessionEnd`, `PreCompact`, `PostCompact`) may also write `outcomes/current.json` (`source: file`). Project hooks need a one-time `grok` `/hooks-trust`. The adapter-written outcome is the automation path.
 
 Live tests are **not** required for CI:

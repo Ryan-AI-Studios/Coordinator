@@ -319,6 +319,9 @@ pub struct MachineConfig {
     /// Adapter progress stall interval (seconds). Missing → 600. `0` disables. No version bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_stall_secs: Option<u64>,
+    /// JSONL journal files to keep under `{state_dir}/journal/`. Missing → 20. `0` skips GC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_keep: Option<u64>,
 }
 
 impl Default for MachineConfig {
@@ -330,6 +333,7 @@ impl Default for MachineConfig {
             phase_timeouts_secs: BTreeMap::new(),
             hermes: HermesNotifyConfig::default(),
             progress_stall_secs: None,
+            journal_keep: None,
         }
     }
 }
@@ -432,7 +436,7 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
 /// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`,
 /// `COORDINATOR_NOTIFY_PROGRESS`, `.env` via `load_dotenv_path`,
-/// `COORDINATOR_PROGRESS_STALL_SECS`,
+/// `COORDINATOR_PROGRESS_STALL_SECS`, `COORDINATOR_JOURNAL`,
 /// `COORDINATOR_CANCEL_WAIT_SECS`, `COORDINATOR_AGY_BIN`,
 /// `COORDINATOR_OPENCODE_BIN`, or `COORDINATOR_GROK_BIN` must
 /// hold this (survives poison so one failure does not cascade).
@@ -513,6 +517,7 @@ mod tests {
             phase_timeouts_secs: BTreeMap::new(),
             hermes: HermesNotifyConfig::default(),
             progress_stall_secs: None,
+            journal_keep: None,
         };
         atomic_write_json(&path, &cfg).unwrap();
         let loaded = load_machine_config_at(&path).unwrap();
@@ -703,6 +708,7 @@ mod tests {
                 progress: false,
             },
             progress_stall_secs: None,
+            journal_keep: None,
         };
         atomic_write_json(&path, &cfg).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

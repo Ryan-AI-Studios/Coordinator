@@ -6,6 +6,8 @@
 //! Track **0032**: Windows empty-`args` wrapper is `pwsh` → Windows PowerShell 5.1
 //! → `cmd.exe` (first existing file). 100% `cmd.spawn()` fail this prompt is
 //! `HarnessCrash`, not Success.
+//!
+//! Track **0034**: bound hubs journal child completion / spawn-fail as JSONL.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +15,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use super::journal::{self, JournalEvent, JournalHub, JournalSnap};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, BufReader};
@@ -46,6 +50,8 @@ pub struct TerminalHub {
     spawn_ok: Arc<AtomicU64>,
     last_spawn_error: Arc<Mutex<Option<String>>>,
     probe_ok: Arc<AtomicBool>,
+    record: Arc<Mutex<Option<crate::registry::ProjectRecord>>>,
+    journal: Arc<Mutex<JournalHub>>,
 }
 
 impl std::fmt::Debug for TerminalHub {
@@ -87,6 +93,15 @@ impl TerminalHub {
             spawn_ok: Arc::new(AtomicU64::new(0)),
             last_spawn_error: Arc::new(Mutex::new(None)),
             probe_ok: Arc::new(AtomicBool::new(false)),
+            record: Arc::new(Mutex::new(None)),
+            journal: Arc::new(Mutex::new(JournalHub::new())),
+        }
+    }
+
+    /// Bind the project so child completions write `{state_dir}/journal/`. Unbound = no-op.
+    pub fn bind_record(&self, record: crate::registry::ProjectRecord) {
+        if let Ok(mut g) = self.record.lock() {
+            *g = Some(record);
         }
     }
 
@@ -96,6 +111,9 @@ impl TerminalHub {
         if let Ok(mut g) = self.last_spawn_error.lock() {
             *g = None;
         }
+        if let Ok(mut g) = self.journal.lock() {
+            g.reset();
+        }
     }
 
     pub fn spawn_tally(&self) -> SpawnTally {
@@ -103,6 +121,31 @@ impl TerminalHub {
             attempts: self.spawn_attempts.load(Ordering::SeqCst),
             ok: self.spawn_ok.load(Ordering::SeqCst),
             last_error: self.last_spawn_error.lock().ok().and_then(|g| g.clone()),
+        }
+    }
+
+    fn create_snapshot(&self, command: &str) -> Option<JournalSnap> {
+        if command == HOST_PROBE_LINE {
+            return None;
+        }
+        let record = self.record.lock().ok().and_then(|g| g.clone())?;
+        Some(journal::snapshot(&record))
+    }
+
+    fn journal_spawn_fail(&self, snap: Option<&JournalSnap>, argv: &str) {
+        let Some(snap) = snap else {
+            return;
+        };
+        if let Ok(mut g) = self.journal.lock() {
+            g.record(JournalEvent {
+                snap,
+                argv_head: argv,
+                exit: None,
+                dur_ms: 0,
+                ok: false,
+                signal: None,
+                spawn_fail: true,
+            });
         }
     }
 
@@ -267,6 +310,8 @@ impl TerminalHub {
         {
             cmd.creation_flags(0x0800_0000);
         }
+        let snap = self.create_snapshot(&command);
+        let argv = journal::argv_head(&command, &args);
         self.spawn_attempts.fetch_add(1, Ordering::SeqCst);
         let mut child = match cmd.spawn() {
             Ok(c) => {
@@ -278,6 +323,7 @@ impl TerminalHub {
                 if let Ok(mut g) = self.last_spawn_error.lock() {
                     *g = Some(msg.clone());
                 }
+                self.journal_spawn_fail(snap.as_ref(), &argv);
                 return rpc_error_value(&req_id, &msg);
             }
         };
@@ -299,24 +345,40 @@ impl TerminalHub {
             spawn_reader(err, term.output.clone(), term.truncated.clone(), limit);
         }
         let waiter = term.clone();
+        let journal = self.journal.clone();
+        let started = Instant::now();
         tokio::spawn(async move {
+            let mut killed = false;
             let status = tokio::select! {
                 status = child.wait() => status,
                 _ = kill_rx => {
+                    killed = true;
                     let _ = child.start_kill();
                     child.wait().await
                 }
             };
-            let ex = match status {
-                Ok(s) => TermExit {
-                    exit_code: s.code().map(|c| c as i64),
-                    signal: None,
-                },
-                Err(_) => TermExit {
-                    exit_code: None,
-                    signal: Some("error"),
-                },
+            let (exit_code, acp_signal) = match status {
+                Ok(s) => (s.code().map(|c| c as i64), None),
+                Err(_) => (None, Some("error")),
             };
+            let ex = TermExit {
+                exit_code,
+                signal: acp_signal,
+            };
+            if let Some(ref snap) = snap
+                && let Ok(mut g) = journal.lock()
+            {
+                let journal_signal = if killed { Some("killed") } else { None };
+                g.record(JournalEvent {
+                    snap,
+                    argv_head: &argv,
+                    exit: exit_code,
+                    dur_ms: started.elapsed().as_millis() as u64,
+                    ok: exit_code == Some(0),
+                    signal: journal_signal,
+                    spawn_fail: false,
+                });
+            }
             *waiter.exit.lock().await = Some(ex);
             waiter.done.notify_waiters();
         });
@@ -936,6 +998,331 @@ mod tests {
             plan.program.file_name().and_then(|s| s.to_str()),
             Some("pwsh")
         );
+    }
+
+    fn fail_args() -> (&'static str, Vec<&'static str>) {
+        if cfg!(windows) {
+            ("cmd.exe", vec!["/C", "exit 1"])
+        } else {
+            ("sh", vec!["-c", "exit 1"])
+        }
+    }
+
+    fn hang_args() -> (&'static str, Vec<&'static str>) {
+        if cfg!(windows) {
+            ("cmd.exe", vec!["/C", "ping", "-n", "60", "127.0.0.1"])
+        } else {
+            ("sleep", vec!["60"])
+        }
+    }
+
+    fn journal_test_rec(ws: &Path) -> crate::registry::ProjectRecord {
+        crate::registry::ProjectRecord {
+            id: "j34-term".into(),
+            path: ws.to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: Some(ws.join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn seed_journal_run(rec: &crate::registry::ProjectRecord) {
+        let mut s = crate::state::RunState::idle(&rec.id);
+        s.phase = "implement".into();
+        s.track_id = Some("0034".into());
+        s.run_epoch = 7;
+        crate::state::save_run_state(rec, &s).unwrap();
+    }
+
+    fn journal_path(rec: &crate::registry::ProjectRecord) -> PathBuf {
+        rec.state_dir
+            .as_ref()
+            .unwrap()
+            .join("journal")
+            .join("0034-7.jsonl")
+    }
+
+    fn read_journal(rec: &crate::registry::ProjectRecord) -> Vec<Value> {
+        let text = std::fs::read_to_string(journal_path(rec)).unwrap();
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).expect(l))
+            .collect()
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    async fn create_and_wait(hub: &TerminalHub, command: &str, args: &[&str]) -> Value {
+        let cwd = std::env::temp_dir();
+        let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let create = serde_json::from_str::<Value>(
+            &hub.handle_sync(
+                TerminalMethod::Create,
+                json!(1),
+                Some(&json!({"command": command, "args": args})),
+                &cwd,
+            )
+            .await,
+        )
+        .unwrap();
+        if let Some(tid) = create
+            .get("result")
+            .and_then(|r| r.get("terminalId"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            let _ = hub
+                .wait_for_exit_reply(json!(2), Some(&json!({"terminalId": tid})))
+                .await;
+        }
+        create
+    }
+
+    #[test]
+    fn bound_echo_writes_one_journal_line() {
+        let _lock = crate::config::test_env_lock();
+        block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            unsafe {
+                std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+                std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+                std::env::remove_var(journal::ENV_COORDINATOR_JOURNAL);
+            }
+            let rec = journal_test_rec(ws.path());
+            seed_journal_run(&rec);
+            let hub = TerminalHub::new();
+            hub.bind_record(rec.clone());
+            let (command, args) = echo_args();
+            let create = create_and_wait(&hub, command, &args).await;
+            assert!(create.get("result").is_some(), "create={create}");
+            let lines = read_journal(&rec);
+            assert_eq!(lines.len(), 1);
+            let v = &lines[0];
+            assert!(v.get("env").is_none());
+            assert_eq!(v["harness"], "grok");
+            assert_eq!(v["phase"], "implement");
+            assert_eq!(v["ok"], true);
+            assert_eq!(v["exit"], 0);
+            assert!(v.get("signal").is_none());
+            assert!(v["argv_head"].as_str().unwrap().contains("echo"));
+            unsafe {
+                std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            }
+        });
+    }
+
+    #[test]
+    fn unbound_create_does_not_write_journal() {
+        let _lock = crate::config::test_env_lock();
+        block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            unsafe {
+                std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+                std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+                std::env::remove_var(journal::ENV_COORDINATOR_JOURNAL);
+            }
+            let rec = journal_test_rec(ws.path());
+            seed_journal_run(&rec);
+            let hub = TerminalHub::new();
+            let (command, args) = echo_args();
+            let create = create_and_wait(&hub, command, &args).await;
+            assert!(create.get("result").is_some(), "create={create}");
+            assert!(!journal_path(&rec).exists());
+            unsafe {
+                std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            }
+        });
+    }
+
+    #[test]
+    fn journal_off_bound_create_writes_nothing() {
+        let _lock = crate::config::test_env_lock();
+        block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            unsafe {
+                std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+                std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+                std::env::set_var(journal::ENV_COORDINATOR_JOURNAL, "off");
+            }
+            let rec = journal_test_rec(ws.path());
+            seed_journal_run(&rec);
+            let hub = TerminalHub::new();
+            hub.bind_record(rec.clone());
+            let (command, args) = echo_args();
+            let create = create_and_wait(&hub, command, &args).await;
+            assert!(create.get("result").is_some(), "create={create}");
+            assert!(!journal_path(&rec).exists());
+            unsafe {
+                std::env::remove_var(journal::ENV_COORDINATOR_JOURNAL);
+                std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            }
+        });
+    }
+
+    #[test]
+    fn spawn_missing_program_journals_one_fail_line() {
+        let _lock = crate::config::test_env_lock();
+        block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            unsafe {
+                std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+                std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+                std::env::remove_var(journal::ENV_COORDINATOR_JOURNAL);
+            }
+            let rec = journal_test_rec(ws.path());
+            seed_journal_run(&rec);
+            let hub = TerminalHub::new();
+            hub.bind_record(rec.clone());
+            let create = create_and_wait(&hub, "__coord_no_such_bin_0034__", &["x"]).await;
+            assert!(create.get("error").is_some(), "create={create}");
+            let lines = read_journal(&rec);
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0]["exit"].is_null());
+            assert_eq!(lines[0]["dur_ms"], 0);
+            assert_eq!(lines[0]["ok"], false);
+            assert!(lines[0].get("env").is_none());
+            unsafe {
+                std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            }
+        });
+    }
+
+    #[test]
+    fn two_failing_commands_one_loop_suspect() {
+        let _lock = crate::config::test_env_lock();
+        block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            unsafe {
+                std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+                std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+                std::env::remove_var(journal::ENV_COORDINATOR_JOURNAL);
+            }
+            let rec = journal_test_rec(ws.path());
+            seed_journal_run(&rec);
+            let hub = TerminalHub::new();
+            hub.bind_record(rec.clone());
+            let (command, args) = fail_args();
+            let _ = create_and_wait(&hub, command, &args).await;
+            let _ = create_and_wait(&hub, command, &args).await;
+            let _ = create_and_wait(&hub, command, &args).await;
+            assert_eq!(read_journal(&rec).len(), 3);
+            let status = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
+            assert_eq!(status.matches("loop_suspect").count(), 1, "status={status}");
+            unsafe {
+                std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            }
+        });
+    }
+
+    #[test]
+    fn two_kills_journal_killed_without_loop_suspect() {
+        let _lock = crate::config::test_env_lock();
+        block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            unsafe {
+                std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+                std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+                std::env::remove_var(journal::ENV_COORDINATOR_JOURNAL);
+            }
+            let rec = journal_test_rec(ws.path());
+            seed_journal_run(&rec);
+            let hub = TerminalHub::new();
+            hub.bind_record(rec.clone());
+            let cwd = std::env::temp_dir();
+            let (command, args) = hang_args();
+            let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            for i in 0..2 {
+                let create = serde_json::from_str::<Value>(
+                    &hub.handle_sync(
+                        TerminalMethod::Create,
+                        json!(i),
+                        Some(&json!({"command": command, "args": args})),
+                        &cwd,
+                    )
+                    .await,
+                )
+                .unwrap();
+                let tid = create["result"]["terminalId"].as_str().unwrap().to_string();
+                let kill = serde_json::from_str::<Value>(
+                    &hub.handle_sync(
+                        TerminalMethod::Kill,
+                        json!(100 + i),
+                        Some(&json!({"terminalId": tid})),
+                        &cwd,
+                    )
+                    .await,
+                )
+                .unwrap();
+                assert!(kill.get("result").is_some(), "kill={kill}");
+                let wait = serde_json::from_str::<Value>(
+                    &hub.wait_for_exit_reply(json!(200 + i), Some(&json!({"terminalId": tid})))
+                        .await,
+                )
+                .unwrap();
+                // ACP wait_for_exit signal stays unset on Ok(wait); journal-only "killed".
+                assert!(
+                    wait["result"]["signal"].is_null(),
+                    "ACP signal must stay None, wait={wait}"
+                );
+            }
+            let lines = read_journal(&rec);
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[0]["signal"], "killed");
+            assert_eq!(lines[1]["signal"], "killed");
+            assert_eq!(lines[0]["ok"], false);
+            let status_path = crate::progress_log::path(&rec);
+            assert!(
+                !status_path.exists()
+                    || !std::fs::read_to_string(&status_path)
+                        .unwrap()
+                        .contains("loop_suspect")
+            );
+            unsafe {
+                std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            }
+        });
+    }
+
+    #[test]
+    fn host_probe_does_not_journal() {
+        let _lock = crate::config::test_env_lock();
+        block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            unsafe {
+                std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+                std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+                std::env::remove_var(journal::ENV_COORDINATOR_JOURNAL);
+            }
+            let rec = journal_test_rec(ws.path());
+            seed_journal_run(&rec);
+            let hub = TerminalHub::new();
+            hub.bind_record(rec.clone());
+            hub.probe_host_shell().await.expect("host probe");
+            assert!(!journal_path(&rec).exists());
+            unsafe {
+                std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            }
+        });
     }
 
     #[cfg(windows)]
