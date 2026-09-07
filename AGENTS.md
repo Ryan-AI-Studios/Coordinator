@@ -65,9 +65,9 @@ Control Plane entrypoints: `project add|list|show|set|scan` (`--auto-merge true|
 | Intent | Skill |
 |--------|--------|
 | Orient | `.agents/skills/onboarding` |
-| Implement track | `.agents/skills/implement` |
-| Cross-model gate | `.agents/skills/codex-review` |
-| Plan only | `C:\dev\coordinator\.agents\skills\plan` |
+| Implement track | `.agents/skills/implement-track` |
+| Cross-model gate | `.agents/skills/codex-review` (local; not shipped) |
+| Plan only | `C:\dev\coordinator\.agents\skills\plan-track` |
 
 Adapter injects name the phase skill as `{workspace|execution}/.agents/skills/<phase>/SKILL.md` (planning skills under the workspace root are not visible from the product `grok_cwd`).
 
