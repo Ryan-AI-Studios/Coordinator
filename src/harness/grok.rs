@@ -215,6 +215,10 @@ impl GrokSession {
             terminals: crate::harness::terminal::TerminalHub::new(),
         };
         session.handshake(timeout).await?;
+        if let Err(e) = session.terminals.probe_host_shell().await {
+            let _ = session.shutdown().await;
+            return Err(CoordinatorError::Message(e));
+        }
         Ok(session)
     }
 
@@ -298,6 +302,10 @@ impl GrokSession {
         self.supports_compact = value;
     }
 
+    pub fn terminal_spawn_tally(&self) -> crate::harness::terminal::SpawnTally {
+        self.terminals.spawn_tally()
+    }
+
     /// Bind this session to a project so ACP `session/update` writes the progress sidecar.
     pub fn set_progress_record(&mut self, record: ProjectRecord) {
         self.progress_record = Some(record);
@@ -362,6 +370,7 @@ impl GrokSession {
             ));
         }
         self.collected_text.clear();
+        self.terminals.reset_prompt_counters();
         let result = self
             .request(
                 "session/prompt",

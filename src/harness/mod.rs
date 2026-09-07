@@ -1,6 +1,7 @@
 //! Grok harness adapter, session pool, and role-binding helpers (track **0007**).
 //! Abort/recycle of a wedged ACP Prompt: track **0027**.
 //! Harness preflight (`doctor`): track **0028**.
+//! Windows `terminal/create` shell fallback + spawn-fail `HarnessCrash`: track **0032**.
 
 pub mod abort;
 pub mod grok;
