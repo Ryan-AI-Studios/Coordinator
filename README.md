@@ -292,7 +292,7 @@ Hard failure may POST `NotifyEvent` JSON to a **loopback** Hermes inbound webhoo
 | Item | Rule |
 |------|------|
 | Config | `{COORDINATOR_HOME}/config.json` additive `hermes.enabled` (default `false`) + `hermes.webhook_url` + `hermes.progress` (default `false`). **Do not** store the HMAC secret. |
-| Env | `COORDINATOR_HERMES=off` force-disables. `COORDINATOR_HERMES_URL` overrides the URL. `COORDINATOR_HERMES_SECRET` is required to POST. `COORDINATOR_NOTIFY=off` still skips **toast only** (does **not** disable Hermes failure or progress). |
+| Env | `COORDINATOR_HERMES=off` force-disables. `COORDINATOR_HERMES_URL` overrides the URL. `COORDINATOR_HERMES_SECRET` is required to POST. `COORDINATOR_NOTIFY=off` still skips **toast only** (does **not** disable Hermes failure or progress). Process start loads gitignored `.env` (cwd/parents, then next to the binary, then `{COORDINATOR_HOME}/.env`); existing process env wins. Copy `.env.example`. |
 | URL | `http://` + literal host in `{127.0.0.1, localhost, ::1, 127.0.0.0/8}` + non-empty path. Docs and examples use **`http://127.0.0.1:8644/...`** (IPv4-deterministic for WSL2). `https://`, non-loopback, empty path, and userinfo are rejected. No redirects off-box. |
 | Auth | Hermes generic **HMAC V2**: `X-Webhook-Signature-V2` + `X-Webhook-Timestamp` over `{timestamp}.{body}` (lowercase hex, no `sha256=` prefix). Unsigned POST is forbidden. |
 | Idempotency | Failure `X-Request-ID` is **Coordinator’s** key `{project_id}:{run_epoch}:{phase}:{failure_class}` (Hermes caches any stable string for 1 hour). Progress uses `{project_id}:{run_epoch}:progress:{from_phase}:{to_phase}:{written_at_unix_millis}`. |

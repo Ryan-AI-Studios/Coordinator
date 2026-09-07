@@ -18,6 +18,26 @@ pub const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Env: override machine home (registry + global config).
 pub const ENV_COORDINATOR_HOME: &str = "COORDINATOR_HOME";
 
+/// Load `.env` into the process. Missing files are ignored. Existing env wins
+/// (never override). Order: cwd/parents, then next to the executable, then
+/// `{COORDINATOR_HOME}/.env` (fills only unset keys).
+pub fn load_dotenv() {
+    let _ = dotenvy::dotenv();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        load_dotenv_path(&dir.join(".env"));
+    }
+    if let Ok(home) = std::env::var(ENV_COORDINATOR_HOME) {
+        load_dotenv_path(&PathBuf::from(home).join(".env"));
+    }
+}
+
+/// Load one `.env` path. Missing/unreadable files are ignored.
+pub fn load_dotenv_path(path: &Path) {
+    let _ = dotenvy::from_path(path);
+}
+
 /// Env: override base directory for per-project state (tests / advanced ops).
 /// When set, each project uses `{COORDINATOR_STATE_DIR}/{project_id}/run-state.json`.
 pub const ENV_COORDINATOR_STATE_DIR: &str = "COORDINATOR_STATE_DIR";
@@ -411,7 +431,8 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_WORKFLOW_DRIVER`, `COORDINATOR_OUTCOME_POLL_MS`,
 /// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
 /// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`,
-/// `COORDINATOR_NOTIFY_PROGRESS`, `COORDINATOR_PROGRESS_STALL_SECS`,
+/// `COORDINATOR_NOTIFY_PROGRESS`, `.env` via `load_dotenv_path`,
+/// `COORDINATOR_PROGRESS_STALL_SECS`,
 /// `COORDINATOR_CANCEL_WAIT_SECS`, `COORDINATOR_AGY_BIN`,
 /// `COORDINATOR_OPENCODE_BIN`, or `COORDINATOR_GROK_BIN` must
 /// hold this (survives poison so one failure does not cascade).
@@ -428,6 +449,41 @@ pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn dotenv_sets_unset_and_does_not_override() {
+        let _guard = test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            "COORDINATOR_HERMES_SECRET=from-file\nCOORDINATOR_HERMES_URL=http://127.0.0.1:8644/webhooks/coordinator-failure\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("COORDINATOR_HERMES_SECRET");
+            std::env::set_var("COORDINATOR_HERMES_URL", "already-set");
+        }
+        load_dotenv_path(&path);
+        assert_eq!(
+            std::env::var("COORDINATOR_HERMES_SECRET").as_deref(),
+            Ok("from-file")
+        );
+        assert_eq!(
+            std::env::var("COORDINATOR_HERMES_URL").as_deref(),
+            Ok("already-set"),
+            "process env must win over .env"
+        );
+        unsafe {
+            std::env::remove_var("COORDINATOR_HERMES_SECRET");
+            std::env::remove_var("COORDINATOR_HERMES_URL");
+        }
+    }
+
+    #[test]
+    fn dotenv_missing_file_is_ok() {
+        load_dotenv_path(Path::new(r"C:\definitely-missing-coordinator-dotenv.env"));
+    }
 
     #[test]
     fn rejects_non_loopback_bind() {
