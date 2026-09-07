@@ -277,6 +277,9 @@ pub struct HermesNotifyConfig {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
+    /// Opt-in phase-advance progress POSTs (track 0033). Missing key → false.
+    #[serde(default)]
+    pub progress: bool,
 }
 
 /// Machine-level prefs (`{COORDINATOR_HOME}/config.json`).
@@ -408,9 +411,9 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_WORKFLOW_DRIVER`, `COORDINATOR_OUTCOME_POLL_MS`,
 /// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
 /// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`,
-/// `COORDINATOR_PROGRESS_STALL_SECS`, `COORDINATOR_CANCEL_WAIT_SECS`,
-/// `COORDINATOR_AGY_BIN`, `COORDINATOR_OPENCODE_BIN`, or
-/// `COORDINATOR_GROK_BIN` must
+/// `COORDINATOR_NOTIFY_PROGRESS`, `COORDINATOR_PROGRESS_STALL_SECS`,
+/// `COORDINATOR_CANCEL_WAIT_SECS`, `COORDINATOR_AGY_BIN`,
+/// `COORDINATOR_OPENCODE_BIN`, or `COORDINATOR_GROK_BIN` must
 /// hold this (survives poison so one failure does not cascade).
 /// Last-used persist tests (`last-used.json`) also isolate `COORDINATOR_HOME`.
 #[cfg(test)]
@@ -623,6 +626,10 @@ mod tests {
         let loaded = load_machine_config_at(&path).unwrap();
         assert!(!loaded.hermes.enabled);
         assert!(loaded.hermes.webhook_url.is_none());
+        assert!(
+            !loaded.hermes.progress,
+            "missing hermes.progress on old config.json defaults false"
+        );
     }
 
     #[test]
@@ -637,6 +644,7 @@ mod tests {
             hermes: HermesNotifyConfig {
                 enabled: true,
                 webhook_url: Some("http://127.0.0.1:8644/webhooks/coordinator-failure".into()),
+                progress: false,
             },
             progress_stall_secs: None,
         };
@@ -652,6 +660,27 @@ mod tests {
             loaded.hermes.webhook_url.as_deref(),
             Some("http://127.0.0.1:8644/webhooks/coordinator-failure")
         );
+        assert!(!loaded.hermes.progress);
+    }
+
+    #[test]
+    fn hermes_progress_round_trip_no_version_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"scan_roots":[],"hermes":{"enabled":true,"webhook_url":"http://127.0.0.1:8644/webhooks/coordinator-failure"}}"#,
+        )
+        .unwrap();
+        let mut loaded = load_machine_config_at(&path).unwrap();
+        assert!(!loaded.hermes.progress);
+        loaded.hermes.progress = true;
+        atomic_write_json(&path, &loaded).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("secret"));
+        let again = load_machine_config_at(&path).unwrap();
+        assert!(again.hermes.progress);
+        assert_eq!(again.version, MACHINE_CONFIG_VERSION);
     }
 
     #[test]

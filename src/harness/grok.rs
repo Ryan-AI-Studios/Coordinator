@@ -1614,6 +1614,7 @@ mod tests {
             state_dir: None,
             auto_merge: false,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
             created_at: chrono::Utc::now(),
         });
         session.inject_prompt("read", timeout()).await.unwrap();

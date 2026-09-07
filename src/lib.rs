@@ -16,6 +16,7 @@
 //! Omit `--track` starts first exact Ready — not started row when unset or backlog-clear: track **0030**.
 //! Address-findings side loop after GateFail (cap 2 then difficulty Stop): track **0031**.
 //! Windows Grok `terminal/create` pwsh→powershell.exe→cmd.exe fallback + spawn-fail `HarnessCrash`: track **0032**.
+//! Opt-in Hermes progress POSTs on phase advance (failure JSON unchanged): track **0033**.
 //! Plan-review Antigravity one-shot (`agy --print`): track **0017**.
 //! Plan-review OpenCode one-shot (`opencode run`): track **0018**.
 //! Role-bound plan/fold/implement/advance drive: track **0019**.

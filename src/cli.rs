@@ -141,6 +141,9 @@ pub enum NotifyCommands {
     HermesTest {
         #[arg(long)]
         project: Option<String>,
+        /// Synthetic progress POST (no artifact / toast). Default is the 0015 failure probe.
+        #[arg(long)]
+        progress: bool,
     },
 }
 
@@ -247,6 +250,9 @@ pub enum ProjectCommands {
         /// true | false (omit = leave unchanged)
         #[arg(long = "auto-merge", value_parser = parse_auto_merge)]
         auto_merge: Option<bool>,
+        /// true | false (omit = leave unchanged). Opt-in Hermes progress POSTs.
+        #[arg(long = "notify-progress", value_parser = parse_auto_merge)]
+        notify_progress: Option<bool>,
         /// Repeatable. Canonical phase id = seconds (>0).
         #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
         phase_timeouts: Vec<(String, u64)>,
@@ -375,6 +381,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 execution_repos_json,
                 execution_repo_name,
                 auto_merge,
+                notify_progress,
                 phase_timeouts,
                 clear_phase_timeout,
                 clear_phase_timeouts,
@@ -404,6 +411,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     execution_repos,
                     execution_repo_name,
                     auto_merge,
+                    notify_progress,
                     phase_timeouts_secs,
                     clear_phase_timeouts,
                     clear_phase_timeout,
@@ -581,13 +589,19 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             },
         },
         Commands::Notify { action } => match action {
-            NotifyCommands::HermesTest { project } => {
+            NotifyCommands::HermesTest { project, progress } => {
                 let project_id = match project {
                     Some(p) => api::resolve_selected(Some(&p), true)?.id,
                     None => "hermes-test".into(),
                 };
-                let event = crate::notify::hermes::synthetic_event(project_id);
-                match crate::notify::hermes::probe(&event) {
+                let outcome = if progress {
+                    let event = crate::notify::hermes::synthetic_progress_event(project_id);
+                    crate::notify::hermes::probe_progress(&event)
+                } else {
+                    let event = crate::notify::hermes::synthetic_event(project_id);
+                    crate::notify::hermes::probe(&event)
+                };
+                match outcome {
                     crate::notify::hermes::ProbeOutcome::Skipped(reason) => {
                         println!("hermes skipped: {reason}");
                     }
@@ -816,7 +830,22 @@ mod tests {
     fn notify_hermes_test_in_help() {
         let cmd = Cli::command();
         let notify = cmd.find_subcommand("notify").expect("notify");
-        assert!(notify.find_subcommand("hermes-test").is_some());
+        let hermes = notify.find_subcommand("hermes-test").expect("hermes-test");
+        assert!(
+            hermes.get_arguments().any(|a| a.get_id() == "progress"),
+            "hermes-test --progress"
+        );
+    }
+
+    #[test]
+    fn project_set_has_notify_progress_flag() {
+        let cmd = Cli::command();
+        let project = cmd.find_subcommand("project").expect("project");
+        let set = project.find_subcommand("set").expect("set");
+        assert!(
+            set.get_arguments().any(|a| a.get_id() == "notify_progress"),
+            "set --notify-progress"
+        );
     }
 
     #[test]

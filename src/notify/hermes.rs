@@ -1,8 +1,10 @@
-//! Opt-in Hermes inbound webhook adapter (track 0015).
+//! Opt-in Hermes inbound webhook adapter (track 0015) + progress POSTs (0033).
 //!
-//! POSTs existing [`NotifyEvent`] JSON to a **loopback** Hermes route, signed
-//! with Hermes generic HMAC V2. Toast + Failure Artifact stay the default;
-//! this adapter is extra and never required for orchestration.
+//! Hard-failure POSTs existing [`NotifyEvent`] JSON (schema unchanged) to a
+//! **loopback** Hermes route, signed with Hermes generic HMAC V2. Toast + Failure
+//! Artifact stay the default; this adapter is extra and never required for
+//! orchestration. Progress uses [`crate::notify::ProgressEvent`] with
+//! `X-Coordinator-Event: progress` on the same URL / secret.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::{HermesNotifyConfig, load_machine_config};
 use crate::error::{CoordinatorError, Result};
-use crate::notify::{NotifyAdapter, NotifyEvent};
+use crate::notify::{EVENT_TYPE_PROGRESS, NotifyAdapter, NotifyEvent, ProgressEvent};
 
 /// Force-disable even if machine config is enabled.
 pub const ENV_COORDINATOR_HERMES: &str = "COORDINATOR_HERMES";
@@ -28,6 +30,7 @@ const HEADER_SIGNATURE_V2: &str = "X-Webhook-Signature-V2";
 const HEADER_REQUEST_ID: &str = "X-Request-ID";
 const HEADER_EVENT: &str = "X-Coordinator-Event";
 const EVENT_HARD_FAILURE: &str = "hard_failure";
+const EVENT_PROGRESS: &str = "progress";
 const POST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why Hermes did not POST.
@@ -170,6 +173,41 @@ impl HermesAdapter {
             HermesKind::Test(inst) => deliver_test(inst, event).map(|()| 200),
         }
     }
+
+    /// Blocking progress POST (CLI `--progress` probe).
+    pub fn notify_progress_blocking(&self, event: &ProgressEvent) -> Result<u16> {
+        match &self.kind {
+            HermesKind::NoOp => Ok(0),
+            HermesKind::Http { url, secret } => post_progress_http(url, secret, event),
+            #[cfg(test)]
+            HermesKind::Test(inst) => deliver_progress_test(inst, event).map(|()| 200),
+        }
+    }
+
+    /// Detached progress POST. Errors never fail the caller.
+    pub fn notify_progress(&self, event: &ProgressEvent) -> Result<()> {
+        match &self.kind {
+            HermesKind::NoOp => Ok(()),
+            HermesKind::Http { url, secret } => {
+                let url = url.clone();
+                let secret = secret.clone();
+                let event = event.clone();
+                let _ = std::thread::Builder::new()
+                    .name("coordinator-hermes-progress".into())
+                    .spawn(move || match post_progress_http(&url, &secret, &event) {
+                        Ok(status) => {
+                            eprintln!("coordinator: hermes progress delivered HTTP {status}");
+                        }
+                        Err(e) => {
+                            eprintln!("coordinator: hermes progress failed (non-fatal): {e}");
+                        }
+                    });
+                Ok(())
+            }
+            #[cfg(test)]
+            HermesKind::Test(inst) => deliver_progress_test(inst, event),
+        }
+    }
 }
 
 impl NotifyAdapter for HermesAdapter {
@@ -240,6 +278,19 @@ pub fn request_id(event: &NotifyEvent) -> String {
     )
 }
 
+/// Progress idempotency key. Millis suffix avoids 1-hour cache collisions on
+/// repeated from→to in the same epoch (0031 bounce loop, race-retry).
+pub fn progress_request_id(event: &ProgressEvent) -> String {
+    format!(
+        "{}:{}:progress:{}:{}:{}",
+        event.project_id,
+        event.run_epoch,
+        event.from_phase,
+        event.to_phase,
+        event.written_at.timestamp_millis()
+    )
+}
+
 /// Resolve config + env. Does not POST.
 pub fn resolve_from_machine() -> HermesResolve {
     if env_is_off(ENV_COORDINATOR_HERMES) {
@@ -285,6 +336,33 @@ pub fn synthetic_event(project_id: impl Into<String>) -> NotifyEvent {
         artifact_path: std::path::PathBuf::from("FAILURE.md"),
         written_at: chrono::Utc::now(),
         run_epoch: 0,
+    }
+}
+
+/// Synthetic progress probe: no artifact, no toast. Blocking POST when gated on.
+pub fn probe_progress(event: &ProgressEvent) -> ProbeOutcome {
+    match resolve_from_machine() {
+        HermesResolve::Skip(reason) => ProbeOutcome::Skipped(reason),
+        HermesResolve::Ready { url, secret } => match post_progress_http(&url, &secret, event) {
+            Ok(status) => ProbeOutcome::Delivered { status },
+            Err(e) => ProbeOutcome::Failed(e),
+        },
+    }
+}
+
+pub fn synthetic_progress_event(project_id: impl Into<String>) -> ProgressEvent {
+    ProgressEvent {
+        event_type: EVENT_TYPE_PROGRESS.into(),
+        project_id: project_id.into(),
+        track_id: Some("hermes-test".into()),
+        from_phase: "hermes-test".into(),
+        to_phase: "idle".into(),
+        elapsed_secs: None,
+        last_event: "hermes-test --progress".into(),
+        message: Some("synthetic progress probe; no FAILURE.md".into()),
+        written_at: chrono::Utc::now(),
+        run_epoch: 0,
+        next_track: None,
     }
 }
 
@@ -397,9 +475,14 @@ struct PreparedPost {
 }
 
 impl PreparedPost {
-    fn new(url: &str, secret: &str, event: &NotifyEvent) -> Result<Self> {
+    fn signed(
+        url: &str,
+        secret: &str,
+        event_header: &str,
+        request_id: String,
+        body: Vec<u8>,
+    ) -> Result<Self> {
         validate_webhook_url(url).map_err(CoordinatorError::Message)?;
-        let body = serde_json::to_vec(event)?;
         let timestamp = unix_now();
         let sig = sign_v2(secret, timestamp, &body);
         let headers = vec![
@@ -407,14 +490,34 @@ impl PreparedPost {
             ("User-Agent".into(), USER_AGENT.into()),
             (HEADER_TIMESTAMP.into(), timestamp.to_string()),
             (HEADER_SIGNATURE_V2.into(), sig),
-            (HEADER_REQUEST_ID.into(), request_id(event)),
-            (HEADER_EVENT.into(), EVENT_HARD_FAILURE.into()),
+            (HEADER_REQUEST_ID.into(), request_id),
+            (HEADER_EVENT.into(), event_header.into()),
         ];
         Ok(Self {
             url: url.to_string(),
             headers,
             body,
         })
+    }
+
+    fn new(url: &str, secret: &str, event: &NotifyEvent) -> Result<Self> {
+        Self::signed(
+            url,
+            secret,
+            EVENT_HARD_FAILURE,
+            request_id(event),
+            serde_json::to_vec(event)?,
+        )
+    }
+
+    fn progress(url: &str, secret: &str, event: &ProgressEvent) -> Result<Self> {
+        Self::signed(
+            url,
+            secret,
+            EVENT_PROGRESS,
+            progress_request_id(event),
+            serde_json::to_vec(event)?,
+        )
     }
 
     #[cfg(test)]
@@ -436,7 +539,14 @@ fn header<'a>(req: &'a CapturedRequest, name: &str) -> Option<&'a str> {
 }
 
 fn post_http(url: &str, secret: &str, event: &NotifyEvent) -> Result<u16> {
-    let prepared = PreparedPost::new(url, secret, event)?;
+    post_prepared(PreparedPost::new(url, secret, event)?)
+}
+
+fn post_progress_http(url: &str, secret: &str, event: &ProgressEvent) -> Result<u16> {
+    post_prepared(PreparedPost::progress(url, secret, event)?)
+}
+
+fn post_prepared(prepared: PreparedPost) -> Result<u16> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(POST_TIMEOUT))
         .max_redirects(0)
@@ -467,7 +577,19 @@ fn post_http(url: &str, secret: &str, event: &NotifyEvent) -> Result<u16> {
 
 #[cfg(test)]
 fn deliver_test(inst: &TestInstall, event: &NotifyEvent) -> Result<()> {
-    let prepared = PreparedPost::new(&inst.url, &inst.secret, event)?;
+    deliver_prepared(inst, PreparedPost::new(&inst.url, &inst.secret, event)?)
+}
+
+#[cfg(test)]
+fn deliver_progress_test(inst: &TestInstall, event: &ProgressEvent) -> Result<()> {
+    deliver_prepared(
+        inst,
+        PreparedPost::progress(&inst.url, &inst.secret, event)?,
+    )
+}
+
+#[cfg(test)]
+fn deliver_prepared(inst: &TestInstall, prepared: PreparedPost) -> Result<()> {
     inst.sink
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -732,6 +854,7 @@ mod tests {
             hermes: HermesNotifyConfig {
                 enabled: true,
                 webhook_url: Some(url.into()),
+                progress: false,
             },
             progress_stall_secs: None,
         };
@@ -993,6 +1116,80 @@ mod tests {
             return;
         }
         match probe(&synthetic_event("hermes-test")) {
+            ProbeOutcome::Delivered { status } => {
+                assert!((200..300).contains(&status), "status {status}");
+            }
+            ProbeOutcome::Skipped(r) => panic!("live skip: {r}"),
+            ProbeOutcome::Failed(e) => panic!("live fail: {e}"),
+        }
+    }
+
+    fn progress_event() -> ProgressEvent {
+        ProgressEvent {
+            event_type: EVENT_TYPE_PROGRESS.into(),
+            project_id: "proj".into(),
+            track_id: Some("0033".into()),
+            from_phase: "implement".into(),
+            to_phase: "cross-model-review".into(),
+            elapsed_secs: Some(12),
+            last_event: "workflow: advance implement → cross-model-review".into(),
+            message: None,
+            written_at: chrono::DateTime::from_timestamp_millis(1_778_000_000_123).unwrap(),
+            run_epoch: 4,
+            next_track: None,
+        }
+    }
+
+    #[test]
+    fn progress_request_id_uses_millis_suffix() {
+        let ev = progress_event();
+        assert_eq!(
+            progress_request_id(&ev),
+            "proj:4:progress:implement:cross-model-review:1778000000123"
+        );
+    }
+
+    #[test]
+    fn recording_progress_header_and_body() {
+        let ev = progress_event();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let adapter = HermesAdapter {
+            kind: HermesKind::Test(TestInstall {
+                url: "http://127.0.0.1:8644/webhooks/coordinator-progress".into(),
+                secret: "s3cret".into(),
+                mode: TestMode::Recording,
+                sink: sink.clone(),
+            }),
+        };
+        adapter.notify_progress(&ev).unwrap();
+        let captured = sink.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        let req = &captured[0];
+        let parsed: ProgressEvent = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(parsed, ev);
+        let v: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(v["event_type"], "progress");
+        assert!(v.get("failure_class").is_none());
+        assert_eq!(header(req, HEADER_EVENT).unwrap(), EVENT_PROGRESS);
+        assert_eq!(
+            header(req, HEADER_REQUEST_ID).unwrap(),
+            progress_request_id(&ev)
+        );
+        let ts: u64 = header(req, HEADER_TIMESTAMP).unwrap().parse().unwrap();
+        assert_eq!(
+            header(req, HEADER_SIGNATURE_V2).unwrap(),
+            sign_v2("s3cret", ts, &req.body)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs Hermes on 127.0.0.1:8644 + COORDINATOR_HERMES_LIVE=1"]
+    fn hermes_live_progress_probe() {
+        if std::env::var(ENV_COORDINATOR_HERMES_LIVE).ok().as_deref() != Some("1") {
+            eprintln!("skip: {ENV_COORDINATOR_HERMES_LIVE} != 1");
+            return;
+        }
+        match probe_progress(&synthetic_progress_event("hermes-test")) {
             ProbeOutcome::Delivered { status } => {
                 assert!((200..300).contains(&status), "status {status}");
             }

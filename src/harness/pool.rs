@@ -1581,6 +1581,7 @@ mod tests {
             state_dir: Some(dir.path().join("state")),
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
+            notify_progress: false,
             created_at: chrono::Utc::now(),
         };
         let stale = PersistedGrokHandle {
@@ -1647,6 +1648,7 @@ mod tests {
             state_dir: Some(dir.path().join("state")),
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
+            notify_progress: false,
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(&rec, None, crate::workflow::WorkflowDriver::FileWait).unwrap();
@@ -1683,6 +1685,7 @@ mod tests {
             state_dir: Some(dir.path().join("state")),
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
+            notify_progress: false,
             created_at: chrono::Utc::now(),
         };
         let t = prompt_timeout_for(&rec);
@@ -1710,6 +1713,7 @@ mod tests {
             state_dir: None,
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
+            notify_progress: false,
             created_at: chrono::Utc::now(),
         };
         let p = persist_path(&rec).unwrap();
@@ -1889,6 +1893,7 @@ mod tests {
             state_dir: None,
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
+            notify_progress: false,
             created_at: chrono::Utc::now(),
         };
         assert_eq!(grok_cwd(&rec), exec);
@@ -2237,6 +2242,7 @@ mod tests {
             state_dir: Some(dir.path().join("state")),
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
+            notify_progress: false,
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(

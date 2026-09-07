@@ -57,6 +57,7 @@ mod tests {
             state_dir: None,
             auto_merge: false,
             phase_timeouts_secs: BTreeMap::new(),
+            notify_progress: false,
             created_at: ChronoUtc::now(),
         }
     }
