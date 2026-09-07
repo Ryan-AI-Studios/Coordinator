@@ -64,7 +64,7 @@ session_start:
   4. Read C:\dev\coordinator\conductor\deferred.md
   5. Open assigned track: conductor\<####-Name>\{spec.md,plan.md}
   6. Tools (when inited): ai-brains + ledgerful — ALWAYS cwd = this product root
-  7. If execute/implement: load .agents/skills/implement/SKILL.md next
+  7. If execute/implement: load .agents/skills/implement-track/SKILL.md next
 ```
 
 ## Tools (product cwd only — always)
@@ -90,7 +90,7 @@ ledgerful change-context --json   # before meaningful edits
 |------|---------------|
 | **ai-brains** | `.agents/skills/ai-brains` |
 | **ledgerful** | `.agents/skills/ledgerful` |
-| **implement** | `.agents/skills/implement` |
+| **implement-track** | `.agents/skills/implement-track` |
 | **codex-review** | `.agents/skills/codex-review` |
 
 Skills may also exist under `C:\dev\coordinator\.agents\skills\`; **CLI cwd is always this repo**.
@@ -115,9 +115,9 @@ C:\dev\coordinator\conductor\
 
 | Owner says | You do |
 |------------|--------|
-| `track N` / `/plan` | Planning only — do not execute |
+| `track N` / `/plan-track` | Planning only — do not execute |
 | `Review track N` | Read-only plan audit |
-| `Implement track N` | Load **implement**; deliver DoD |
+| `Implement track N` / `/implement-track` | Load **implement-track**; deliver DoD |
 
 ### Plan fidelity
 
@@ -157,9 +157,9 @@ C:\dev\coordinator\conductor\
 
 | Intent | Skill |
 |--------|--------|
-| Execute Ready track | **`implement`** |
-| Cross-model audit | **`codex-review`** |
-| Plan only | `C:\dev\coordinator\.agents\skills\plan` |
+| Execute Ready track | **`implement-track`** |
+| Cross-model audit | **`codex-review`** (local; not shipped) |
+| Plan only | `C:\dev\coordinator\.agents\skills\plan-track` |
 | Audit a plan | `C:\dev\coordinator\.agents\skills\review-track` |
 
 ---
