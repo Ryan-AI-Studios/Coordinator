@@ -11,11 +11,14 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{CoordinatorError, Result};
 use crate::harness::grok::{ENV_GROK_BIN, GrokSession, PromptResult, map_failure_class};
+use crate::harness::terminal::SpawnTally;
 use crate::harness::{grok_cwd, resolve_grok_binary};
 
 /// Child-only model pin for the detached holder (never `set_var` on the parent).
 pub(crate) const ENV_GROK_MODEL: &str = "COORDINATOR_GROK_MODEL";
-use crate::outcome::{FailureClass, OutcomeSource, PhaseOutcome, write_and_apply};
+use crate::outcome::{
+    FailureClass, LAST_EVENT_MESSAGE_CAP, OutcomeSource, PhaseOutcome, write_and_apply,
+};
 use crate::persist::atomic_write_json;
 use crate::registry::ProjectRecord;
 use crate::state::{RunStatus, StatusView, ensure_state_dir, load_run_state, resolve_state_dir};
@@ -300,6 +303,7 @@ async fn apply_turn(
     turn: std::result::Result<PromptResult, CoordinatorError>,
     harness: GrokHarnessStatus,
     injected_phase: &str,
+    spawn: SpawnTally,
 ) -> Result<HarnessPromptView> {
     let state = load_run_state(record)?;
     let drifted = state.phase != injected_phase;
@@ -307,42 +311,61 @@ async fn apply_turn(
         Ok(pr) => {
             let mut applied = false;
             let mut status = None;
+            let mut error = None;
+            let mut failure_class = None;
             let skip = state.status != RunStatus::Running
                 || crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref())
                 || harness_is_aborted(&state, &harness)
                 || drifted;
             if !skip {
-                let msg = if pr.text.is_empty() {
-                    None
+                let spawn_dead =
+                    crate::workflow::graph::is_grok_bound(injected_phase) && spawn.all_failed();
+                if spawn_dead {
+                    let msg = spawn_fail_message(&spawn);
+                    let outcome = PhaseOutcome::failure(
+                        injected_phase,
+                        FailureClass::HarnessCrash,
+                        OutcomeSource::Adapter,
+                        Some(msg.clone()),
+                        Some(state.run_epoch),
+                    );
+                    status = Some(write_and_apply(record, outcome)?);
+                    applied = true;
+                    error = Some(msg);
+                    failure_class = Some(FailureClass::HarnessCrash);
                 } else {
-                    Some(pr.text.clone())
-                };
-                let next = if injected_phase == crate::workflow::graph::PHASE_ADVANCE {
-                    match crate::workflow::prompts::parse_next_track_line(&pr.text) {
-                        Some(Some(id)) => Some(id),
-                        Some(None) => Some(String::new()),
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-                let outcome = PhaseOutcome::success(
-                    injected_phase,
-                    OutcomeSource::Adapter,
-                    msg,
-                    next,
-                    Some(state.run_epoch),
-                );
-                status = Some(write_and_apply(record, outcome)?);
-                applied = true;
+                    let msg = if pr.text.is_empty() {
+                        None
+                    } else {
+                        Some(pr.text.clone())
+                    };
+                    let next = if injected_phase == crate::workflow::graph::PHASE_ADVANCE {
+                        match crate::workflow::prompts::parse_next_track_line(&pr.text) {
+                            Some(Some(id)) => Some(id),
+                            Some(None) => Some(String::new()),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let outcome = PhaseOutcome::success(
+                        injected_phase,
+                        OutcomeSource::Adapter,
+                        msg,
+                        next,
+                        Some(state.run_epoch),
+                    );
+                    status = Some(write_and_apply(record, outcome)?);
+                    applied = true;
+                }
             }
             Ok(HarnessPromptView {
                 text: Some(pr.text),
                 stop_reason: pr.stop_reason,
                 applied,
                 skipped: if skip { Some(true) } else { None },
-                error: None,
-                failure_class: None,
+                error,
+                failure_class,
                 status,
                 harness: Some(harness),
             })
@@ -376,6 +399,20 @@ async fn apply_turn(
                 harness: Some(harness),
             })
         }
+    }
+}
+
+fn spawn_fail_message(spawn: &SpawnTally) -> String {
+    let mut msg = format!("terminal spawn {}/{} ok", spawn.ok, spawn.attempts);
+    if let Some(err) = &spawn.last_error {
+        msg.push_str(" — last: ");
+        msg.push_str(err);
+    }
+    if msg.chars().count() <= LAST_EVENT_MESSAGE_CAP {
+        msg
+    } else {
+        let cut: String = msg.chars().take(LAST_EVENT_MESSAGE_CAP).collect();
+        format!("{cut}…")
     }
 }
 
@@ -856,8 +893,18 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             );
                         }
                     }
-                    let view =
-                        apply_turn(record, turn, snapshot_status(&shared), &injected_phase).await?;
+                    let tally = {
+                        let session = shared.session.lock().await;
+                        session.terminal_spawn_tally()
+                    };
+                    let view = apply_turn(
+                        record,
+                        turn,
+                        snapshot_status(&shared),
+                        &injected_phase,
+                        tally,
+                    )
+                    .await?;
                     (view_to_hold(view), false)
                 }
             },
@@ -1053,7 +1100,13 @@ pub async fn prompt(
         }
     }
     let harness = current_status(&rec).await;
-    apply_turn(&rec, turn, harness, &injected_phase).await
+    let tally = {
+        let mut pool = global_pool().lock().await;
+        pool.get_mut(&rec.id)
+            .map(|s| s.terminal_spawn_tally())
+            .unwrap_or_default()
+    };
+    apply_turn(&rec, turn, harness, &injected_phase, tally).await
 }
 
 pub async fn compact(project: Option<&str>, infer_cwd: bool) -> Result<HarnessPromptView> {
@@ -2261,6 +2314,7 @@ mod tests {
             turn,
             harness_stub(),
             crate::workflow::graph::PHASE_PLAN,
+            SpawnTally::default(),
         )
         .await
         .unwrap();
@@ -2307,6 +2361,7 @@ mod tests {
             turn,
             harness_stub(),
             crate::workflow::graph::PHASE_PLAN,
+            SpawnTally::default(),
         )
         .await
         .unwrap();
@@ -2357,6 +2412,7 @@ mod tests {
             turn,
             harness_stub(),
             crate::workflow::graph::PHASE_ADVANCE,
+            SpawnTally::default(),
         )
         .await
         .unwrap();
@@ -2406,6 +2462,7 @@ mod tests {
             turn,
             harness_stub(),
             crate::workflow::graph::PHASE_ADVANCE,
+            SpawnTally::default(),
         )
         .await
         .unwrap();
@@ -2455,6 +2512,7 @@ mod tests {
             turn,
             harness_stub(),
             crate::workflow::graph::PHASE_ADVANCE,
+            SpawnTally::default(),
         )
         .await
         .unwrap();
@@ -2464,6 +2522,171 @@ mod tests {
         assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN);
         assert_eq!(st.track_id.as_deref(), Some("0002"));
         assert!(st.last_event.contains("auto-start"));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    fn spawn_fail_tally() -> SpawnTally {
+        SpawnTally {
+            attempts: 2,
+            ok: 0,
+            last_error: Some("terminal/create spawn: program not found".into()),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn apply_turn_all_spawn_fail_is_harness_crash_not_gate() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0032".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+
+        let turn = Ok(PromptResult {
+            text: "implement claimed done".into(),
+            stop_reason: Some("end_turn".into()),
+        });
+        let view = apply_turn(
+            &rec,
+            turn,
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            spawn_fail_tally(),
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        let st = view.status.expect("applied");
+        assert_eq!(st.status, crate::state::RunStatus::Stopped);
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_IMPLEMENT);
+        assert_eq!(st.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(st.review.is_none() || st.review.as_ref().unwrap().attempted.is_empty());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn apply_turn_mixed_spawn_stays_success() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0032".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+
+        let turn = Ok(PromptResult {
+            text: "mixed".into(),
+            stop_reason: Some("end_turn".into()),
+        });
+        let view = apply_turn(
+            &rec,
+            turn,
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally {
+                attempts: 2,
+                ok: 1,
+                last_error: Some("terminal/create spawn: program not found".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        assert!(view.failure_class.is_none());
+        let st = view.status.expect("applied");
+        assert_eq!(st.status, crate::state::RunStatus::Running);
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_CROSS_MODEL);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn prompt_all_terminal_create_spawn_fail_stops_implement() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0032".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+
+        let mut lines = mock_handshake_ok("sess-spawn-dead");
+        lines.push(crate::harness::terminal::terminal_create(
+            99,
+            "sess-spawn-dead",
+            "__coord_no_such_bin_0032__",
+            &["x"],
+        ));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            lines,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+
+        let view = prompt(Some(&rec.id), "go".into(), false).await.unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        let st = view.status.expect("applied");
+        assert_eq!(st.status, crate::state::RunStatus::Stopped);
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_IMPLEMENT);
+        assert!(st.review.is_none() || st.review.as_ref().unwrap().attempted.is_empty());
+        let _ = shutdown(Some(&rec.id), false).await;
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }

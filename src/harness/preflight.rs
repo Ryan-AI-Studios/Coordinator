@@ -404,6 +404,7 @@ fn probe_row(
     }
 
     let (status, detail) = classify_auth(&harness, &path, probe, auth_cache);
+    let detail = merge_shell_detail(&harness, detail);
     DoctorRow {
         role: role.to_string(),
         harness,
@@ -413,6 +414,19 @@ fn probe_row(
         required,
         login,
         detail,
+    }
+}
+
+fn merge_shell_detail(harness: &str, existing: Option<String>) -> Option<String> {
+    if !harness.eq_ignore_ascii_case("grok") {
+        return existing;
+    }
+    let Some(extra) = crate::harness::terminal::grok_terminal_shell_detail() else {
+        return existing;
+    };
+    match existing {
+        None => Some(extra),
+        Some(old) => Some(format!("{old}; {extra}")),
     }
 }
 
@@ -788,6 +802,20 @@ mod tests {
         );
         assert!(row(&report, "planner").required);
         assert!(!row(&report, "cross_model_secondary").required);
+        assert!(
+            report.ok,
+            "missing pwsh must not refuse run: {:?}",
+            row(&report, "planner").detail
+        );
+    }
+
+    #[test]
+    fn merge_shell_detail_skips_non_grok() {
+        assert_eq!(
+            merge_shell_detail("agy", Some("x".into())),
+            Some("x".into())
+        );
+        assert_eq!(merge_shell_detail("gh", None), None);
     }
 
     #[test]
