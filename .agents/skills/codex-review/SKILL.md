@@ -95,6 +95,8 @@ Orchestrator writes canonical `review.md`.
 
 ### Codex Primary (Windows)
 
+Default model: **`gpt-5.6-luna`** with `model_reasoning_effort=high`. Do not pin `gpt-5.4` (retired on ChatGPT Codex accounts).
+
 ```powershell
 $TrackDir = "C:\dev\coordinator\conductor\<####-Name>"
 $PrimaryRepo = "C:\dev\coordinator\coordinator"
@@ -108,7 +110,7 @@ Audit every DoD against implementation. Flag planning docs committed into produc
 "@
 
 codex exec -C $PrimaryRepo -s read-only `
-  -m gpt-5.4 -c 'model_reasoning_effort="high"' `
+  -m gpt-5.6-luna -c 'model_reasoning_effort="high"' `
   --add-dir "C:\dev\coordinator" --ephemeral `
   -o "$TrackDir\review.codex.md" $Prompt
 ```
