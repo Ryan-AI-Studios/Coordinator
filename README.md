@@ -280,7 +280,7 @@ Hard failure (apply `status=failure`, including timeout synthesis and adapter fa
 | Artifact | Atomic markdown: project/track/phase/class/epoch + fenced `last_event` / message + `recommended_action` (advisory — no auto-retry) |
 | Toast | `tauri-winrt-notification` 0.8.1, PowerShell AUMID (no installer). Title `Coordinator: {class}`. Disabled with `COORDINATOR_NOTIFY=off` |
 | Adapters | `NotifyAdapter` trait: Artifact + Toast + Log + **opt-in Hermes** (HMAC V2 POST of unchanged `NotifyEvent` JSON). Default **off**. Adapter errors never undo `FAILURE.md` or skip toast. |
-| Surfaces | `coordinator failure show` prints the markdown; `GET /v1/failure` returns `{path, body}` or **404**. `coordinator notify hermes-test` probes Hermes only (no artifact, no toast). |
+| Surfaces | `coordinator failure show` prints the markdown; `GET /v1/failure` returns `{path, body}` or **404**. `coordinator notify hermes-test` probes Hermes only (no artifact, no toast). `hermes-test --progress` probes a synthetic progress event. |
 | Status | Additive `failure_artifact` path (`null` when the file is absent). Existing `failure_class` / `run_epoch` / `phase_started_at` / `next_track` are also on status JSON |
 
 ### Hermes notify (opt-in)
@@ -291,18 +291,19 @@ Hard failure may POST `NotifyEvent` JSON to a **loopback** Hermes inbound webhoo
 
 | Item | Rule |
 |------|------|
-| Config | `{COORDINATOR_HOME}/config.json` additive `hermes.enabled` (default `false`) + `hermes.webhook_url`. **Do not** store the HMAC secret. |
-| Env | `COORDINATOR_HERMES=off` force-disables. `COORDINATOR_HERMES_URL` overrides the URL. `COORDINATOR_HERMES_SECRET` is required to POST. `COORDINATOR_NOTIFY=off` still skips **toast only**. |
+| Config | `{COORDINATOR_HOME}/config.json` additive `hermes.enabled` (default `false`) + `hermes.webhook_url` + `hermes.progress` (default `false`). **Do not** store the HMAC secret. |
+| Env | `COORDINATOR_HERMES=off` force-disables. `COORDINATOR_HERMES_URL` overrides the URL. `COORDINATOR_HERMES_SECRET` is required to POST. `COORDINATOR_NOTIFY=off` still skips **toast only** (does **not** disable Hermes failure or progress). |
 | URL | `http://` + literal host in `{127.0.0.1, localhost, ::1, 127.0.0.0/8}` + non-empty path. Docs and examples use **`http://127.0.0.1:8644/...`** (IPv4-deterministic for WSL2). `https://`, non-loopback, empty path, and userinfo are rejected. No redirects off-box. |
 | Auth | Hermes generic **HMAC V2**: `X-Webhook-Signature-V2` + `X-Webhook-Timestamp` over `{timestamp}.{body}` (lowercase hex, no `sha256=` prefix). Unsigned POST is forbidden. |
-| Idempotency | `X-Request-ID` is **Coordinator’s** key `{project_id}:{run_epoch}:{phase}:{failure_class}` (Hermes caches any stable string for 1 hour). |
+| Idempotency | Failure `X-Request-ID` is **Coordinator’s** key `{project_id}:{run_epoch}:{phase}:{failure_class}` (Hermes caches any stable string for 1 hour). Progress uses `{project_id}:{run_epoch}:progress:{from_phase}:{to_phase}:{written_at_unix_millis}`. |
 
 ```json
 {
   "version": 1,
   "hermes": {
     "enabled": true,
-    "webhook_url": "http://127.0.0.1:8644/webhooks/coordinator-failure"
+    "webhook_url": "http://127.0.0.1:8644/webhooks/coordinator-failure",
+    "progress": false
   }
 }
 ```
@@ -310,6 +311,7 @@ Hard failure may POST `NotifyEvent` JSON to a **loopback** Hermes inbound webhoo
 ```powershell
 $env:COORDINATOR_HERMES_SECRET = "<same as Hermes route secret>"
 cargo run -- notify hermes-test
+cargo run -- notify hermes-test --progress
 ```
 
 Hermes must be reachable from Windows at **`127.0.0.1:8644`**. Recommended route (`~/.hermes/config.yaml` on the Hermes host) — **`deliver_only: true` is mandatory** so a hard fail does not wake an LLM turn:
@@ -335,6 +337,26 @@ platforms:
 ```
 
 Omit `events` (or do not filter on GitHub event types).
+
+### Hermes progress (opt-in, default off)
+
+Hard-failure JSON is **unchanged** (no `event_type` on `NotifyEvent`). Progress is a separate `ProgressEvent` POST: `event_type=progress`, header `X-Coordinator-Event: progress`, never toast, never `FAILURE.md`, never stalls apply.
+
+Enable with **any** of: env `COORDINATOR_NOTIFY_PROGRESS` in `{1,true,on}` (case-insensitive), machine `hermes.progress: true`, or `project set --notify-progress true`. Env `COORDINATOR_NOTIFY_PROGRESS=off` force-disables. Progress still requires the 0015 Hermes gate (`enabled`/URL + `COORDINATOR_HERMES_SECRET`, not `COORDINATOR_HERMES=off`). HTTP `PATCH`/`POST` project set accepts additive `notify_progress`.
+
+Prefer a **second Hermes route** so a failure prompt does not render `{from_phase}` literals:
+
+```yaml
+        coordinator-progress:
+          secret: "<same>"
+          deliver: telegram
+          deliver_only: true
+          events: ["progress"]
+          prompt: |
+            Coordinator {from_phase} → {to_phase} track={track_id} {last_event}
+```
+
+Operator may point `webhook_url` at either route (one URL in Coordinator). Missing template keys stay literal `{key}` per Hermes. Do not ship Hermes config from this repo. The operator poll cron is unchanged.
 
 `COORDINATOR_NOTIFY=off` is the CI / headless default path. `cargo test` never requires a visible toast (recording adapter).
 
@@ -376,7 +398,7 @@ After a successful Review Gate, Coordinator watches CI **outside** any model Ses
 | Fail | `failure_class=ci_failed` → Stopped + Failure Artifact + toast. No auto-retry of the workflow |
 | Process cap | Each `gh`/`git` spawn: 30s then kill (transient, `ci-wait: gh timed out`) |
 
-`project add` / `project set` accept `--auto-merge true|false` (omit = default on / leave unchanged). HTTP `POST /v1/projects` and `/v1/projects/set` take optional `auto_merge`. Old `registry.json` records without the field load as **true**.
+`project add` / `project set` accept `--auto-merge true|false` (omit = default on / leave unchanged). HTTP `POST /v1/projects` and `/v1/projects/set` take optional `auto_merge`. Old `registry.json` records without the field load as **true**. `project set --notify-progress true|false` is additive (omit = leave unchanged; missing JSON field = **false**). HTTP set takes optional `notify_progress`.
 
 Default `cargo test` uses a scripted `CiBackend` and never needs `gh` auth. Optional live smoke: `$env:COORDINATOR_GH_LIVE='1'; cargo test ci_live -- --ignored --nocapture`.
 
@@ -471,7 +493,7 @@ coordinator project show [--project <path|id>]
 coordinator project set [--project …]
     [--profile …] [--execution-repo …] [--conductor-dir …] [--state-dir …]
     [--display-name …] [--execution-repos-json <json>] [--execution-repo-name …]
-    [--auto-merge true|false]
+    [--auto-merge true|false] [--notify-progress true|false]
     [--phase-timeout PHASE=SECS]... [--clear-phase-timeout PHASE]...
     [--clear-phase-timeouts]
 coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]
@@ -486,7 +508,7 @@ coordinator outcome write --phase <id> --status success|failure
     [--next-track <id>] [--source cli]
 coordinator outcome show [--project …]
 coordinator failure show [--project …]
-coordinator notify hermes-test [--project …]
+coordinator notify hermes-test [--project …] [--progress]
 coordinator wait [--project …] [--timeout-secs N]
 coordinator harness grok start [--project …]
 coordinator harness grok prompt --text <…> | --file <path> [--project …]

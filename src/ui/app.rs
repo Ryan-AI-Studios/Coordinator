@@ -974,6 +974,7 @@ mod tests {
             state_dir: None,
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);
@@ -1016,6 +1017,7 @@ mod tests {
             state_dir: None,
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);

@@ -353,6 +353,7 @@ fn apply_lock() -> &'static Mutex<()> {
 struct ApplyCommit {
     view: StatusView,
     notify: Option<crate::notify::NotifyEvent>,
+    progress: Option<crate::notify::ProgressEvent>,
 }
 
 /// Single entry for mutating run-state from a Phase Outcome.
@@ -369,13 +370,16 @@ pub fn apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView
             .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
         with_run_state_lock(record, || apply_locked(record, outcome))?
     };
-    fire_pending_notify(record, commit.notify);
+    fire_pending_notify(record, &commit);
     Ok(refresh_failure_artifact(record, commit.view))
 }
 
-fn fire_pending_notify(record: &ProjectRecord, pending: Option<crate::notify::NotifyEvent>) {
-    if let Some(event) = pending {
-        crate::notify::on_hard_failure(record, &event);
+fn fire_pending_notify(record: &ProjectRecord, commit: &ApplyCommit) {
+    if let Some(event) = &commit.notify {
+        crate::notify::on_hard_failure(record, event);
+    }
+    if let Some(event) = &commit.progress {
+        crate::notify::on_progress(event);
     }
 }
 
@@ -396,6 +400,7 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
         return Ok(ApplyCommit {
             view: StatusView::from_record(record, &base),
             notify: None,
+            progress: None,
         });
     }
 
@@ -432,6 +437,15 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
             outcome.phase, base.phase
         )));
     }
+
+    let from_phase = base.phase.clone();
+    let snap_track = base.track_id.clone();
+    let snap_epoch = base.run_epoch;
+    let elapsed_secs = if base.phase_started_at.is_some() {
+        Some(base.effective_running_elapsed(outcome.written_at).as_secs())
+    } else {
+        None
+    };
 
     let mut state = base.clone();
     let canonical = crate::workflow::is_canonical(&outcome.phase);
@@ -510,6 +524,7 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
         return Ok(ApplyCommit {
             view: StatusView::from_record(record, &fresh),
             notify: None,
+            progress: None,
         });
     }
     if fresh.run_epoch != base.run_epoch
@@ -558,6 +573,35 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
         kind = "end";
         notify = None;
     }
+    let progress = if crate::notify::progress_enabled(record)
+        && ((matches!(outcome.status, OutcomeStatus::Success) && canonical) || bounced)
+    {
+        let to_phase = if state.status == RunStatus::Idle {
+            "idle".to_string()
+        } else {
+            state.phase.clone()
+        };
+        let next_track = if state.run_epoch != snap_epoch {
+            state.track_id.clone()
+        } else {
+            state.next_track.clone()
+        };
+        Some(crate::notify::ProgressEvent {
+            event_type: crate::notify::EVENT_TYPE_PROGRESS.into(),
+            project_id: record.id.clone(),
+            track_id: snap_track,
+            from_phase,
+            to_phase,
+            elapsed_secs,
+            last_event: state.last_event.clone(),
+            message: outcome.message.clone(),
+            written_at: outcome.written_at,
+            run_epoch: snap_epoch,
+            next_track,
+        })
+    } else {
+        None
+    };
     crate::progress_log::append(
         record,
         kind,
@@ -566,6 +610,7 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
     Ok(ApplyCommit {
         view: StatusView::from_record(record, &state),
         notify,
+        progress,
     })
 }
 
@@ -720,7 +765,7 @@ pub fn try_timeout_under_lock(record: &ProjectRecord) -> Result<Option<StatusVie
     };
     match commit {
         Some(c) => {
-            fire_pending_notify(record, c.notify);
+            fire_pending_notify(record, &c);
             Ok(Some(refresh_failure_artifact(record, c.view)))
         }
         None => Ok(None),
@@ -796,6 +841,7 @@ mod tests {
             state_dir: None,
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
             created_at: Utc::now(),
         }
     }

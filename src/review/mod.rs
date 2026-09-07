@@ -412,6 +412,7 @@ mod tests {
             state_dir: None,
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
+            notify_progress: false,
             created_at: Utc::now(),
         }
     }

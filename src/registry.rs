@@ -48,6 +48,8 @@ pub struct ProjectSetOptions {
     pub execution_repo_name: Option<String>,
     /// Omit = leave unchanged.
     pub auto_merge: Option<bool>,
+    /// Omit = leave unchanged. Opt-in Hermes progress POSTs (track 0033).
+    pub notify_progress: Option<bool>,
     /// Overlay keys (None = no overlay). Merge; does not replace the map.
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
     /// Wipe the project timeout map before overlay.
@@ -80,6 +82,9 @@ pub struct ProjectRecord {
     /// Per-project phase wall clocks (seconds). Empty omits the key on save.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub phase_timeouts_secs: BTreeMap<String, u64>,
+    /// Opt-in Hermes progress POSTs (track 0033). Missing field on old records = off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notify_progress: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -196,6 +201,7 @@ impl Registry {
             state_dir,
             auto_merge: opts.auto_merge.unwrap_or(true),
             phase_timeouts_secs: opts.phase_timeouts_secs,
+            notify_progress: false,
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
@@ -253,6 +259,9 @@ impl Registry {
         }
         if let Some(v) = opts.auto_merge {
             rec.auto_merge = v;
+        }
+        if let Some(v) = opts.notify_progress {
+            rec.notify_progress = v;
         }
         // Clears first, then overlay so clear-all + plan=3600 leaves only plan.
         if opts.clear_phase_timeouts {
@@ -601,6 +610,10 @@ mod tests {
             loaded.projects[0].phase_timeouts_secs.is_empty(),
             "missing phase_timeouts_secs on old registry JSON defaults empty"
         );
+        assert!(
+            !loaded.projects[0].notify_progress,
+            "missing notify_progress on old registry JSON defaults false"
+        );
         let _guard = crate::config::test_env_lock();
         let isolated = tempdir().unwrap();
         unsafe {
@@ -637,6 +650,48 @@ mod tests {
         reg.save(&reg_path).unwrap();
         let loaded = Registry::load(&reg_path).unwrap();
         assert!(!loaded.projects[0].auto_merge);
+    }
+
+    #[test]
+    fn set_notify_progress_true_false_round_trip() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        assert!(!rec.notify_progress);
+        let on = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    notify_progress: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(on.notify_progress);
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert!(loaded.projects[0].notify_progress);
+        let mut r = Registry::load(&reg_path).unwrap();
+        let off = r
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    notify_progress: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!off.notify_progress);
+        r.save(&reg_path).unwrap();
+        let again = Registry::load(&reg_path).unwrap();
+        assert!(!again.projects[0].notify_progress);
+        let text = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(
+            !text.contains("notify_progress"),
+            "false notify_progress must omit the key: {text}"
+        );
     }
 
     #[test]

@@ -447,6 +447,7 @@ mod tests {
             state_dir: None,
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
             created_at: chrono::Utc::now(),
         }
     }
@@ -489,6 +490,7 @@ mod tests {
                 state_dir: None,
                 auto_merge: true,
                 phase_timeouts_secs: std::collections::BTreeMap::new(),
+                notify_progress: false,
                 created_at: chrono::Utc::now(),
             };
             let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::File, None, None, None);

@@ -273,6 +273,7 @@ mod tests {
             state_dir: None,
             auto_merge: false,
             phase_timeouts_secs: BTreeMap::new(),
+            notify_progress: false,
             created_at: Utc::now(),
         }
     }
@@ -338,6 +339,7 @@ mod tests {
             state_dir: None,
             auto_merge: false,
             phase_timeouts_secs: BTreeMap::new(),
+            notify_progress: false,
             created_at: Utc::now(),
         }
     }
@@ -552,6 +554,7 @@ mod tests {
             state_dir: None,
             auto_merge: true,
             phase_timeouts_secs: BTreeMap::new(),
+            notify_progress: false,
             created_at: Utc::now(),
         };
         run_with_driver(&rec, Some("0031".into()), WorkflowDriver::FileWait).unwrap();

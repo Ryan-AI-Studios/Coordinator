@@ -62,6 +62,8 @@ pub struct ProjectSetRequest {
     #[serde(default)]
     pub auto_merge: Option<bool>,
     #[serde(default)]
+    pub notify_progress: Option<bool>,
+    #[serde(default)]
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     pub clear_phase_timeouts: Option<bool>,
@@ -267,6 +269,7 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         execution_repos: req.execution_repos,
         execution_repo_name: req.execution_repo_name,
         auto_merge: req.auto_merge,
+        notify_progress: req.notify_progress,
         phase_timeouts_secs: req.phase_timeouts_secs,
         clear_phase_timeouts: req.clear_phase_timeouts.unwrap_or(false),
         clear_phase_timeout: req.clear_phase_timeout.unwrap_or_default(),
@@ -624,6 +627,15 @@ mod tests {
     use crate::state::RunStatus;
     use crate::workflow::ENV_PHASE_TIMEOUT_SECS;
     use tempfile::tempdir;
+
+    #[test]
+    fn project_set_request_notify_progress_round_trip() {
+        let raw = r#"{"project":"abc","notify_progress":true}"#;
+        let req: ProjectSetRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.notify_progress, Some(true));
+        let omitted: ProjectSetRequest = serde_json::from_str(r#"{"project":"abc"}"#).unwrap();
+        assert_eq!(omitted.notify_progress, None);
+    }
 
     fn add_isolated_project() -> (tempfile::TempDir, tempfile::TempDir, ProjectRecord) {
         let home = tempdir().unwrap();
