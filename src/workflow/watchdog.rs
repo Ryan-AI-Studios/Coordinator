@@ -2,7 +2,8 @@
 //!
 //! Detects and surfaces a silent ACP hang. Does **not** write `FAILURE.md`,
 //! toast, or stop the run. First stall this phase is recycled by **0027**
-//! only when the last heartbeat was inject (not `session/update`).
+//! unless sidecar `tool_in_flight` (track **0035**). `session/update` text is
+//! not a skip.
 
 use std::time::Duration;
 
@@ -46,6 +47,9 @@ struct ProgressSidecar {
     kind: ProgressKind,
     #[serde(default)]
     session_id: String,
+    /// Client-visible tool/terminal actually running (track **0035**). Missing → false.
+    #[serde(default)]
+    tool_in_flight: bool,
 }
 
 /// Sidecar path: same `resolve_state_dir` as `harness-grok.json`.
@@ -92,19 +96,31 @@ pub fn progress_stall_interval() -> Option<Duration> {
 /// Write a heartbeat to the sidecar. Never takes the run-state lock.
 ///
 /// Debounce: `session/update` writes are skipped when the previous write was
-/// less than 2s ago, **except** the first update after `inject`.
-pub fn note_progress(record: &ProjectRecord, kind: ProgressKind, session_id: Option<&str>) {
-    let _ = note_progress_inner(record, kind, session_id);
+/// less than 2s ago, **except** the first update after `inject` **or** a
+/// `tool_in_flight` flip (cargo-end must land even 500ms after a chunk).
+pub fn note_progress(
+    record: &ProjectRecord,
+    kind: ProgressKind,
+    session_id: Option<&str>,
+    tool_in_flight: bool,
+) {
+    let _ = note_progress_inner(record, kind, session_id, tool_in_flight);
 }
 
 fn note_progress_inner(
     record: &ProjectRecord,
     kind: ProgressKind,
     session_id: Option<&str>,
+    tool_in_flight: bool,
 ) -> Result<()> {
     let now = Utc::now();
-    if kind == ProgressKind::SessionUpdate
-        && let Some(prev) = read_sidecar(record)
+    let prev = read_sidecar(record);
+    let flip = prev
+        .as_ref()
+        .is_none_or(|p| p.tool_in_flight != tool_in_flight);
+    if !flip
+        && kind == ProgressKind::SessionUpdate
+        && let Some(prev) = &prev
         && prev.kind != ProgressKind::Inject
     {
         let gap = (now - prev.last_progress_at)
@@ -120,7 +136,11 @@ fn note_progress_inner(
         version: SIDECAR_VERSION,
         last_progress_at: now,
         kind,
-        session_id: session_id.unwrap_or("").to_string(),
+        session_id: session_id
+            .map(str::to_string)
+            .or_else(|| prev.map(|p| p.session_id))
+            .unwrap_or_default(),
+        tool_in_flight,
     };
     atomic_write_json(&path, &sidecar)
 }
@@ -219,12 +239,11 @@ fn should_watch(state: &RunState) -> bool {
     state.last_driven_phase.as_deref() == Some(state.phase.as_str())
 }
 
-/// True when the sidecar's last heartbeat was an ACP `session/update` (Grok already worked).
-pub fn last_progress_was_session_update(record: &ProjectRecord) -> bool {
-    matches!(
-        read_sidecar(record).map(|s| s.kind),
-        Some(ProgressKind::SessionUpdate)
-    )
+/// True when a Client-visible tool/terminal is running. Missing/old sidecar → false.
+pub fn sidecar_tool_in_flight(record: &ProjectRecord) -> bool {
+    read_sidecar(record)
+        .map(|s| s.tool_in_flight)
+        .unwrap_or(false)
 }
 
 fn read_sidecar(record: &ProjectRecord) -> Option<ProgressSidecar> {
@@ -309,11 +328,23 @@ mod tests {
         session_id: &str,
     ) {
         crate::state::ensure_state_dir(r).unwrap();
+        write_sidecar_full(r, at, kind, session_id, false);
+    }
+
+    fn write_sidecar_full(
+        r: &ProjectRecord,
+        at: DateTime<Utc>,
+        kind: ProgressKind,
+        session_id: &str,
+        tool_in_flight: bool,
+    ) {
+        crate::state::ensure_state_dir(r).unwrap();
         let sidecar = ProgressSidecar {
             version: SIDECAR_VERSION,
             last_progress_at: at,
             kind,
             session_id: session_id.into(),
+            tool_in_flight,
         };
         atomic_write_json(&progress_path(r).unwrap(), &sidecar).unwrap();
     }
@@ -375,7 +406,7 @@ mod tests {
         isolate_clocks(home.path(), "1", "3600");
         let r = rec(dir.path());
         start_driven_adapter(&r);
-        note_progress(&r, ProgressKind::Inject, Some("sess-1"));
+        note_progress(&r, ProgressKind::Inject, Some("sess-1"), false);
 
         let tick = poll_once(&r).unwrap();
         assert!(
@@ -408,7 +439,7 @@ mod tests {
         let stalled = check_stall(&r).unwrap().expect("stall");
         assert!(stalled.last_event.contains("watchdog: stall"));
 
-        note_progress(&r, ProgressKind::SessionUpdate, Some("sess-1"));
+        note_progress(&r, ProgressKind::SessionUpdate, Some("sess-1"), false);
         let view = check_stall(&r).unwrap().expect("resume");
         assert_eq!(view.last_event, "watchdog: progress");
         assert!(view.stall.is_none());
@@ -470,7 +501,7 @@ mod tests {
         isolate_clocks(home.path(), "1", "3600");
         let r = rec(dir.path());
         start_driven_adapter(&r);
-        note_progress(&r, ProgressKind::Inject, Some("sess-1"));
+        note_progress(&r, ProgressKind::Inject, Some("sess-1"), false);
         run::pause(&r).unwrap();
         std::thread::sleep(Duration::from_millis(1200));
         run::resume(&r).unwrap();
@@ -756,6 +787,78 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(progress_path(&r).unwrap()).unwrap())
                 .unwrap();
         assert_eq!(parsed.kind, ProgressKind::SessionUpdate);
+        assert!(
+            parsed.tool_in_flight,
+            "missing tool_call status defaults pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_tool_call_pending_and_completed() {
+        use crate::harness::grok::{
+            mock_handshake_ok, session_update_tool_call_status, session_update_tool_call_update,
+        };
+
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        let mut lines = mock_handshake_ok("sess-pending");
+        lines.push(session_update_tool_call_status("read", Some("pending")));
+        lines.push(session_update_tool_call_update("completed"));
+        lines.push(crate::harness::grok::rpc_result(
+            4,
+            serde_json::json!({ "stopReason": "end_turn" }),
+        ));
+        let mut session = crate::harness::GrokSession::start_mock(
+            dir.path().to_path_buf(),
+            lines,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        session.set_progress_record(r.clone());
+        session
+            .inject_prompt("go", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let parsed: ProgressSidecar =
+            serde_json::from_str(&std::fs::read_to_string(progress_path(&r).unwrap()).unwrap())
+                .unwrap();
+        assert!(
+            !parsed.tool_in_flight,
+            "completed with no running terminals → false"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_chunk_only_is_not_tool_in_flight() {
+        use crate::harness::grok::{mock_handshake_ok, session_update_chunk};
+
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        let mut lines = mock_handshake_ok("sess-chunk");
+        lines.push(session_update_chunk("thinking"));
+        lines.push(crate::harness::grok::rpc_result(
+            4,
+            serde_json::json!({ "stopReason": "end_turn" }),
+        ));
+        let mut session = crate::harness::GrokSession::start_mock(
+            dir.path().to_path_buf(),
+            lines,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        session.set_progress_record(r.clone());
+        session
+            .inject_prompt("go", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let parsed: ProgressSidecar =
+            serde_json::from_str(&std::fs::read_to_string(progress_path(&r).unwrap()).unwrap())
+                .unwrap();
+        assert!(!parsed.tool_in_flight);
     }
 
     #[test]
@@ -791,7 +894,7 @@ mod tests {
         isolate_clocks(home.path(), "1", "3600");
         let r = rec(dir.path());
         start_driven_adapter(&r);
-        note_progress(&r, ProgressKind::Inject, Some("sess-1"));
+        note_progress(&r, ProgressKind::Inject, Some("sess-1"), false);
         let running = run::status(&r).unwrap();
         assert!(running.last_progress_at.is_some());
         run::stop(&r).unwrap();
@@ -843,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn first_stall_after_session_update_does_not_recycle() {
+    fn first_stall_after_session_update_does_recycle() {
         let _guard = test_env_lock();
         let home = tempdir().unwrap();
         let dir = tempdir().unwrap();
@@ -856,6 +959,32 @@ mod tests {
             ProgressKind::SessionUpdate,
             "sess-work",
         );
+        let view = poll_once(&r).unwrap().expect("stall recycles");
+        assert!(
+            view.last_event.contains("recycle: stall"),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(load_run_state(&r).unwrap().stall_recycles, 1);
+        assert_eq!(view.status, RunStatus::Running);
+        clear_clocks();
+    }
+
+    #[test]
+    fn first_stall_during_tool_in_flight_does_not_recycle() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        isolate_clocks(home.path(), "1", "3600");
+        let r = rec(dir.path());
+        start_driven_adapter(&r);
+        write_sidecar_full(
+            &r,
+            Utc::now() - chrono::Duration::seconds(5),
+            ProgressKind::SessionUpdate,
+            "sess-tool",
+            true,
+        );
         let view = poll_once(&r).unwrap().expect("stall surfaces");
         assert!(
             view.last_event.contains("watchdog: stall"),
@@ -864,11 +993,38 @@ mod tests {
         );
         assert!(!view.last_event.contains("recycle: stall"));
         assert_eq!(load_run_state(&r).unwrap().stall_recycles, 0);
-        assert_eq!(
-            load_run_state(&r).unwrap().last_driven_phase.as_deref(),
-            Some(graph::PHASE_PLAN)
-        );
         assert_eq!(view.status, RunStatus::Running);
+        clear_clocks();
+    }
+
+    #[test]
+    fn old_sidecar_without_tool_in_flight_is_false() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        let path = progress_path(&r).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"last_progress_at":"2026-09-07T00:00:00Z","kind":"session/update","session_id":"x"}"#,
+        )
+        .unwrap();
+        assert!(!sidecar_tool_in_flight(&r));
+    }
+
+    #[test]
+    fn tool_in_flight_flip_bypasses_debounce() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        isolate_clocks(home.path(), "600", "3600");
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        note_progress(&r, ProgressKind::SessionUpdate, Some("s"), true);
+        note_progress(&r, ProgressKind::SessionUpdate, Some("s"), false);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(progress_path(&r).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(v["tool_in_flight"], false);
         clear_clocks();
     }
 

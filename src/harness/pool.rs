@@ -875,6 +875,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             record,
                             crate::workflow::watchdog::ProgressKind::Inject,
                             Some(&session.session_id),
+                            false,
                         );
                         session
                             .inject_prompt(&text, prompt_timeout_for(record))
@@ -1084,6 +1085,7 @@ pub async fn prompt(
             &rec,
             crate::workflow::watchdog::ProgressKind::Inject,
             Some(&session.session_id),
+            false,
         );
         session.inject_prompt(&text, prompt_timeout_for(&rec)).await
     };
