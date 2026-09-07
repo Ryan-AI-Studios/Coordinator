@@ -1,5 +1,5 @@
 //! Grok harness adapter, session pool, and role-binding helpers (track **0007**).
-//! Abort/recycle of a wedged ACP Prompt: track **0027**.
+//! Abort/recycle of a wedged ACP Prompt: track **0027**. Recycle gate is sidecar `tool_in_flight` (track **0035**).
 //! Harness preflight (`doctor`): track **0028**.
 //! Windows `terminal/create` shell fallback + spawn-fail `HarnessCrash`: track **0032**.
 //! TerminalHub JSONL command journal + `loop_suspect`: track **0034**.

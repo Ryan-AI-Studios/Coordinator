@@ -471,6 +471,7 @@ impl GrokSession {
                 .map_err(|e| CoordinatorError::Message(format!("invalid ACP JSON line: {e}")))?;
             if v.get("method").and_then(|m| m.as_str()) == Some("session/update") {
                 collect_update(&v, &mut self.collected_text);
+                self.terminals.apply_acp_tool_update(&v);
                 if let Some(ref rec) = self.progress_record {
                     let sid = if self.session_id.is_empty() {
                         None
@@ -481,6 +482,7 @@ impl GrokSession {
                         rec,
                         crate::workflow::watchdog::ProgressKind::SessionUpdate,
                         sid,
+                        self.terminals.tool_in_flight(),
                     );
                 }
                 continue;
@@ -557,7 +559,6 @@ impl GrokSession {
         let Some(req_id) = v.get("id").cloned() else {
             return Ok(true);
         };
-        self.note_session_progress();
         if kind == crate::harness::terminal::TerminalMethod::Create
             && let Some(raw) = v
                 .get("params")
@@ -575,13 +576,16 @@ impl GrokSession {
             }
         }
         if kind == crate::harness::terminal::TerminalMethod::WaitForExit {
+            self.terminals.inc_wait();
             let params = v.get("params").cloned();
             let hub = self.terminals.clone();
             let writer = self.writer.clone();
             tokio::spawn(async move {
                 let reply = hub.wait_for_exit_reply(req_id, params.as_ref()).await;
+                hub.dec_wait();
                 let _ = writer.write_line(&reply).await;
             });
+            self.note_session_progress();
             return Ok(true);
         }
         let reply = self
@@ -589,6 +593,7 @@ impl GrokSession {
             .handle_sync(kind, req_id, v.get("params"), &self.cwd)
             .await;
         self.write_line(&reply).await?;
+        self.note_session_progress();
         Ok(true)
     }
 
@@ -605,6 +610,7 @@ impl GrokSession {
             rec,
             crate::workflow::watchdog::ProgressKind::SessionUpdate,
             sid,
+            self.terminals.tool_in_flight(),
         );
     }
 
@@ -1052,17 +1058,39 @@ pub fn session_update_chunk(text: &str) -> String {
     .to_string()
 }
 
-/// Mock ACP `session/update` with `tool_call` (any `sessionUpdate` kind is progress).
+/// Mock ACP `session/update` with `tool_call` (status omitted → ACP default pending).
 pub fn session_update_tool_call(title: &str) -> String {
+    session_update_tool_call_status(title, None)
+}
+
+/// Mock `tool_call` / `tool_call_update` with optional `status`.
+pub fn session_update_tool_call_status(title: &str, status: Option<&str>) -> String {
+    let mut update = json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call_1",
+        "title": title,
+        "kind": "read"
+    });
+    if let Some(s) = status {
+        update["status"] = json!(s);
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "update": update }
+    })
+    .to_string()
+}
+
+pub fn session_update_tool_call_update(status: &str) -> String {
     json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
             "update": {
-                "sessionUpdate": "tool_call",
+                "sessionUpdate": "tool_call_update",
                 "toolCallId": "call_1",
-                "title": title,
-                "kind": "read"
+                "status": status
             }
         }
     })

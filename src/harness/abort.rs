@@ -1,4 +1,5 @@
 //! Abort a wedged ACP Prompt and recycle the holder (track **0027**).
+//! First stall recycles unless sidecar `tool_in_flight` (track **0035**).
 //!
 //! CancelHandle registry lives **outside** `global_pool()` — `prompt()` holds
 //! that mutex for the whole inject.
@@ -202,8 +203,8 @@ async fn abort_stuck_prompt_async(record: &ProjectRecord, reason: AbortReason) -
     Ok(())
 }
 
-/// First stall this phase: stamp recycle, then abort — unless the last
-/// heartbeat was `session/update` (mid-tool). Second stall: surface only.
+/// First stall this phase: stamp recycle, then abort — unless sidecar
+/// `tool_in_flight`. `session/update` text is not a skip. Second stall: surface only.
 pub fn maybe_stamp_and_abort_stall(record: &ProjectRecord) -> Option<StatusView> {
     let stamped = with_run_state_lock(record, || {
         let mut state = load_run_state(record)?;
@@ -216,9 +217,7 @@ pub fn maybe_stamp_and_abort_stall(record: &ProjectRecord) -> Option<StatusView>
         if state.stalled_at.is_none() && !last_event_is_stall(&state.last_event) {
             return Ok(None);
         }
-        // Recycle is for a silent inject (no ACP updates). If Grok already
-        // sent session/update, it is mid-tool — aborting restarts the hang.
-        if crate::workflow::watchdog::last_progress_was_session_update(record) {
+        if crate::workflow::watchdog::sidecar_tool_in_flight(record) {
             return Ok(None);
         }
         state.stall_recycles = state.stall_recycles.saturating_add(1);
@@ -242,9 +241,31 @@ pub fn maybe_stamp_and_abort_stall(record: &ProjectRecord) -> Option<StatusView>
     .flatten();
 
     if stamped.is_some() {
+        if crate::workflow::watchdog::sidecar_tool_in_flight(record) {
+            return revert_recycle_stamp(record);
+        }
         abort_stuck_prompt(record, AbortReason::Stall);
     }
     stamped
+}
+
+/// Stamp raced a live tool: drop CAP, surface stall, do not abort.
+fn revert_recycle_stamp(record: &ProjectRecord) -> Option<StatusView> {
+    with_run_state_lock(record, || {
+        let mut state = load_run_state(record)?;
+        state.stall_recycles = 0;
+        state.aborted_session_id = None;
+        state.last_driven_phase = Some(state.phase.clone());
+        if state.stalled_at.is_none() {
+            state.stalled_at = Some(chrono::Utc::now());
+        }
+        state.last_event = "watchdog: stall".into();
+        state.updated_at = chrono::Utc::now();
+        save_run_state(record, &state)?;
+        Ok(Some(StatusView::from_record(record, &state)))
+    })
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]

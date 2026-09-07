@@ -211,6 +211,7 @@ fn drive_adapter(
         record,
         crate::workflow::watchdog::ProgressKind::Inject,
         inject_sid.as_deref(),
+        false,
     );
 
     #[cfg(test)]

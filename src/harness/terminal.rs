@@ -9,7 +9,7 @@
 //!
 //! Track **0034**: bound hubs journal child completion / spawn-fail as JSONL.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -52,6 +52,9 @@ pub struct TerminalHub {
     probe_ok: Arc<AtomicBool>,
     record: Arc<Mutex<Option<crate::registry::ProjectRecord>>>,
     journal: Arc<Mutex<JournalHub>>,
+    running: Arc<AtomicU64>,
+    wait_count: Arc<AtomicU64>,
+    tool_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for TerminalHub {
@@ -95,6 +98,9 @@ impl TerminalHub {
             probe_ok: Arc::new(AtomicBool::new(false)),
             record: Arc::new(Mutex::new(None)),
             journal: Arc::new(Mutex::new(JournalHub::new())),
+            running: Arc::new(AtomicU64::new(0)),
+            wait_count: Arc::new(AtomicU64::new(0)),
+            tool_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -130,6 +136,71 @@ impl TerminalHub {
         }
         let record = self.record.lock().ok().and_then(|g| g.clone())?;
         Some(journal::snapshot(&record))
+    }
+
+    pub fn inc_wait(&self) {
+        self.wait_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn dec_wait(&self) {
+        let _ = self
+            .wait_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            });
+        self.clear_tool_ids_if_idle();
+        self.note_bound_progress();
+    }
+
+    pub fn tool_in_flight(&self) -> bool {
+        let ids = self.tool_ids.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        ids || self.running.load(Ordering::SeqCst) > 0 || self.wait_count.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn apply_acp_tool_update(&self, msg: &serde_json::Value) {
+        let Some(update) = msg.get("params").and_then(|p| p.get("update")) else {
+            return;
+        };
+        let kind = update.get("sessionUpdate").and_then(|s| s.as_str());
+        if kind != Some("tool_call") && kind != Some("tool_call_update") {
+            return;
+        }
+        let Some(id) = update.get("toolCallId").and_then(|s| s.as_str()) else {
+            return;
+        };
+        let status = update.get("status").and_then(|s| s.as_str());
+        if let Ok(mut g) = self.tool_ids.lock() {
+            match status {
+                None | Some("pending") | Some("in_progress") => {
+                    g.insert(id.to_string());
+                }
+                Some("completed") | Some("failed") => {
+                    g.remove(id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn clear_tool_ids_if_idle(&self) {
+        if self.running.load(Ordering::SeqCst) == 0
+            && self.wait_count.load(Ordering::SeqCst) == 0
+            && let Ok(mut g) = self.tool_ids.lock()
+        {
+            g.clear();
+        }
+    }
+
+    fn note_bound_progress(&self) {
+        let Some(rec) = self.record.lock().ok().and_then(|g| g.clone()) else {
+            return;
+        };
+        crate::workflow::watchdog::note_progress(
+            &rec,
+            crate::workflow::watchdog::ProgressKind::SessionUpdate,
+            None,
+            self.tool_in_flight(),
+        );
     }
 
     fn journal_spawn_fail(&self, snap: Option<&JournalSnap>, argv: &str) {
@@ -344,8 +415,10 @@ impl TerminalHub {
         if let Some(err) = stderr {
             spawn_reader(err, term.output.clone(), term.truncated.clone(), limit);
         }
+        self.running.fetch_add(1, Ordering::SeqCst);
         let waiter = term.clone();
         let journal = self.journal.clone();
+        let hub = self.clone();
         let started = Instant::now();
         tokio::spawn(async move {
             let mut killed = false;
@@ -379,9 +452,17 @@ impl TerminalHub {
                     spawn_fail: false,
                 });
             }
+            let _ = hub
+                .running
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    Some(n.saturating_sub(1))
+                });
+            hub.clear_tool_ids_if_idle();
+            hub.note_bound_progress();
             *waiter.exit.lock().await = Some(ex);
             waiter.done.notify_waiters();
         });
+        self.note_bound_progress();
 
         let tid = format!("term-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         self.inner.lock().await.insert(tid.clone(), term);
@@ -1296,6 +1377,66 @@ mod tests {
                         .unwrap()
                         .contains("loop_suspect")
             );
+            unsafe {
+                std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            }
+        });
+    }
+
+    #[test]
+    fn waiter_term_exit_clears_tool_in_flight_without_session_update() {
+        let _lock = crate::config::test_env_lock();
+        block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            unsafe {
+                std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+                std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+            }
+            let rec = journal_test_rec(ws.path());
+            seed_journal_run(&rec);
+            crate::state::ensure_state_dir(&rec).unwrap();
+            let hub = TerminalHub::new();
+            hub.bind_record(rec.clone());
+            let (command, args) = hang_args();
+            let cwd = std::env::temp_dir();
+            let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            let create = serde_json::from_str::<Value>(
+                &hub.handle_sync(
+                    TerminalMethod::Create,
+                    json!(1),
+                    Some(&json!({"command": command, "args": args})),
+                    &cwd,
+                )
+                .await,
+            )
+            .unwrap();
+            let tid = create["result"]["terminalId"].as_str().unwrap().to_string();
+            assert!(hub.tool_in_flight());
+            let v: Value = serde_json::from_str(
+                &std::fs::read_to_string(crate::workflow::watchdog::progress_path(&rec).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v["tool_in_flight"], true, "sidecar={v}");
+            let _ = hub
+                .handle_sync(
+                    TerminalMethod::Kill,
+                    json!(2),
+                    Some(&json!({"terminalId": tid})),
+                    &cwd,
+                )
+                .await;
+            let _ = hub
+                .wait_for_exit_reply(json!(3), Some(&json!({"terminalId": tid})))
+                .await;
+            assert!(!hub.tool_in_flight());
+            let v: Value = serde_json::from_str(
+                &std::fs::read_to_string(crate::workflow::watchdog::progress_path(&rec).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v["tool_in_flight"], false, "sidecar after exit={v}");
             unsafe {
                 std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
             }
