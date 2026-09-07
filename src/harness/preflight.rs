@@ -593,7 +593,7 @@ fn sanitize_out(out: RawOut) -> RawOut {
     }
 }
 
-fn redact_secrets(s: &str) -> String {
+pub(crate) fn redact_secrets(s: &str) -> String {
     let mut out = s.to_string();
     for prefix in ["gho_", "ghs_", "sk-", "xai-", "ghp_"] {
         out = redact_prefix(&out, prefix);
