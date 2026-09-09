@@ -230,6 +230,22 @@ pub fn project_show(project: Option<&str>, infer_cwd: bool) -> Result<ProjectSho
             },
         );
     }
+    phase_timeouts.insert(
+        crate::workflow::timeouts::TIMEOUT_KEY_PLAN_REVIEW_SLOT.to_string(),
+        PhaseTimeoutView {
+            secs: crate::workflow::timeout_for_phase(
+                &rec,
+                crate::workflow::timeouts::TIMEOUT_KEY_PLAN_REVIEW_SLOT,
+            )
+            .as_secs(),
+            source: crate::workflow::timeout_source(
+                &rec,
+                crate::workflow::timeouts::TIMEOUT_KEY_PLAN_REVIEW_SLOT,
+            )
+            .as_str()
+            .to_string(),
+        },
+    );
     Ok(ProjectShowView {
         project: rec,
         resolved,
@@ -1069,6 +1085,10 @@ mod tests {
         assert_eq!(view.phase_timeouts["plan"].source, "project");
         assert_eq!(view.phase_timeouts["implement"].secs, 7200);
         assert_eq!(view.phase_timeouts["implement"].source, "table");
+        assert_eq!(view.phase_timeouts["plan-review"].secs, 2400);
+        assert_eq!(view.phase_timeouts["plan-review"].source, "table");
+        assert_eq!(view.phase_timeouts["plan_review_slot"].secs, 2400);
+        assert_eq!(view.phase_timeouts["plan_review_slot"].source, "table");
         assert_eq!(view.project.phase_timeouts_secs.get("plan"), Some(&3600));
         unsafe {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "7");

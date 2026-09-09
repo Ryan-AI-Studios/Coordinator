@@ -22,7 +22,7 @@ use crate::workflow::graph::{
     PHASE_PLAN_REVIEW, REVIEW_SLUG_AGY, REVIEW_SLUG_OPENCODE, ROLE_REVIEWER_AGY,
     ROLE_REVIEWER_OPENCODE, resolve_track_dir, role_phase,
 };
-use crate::workflow::timeouts::timeout_for_phase;
+use crate::workflow::timeouts::{TIMEOUT_KEY_PLAN_REVIEW_SLOT, timeout_for_phase};
 
 const MIN_SPAWN_BUDGET: Duration = Duration::from_secs(60);
 
@@ -230,6 +230,18 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
         .join("SKILL.md");
     let file = format!("{slug}-review.md");
     let layout = crate::workflow::prompts::layout_block(record, track_id);
+    let research = if slug == REVIEW_SLUG_OPENCODE {
+        "Knowledge is stale. Verify APIs, hooks, and plan-vs-live-src against docs.rs, \
+         official harness docs, and the execution repo — not crate-version pins.\n\
+         \n\
+         Dependency-pin / crate-version currency is out of scope (CI and release checks \
+         cover pins). Do not fetch crates.io crate/version lists or spawn sub-agents to \
+         parse pin JSON."
+    } else {
+        "Knowledge is stale. Verify pins, APIs, and hooks against primary sources \
+         (crates.io, docs.rs, official harness docs) before trusting training data or \
+         the track's plan-time snapshot."
+    };
     format!(
         "You are reviewing a Coordinator conductor-track plan (review-track).\n\
          This slot loads the `review-track` skill from {}.\n\
@@ -242,9 +254,7 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
          Write your review to this exact path (overwrite):\n\
          {track_dir}/{file}\n\
          \n\
-         Knowledge is stale. Verify pins, APIs, and hooks against primary sources \
-         (crates.io, docs.rs, official harness docs) before trusting training data or \
-         the track's plan-time snapshot.\n\
+         {research}\n\
          \n\
          Requirements:\n\
          - Review the plan for completeness, risks, and missing Definition of Done.\n\
@@ -333,14 +343,12 @@ fn remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
         .saturating_sub(state.effective_running_elapsed(chrono::Utc::now()))
 }
 
-fn retry_remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
-    #[cfg(test)]
-    {
-        if let Some(d) = TEST_RETRY_REMAINING.with(|c| c.get()) {
-            return d;
-        }
+fn slot_remaining(record: &ProjectRecord, state: &RunState, slug: &str) -> Duration {
+    if slug == REVIEW_SLUG_OPENCODE {
+        timeout_for_phase(record, TIMEOUT_KEY_PLAN_REVIEW_SLOT).min(remaining_budget(record, state))
+    } else {
+        remaining_budget(record, state)
     }
-    remaining_budget(record, state)
 }
 
 /// Fire-and-forget spawn of the agy slot. Does not block `poll_once`.
@@ -418,7 +426,7 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
 
     let rec = record.clone();
     let spawn_state = load_run_state(record).unwrap_or(live);
-    let remaining = remaining_budget(record, &spawn_state);
+    let remaining = slot_remaining(record, &spawn_state, slug);
     let paths = crate::layout::resolve(record);
     let spawn_track_id = spawn_state.track_id.clone();
     let spawn_epoch = spawn_state.run_epoch;
@@ -553,12 +561,27 @@ fn finish_slot(
                     if !apply_allowed(&latest, req) {
                         return Ok(None);
                     }
-                    let remaining = retry_remaining_budget(record, &latest);
-                    if remaining >= MIN_SPAWN_BUDGET {
-                        Ok(Some(remaining))
-                    } else {
-                        Ok(None)
-                    }
+                    let remaining = {
+                        #[cfg(test)]
+                        {
+                            if let Some(d) = TEST_RETRY_REMAINING.with(|c| c.get()) {
+                                if d >= MIN_SPAWN_BUDGET { Some(d) } else { None }
+                            } else if remaining_budget(record, &latest) < MIN_SPAWN_BUDGET {
+                                None
+                            } else {
+                                Some(slot_remaining(record, &latest, REVIEW_SLUG_OPENCODE))
+                            }
+                        }
+                        #[cfg(not(test))]
+                        {
+                            if remaining_budget(record, &latest) < MIN_SPAWN_BUDGET {
+                                None
+                            } else {
+                                Some(slot_remaining(record, &latest, REVIEW_SLUG_OPENCODE))
+                            }
+                        }
+                    };
+                    Ok(remaining)
                 });
                 match retry_remaining {
                     Ok(Some(remaining)) => {
@@ -1329,7 +1352,7 @@ mod tests {
     use crate::config::{
         ENV_COORDINATOR_AGY_BIN, ENV_COORDINATOR_HOME, ENV_COORDINATOR_OPENCODE_BIN, test_env_lock,
     };
-    use crate::outcome::{OutcomeSource, write_and_apply};
+    use crate::outcome::{FailureClass, OutcomeSource, write_and_apply};
     use crate::run;
     use crate::state::{load_run_state, save_run_state};
     use crate::watch::poll_once;
@@ -1655,6 +1678,8 @@ mod tests {
         assert!(contains_skill(&text, "review-track"), "skill path: {text}");
         assert!(text.contains("review-track"));
         assert!(text.contains("stale") && text.contains("primary sources"));
+        assert!(text.contains("Verify pins, APIs, and hooks against primary sources (crates.io"));
+        assert!(!text.to_ascii_lowercase().contains("out of scope"));
         assert!(text.contains("Workspace root:"));
         assert!(text.contains("Execution repos:"));
         assert!(text.contains("agy-review.md"));
@@ -1665,6 +1690,32 @@ mod tests {
         assert!(oc.contains("stale"));
         assert!(oc.contains("opencode-review.md"));
         assert!(!oc.contains("## Verdict: PASS"));
+        assert!(
+            oc.to_ascii_lowercase().contains("out of scope"),
+            "opencode prompt must carve pins out of scope: {oc}"
+        );
+        assert!(
+            !oc.contains("Verify pins, APIs, and hooks against primary sources (crates.io"),
+            "opencode must not instruct crates.io pin crawls: {oc}"
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_pin_oos_agy_keeps_crates_io() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        let oc = opencode_prompt(&r, Some("0001"));
+        assert!(oc.contains("out of scope"));
+        assert!(oc.contains("Do not fetch crates.io"));
+        assert!(oc.contains("CI and release"));
+        assert!(!oc.contains("Verify pins, APIs, and hooks against primary sources (crates.io"));
+        let agy = agy_prompt(&r, Some("0001"));
+        assert!(agy.contains(
+            "Verify pins, APIs, and hooks against primary sources (crates.io, docs.rs, official harness docs)"
+        ));
+        assert!(!agy.to_ascii_lowercase().contains("out of scope"));
+        assert!(!agy.contains("Do not fetch crates.io"));
     }
 
     #[test]
@@ -1750,6 +1801,194 @@ mod tests {
         let slugs = counts.slugs();
         assert_eq!(slugs.iter().filter(|s| *s == "agy").count(), 1);
         assert_eq!(slugs.iter().filter(|s| *s == "opencode").count(), 1);
+    }
+
+    fn remaining_of(reqs: &[PlanReviewRequest], slug: &str) -> Duration {
+        reqs.iter().find(|q| q.slug == slug).unwrap().remaining
+    }
+
+    #[test]
+    fn table_default_remaining_opencode_and_agy_use_2400_join() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            ok_review_body("0001"),
+        ))));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_both_consumed(&r);
+        let reqs = counts.requests.lock().unwrap();
+        let oc = remaining_of(&reqs, "opencode");
+        let agy = remaining_of(&reqs, "agy");
+        assert!(
+            oc > Duration::from_secs(1200) && oc <= Duration::from_secs(2400),
+            "opencode remaining={oc:?}"
+        );
+        assert!(agy > Duration::from_secs(1200), "agy remaining={agy:?}");
+        let phase_budget = timeout_for_phase(&r, PHASE_PLAN_REVIEW);
+        assert!(
+            agy <= phase_budget,
+            "agy remaining={agy:?} budget={phase_budget:?}"
+        );
+        assert!(
+            phase_budget - agy < Duration::from_secs(2),
+            "agy remaining {agy:?} should equal phase remaining at spawn (budget {phase_budget:?})"
+        );
+    }
+
+    #[test]
+    fn asymmetric_slot_overlay_caps_opencode_not_agy() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let mut r = rec(dir.path());
+        r.phase_timeouts_secs
+            .insert(TIMEOUT_KEY_PLAN_REVIEW_SLOT.into(), 600);
+        enter_plan_review(&r, "0001");
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            ok_review_body("0001"),
+        ))));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_both_consumed(&r);
+        let reqs = counts.requests.lock().unwrap();
+        let oc = remaining_of(&reqs, "opencode");
+        let agy = remaining_of(&reqs, "agy");
+        assert!(oc <= Duration::from_secs(600), "opencode remaining={oc:?}");
+        assert!(agy > Duration::from_secs(1200), "agy remaining={agy:?}");
+        let phase_budget = timeout_for_phase(&r, PHASE_PLAN_REVIEW);
+        assert!(agy <= phase_budget);
+        assert!(
+            phase_budget - agy < Duration::from_secs(2),
+            "agy remaining {agy:?} should equal phase remaining (budget {phase_budget:?})"
+        );
+    }
+
+    #[test]
+    fn run_process_remaining_timeout_is_124_not_stall() {
+        let dir = tempdir().unwrap();
+        let cmd = dir.path().join("sleep.cmd");
+        std::fs::write(&cmd, "@echo off\r\nping -n 30 127.0.0.1 >nul 2>&1\r\n").unwrap();
+        let out = run_process(
+            &cmd,
+            &[],
+            dir.path(),
+            ProcessWait {
+                timeout: Duration::from_secs(2),
+                stall: None,
+                watch_paths: &[],
+            },
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.exit, 124);
+        assert!(
+            out.stderr.contains("review CLI timed out after"),
+            "stderr={}",
+            out.stderr
+        );
+        assert!(
+            !crate::review::spawn::is_reviewer_stall(&out.stderr),
+            "stderr={}",
+            out.stderr
+        );
+        assert!(
+            !out.stderr.to_ascii_lowercase().contains("exhausted"),
+            "stderr={}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn sleeper_slot_overlay_times_out_once_without_backend() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let sleeper = dir.path().join("sleep-opencode.cmd");
+        std::fs::write(&sleeper, "@echo off\r\nping -n 30 127.0.0.1 >nul 2>&1\r\n").unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_OPENCODE_BIN, &sleeper);
+        }
+        let mut r = rec(dir.path());
+        r.phase_timeouts_secs
+            .insert(TIMEOUT_KEY_PLAN_REVIEW_SLOT.into(), 2);
+        enter_plan_review(&r, "0001");
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["opencode".into()];
+        state.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &state).unwrap();
+        write_review_markdown(&r, "agy", Some("agy done\n")).unwrap();
+        tick(&r).unwrap();
+        let mut saw_timeout = false;
+        let mut spawned_at_timeout: Vec<String> = Vec::new();
+        for _ in 0..80 {
+            let path = outcome_roles_dir(&r).unwrap().join("opencode.json");
+            if path.is_file()
+                && let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(o) = serde_json::from_str::<PhaseOutcome>(&text)
+                && o.status == OutcomeStatus::Failure
+                && o.failure_class == Some(FailureClass::Timeout)
+            {
+                saw_timeout = true;
+                spawned_at_timeout = load_run_state(&r).unwrap().plan_review_spawned.clone();
+            }
+            let s = load_run_state(&r).unwrap();
+            if !s.pending_roles.iter().any(|x| x == "opencode") && saw_timeout {
+                break;
+            }
+            let _ = tick(&r);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            saw_timeout,
+            "opencode role outcome must be Timeout before consume"
+        );
+        let oc_spawned = spawned_at_timeout
+            .iter()
+            .filter(|x| *x == "opencode")
+            .count();
+        assert_eq!(oc_spawned, 1, "spawned at timeout={spawned_at_timeout:?}");
+        let s = load_run_state(&r).unwrap();
+        assert!(
+            !s.pending_roles.iter().any(|x| x == "opencode"),
+            "opencode still pending: {:?}",
+            s.pending_roles
+        );
+    }
+
+    #[test]
+    fn complete_opencode_review_mentioning_crates_io_is_success() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["opencode".into()];
+        state.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &state).unwrap();
+        let body = "# Track review: {track}-Example\n\n**Track:** `{track}`\n\nmentions crates.io as noise\n";
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            body,
+        ))));
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_slots_consumed(&r, &["opencode"]);
+        let written = std::fs::read_to_string(track_file(dir.path(), "0001", "opencode")).unwrap();
+        assert!(written.contains("crates.io"));
+        assert!(written.contains("# Track review:"));
+        assert!(written.contains("0001"));
+        let state_file = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
+        assert!(state_file.is_file(), "opencode state review missing");
+        let state = load_run_state(&r).unwrap();
+        assert!(state.failure_class.is_none());
+        assert!(!state.last_event.to_ascii_lowercase().contains("fail"));
     }
 
     #[test]
@@ -2649,6 +2888,50 @@ mod tests {
             "degenerate failure must name the missing header, got {msg}"
         );
         assert!(!msg.contains("produced no review file and no stdout"));
+    }
+
+    #[test]
+    fn short_slot_overlay_still_retries_degenerate_when_phase_budget_remains() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let mut r = rec(dir.path());
+        r.phase_timeouts_secs
+            .insert(TIMEOUT_KEY_PLAN_REVIEW_SLOT.into(), 10);
+        enter_plan_review(&r, "0001");
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["opencode".into()];
+        state.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &state).unwrap();
+        let seq = OpencodeSequenceBackend {
+            opencode: Mutex::new(vec![
+                ScriptedBackend::ok_file(degenerate_review_body()),
+                ScriptedBackend::ok_file(ok_review_body("0001")),
+            ]),
+            other: ScriptedBackend::ok_file(ok_review_body("0001")),
+        };
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_slots_consumed(&r, &["opencode"]);
+        let oc_runs = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(
+            oc_runs, 2,
+            "phase MIN_SPAWN_BUDGET must admit retry even when plan_review_slot < 60s"
+        );
+        let reqs = counts.requests.lock().unwrap();
+        let retries: Vec<_> = reqs.iter().filter(|q| q.slug == "opencode").collect();
+        assert_eq!(retries.len(), 2);
+        assert!(
+            retries[1].remaining <= Duration::from_secs(10),
+            "retry remaining should be slot-capped, got {:?}",
+            retries[1].remaining
+        );
     }
 
     #[test]
