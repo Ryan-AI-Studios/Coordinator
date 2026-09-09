@@ -30,6 +30,7 @@ Use this when implementing Control Plane shells (0004+) and real Status Surface 
 | Pause | `article[data-state="paused"]` |
 | Token-idle CI | `article[data-state="token-idle-ci"]` |
 | Hard failure + artifact | `article[data-state="hard-failure"]` · `[data-region="failure-artifact"]` |
+| Superseded failure note | `article[data-state="idle"]` · `[data-region="failure-artifact"]` titled `[SUPERSEDED]` (0040) |
 | Idle / no active track | `article[data-state="idle"]` |
 | Stop semantics | Header `.ops-help`, Stop button `title` attributes, idle card Stop note |
 | Multi-project overview | `main#projects` grid (2-col desktop, 1-col ≤980px) |

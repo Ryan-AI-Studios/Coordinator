@@ -495,7 +495,37 @@ pub fn cmd_failure_show(
     infer_cwd: bool,
 ) -> Result<Option<crate::notify::FailureShow>> {
     let rec = resolve_selected(project, infer_cwd)?;
-    crate::notify::artifact::read(&rec)
+    let mut shown = crate::notify::artifact::read(&rec)?;
+    if let Some(ref mut s) = shown
+        && let Ok(state) = crate::state::load_run_state(&rec)
+    {
+        s.superseded =
+            crate::workflow::conductor_md::failure_superseded(&rec, &state, Some(&s.body));
+    }
+    Ok(shown)
+}
+
+/// Operator ack: delete FAILURE.md and drop `failure_class` (Idle/Stopped only).
+pub fn cmd_failure_resolve(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+    let rec = resolve_selected(project, infer_cwd)?;
+    crate::state::with_run_state_lock(&rec, || {
+        let mut state = crate::state::load_run_state(&rec)?;
+        if matches!(
+            state.status,
+            crate::state::RunStatus::Running | crate::state::RunStatus::Paused
+        ) {
+            return Err(CoordinatorError::InvalidTransition {
+                action: "failure resolve",
+                from: state.status.to_string(),
+            });
+        }
+        crate::notify::clear_artifact(&rec);
+        state.failure_class = None;
+        state.last_event = crate::notify::LAST_EVENT_FAILURE_RESOLVED.into();
+        crate::progress_log::append(&rec, "resolve", crate::notify::LAST_EVENT_FAILURE_RESOLVED);
+        crate::state::save_run_state(&rec, &state)?;
+        Ok(StatusView::from_record(&rec, &state))
+    })
 }
 
 /// Block until outcome applied or wait budget expires.
@@ -1365,6 +1395,141 @@ mod tests {
             std::env::remove_var(ENV_OUTCOME_POLL_MS);
             std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
         }
+        clear_home();
+    }
+
+    fn write_failure(rec: &ProjectRecord, track: &str, epoch: u64) {
+        let event = crate::notify::NotifyEvent {
+            project_id: rec.id.clone(),
+            track_id: Some(track.into()),
+            phase: "plan".into(),
+            failure_class: crate::outcome::FailureClass::HarnessCrash,
+            message: Some("test crash".into()),
+            last_event: "test".into(),
+            artifact_path: artifact::path(rec).unwrap(),
+            written_at: chrono::Utc::now(),
+            run_epoch: epoch,
+        };
+        artifact::write(rec, &event).unwrap();
+    }
+
+    #[test]
+    fn cmd_failure_show_reads_body_when_present() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.status = RunStatus::Stopped;
+        state.track_id = Some("0040".into());
+        state.run_epoch = 2;
+        state.failure_class = Some(crate::outcome::FailureClass::HarnessCrash);
+        crate::state::save_run_state(&rec, &state).unwrap();
+        write_failure(&rec, "0040", 2);
+        let shown = cmd_failure_show(Some(&rec.id), false)
+            .unwrap()
+            .expect("artifact");
+        assert!(shown.body.contains("track_id: 0040"));
+        assert!(shown.body.contains("run_epoch: 2"));
+        assert!(shown.superseded.is_none());
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_failure_show_none_when_absent() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        assert!(cmd_failure_show(Some(&rec.id), false).unwrap().is_none());
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_failure_resolve_clears_artifact_keeps_hash() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.status = RunStatus::Stopped;
+        state.track_id = Some("0040".into());
+        state.run_epoch = 2;
+        state.failure_class = Some(crate::outcome::FailureClass::HarnessCrash);
+        state.last_applied_outcome_hash = Some("keep-me".into());
+        crate::state::save_run_state(&rec, &state).unwrap();
+        write_failure(&rec, "0040", 2);
+        let view = cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        assert!(artifact::existing_path(&rec).is_none());
+        assert!(view.failure_class.is_none());
+        assert_eq!(view.last_event, crate::notify::LAST_EVENT_FAILURE_RESOLVED);
+        let loaded = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(loaded.last_applied_outcome_hash.as_deref(), Some("keep-me"));
+        assert_eq!(loaded.track_id.as_deref(), Some("0040"));
+        assert_eq!(loaded.run_epoch, 2);
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
+        assert!(log.contains(crate::notify::LAST_EVENT_FAILURE_RESOLVED));
+        let pick = crate::workflow::ReadyPickState::from(&view);
+        assert!(!crate::workflow::should_pick_next_ready(&pick));
+        let _ = proj;
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_failure_resolve_absent_is_ok() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let view = cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        assert!(view.failure_class.is_none());
+        assert_eq!(view.last_event, crate::notify::LAST_EVENT_FAILURE_RESOLVED);
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_failure_resolve_running_is_invalid_transition() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        cmd_run(
+            Some(&rec.id),
+            Some("0040".into()),
+            Some("file_wait"),
+            false,
+            false,
+        )
+        .unwrap();
+        let err = cmd_failure_resolve(Some(&rec.id), false).unwrap_err();
+        match err {
+            CoordinatorError::InvalidTransition { action, from } => {
+                assert_eq!(action, "failure resolve");
+                assert_eq!(from, "Running");
+            }
+            other => panic!("expected InvalidTransition, got {other}"),
+        }
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_failure_show_superseded_when_conductor_completed() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        let cond = proj.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0038-Done")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0038-Done](0038-Done/spec.md) | `.` | **Completed** | shipped |\n",
+        )
+        .unwrap();
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.status = RunStatus::Stopped;
+        state.track_id = Some("0038".into());
+        state.run_epoch = 2;
+        state.failure_class = Some(crate::outcome::FailureClass::HarnessCrash);
+        crate::state::save_run_state(&rec, &state).unwrap();
+        write_failure(&rec, "0038", 2);
+        let shown = cmd_failure_show(Some(&rec.id), false)
+            .unwrap()
+            .expect("artifact");
+        assert_eq!(
+            shown.superseded.as_deref(),
+            Some(crate::notify::SUPERSEDED_COMPLETED)
+        );
+        assert!(shown.body.contains("track_id: 0038"));
         clear_home();
     }
 }

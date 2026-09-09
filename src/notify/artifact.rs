@@ -33,6 +33,93 @@ pub fn clear(record: &ProjectRecord) {
     }
 }
 
+/// Operator ack `last_event` / progress_log detail (0040).
+pub const LAST_EVENT_FAILURE_RESOLVED: &str = "failure: resolved by operator";
+/// Display reason when the conductor row is Completed.
+pub const SUPERSEDED_COMPLETED: &str = "conductor row Completed";
+/// Display reason when artifact track/epoch disagrees with run-state.
+pub const SUPERSEDED_MISMATCH: &str = "track/epoch mismatch";
+/// progress_log detail for backlog-clear same-track auto-clear (last_event unchanged).
+pub const AUTO_CLEAR_DETAIL: &str = "failure: auto-cleared on backlog clear";
+
+/// Parsed FAILURE.md bullets (`- track_id:` / `- run_epoch:`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactMeta {
+    pub track_id: Option<String>,
+    pub run_epoch: Option<u64>,
+}
+
+/// Scan markdown bullets. `"null"`, absent, or a non-integer epoch → `None`.
+pub fn parse_metadata(body: &str) -> ArtifactMeta {
+    let mut meta = ArtifactMeta::default();
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("- track_id:") {
+            let v = rest.trim();
+            if !v.is_empty() && v != "null" {
+                meta.track_id = Some(v.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("- run_epoch:") {
+            let v = rest.trim();
+            if let Ok(n) = v.parse::<u64>() {
+                meta.run_epoch = Some(n);
+            }
+        }
+    }
+    meta
+}
+
+/// Equal, or same 4-digit leading id (`0040` ↔ `0040-Slug`). Empty / `null` never match.
+pub fn track_ids_match(a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    if a.is_empty() || b.is_empty() || a == "null" || b == "null" {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    match (numeric_track_id(a), numeric_track_id(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn numeric_track_id(s: &str) -> Option<&str> {
+    if s.len() >= 4 && s.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+        let rest = &s[4..];
+        if rest.is_empty() || rest.starts_with('-') {
+            return Some(&s[..4]);
+        }
+    }
+    None
+}
+
+/// Read-time SUPERSEDED reason. `completed` is the conductor-row signal (false if unknown).
+pub fn compute_superseded(
+    body: Option<&str>,
+    state_track: Option<&str>,
+    state_epoch: u64,
+    completed: bool,
+) -> Option<String> {
+    if completed {
+        return Some(SUPERSEDED_COMPLETED.into());
+    }
+    let body = body?;
+    let meta = parse_metadata(body);
+    if let (Some(a), Some(b)) = (meta.track_id.as_deref(), state_track)
+        && !track_ids_match(a, b)
+    {
+        return Some(SUPERSEDED_MISMATCH.into());
+    }
+    if let Some(ep) = meta.run_epoch
+        && ep != state_epoch
+    {
+        return Some(SUPERSEDED_MISMATCH.into());
+    }
+    None
+}
+
 /// Read artifact body when present.
 pub fn read(record: &ProjectRecord) -> Result<Option<FailureShow>> {
     let p = path(record)?;
@@ -40,7 +127,11 @@ pub fn read(record: &ProjectRecord) -> Result<Option<FailureShow>> {
         return Ok(None);
     }
     let body = std::fs::read_to_string(&p)?;
-    Ok(Some(FailureShow { path: p, body }))
+    Ok(Some(FailureShow {
+        path: p,
+        body,
+        superseded: None,
+    }))
 }
 
 /// CLI / HTTP payload for `failure show`.
@@ -48,6 +139,8 @@ pub fn read(record: &ProjectRecord) -> Result<Option<FailureShow>> {
 pub struct FailureShow {
     pub path: PathBuf,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded: Option<String>,
 }
 
 /// Atomic UTF-8 markdown write of `FAILURE.md`.
@@ -179,5 +272,46 @@ mod tests {
         clear(&r);
         assert!(read(&r).unwrap().is_none());
         assert!(existing_path(&r).is_none());
+    }
+
+    #[test]
+    fn parse_metadata_bullets_and_nulls() {
+        let meta =
+            parse_metadata("# Coordinator failure\n\n- track_id: 0040-Slug\n- run_epoch: 2\n");
+        assert_eq!(meta.track_id.as_deref(), Some("0040-Slug"));
+        assert_eq!(meta.run_epoch, Some(2));
+        let missing = parse_metadata("# Coordinator failure\n");
+        assert_eq!(missing, ArtifactMeta::default());
+        let nulls = parse_metadata("- track_id: null\n- run_epoch: nope\n");
+        assert_eq!(nulls, ArtifactMeta::default());
+    }
+
+    #[test]
+    fn track_ids_match_numeric_prefix() {
+        assert!(track_ids_match("0040", "0040-FailureArtifactLifecycle"));
+        assert!(track_ids_match("0040-FailureArtifactLifecycle", "0040"));
+        assert!(track_ids_match("0040", "0040"));
+        assert!(!track_ids_match("0040", "0041"));
+        assert!(!track_ids_match("null", "0040"));
+        assert!(!track_ids_match("", "0040"));
+    }
+
+    #[test]
+    fn compute_superseded_reasons() {
+        let body = "- track_id: 0038\n- run_epoch: 2\n";
+        assert_eq!(
+            compute_superseded(Some(body), Some("0038"), 2, true).as_deref(),
+            Some(SUPERSEDED_COMPLETED)
+        );
+        assert_eq!(compute_superseded(Some(body), Some("0038"), 2, false), None);
+        assert_eq!(
+            compute_superseded(Some(body), Some("0038"), 9, false).as_deref(),
+            Some(SUPERSEDED_MISMATCH)
+        );
+        assert_eq!(
+            compute_superseded(Some(body), Some("0040"), 2, false).as_deref(),
+            Some(SUPERSEDED_MISMATCH)
+        );
+        assert_eq!(compute_superseded(None, Some("0038"), 2, false), None);
     }
 }

@@ -115,6 +115,64 @@ pub fn is_eligible_ready(status_raw: &str) -> bool {
     status_clean(status_raw) == READY_NORMALIZED
 }
 
+/// Registry `**Completed**` (and the same after status_clean).
+pub fn is_completed(status_raw: &str) -> bool {
+    status_clean(status_raw) == "Completed"
+}
+
+/// Best-effort `{conductor_dir}/conductor.md` rows. Missing / unreadable → `None`.
+pub fn load_track_rows(record: &ProjectRecord) -> Option<Vec<TrackRow>> {
+    let path = crate::layout::resolve(record)
+        .conductor_dir
+        .join("conductor.md");
+    if !path.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_conductor_md(&text).ok()
+}
+
+fn row_matches_track(row: &TrackRow, key: &str) -> bool {
+    let slug = if row.slug.is_empty() {
+        row.id.clone()
+    } else {
+        format!("{}-{}", row.id, row.slug)
+    };
+    crate::notify::artifact::track_ids_match(&row.id, key)
+        || crate::notify::artifact::track_ids_match(&slug, key)
+}
+
+/// True when a row matching `key` has status Completed.
+pub fn track_row_completed(rows: &[TrackRow], key: &str) -> bool {
+    rows.iter()
+        .any(|r| row_matches_track(r, key) && is_completed(&r.status_raw))
+}
+
+/// Read-time SUPERSEDED reason (0040). Missing conductor.md skips the Completed signal.
+pub fn failure_superseded(
+    record: &ProjectRecord,
+    state: &RunState,
+    body: Option<&str>,
+) -> Option<String> {
+    let meta = body.map(crate::notify::artifact::parse_metadata);
+    let key = meta
+        .as_ref()
+        .and_then(|m| m.track_id.as_deref())
+        .or(state.track_id.as_deref());
+    let completed = key
+        .and_then(|k| {
+            let rows = load_track_rows(record)?;
+            Some(track_row_completed(&rows, k))
+        })
+        .unwrap_or(false);
+    crate::notify::artifact::compute_superseded(
+        body,
+        state.track_id.as_deref(),
+        state.run_epoch,
+        completed,
+    )
+}
+
 /// Skip even exact Ready when id, slug, cleaned status, or summary matches HITL.
 pub fn is_hitl_marked(id: &str, slug: &str, status: &str, summary: &str) -> bool {
     [id, slug, status, summary].iter().any(|p| field_is_hitl(p))
@@ -478,7 +536,7 @@ pub fn write_ready_fixture(ws: &std::path::Path, id: &str) -> std::io::Result<()
 mod tests {
     use super::*;
     use crate::outcome::FailureClass;
-    use crate::state::RunStatus;
+    use crate::state::{RunState, RunStatus};
     use std::path::Path;
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -539,6 +597,10 @@ mod tests {
         ));
         assert!(!is_eligible_ready("**Completed**"));
         assert!(!is_eligible_ready("**Ready — not started** (owner only)"));
+        assert!(is_completed("**Completed**"));
+        assert!(is_completed("Completed"));
+        assert!(!is_completed("**Ready — not started**"));
+        assert!(!is_completed("**Cancelled**"));
     }
 
     #[test]
@@ -643,6 +705,41 @@ mod tests {
         assert_eq!(rows[1].id, "0099");
         assert!(is_eligible_ready(&rows[1].status_raw));
         assert_eq!(rows[0].status_raw, "**Completed**");
+        assert!(is_completed(&rows[0].status_raw));
+        assert!(track_row_completed(&rows, "0001"));
+        assert!(track_row_completed(&rows, "0001-Orca"));
+    }
+
+    #[test]
+    fn failure_superseded_completed_then_mismatch() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        write_md(
+            dir.path(),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0038-Done | `.` | **Completed** | shipped |\n",
+        );
+        let body = "- track_id: 0038\n- run_epoch: 2\n";
+        let mut state = RunState::idle(&r.id);
+        state.track_id = Some("0038".into());
+        state.run_epoch = 2;
+        assert_eq!(
+            failure_superseded(&r, &state, Some(body)).as_deref(),
+            Some(crate::notify::SUPERSEDED_COMPLETED)
+        );
+        write_md(
+            dir.path(),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0038-Done | `.` | **Ready — not started** | open |\n",
+        );
+        assert_eq!(failure_superseded(&r, &state, Some(body)), None);
+        state.run_epoch = 9;
+        assert_eq!(
+            failure_superseded(&r, &state, Some(body)).as_deref(),
+            Some(crate::notify::SUPERSEDED_MISMATCH)
+        );
     }
 
     #[test]

@@ -277,6 +277,7 @@
     .pill.failed { background: color-mix(in srgb, var(--bad) 22%, transparent); color: #ffb0b0; }
     .pill.paused { background: color-mix(in srgb, var(--info) 22%, transparent); color: #b7d9f5; }
     .pill.idle { background: color-mix(in srgb, var(--muted) 18%, transparent); color: #c5d0dc; }
+    .pill.info { background: color-mix(in srgb, var(--info) 22%, transparent); color: #b7d9f5; }
 
     .sessions {
       width: 100%;
@@ -663,6 +664,52 @@
           <span><span class="k">Sessions</span><span class="v">left for attach after quota recovery</span></span>
         </div>
         <p class="toast">Windows toast sent (Notify Adapter later). Static mock — no real notify.</p>
+      </div>
+    </article>
+
+    <!-- 4b · Superseded failure note (0040) -->
+    <article class="project idle-surface" data-project="demo-superseded" data-state="idle">
+      <div class="project-head">
+        <div>
+          <h2>Demo-Superseded</h2>
+          <p class="project-path">C:\dev\scratch\demo-superseded</p>
+        </div>
+        <div class="project-actions">
+          <button type="button" class="primary" title="Start a track (mock)">Start track</button>
+          <button type="button" class="danger" title="Stop: abort current phase · no merge · sessions left for attach (no-op when idle)">Stop</button>
+        </div>
+      </div>
+      <div class="kv">
+        <div class="row">
+          <span class="label">Track</span>
+          <span class="value">0038-AdaptiveAcpSpawn</span>
+          <span class="pill idle">idle</span>
+        </div>
+        <div class="row">
+          <span class="label">Phase</span>
+          <span class="value">plan</span>
+          <span class="pill info">superseded</span>
+        </div>
+        <div class="row">
+          <span class="label">Class</span>
+          <span class="value">harness_crash</span>
+          <span class="pill idle">note</span>
+        </div>
+        <div class="row">
+          <span class="label">Layout</span>
+          <span class="value">nested</span>
+          <span class="pill idle">profile</span>
+        </div>
+      </div>
+      <p class="note">
+        Superseded failure note (conductor row Completed). See Failure Artifact.
+      </p>
+      <div class="artifact" data-region="failure-artifact">
+        <h3>Failure Artifact [SUPERSEDED]</h3>
+        <div class="meta">
+          <span><span class="k">Path</span><span class="v">C:\dev\scratch\demo-superseded\.coordinator\FAILURE.md</span></span>
+          <span><span class="k">Reason</span><span class="v">conductor row Completed</span></span>
+        </div>
       </div>
     </article>
 

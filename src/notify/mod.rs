@@ -20,7 +20,11 @@ use crate::registry::ProjectRecord;
 pub use adapter::{
     ArtifactAdapter, Composite, HermesAdapter, LogAdapter, NotifyAdapter, RecordingAdapter,
 };
-pub use artifact::{FailureShow, clear as clear_artifact};
+pub use artifact::{
+    AUTO_CLEAR_DETAIL, ArtifactMeta, FailureShow, LAST_EVENT_FAILURE_RESOLVED,
+    SUPERSEDED_COMPLETED, SUPERSEDED_MISMATCH, clear as clear_artifact, compute_superseded,
+    parse_metadata, track_ids_match,
+};
 pub use recovery::recommended_action;
 pub use toast::{ENV_COORDINATOR_NOTIFY, ToastAdapter, notify_enabled};
 
