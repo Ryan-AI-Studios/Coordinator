@@ -426,14 +426,32 @@ pub fn status_after_wait(record: &ProjectRecord) -> Result<StatusView> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, test_env_lock};
+    use crate::config::{
+        ENV_COORDINATOR_HOME, ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, MachineConfig,
+        save_machine_config, test_env_lock,
+    };
     use crate::outcome::{
         FailureClass, OutcomeSource, PhaseOutcome, outcome_current_path, save_current_outcome,
         write_and_apply,
     };
     use crate::state::STUB_PHASE_ACTIVE;
+    use crate::workflow::graph::{ROLE_IMPLEMENTOR, ROLE_PLANNER};
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    fn pin_dummy_adapter_bindings(home: &std::path::Path) {
+        let dummy = home.join("dummy-grok.exe");
+        std::fs::write(&dummy, b"").unwrap();
+        let cmd = dummy.to_string_lossy().into_owned();
+        let mut cfg = MachineConfig::default();
+        if let Some(b) = cfg.role_bindings.get_mut(ROLE_PLANNER) {
+            b.command = cmd.clone();
+        }
+        if let Some(b) = cfg.role_bindings.get_mut(ROLE_IMPLEMENTOR) {
+            b.command = cmd;
+        }
+        save_machine_config(&cfg).unwrap();
+    }
 
     fn rec(path: &std::path::Path) -> ProjectRecord {
         ProjectRecord {
@@ -616,6 +634,12 @@ mod tests {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "3600");
             std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "3600");
         }
+        let home = tempdir().unwrap();
+        let prev_home = std::env::var_os(ENV_COORDINATOR_HOME);
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        pin_dummy_adapter_bindings(home.path());
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         run_with_driver(&r, Some("0013".into()), WorkflowDriver::Adapter).unwrap();
@@ -645,6 +669,10 @@ mod tests {
             std::env::remove_var(ENV_OUTCOME_POLL_MS);
             std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
             std::env::remove_var(ENV_STUB_PHASE_TIMEOUT_SECS);
+            match prev_home {
+                Some(v) => std::env::set_var(ENV_COORDINATOR_HOME, v),
+                None => std::env::remove_var(ENV_COORDINATOR_HOME),
+            }
         }
     }
 
@@ -668,6 +696,7 @@ mod tests {
             std::env::set_var(ENV_OUTCOME_POLL_MS, "50");
             std::env::set_var(ENV_COORDINATOR_NOTIFY, "off");
         }
+        pin_dummy_adapter_bindings(home.path());
         let mut reg = Registry::default();
         let r = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
