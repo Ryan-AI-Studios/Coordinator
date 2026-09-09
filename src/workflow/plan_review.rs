@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{ENV_COORDINATOR_AGY_BIN, RoleBinding};
 use crate::error::{CoordinatorError, Result};
@@ -15,7 +15,7 @@ use crate::outcome::{
     FailureClass, OutcomeMetadata, OutcomeSource, OutcomeStatus, PhaseOutcome, outcome_roles_dir,
 };
 use crate::registry::ProjectRecord;
-use crate::review::spawn::{resolve_review_bin, run_process};
+use crate::review::spawn::{ProcessWait, resolve_review_bin, run_process};
 use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock};
 use crate::workflow::drive::write_review_markdown;
 use crate::workflow::graph::{
@@ -68,11 +68,19 @@ pub struct AgyCli;
 impl PlanReviewBackend for AgyCli {
     fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
         let bin = resolve_agy_bin(&req.command)?;
+        let mut watch_paths = Vec::new();
+        if let Some(ref td) = req.track_dir {
+            watch_paths.push(td.join(format!("{}-review.md", req.slug)));
+        }
         let out = run_process(
             &bin,
             &req.argv,
             &req.workspace_root,
-            req.remaining,
+            ProcessWait {
+                timeout: req.remaining,
+                stall: crate::workflow::watchdog::progress_stall_interval(),
+                watch_paths: &watch_paths,
+            },
             &[],
             None,
         )?;
@@ -96,11 +104,19 @@ impl PlanReviewBackend for OpenCodeCli {
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
+        let mut watch_paths = Vec::new();
+        if let Some(ref td) = req.track_dir {
+            watch_paths.push(td.join(format!("{}-review.md", req.slug)));
+        }
         let out = run_process(
             &bin,
             &req.argv,
             &req.workspace_root,
-            req.remaining,
+            ProcessWait {
+                timeout: req.remaining,
+                stall: crate::workflow::watchdog::progress_stall_interval(),
+                watch_paths: &watch_paths,
+            },
             &extra,
             Some(req.prompt.as_bytes()),
         )?;
@@ -508,7 +524,11 @@ fn apply_slot_result(
     backend: &dyn PlanReviewBackend,
     req: &PlanReviewRequest,
 ) {
+    let t0 = Instant::now();
     let result = backend.run(req);
+    if let Ok(ref out) = result {
+        journal_reviewer_stall(record, req, out, t0.elapsed());
+    }
     finish_slot(record, backend, req, result, false);
 }
 
@@ -545,7 +565,11 @@ fn finish_slot(
                         unlink_track_review(req);
                         let mut retry_req = req.clone();
                         retry_req.remaining = remaining;
+                        let t1 = Instant::now();
                         let second = backend.run(&retry_req);
+                        if let Ok(ref out) = second {
+                            journal_reviewer_stall(record, &retry_req, out, t1.elapsed());
+                        }
                         finish_slot(record, backend, &retry_req, second, true);
                         return;
                     }
@@ -690,6 +714,9 @@ fn opencode_review_looks_complete(body: &str, track_id: Option<&str>) -> bool {
 }
 
 fn opencode_should_retry(req: &PlanReviewRequest, out: &PlanReviewResult) -> bool {
+    if out.exit == 124 || crate::review::spawn::is_reviewer_stall(&out.stderr) {
+        return false;
+    }
     if let Some(body) = track_review_body(req.track_dir.as_deref(), &req.slug) {
         return !opencode_review_looks_complete(&body, req.spawn_track_id.as_deref());
     }
@@ -700,6 +727,23 @@ fn opencode_should_retry(req: &PlanReviewRequest, out: &PlanReviewResult) -> boo
         OpencodeStdout::Empty => true,
         OpencodeStdout::Error(_) => false,
     }
+}
+
+fn journal_reviewer_stall(
+    record: &ProjectRecord,
+    req: &PlanReviewRequest,
+    out: &PlanReviewResult,
+    dur: Duration,
+) {
+    if out.exit != 124 || !crate::review::spawn::is_reviewer_stall(&out.stderr) {
+        return;
+    }
+    crate::harness::journal::record_reviewer_stall(
+        record,
+        &req.slug,
+        &crate::harness::journal::argv_head(&req.command, &req.argv),
+        dur.as_millis() as u64,
+    );
 }
 
 fn unlink_track_review(req: &PlanReviewRequest) {
@@ -1193,6 +1237,17 @@ impl ScriptedBackend {
                 exit: 0,
                 stdout: String::new(),
                 stderr: String::new(),
+            },
+            write_track: None,
+        }
+    }
+
+    pub fn stall() -> Self {
+        Self {
+            result: PlanReviewResult {
+                exit: 124,
+                stdout: String::new(),
+                stderr: "reviewer stall — no progress for 600s".into(),
             },
             write_track: None,
         }
@@ -2443,6 +2498,30 @@ mod tests {
             load_run_state(&r).unwrap().phase,
             load_run_state(&r).unwrap().last_event
         );
+    }
+
+    #[test]
+    fn stalled_opencode_does_not_retry() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["opencode".into()];
+        state.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &state).unwrap();
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::stall())));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_slots_consumed(&r, &["opencode"]);
+        let oc_runs = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(oc_runs, 1, "stall must not retry opencode");
     }
 
     #[test]

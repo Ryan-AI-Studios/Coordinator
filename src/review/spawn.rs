@@ -1,8 +1,15 @@
 //! Live one-shot review CLI spawn (Codex / Claude / OpenCode).
+//!
+//! Per-spawn silence stall + tree-kill (track **0036**): drain stdio in
+//! chunked reader threads; kill an alive-idle child after
+//! `progress_stall_interval()` with stderr `reviewer stall — no progress for`.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{
     ENV_COORDINATOR_CLAUDE_BIN, ENV_COORDINATOR_CODEX_BIN, ENV_COORDINATOR_OPENCODE_BIN,
@@ -39,11 +46,19 @@ impl ReviewBackend for LiveCli {
         } else {
             None
         };
+        let mut watch_paths = vec![last_path.clone()];
+        if let Some(ref td) = req.track_dir {
+            watch_paths.push(td.join(format!("review.{}.md", req.slug)));
+        }
         let out = run_process(
             &bin,
             &args,
             &req.exec_repo,
-            req.remaining_timeout,
+            ProcessWait {
+                timeout: req.remaining_timeout,
+                stall: crate::workflow::watchdog::progress_stall_interval(),
+                watch_paths: &watch_paths,
+            },
             &[],
             stdin,
         )?;
@@ -171,11 +186,27 @@ pub(crate) struct ProcOut {
     pub stderr: String,
 }
 
+/// Wait / stall options for [`run_process`]. `Path` is unsized — watch paths
+/// are `PathBuf`.
+pub(crate) struct ProcessWait<'a> {
+    pub timeout: Duration,
+    pub stall: Option<Duration>,
+    pub watch_paths: &'a [PathBuf],
+}
+
+pub(crate) fn is_reviewer_stall(stderr: &str) -> bool {
+    stderr.contains("reviewer stall")
+}
+
+pub(crate) fn reviewer_stall_stderr(idle: Duration) -> String {
+    format!("reviewer stall — no progress for {}s", idle.as_secs())
+}
+
 pub(crate) fn run_process(
     bin: &Path,
     args: &[String],
     cwd: &Path,
-    timeout: Duration,
+    wait: ProcessWait<'_>,
     extra_env: &[(&str, String)],
     stdin: Option<&[u8]>,
 ) -> Result<ProcOut> {
@@ -214,20 +245,30 @@ pub(crate) fn run_process(
         use std::io::Write;
         let _ = pipe.write_all(bytes);
     }
+
+    let stdout_bytes = Arc::new(AtomicU64::new(0));
+    let stderr_bytes = Arc::new(AtomicU64::new(0));
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let mut stdout_h = child
+        .stdout
+        .take()
+        .map(|p| drain_pipe(p, Arc::clone(&stdout_bytes), Arc::clone(&stdout_buf)));
+    let mut stderr_h = child
+        .stderr
+        .take()
+        .map(|p| drain_pipe(p, Arc::clone(&stderr_bytes), Arc::clone(&stderr_buf)));
+
     let start = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut last_out = 0u64;
+    let mut last_err = 0u64;
+    let mut last_watch = sample_watch(wait.watch_paths);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_string(&mut stdout);
-                }
-                if let Some(mut s) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_string(&mut stderr);
-                }
+                let stdout = join_drain(stdout_h.take(), stdout_buf);
+                let stderr = join_drain(stderr_h.take(), stderr_buf);
                 let exit = status.code().unwrap_or(-1);
                 return Ok(ProcOut {
                     exit,
@@ -236,18 +277,46 @@ pub(crate) fn run_process(
                 });
             }
             Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                let out_n = stdout_bytes.load(Ordering::Relaxed);
+                let err_n = stderr_bytes.load(Ordering::Relaxed);
+                let now_watch = sample_watch(wait.watch_paths);
+                if out_n > last_out || err_n > last_err || now_watch != last_watch {
+                    last_progress = Instant::now();
+                    last_out = out_n;
+                    last_err = err_n;
+                    last_watch = now_watch;
+                }
+                let idle = last_progress.elapsed();
+                if let Some(s) = wait.stall
+                    && !s.is_zero()
+                    && s < wait.timeout
+                    && idle >= s
+                {
+                    tree_kill(&mut child);
+                    let _ = join_drain(stdout_h.take(), stdout_buf);
+                    let _ = join_drain(stderr_h.take(), stderr_buf);
                     return Ok(ProcOut {
                         exit: 124,
                         stdout: String::new(),
-                        stderr: format!("review CLI timed out after {}s", timeout.as_secs()),
+                        stderr: reviewer_stall_stderr(idle),
+                    });
+                }
+                if start.elapsed() >= wait.timeout {
+                    tree_kill(&mut child);
+                    let _ = join_drain(stdout_h.take(), stdout_buf);
+                    let _ = join_drain(stderr_h.take(), stderr_buf);
+                    return Ok(ProcOut {
+                        exit: 124,
+                        stdout: String::new(),
+                        stderr: format!("review CLI timed out after {}s", wait.timeout.as_secs()),
                     });
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
+                tree_kill(&mut child);
+                let _ = join_drain(stdout_h.take(), stdout_buf);
+                let _ = join_drain(stderr_h.take(), stderr_buf);
                 return Err(CoordinatorError::Message(format!(
                     "wait failed for {}: {e}",
                     bin.display()
@@ -255,6 +324,72 @@ pub(crate) fn run_process(
             }
         }
     }
+}
+
+fn drain_pipe(
+    mut pipe: impl Read + Send + 'static,
+    bytes: Arc<AtomicU64>,
+    buf: Arc<Mutex<Vec<u8>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Ok(mut g) = buf.lock() {
+                        g.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn join_drain(handle: Option<std::thread::JoinHandle<()>>, buf: Arc<Mutex<Vec<u8>>>) -> String {
+    if let Some(h) = handle {
+        let _ = h.join();
+    }
+    let bytes = buf.lock().map(|g| g.clone()).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn sample_watch(paths: &[PathBuf]) -> Vec<Option<(SystemTime, u64)>> {
+    paths
+        .iter()
+        .map(|p| {
+            let meta = std::fs::metadata(p).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        })
+        .collect()
+}
+
+/// Tree-kill a live child. Local to spawn (do not reuse Grok `kill_pid_best_effort`).
+fn tree_kill(child: &mut Child) {
+    let pid = child.id();
+    if pid != 0 && pid != std::process::id() {
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn spawn_command(bin: &Path) -> Command {
@@ -385,6 +520,234 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "-m" && w[1] == "gpt-5.6-terra")
+        );
+    }
+
+    fn wait(timeout: Duration, stall: Option<Duration>, watch: &[PathBuf]) -> ProcessWait<'_> {
+        ProcessWait {
+            timeout,
+            stall,
+            watch_paths: watch,
+        }
+    }
+
+    fn write_cmd(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn pid_is_live(pid: u32) -> bool {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        match out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.contains(&pid.to_string()) && !s.to_ascii_lowercase().contains("no tasks")
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn zero_stdio_sleeper_stall_kills_with_stall_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = write_cmd(
+            dir.path(),
+            "sleep.cmd",
+            "@echo off\r\nping -n 30 127.0.0.1 >nul 2>&1\r\n",
+        );
+        let t0 = Instant::now();
+        let out = run_process(
+            &cmd,
+            &[],
+            dir.path(),
+            wait(Duration::from_secs(30), Some(Duration::from_secs(1)), &[]),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(8),
+            "stall-kill should finish in a few seconds, took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(out.exit, 124);
+        assert!(is_reviewer_stall(&out.stderr), "stderr={}", out.stderr);
+        assert!(
+            out.stderr.contains("reviewer stall — no progress for"),
+            "stderr={}",
+            out.stderr
+        );
+        assert!(
+            !out.stderr.contains("timed out after"),
+            "stderr={}",
+            out.stderr
+        );
+        assert!(
+            !out.stderr.to_ascii_lowercase().contains("exhausted"),
+            "stderr={}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn chatty_stderr_child_exits_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "1..15 | ForEach-Object { [Console]::Error.WriteLine('tick'); Start-Sleep -Milliseconds 200 }"
+                .into(),
+        ];
+        let out = run_process(
+            Path::new("powershell.exe"),
+            &args,
+            dir.path(),
+            wait(Duration::from_secs(10), Some(Duration::from_secs(1)), &[]),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.exit, 0, "stderr={} stdout={}", out.stderr, out.stdout);
+        assert!(!is_reviewer_stall(&out.stderr), "stderr={}", out.stderr);
+    }
+
+    #[test]
+    fn artifact_mtime_child_exits_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let watch = dir.path().join("watch.txt");
+        std::fs::write(&watch, "start\n").unwrap();
+        let args = vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "$ErrorActionPreference='Stop'; 1..15 | ForEach-Object { Set-Content -LiteralPath $env:COORDINATOR_TEST_WATCH -Value $_; Start-Sleep -Milliseconds 200 }".into(),
+        ];
+        let watch_paths = vec![watch.clone()];
+        let out = run_process(
+            Path::new("powershell.exe"),
+            &args,
+            dir.path(),
+            wait(
+                Duration::from_secs(10),
+                Some(Duration::from_secs(1)),
+                &watch_paths,
+            ),
+            &[(
+                "COORDINATOR_TEST_WATCH",
+                watch.to_string_lossy().into_owned(),
+            )],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.exit, 0, "stderr={} stdout={}", out.stderr, out.stdout);
+        assert!(!is_reviewer_stall(&out.stderr), "stderr={}", out.stderr);
+    }
+
+    #[test]
+    fn stall_disabled_uses_remaining_timeout_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = write_cmd(
+            dir.path(),
+            "sleep.cmd",
+            "@echo off\r\nping -n 30 127.0.0.1 >nul 2>&1\r\n",
+        );
+        let out = run_process(
+            &cmd,
+            &[],
+            dir.path(),
+            wait(Duration::from_secs(1), None, &[]),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.exit, 124);
+        assert!(
+            out.stderr.contains("review CLI timed out after"),
+            "stderr={}",
+            out.stderr
+        );
+        assert!(!is_reviewer_stall(&out.stderr), "stderr={}", out.stderr);
+    }
+
+    #[test]
+    fn stall_at_least_remaining_uses_timeout_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = write_cmd(
+            dir.path(),
+            "sleep.cmd",
+            "@echo off\r\nping -n 30 127.0.0.1 >nul 2>&1\r\n",
+        );
+        let out = run_process(
+            &cmd,
+            &[],
+            dir.path(),
+            wait(Duration::from_secs(1), Some(Duration::from_secs(5)), &[]),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.exit, 124);
+        assert!(
+            out.stderr.contains("review CLI timed out after"),
+            "stderr={}",
+            out.stderr
+        );
+        assert!(!is_reviewer_stall(&out.stderr), "stderr={}", out.stderr);
+    }
+
+    #[test]
+    fn cmd_tree_kill_reaps_grandchild_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let cmd = write_cmd(
+            dir.path(),
+            "tree.cmd",
+            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"$p = Start-Process -FilePath ping.exe -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru; Set-Content -LiteralPath $env:COORDINATOR_TEST_PIDFILE -Value $p.Id; Wait-Process -Id $p.Id\"\r\n",
+        );
+        let pidfile_s = pidfile.to_string_lossy().into_owned();
+        let handle = std::thread::spawn({
+            let cmd = cmd.clone();
+            let cwd = dir.path().to_path_buf();
+            let pidfile_s = pidfile_s.clone();
+            move || {
+                run_process(
+                    &cmd,
+                    &[],
+                    &cwd,
+                    wait(Duration::from_secs(30), Some(Duration::from_secs(2)), &[]),
+                    &[("COORDINATOR_TEST_PIDFILE", pidfile_s)],
+                    None,
+                )
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut pid = None;
+        while Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&pidfile)
+                && let Ok(p) = s.trim().parse::<u32>()
+                && p != 0
+                && pid_is_live(p)
+            {
+                pid = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let pid = pid.expect("grandchild PID file should appear while child is live");
+        let out = handle.join().expect("run_process thread").unwrap();
+        assert_eq!(out.exit, 124);
+        assert!(is_reviewer_stall(&out.stderr), "stderr={}", out.stderr);
+        let gone_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < gone_deadline && pid_is_live(pid) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !pid_is_live(pid),
+            "grandchild PID {pid} should be gone after tree-kill"
         );
     }
 }

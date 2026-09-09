@@ -107,7 +107,11 @@ impl Probe for DefaultProbe {
             bin,
             args,
             &std::env::temp_dir(),
-            PROBE_TIMEOUT,
+            crate::review::spawn::ProcessWait {
+                timeout: PROBE_TIMEOUT,
+                stall: None,
+                watch_paths: &[],
+            },
             &[],
             None,
         ) {

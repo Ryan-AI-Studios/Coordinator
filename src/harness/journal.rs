@@ -124,6 +124,41 @@ pub(crate) fn enabled() -> bool {
     )
 }
 
+/// One-shot reviewer stall line (0036). Caller-supplied `harness` slug.
+/// Does **not** call [`JournalHub::record`] (that hardcodes `grok`) and does
+/// not increment `loop_suspect`.
+pub(crate) fn record_reviewer_stall(
+    record: &ProjectRecord,
+    harness: &str,
+    argv_head: &str,
+    dur_ms: u64,
+) {
+    if !enabled() {
+        return;
+    }
+    let snap = snapshot(record);
+    let line = JournalLine {
+        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        phase: &snap.phase,
+        harness,
+        argv_head,
+        exit: Some(124),
+        dur_ms,
+        ok: false,
+        signal: Some("reviewer_stall"),
+    };
+    let Ok(json) = serde_json::to_string(&line) else {
+        return;
+    };
+    let Some(path) = journal_file(&snap.record, &snap.track, snap.epoch) else {
+        return;
+    };
+    if append_line(&path, &json).is_err() {
+        return;
+    }
+    gc_after_append(&path);
+}
+
 pub(crate) fn snapshot(record: &ProjectRecord) -> JournalSnap {
     let missing = crate::state::run_state_path(record)
         .map(|p| !p.exists())
@@ -437,6 +472,38 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert!(v.get("signal").is_none());
         assert!(v["ts"].as_str().unwrap().contains('T'));
+    }
+
+    #[test]
+    fn reviewer_stall_line_uses_caller_harness() {
+        let iso = Isolated::enter();
+        let rec = iso.rec();
+        seed_run(&rec, "cross-model-review", "0036", 3);
+        record_reviewer_stall(&rec, "codex", "codex exec", 600_000);
+        let path = journal_file(&rec, "0036", 3).unwrap();
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 1);
+        let v = &lines[0];
+        assert_eq!(v["harness"], "codex");
+        assert_eq!(v["signal"], "reviewer_stall");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["exit"], 124);
+        assert_eq!(v["phase"], "cross-model-review");
+        assert_eq!(v["argv_head"], "codex exec");
+        assert!(v.get("env").is_none());
+    }
+
+    #[test]
+    fn reviewer_stall_journal_off_writes_nothing() {
+        let iso = Isolated::enter();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_JOURNAL, "off");
+        }
+        let rec = iso.rec();
+        seed_run(&rec, "cross-model-review", "0036", 3);
+        record_reviewer_stall(&rec, "codex", "codex exec", 1);
+        let path = journal_file(&rec, "0036", 3).unwrap();
+        assert!(!path.exists() || fs::read_to_string(&path).unwrap().trim().is_empty());
     }
 
     #[test]

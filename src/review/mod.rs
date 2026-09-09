@@ -8,7 +8,7 @@ pub mod parse;
 pub mod prompt;
 pub mod spawn;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -192,9 +192,25 @@ pub fn drive_with(
         };
 
         any_started = true;
+        let t0 = Instant::now();
         let class = match backend.run(&req) {
             Ok(result) => {
                 let class = classify_result(&result);
+                if result.exit == 124 && spawn::is_reviewer_stall(&result.stderr) {
+                    crate::harness::journal::record_reviewer_stall(
+                        record,
+                        slug,
+                        &crate::harness::journal::argv_head(&req.command, &[] as &[&str]),
+                        t0.elapsed().as_millis() as u64,
+                    );
+                    persist_review_state(record, |s, rv| {
+                        if !rv.stalled.iter().any(|x| x == slug) {
+                            rv.stalled.push(slug.to_string());
+                        }
+                        rv.active = None;
+                        s.last_event = truncate_msg(&format!("reviewer stall ({slug})"));
+                    })?;
+                }
                 if matches!(
                     class,
                     TierClass::Pass | TierClass::PassWithLows | TierClass::GateFail
@@ -335,10 +351,17 @@ fn write_reports(record: &ProjectRecord, state: &RunState, slug: &str, body: &st
 }
 
 fn persist_review(record: &ProjectRecord, f: impl FnOnce(&mut ReviewWatchState)) -> Result<()> {
+    persist_review_state(record, |_, rv| f(rv))
+}
+
+fn persist_review_state(
+    record: &ProjectRecord,
+    f: impl FnOnce(&mut RunState, &mut ReviewWatchState),
+) -> Result<()> {
     with_run_state_lock(record, || {
         let mut s = load_run_state(record)?;
         let mut rv = s.review.take().unwrap_or_default();
-        f(&mut rv);
+        f(&mut s, &mut rv);
         s.review = Some(rv);
         s.updated_at = Utc::now();
         save_run_state(record, &s)
@@ -467,6 +490,24 @@ mod tests {
         }
     }
 
+    fn stall_text() -> ReviewResult {
+        ReviewResult {
+            exit: 124,
+            stdout: String::new(),
+            stderr: "reviewer stall — no progress for 600s".into(),
+            last_message: String::new(),
+        }
+    }
+
+    fn timeout_text() -> ReviewResult {
+        ReviewResult {
+            exit: 124,
+            stdout: String::new(),
+            stderr: "review CLI timed out after 60s".into(),
+            last_message: String::new(),
+        }
+    }
+
     fn hook(scripted: ScriptedBackend) -> (TestBackendGuard, CallCounts) {
         let rec = RecordingBackend::wrap(Arc::new(scripted));
         let counts = rec.counts.clone();
@@ -549,6 +590,71 @@ mod tests {
         assert!(view.last_event.contains("cross-model: pass (claude)"));
         assert_eq!(counts.n(), 2);
         assert_eq!(counts.slugs(), vec!["codex", "claude"]);
+        clear_env();
+    }
+
+    #[test]
+    fn primary_stall_secondary_pass_stamps_stalled_not_stalled_at() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new()
+            .push_ok(stall_text())
+            .push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("pass");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(view.last_event.contains("cross-model: pass (claude)"));
+        assert_eq!(counts.n(), 2);
+        assert_eq!(counts.slugs(), vec!["codex", "claude"]);
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(
+            st.review.as_ref().map(|x| x.stalled.clone()),
+            Some(vec!["codex".into()])
+        );
+        assert!(st.stalled_at.is_none());
+        assert!(
+            view.review
+                .as_ref()
+                .map(|v| v.stalled == ["codex"])
+                .unwrap_or(false),
+            "status review.stalled={:?}",
+            view.review
+        );
+        let attempted = st.review.as_ref().map(|x| x.attempted.clone());
+        assert!(
+            attempted
+                .as_ref()
+                .is_some_and(|a| a.iter().any(|s| s == "codex") && a.iter().any(|s| s == "claude")),
+            "attempted={attempted:?}"
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn timeout_124_without_stall_marker_does_not_stamp_stalled() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new()
+            .push_ok(timeout_text())
+            .push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("pass");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(counts.n(), 2);
+        let st = load_run_state(&r).unwrap();
+        assert!(
+            st.review
+                .as_ref()
+                .map(|x| x.stalled.is_empty())
+                .unwrap_or(true),
+            "stalled={:?}",
+            st.review.as_ref().map(|x| &x.stalled)
+        );
+        assert!(st.stalled_at.is_none());
         clear_env();
     }
 
