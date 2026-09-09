@@ -19,6 +19,7 @@
 //! Opt-in Hermes progress POSTs on phase advance (failure JSON unchanged): track **0033**.
 //! TerminalHub JSONL command journal + `loop_suspect` on repeated fail: track **0034**.
 //! First stall recycles unless sidecar `tool_in_flight` (`session/update` is not mid-tool): track **0035**.
+//! One-shot reviewer silence stall (tree-kill + 0011 fall-through; not ACP recycle): track **0036**.
 //! Plan-review Antigravity one-shot (`agy --print`): track **0017**.
 //! Plan-review OpenCode one-shot (`opencode run`): track **0018**.
 //! OpenCode prompt on stdin (plan-review + 0011); degenerate `opencode-review.md` retry: track **0037**.

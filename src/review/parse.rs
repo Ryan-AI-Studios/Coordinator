@@ -453,6 +453,15 @@ mod tests {
     }
 
     #[test]
+    fn stall_kill_with_pass_is_crash_not_exhaustion() {
+        let mut r = res("## Verdict: PASS\n");
+        r.exit = 124;
+        r.stderr = "reviewer stall — no progress for 600s".into();
+        assert_eq!(classify_result(&r), TierClass::Crash);
+        assert!(!r.stderr.to_ascii_lowercase().contains("exhausted"));
+    }
+
+    #[test]
     fn gate_fail_still_wins_on_nonzero_exit() {
         let mut r = res("## Verdict: FAIL\n");
         r.exit = 1;
