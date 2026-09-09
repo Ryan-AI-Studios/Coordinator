@@ -676,6 +676,7 @@ mod tests {
                 cwd: Some(PathBuf::from(r"C:\dev\demo")),
                 supports_compact: true,
                 pid: Some(42),
+                adapter: "grok".into(),
             }),
         });
         let rows = session_rows(&v);

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::api;
 use crate::config::DEFAULT_SERVE_PORT;
@@ -128,11 +128,33 @@ pub enum Commands {
         #[command(subcommand)]
         action: HarnessCommands,
     },
+    /// Show or toggle machine Role Bindings (planner/implementor ACP harness)
+    Roles {
+        #[command(subcommand)]
+        action: RolesCommands,
+    },
     /// Notify probes (Hermes inbound webhook)
     Notify {
         #[command(subcommand)]
         action: NotifyCommands,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RolesCommands {
+    /// Pretty JSON of machine `role_bindings`
+    Show,
+    /// Set planner+implementor (and present fold/next) to grok or cursor
+    Use {
+        /// grok | cursor
+        target: RolesTarget,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RolesTarget {
+    Grok,
+    Cursor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -588,6 +610,20 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 }
             },
         },
+        Commands::Roles { action } => match action {
+            RolesCommands::Show => {
+                let bindings = crate::harness::roles::roles_show()?;
+                println!("{}", serde_json::to_string_pretty(&bindings)?);
+            }
+            RolesCommands::Use { target } => {
+                let slug = match target {
+                    RolesTarget::Grok => "grok",
+                    RolesTarget::Cursor => "cursor",
+                };
+                let bindings = crate::harness::roles::roles_use(slug)?;
+                println!("{}", serde_json::to_string_pretty(&bindings)?);
+            }
+        },
         Commands::Notify { action } => match action {
             NotifyCommands::HermesTest { project, progress } => {
                 let project_id = match project {
@@ -920,5 +956,27 @@ mod tests {
                 "missing {expected}"
             );
         }
+    }
+
+    #[test]
+    fn roles_commands_in_help() {
+        let cmd = Cli::command();
+        let roles = cmd.find_subcommand("roles").expect("roles");
+        assert!(roles.find_subcommand("show").is_some(), "missing show");
+        assert!(roles.find_subcommand("use").is_some(), "missing use");
+        let parsed = Cli::try_parse_from(["coordinator", "roles", "use", "cursor"]).unwrap();
+        match parsed.command {
+            Commands::Roles {
+                action:
+                    RolesCommands::Use {
+                        target: RolesTarget::Cursor,
+                    },
+            } => {}
+            other => panic!("expected roles use cursor, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["coordinator", "roles", "use", "opencode"]).is_err(),
+            "unknown token must be clap error"
+        );
     }
 }

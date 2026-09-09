@@ -50,6 +50,7 @@ pub(crate) struct JournalEvent<'a> {
     pub ok: bool,
     pub signal: Option<&'static str>,
     pub spawn_fail: bool,
+    pub harness: &'a str,
 }
 
 pub(crate) struct JournalHub {
@@ -71,10 +72,15 @@ impl JournalHub {
         if !enabled() {
             return;
         }
+        let harness = if ev.harness.trim().is_empty() {
+            "grok"
+        } else {
+            ev.harness
+        };
         let line = JournalLine {
             ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             phase: &ev.snap.phase,
-            harness: "grok",
+            harness,
             argv_head: ev.argv_head,
             exit: ev.exit,
             dur_ms: ev.dur_ms,
@@ -125,8 +131,8 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// One-shot reviewer stall line (0036). Caller-supplied `harness` slug.
-/// Does **not** call [`JournalHub::record`] (that hardcodes `grok`) and does
-/// not increment `loop_suspect`.
+/// Does **not** call [`JournalHub::record`] (ACP journal path; no `loop_suspect`)
+/// and does not increment `loop_suspect`.
 pub(crate) fn record_reviewer_stall(
     record: &ProjectRecord,
     harness: &str,
@@ -379,6 +385,7 @@ mod tests {
             ok,
             signal,
             spawn_fail,
+            harness: "grok",
         }
     }
 
@@ -776,5 +783,27 @@ mod tests {
         assert_eq!(v["dur_ms"], 0);
         assert_eq!(v["ok"], false);
         assert!(v.get("env").is_none());
+    }
+
+    #[test]
+    fn record_uses_caller_harness_not_hardcoded_grok() {
+        let iso = Isolated::enter();
+        let rec = iso.rec();
+        seed_run(&rec, "implement", "0038", 1);
+        let snap = snapshot(&rec);
+        let mut hub = JournalHub::new();
+        let mut ev = ev(
+            &snap,
+            "cursor-agent --yolo --trust acp",
+            Some(0),
+            3,
+            true,
+            None,
+            false,
+        );
+        ev.harness = "cursor";
+        hub.record(ev);
+        let v = &read_lines(&journal_file(&rec, "0038", 1).unwrap())[0];
+        assert_eq!(v["harness"], "cursor");
     }
 }

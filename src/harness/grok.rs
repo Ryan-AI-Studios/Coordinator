@@ -34,6 +34,15 @@ pub const ENV_GROK_BIN: &str = "COORDINATOR_GROK_BIN";
 /// Set to `1` to run ignored live ACP tests.
 pub const ENV_GROK_LIVE: &str = "COORDINATOR_GROK_LIVE";
 
+/// Absolute override for the `cursor-agent` binary.
+pub const ENV_CURSOR_BIN: &str = "COORDINATOR_CURSOR_BIN";
+
+/// Set to `1` to run ignored live Cursor ACP tests.
+pub const ENV_CURSOR_LIVE: &str = "COORDINATOR_CURSOR_LIVE";
+
+/// Holder-child env: which ACP harness (`grok` or `cursor`) this session is.
+pub const ENV_ACP_HARNESS: &str = "COORDINATOR_ACP_HARNESS";
+
 /// Result of one `session/prompt` turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptResult {
@@ -49,6 +58,10 @@ pub struct GrokSession {
     pub cwd: PathBuf,
     pub pid: Option<u32>,
     pub supports_compact: bool,
+    /// Harness slug (`grok` or `cursor`).
+    pub adapter: String,
+    /// Session-only slash command (`/compact`, `/summarize`). Always leading `/` when `Some`.
+    pub compact_command: Option<String>,
     next_id: u64,
     collected_text: String,
     /// When set, every ACP `session/update` writes `{state_dir}/harness-progress.json`.
@@ -142,14 +155,26 @@ impl GrokSession {
     }
 
     /// Spawn with an already-resolved phase binary and optional `-m` model.
+    /// Grok-default wrapper so existing callers (`pool.rs`) keep compiling.
     pub async fn start_with_bin(
         cwd: PathBuf,
         timeout: Duration,
         bin: PathBuf,
         model: Option<&str>,
     ) -> Result<Self> {
-        let mut cmd = tokio::process::Command::new(&bin);
-        for arg in grok_agent_argv(model) {
+        Self::start_with_harness(cwd, timeout, bin, model, "grok").await
+    }
+
+    /// Spawn ACP stdio for `harness` (`grok` or `cursor`).
+    pub async fn start_with_harness(
+        cwd: PathBuf,
+        timeout: Duration,
+        bin: PathBuf,
+        model: Option<&str>,
+        harness: &str,
+    ) -> Result<Self> {
+        let mut cmd = acp_spawn_command(&bin);
+        for arg in acp_agent_argv(harness, model) {
             cmd.arg(arg);
         }
         cmd.stdin(Stdio::piped())
@@ -164,7 +189,7 @@ impl GrokSession {
         }
         let mut child = cmd.spawn().map_err(|e| {
             CoordinatorError::Message(format!(
-                "failed to spawn grok agent stdio ({}): {e}",
+                "failed to spawn {} ({harness}): {e}",
                 bin.display()
             ))
         })?;
@@ -205,6 +230,8 @@ impl GrokSession {
             cwd,
             pid,
             supports_compact: true,
+            adapter: harness.to_string(),
+            compact_command: None,
             next_id: 1,
             collected_text: String::new(),
             progress_record: None,
@@ -214,6 +241,7 @@ impl GrokSession {
             cancel_requested,
             terminals: crate::harness::terminal::TerminalHub::new(),
         };
+        session.terminals.set_adapter(harness);
         session.handshake(timeout).await?;
         if let Err(e) = session.terminals.probe_host_shell().await {
             let _ = session.shutdown().await;
@@ -227,6 +255,16 @@ impl GrokSession {
         cwd: PathBuf,
         responses: Vec<String>,
         timeout: Duration,
+    ) -> Result<Self> {
+        Self::start_mock_for(cwd, responses, timeout, "grok").await
+    }
+
+    /// Mock transport with an explicit harness slug (auth / compact defaults).
+    pub async fn start_mock_for(
+        cwd: PathBuf,
+        responses: Vec<String>,
+        timeout: Duration,
+        harness: &str,
     ) -> Result<Self> {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         for line in responses {
@@ -253,6 +291,8 @@ impl GrokSession {
             cwd,
             pid: Some(4242),
             supports_compact: true,
+            adapter: harness.to_string(),
+            compact_command: None,
             next_id: 1,
             collected_text: String::new(),
             progress_record: None,
@@ -262,6 +302,7 @@ impl GrokSession {
             cancel_requested,
             terminals: crate::harness::terminal::TerminalHub::new(),
         };
+        session.terminals.set_adapter(harness);
         session.handshake(timeout).await?;
         Ok(session)
     }
@@ -309,6 +350,7 @@ impl GrokSession {
     /// Bind this session to a project so ACP `session/update` writes the progress sidecar
     /// and TerminalHub journals child commands (track 0034).
     pub fn set_progress_record(&mut self, record: ProjectRecord) {
+        self.terminals.set_adapter(&self.adapter);
         self.terminals.bind_record(record.clone());
         self.progress_record = Some(record);
     }
@@ -327,9 +369,10 @@ impl GrokSession {
                 timeout,
             )
             .await?;
-        self.supports_compact = compact_supported(&init);
+        self.compact_command = context_reduce_command(&init, &self.adapter);
+        self.supports_compact = self.compact_command.is_some();
 
-        let method_id = pick_auth_method(&init)?;
+        let method_id = pick_auth_method(&init, &self.adapter)?;
         self.request(
             "authenticate",
             json!({
@@ -393,20 +436,26 @@ impl GrokSession {
         })
     }
 
-    /// Compact via `session/prompt` `/compact` (not a separate RPC).
+    /// Compact via `session/prompt` with the stored slash command (not a separate RPC).
     pub async fn compact(&mut self, timeout: Duration) -> Result<PromptResult> {
-        if !self.supports_compact {
-            return Err(CoordinatorError::Message(
-                "compact is not supported by this Grok session".into(),
-            ));
-        }
-        self.inject_prompt("/compact", timeout).await
+        let cmd = match (self.supports_compact, self.compact_command.as_deref()) {
+            (true, Some(cmd)) => cmd.to_string(),
+            _ => {
+                return Err(CoordinatorError::Message(
+                    "compact is not supported by this Grok session".into(),
+                ));
+            }
+        };
+        self.inject_prompt(&cmd, timeout).await
     }
 
     /// Kill the ACP child (explicit teardown). Mock transport is a no-op drop.
     pub async fn shutdown(&mut self) -> Result<()> {
         match &mut self.transport {
             AcpTransport::Process { child, .. } => {
+                if let Some(pid) = child.id() {
+                    tree_kill_pid(pid);
+                }
                 let _ = child.kill().await;
             }
             AcpTransport::Mock { .. } => {}
@@ -509,15 +558,42 @@ impl GrokSession {
             if self.handle_agent_terminal(&v).await? {
                 continue;
             }
+            if let Some(method_name) = v.get("method").and_then(|m| m.as_str())
+                && method_name.starts_with("cursor/")
+            {
+                if let Some(req_id) = v.get("id").cloned() {
+                    let outcome = match method_name {
+                        "cursor/ask_question" => "skipped",
+                        "cursor/create_plan" => "accepted",
+                        _ => "cancelled",
+                    };
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": { "outcome": { "outcome": outcome } }
+                    });
+                    self.write_line(&reply.to_string()).await?;
+                }
+                continue;
+            }
             if v.get("id") == Some(&json!(id)) {
                 self.in_flight_id.store(0, Ordering::SeqCst);
                 if let Some(err) = v.get("error") {
                     let msg = err
                         .get("message")
                         .and_then(|m| m.as_str())
-                        .unwrap_or("ACP error")
-                        .to_string();
-                    return Err(CoordinatorError::Message(format!("ACP {method}: {msg}")));
+                        .unwrap_or("ACP error");
+                    let formatted = match err.get("data") {
+                        Some(data) => {
+                            let data_s = data
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| data.to_string());
+                            format!("ACP {method}: {msg} {data_s}")
+                        }
+                        None => format!("ACP {method}: {msg}"),
+                    };
+                    return Err(CoordinatorError::Message(formatted));
                 }
                 return Ok(v.get("result").cloned().unwrap_or(json!({})));
             }
@@ -727,19 +803,39 @@ fn collect_update(msg: &Value, out: &mut String) {
     }
 }
 
-fn compact_supported(init: &Value) -> bool {
-    let Some(cmds) = init.get("availableCommands").and_then(|c| c.as_array()) else {
-        return true;
+fn context_reduce_command(init: &Value, harness: &str) -> Option<String> {
+    const PREFERRED: &[&str] = &[
+        "summarize",
+        "/summarize",
+        "compact",
+        "/compact",
+        "compress",
+        "/compress",
+    ];
+    let Some(cmds_val) = init.get("availableCommands") else {
+        return if harness.eq_ignore_ascii_case("cursor") {
+            Some("/summarize".into())
+        } else {
+            Some("/compact".into())
+        };
     };
-    cmds.iter().any(|c| {
-        matches!(
-            c.get("name").and_then(|n| n.as_str()),
-            Some("compact") | Some("/compact")
-        )
-    })
+    let cmds = cmds_val.as_array()?;
+    let names: Vec<&str> = cmds
+        .iter()
+        .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+        .collect();
+    for pref in PREFERRED {
+        if names.iter().any(|n| n == pref) {
+            if pref.starts_with('/') {
+                return Some((*pref).to_string());
+            }
+            return Some(format!("/{pref}"));
+        }
+    }
+    None
 }
 
-fn pick_auth_method(init: &Value) -> Result<String> {
+fn pick_auth_method(init: &Value, harness: &str) -> Result<String> {
     let methods: Vec<String> = init
         .get("authMethods")
         .and_then(|a| a.as_array())
@@ -750,16 +846,21 @@ fn pick_auth_method(init: &Value) -> Result<String> {
         })
         .unwrap_or_default();
 
-    // Spec: prefer cached_token, else xai.api_key when XAI_API_KEY is set.
-    if methods.iter().any(|m| m == "cached_token") || methods.is_empty() {
-        return Ok("cached_token".into());
+    if harness.eq_ignore_ascii_case("grok") {
+        // Spec: prefer cached_token, else xai.api_key when XAI_API_KEY is set.
+        if methods.iter().any(|m| m == "cached_token") || methods.is_empty() {
+            return Ok("cached_token".into());
+        }
+        if std::env::var("XAI_API_KEY").is_ok() && methods.iter().any(|m| m == "xai.api_key") {
+            return Ok("xai.api_key".into());
+        }
+    } else if let Some(first) = methods.first() {
+        return Ok(first.clone());
     }
-    if std::env::var("XAI_API_KEY").is_ok() && methods.iter().any(|m| m == "xai.api_key") {
-        return Ok("xai.api_key".into());
-    }
-    Err(CoordinatorError::Message(
-        "no usable Grok auth method (need grok login / cached_token, or XAI_API_KEY)".into(),
-    ))
+    let advertised = methods.join(", ");
+    Err(CoordinatorError::Message(format!(
+        "no usable {harness} auth method (advertised: {advertised})"
+    )))
 }
 
 /// Map ACP/auth/timeout errors onto ADR-0009 failure classes.
@@ -777,7 +878,11 @@ pub fn map_failure_class(err: &str) -> FailureClass {
     {
         return FailureClass::Permission;
     }
-    if e.contains("quota")
+    if e.contains("402")
+        || e.contains("payment required")
+        || e.contains("usage balance")
+        || e.contains("credits")
+        || e.contains("quota")
         || e.contains("rate limit")
         || e.contains("exhaust")
         || e.contains("resource_exhausted")
@@ -785,6 +890,11 @@ pub fn map_failure_class(err: &str) -> FailureClass {
         return FailureClass::ModelExhaustion;
     }
     FailureClass::HarnessCrash
+}
+
+/// Case-insensitive `grok` or `cursor` — harnesses that use this ACP client.
+pub fn is_acp_session_harness(h: &str) -> bool {
+    h.eq_ignore_ascii_case("grok") || h.eq_ignore_ascii_case("cursor")
 }
 
 /// `grok agent [-m {model}] stdio`. Omit `-m` when model is none/empty.
@@ -801,6 +911,65 @@ pub fn grok_agent_argv(model: Option<&str>) -> Vec<String> {
     args
 }
 
+/// ACP child argv for `harness`. Grok stays `agent [-m] stdio`; cursor is `--yolo --trust [--model] acp`.
+pub fn acp_agent_argv(harness: &str, model: Option<&str>) -> Vec<String> {
+    if harness.eq_ignore_ascii_case("cursor") {
+        let mut args = vec!["--yolo".into(), "--trust".into()];
+        if let Some(m) = model {
+            let t = m.trim();
+            if !t.is_empty() {
+                args.push("--model".into());
+                args.push(t.to_string());
+            }
+        }
+        args.push("acp".into());
+        args
+    } else {
+        grok_agent_argv(model)
+    }
+}
+
+fn acp_spawn_command(bin: &Path) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let ext = bin
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "cmd" || ext == "bat" {
+            let mut c = tokio::process::Command::new("cmd.exe");
+            c.arg("/C").arg(bin);
+            return c;
+        }
+    }
+    tokio::process::Command::new(bin)
+}
+
+/// Tree-kill `pid` (`taskkill /F /T /PID` on Windows). Never pid 0 or this process.
+pub(crate) fn tree_kill_pid(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 /// Resolve `COORDINATOR_GROK_BIN` or the role-binding `grok` command on PATH.
 pub fn resolve_grok_binary() -> Result<PathBuf> {
     if let Ok(over) = std::env::var(ENV_GROK_BIN)
@@ -810,6 +979,16 @@ pub fn resolve_grok_binary() -> Result<PathBuf> {
     }
     let cmd = crate::harness::roles::resolve_grok_command()?;
     resolve_command(&cmd)
+}
+
+/// Resolve `COORDINATOR_CURSOR_BIN` or `cursor-agent` on PATH. Never uses the grok pin.
+pub fn resolve_cursor_binary() -> Result<PathBuf> {
+    if let Ok(over) = std::env::var(ENV_CURSOR_BIN)
+        && !over.trim().is_empty()
+    {
+        return resolve_command(over.trim());
+    }
+    resolve_command("cursor-agent")
 }
 
 /// Walk PATH (+ Windows PATHEXT) or accept an absolute file. No `which` crate.
@@ -1159,6 +1338,22 @@ pub fn mock_handshake_ok(session_id: &str) -> Vec<String> {
     ]
 }
 
+/// Cursor handshake: `cursor_login`, no `availableCommands` → default `/summarize`.
+#[cfg(test)]
+fn mock_cursor_handshake_ok(session_id: &str) -> Vec<String> {
+    vec![
+        rpc_result(
+            1,
+            json!({
+                "protocolVersion": 1,
+                "authMethods": [{ "id": "cursor_login" }]
+            }),
+        ),
+        rpc_result(2, json!({})),
+        rpc_result(3, json!({ "sessionId": session_id })),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,6 +1376,110 @@ mod tests {
         assert_eq!(grok_agent_argv(None), ["agent", "stdio"]);
         assert_eq!(grok_agent_argv(Some("")), ["agent", "stdio"]);
         assert_eq!(grok_agent_argv(Some("   ")), ["agent", "stdio"]);
+    }
+
+    #[test]
+    fn cursor_agent_argv_is_yolo_trust_acp() {
+        assert_eq!(acp_agent_argv("cursor", None), ["--yolo", "--trust", "acp"]);
+        let with_model = acp_agent_argv("cursor", Some("gpt-5"));
+        assert_eq!(with_model, ["--yolo", "--trust", "--model", "gpt-5", "acp"]);
+        assert!(!with_model.iter().any(|a| a == "agent"));
+        assert!(!with_model.iter().any(|a| a == "stdio"));
+        assert_eq!(
+            acp_agent_argv("cursor", Some("")),
+            ["--yolo", "--trust", "acp"]
+        );
+        assert_eq!(
+            acp_agent_argv("cursor", Some("   ")),
+            ["--yolo", "--trust", "acp"]
+        );
+        assert_eq!(acp_agent_argv("grok", None), grok_agent_argv(None));
+        assert!(is_acp_session_harness("grok"));
+        assert!(is_acp_session_harness("CURSOR"));
+        assert!(!is_acp_session_harness("opencode"));
+    }
+
+    #[test]
+    fn pick_auth_method_cursor_login() {
+        let init = json!({
+            "authMethods": [{ "id": "cursor_login" }]
+        });
+        assert_eq!(pick_auth_method(&init, "cursor").unwrap(), "cursor_login");
+    }
+
+    #[test]
+    fn pick_auth_method_lists_ids_on_failure() {
+        let init = json!({
+            "authMethods": [{ "id": "unknown_method" }]
+        });
+        let err = pick_auth_method(&init, "grok").unwrap_err().to_string();
+        assert!(err.contains("advertised"), "{err}");
+        assert!(err.contains("unknown_method"), "{err}");
+        assert!(err.contains("grok"), "{err}");
+        assert_eq!(map_failure_class(&err), FailureClass::Permission);
+    }
+
+    #[test]
+    fn grok_xai_api_key_still_requires_advertised_id() {
+        let _guard = crate::config::test_env_lock();
+        let prev = std::env::var("XAI_API_KEY").ok();
+        unsafe {
+            std::env::set_var("XAI_API_KEY", "test-not-a-real-key");
+        }
+        let init = json!({
+            "authMethods": [{ "id": "something_else" }]
+        });
+        let result = pick_auth_method(&init, "grok");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XAI_API_KEY", v),
+                None => std::env::remove_var("XAI_API_KEY"),
+            }
+        }
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("advertised"), "{err}");
+        assert!(err.contains("something_else"), "{err}");
+    }
+
+    #[test]
+    fn map_failure_class_402_data_is_exhaustion_bare_internal_is_crash() {
+        assert_eq!(
+            map_failure_class(r#"ACP session/prompt: Internal error {"status":402}"#),
+            FailureClass::ModelExhaustion
+        );
+        assert_eq!(
+            map_failure_class("ACP session/prompt: Internal error"),
+            FailureClass::HarnessCrash
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_error_flatten_includes_data() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-402");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "error": {
+                    "code": -32000,
+                    "message": "Internal error",
+                    "data": { "status": 402 }
+                }
+            })
+            .to_string(),
+        );
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        let err = session
+            .inject_prompt("x", timeout())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ACP session/prompt: Internal error"), "{err}");
+        assert!(err.contains("402"), "{err}");
+        assert_eq!(map_failure_class(&err), FailureClass::ModelExhaustion);
     }
 
     #[tokio::test]
@@ -1765,6 +2064,104 @@ mod tests {
         assert_eq!(slice_text_lines(text, Some(10), Some(2)), "");
         assert_eq!(slice_text_lines(text, None, Some(1)), "a\n");
     }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cursor_spawn_path_argv_is_yolo_trust_acp() {
+        let dir = tempdir().unwrap();
+        let stub = dir.path().join("cursor-stub.cmd");
+        std::fs::write(&stub, "@echo off\r\n>\"%~dp0argv.txt\" echo %*\r\n").unwrap();
+        let _ = GrokSession::start_with_harness(
+            dir.path().to_path_buf(),
+            Duration::from_millis(400),
+            stub,
+            None,
+            "cursor",
+        )
+        .await;
+        let argv_path = dir.path().join("argv.txt");
+        let text = std::fs::read_to_string(&argv_path)
+            .unwrap_or_else(|e| panic!("argv.txt missing after spawn: {e}"));
+        assert!(text.contains("--yolo"), "argv={text:?}");
+        assert!(text.contains("--trust"), "argv={text:?}");
+        assert!(text.contains("acp"), "argv={text:?}");
+        assert!(!text.contains("agent"), "argv={text:?}");
+        assert!(!text.contains("stdio"), "argv={text:?}");
+    }
+
+    #[tokio::test]
+    async fn mock_cursor_handshake_missing_available_commands_summarize() {
+        let dir = tempdir().unwrap();
+        let lines = mock_cursor_handshake_ok("sess-cur");
+        let session =
+            GrokSession::start_mock_for(dir.path().to_path_buf(), lines, timeout(), "cursor")
+                .await
+                .unwrap();
+        assert_eq!(session.adapter, "cursor");
+        assert_eq!(session.compact_command.as_deref(), Some("/summarize"));
+        assert!(session.supports_compact);
+        let written = session.mock_written().unwrap();
+        let auth: Value = serde_json::from_str(&written[1]).unwrap();
+        assert_eq!(auth["params"]["methodId"], "cursor_login");
+    }
+
+    #[tokio::test]
+    async fn advertised_summarize_injects_slash_summarize() {
+        let dir = tempdir().unwrap();
+        let mut lines = vec![
+            rpc_result(
+                1,
+                json!({
+                    "protocolVersion": 1,
+                    "authMethods": [{ "id": "cursor_login" }],
+                    "availableCommands": [{ "name": "summarize" }]
+                }),
+            ),
+            rpc_result(2, json!({})),
+            rpc_result(3, json!({ "sessionId": "sess-sum" })),
+        ];
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session =
+            GrokSession::start_mock_for(dir.path().to_path_buf(), lines, timeout(), "cursor")
+                .await
+                .unwrap();
+        assert_eq!(session.compact_command.as_deref(), Some("/summarize"));
+        session.compact(timeout()).await.unwrap();
+        let written = session.mock_written().unwrap();
+        let prompt: Value = serde_json::from_str(written.last().unwrap()).unwrap();
+        assert_eq!(prompt["params"]["prompt"][0]["text"], "/summarize");
+    }
+
+    #[tokio::test]
+    async fn mock_cursor_ask_question_during_prompt_completes() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_cursor_handshake_ok("sess-ask");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "cursor/ask_question",
+                "params": { "sessionId": "sess-ask" }
+            })
+            .to_string(),
+        );
+        lines.push(session_update_chunk("ok"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session =
+            GrokSession::start_mock_for(dir.path().to_path_buf(), lines, timeout(), "cursor")
+                .await
+                .unwrap();
+        let result = session.inject_prompt("ok", timeout()).await.unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("cursor/ask_question result written");
+        assert_eq!(reply["result"]["outcome"]["outcome"], "skipped");
+        assert!(reply.get("method").is_none());
+    }
 }
 
 /// Live ACP smoke. Default `cargo test` ignores this. Owner machine:
@@ -1810,6 +2207,49 @@ mod live_tests {
             .await
             .expect("live grok prompt");
         eprintln!("live text={:?} stop={:?}", result.text, result.stop_reason);
+        session.shutdown().await.unwrap();
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    fn cursor_live_enabled() -> bool {
+        std::env::var(ENV_CURSOR_LIVE).ok().as_deref() == Some("1")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires cursor-agent on PATH + login; set COORDINATOR_CURSOR_LIVE=1"]
+    #[allow(clippy::await_holding_lock)]
+    async fn cursor_live_handshake_pong() {
+        if !cursor_live_enabled() {
+            eprintln!("skip: {ENV_CURSOR_LIVE} != 1");
+            return;
+        }
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+
+        let cwd = crate::harness::grok_cwd(&rec);
+        let bin = resolve_cursor_binary().expect("cursor-agent on PATH");
+        let mut session =
+            GrokSession::start_with_harness(cwd, Duration::from_secs(60), bin, None, "cursor")
+                .await
+                .expect("live cursor start");
+        assert!(!session.session_id.is_empty());
+        let result = session
+            .inject_prompt("Reply with exactly: pong", Duration::from_secs(60))
+            .await
+            .expect("live cursor prompt");
+        eprintln!(
+            "cursor live text={:?} stop={:?}",
+            result.text, result.stop_reason
+        );
         session.shutdown().await.unwrap();
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);

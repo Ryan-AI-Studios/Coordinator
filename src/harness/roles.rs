@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::config::save_machine_config;
 pub use crate::config::{RoleBinding, default_role_bindings, load_machine_config};
 
 use crate::error::{CoordinatorError, Result};
-use crate::harness::grok::{ENV_GROK_BIN, reject_or_replace_ps1, resolve_command};
+use crate::harness::grok::{ENV_CURSOR_BIN, ENV_GROK_BIN, reject_or_replace_ps1, resolve_command};
 use crate::workflow::graph::{
     PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT, PHASE_PLAN,
     ROLE_IMPLEMENTOR, ROLE_PLANNER,
@@ -114,6 +115,11 @@ fn resolve_binding_binary(binding: &RoleBinding, role: &str) -> Result<PathBuf> 
             Ok(over) if !over.trim().is_empty() => over,
             _ => binding.command.clone(),
         }
+    } else if binding.harness.eq_ignore_ascii_case("cursor") {
+        match std::env::var(ENV_CURSOR_BIN) {
+            Ok(over) if !over.trim().is_empty() => over,
+            _ => binding.command.clone(),
+        }
     } else {
         binding.command.clone()
     };
@@ -122,11 +128,50 @@ fn resolve_binding_binary(binding: &RoleBinding, role: &str) -> Result<PathBuf> 
         .map_err(|e| CoordinatorError::Message(format!("role {role} command not resolvable: {e}")))
 }
 
+/// Pretty-JSON source for `coordinator roles show`.
+pub fn roles_show() -> Result<BTreeMap<String, RoleBinding>> {
+    load_role_bindings()
+}
+
+/// Rewrite planner + implementor (and present `fold` / `next`) to grok or cursor.
+///
+/// Clears `model`. Does not touch plan-reviewers or cross-model keys.
+pub fn roles_use(target: &str) -> Result<BTreeMap<String, RoleBinding>> {
+    let (harness, command) = match target.trim().to_ascii_lowercase().as_str() {
+        "grok" => ("grok", "grok"),
+        "cursor" => ("cursor", "cursor-agent"),
+        other => {
+            return Err(CoordinatorError::Message(format!(
+                "unknown roles target {other} (expected grok or cursor)"
+            )));
+        }
+    };
+    let mut cfg = load_machine_config()?;
+    let binding = RoleBinding {
+        harness: harness.into(),
+        command: command.into(),
+        model: None,
+    };
+    cfg.role_bindings
+        .insert(ROLE_PLANNER.to_string(), binding.clone());
+    cfg.role_bindings
+        .insert(ROLE_IMPLEMENTOR.to_string(), binding.clone());
+    if cfg.role_bindings.contains_key(ROLE_FOLD) {
+        cfg.role_bindings
+            .insert(ROLE_FOLD.to_string(), binding.clone());
+    }
+    if cfg.role_bindings.contains_key(ROLE_NEXT) {
+        cfg.role_bindings.insert(ROLE_NEXT.to_string(), binding);
+    }
+    save_machine_config(&cfg)?;
+    Ok(cfg.role_bindings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ENV_COORDINATOR_HOME, MachineConfig, save_machine_config, test_env_lock};
-    use crate::harness::grok::ENV_GROK_BIN;
+    use crate::harness::grok::{ENV_CURSOR_BIN, ENV_GROK_BIN};
     use crate::workflow::graph::{
         PHASE_CI_WAIT, PHASE_CROSS_MODEL, PHASE_PLAN_REVIEW, is_grok_bound,
     };
@@ -136,6 +181,7 @@ mod tests {
     struct IsolatedHome {
         prev_home: Option<OsString>,
         prev_bin: Option<OsString>,
+        prev_cursor: Option<OsString>,
         prev_state: Option<OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
         _home: tempfile::TempDir,
@@ -146,16 +192,19 @@ mod tests {
             let lock = test_env_lock();
             let prev_home = std::env::var_os(ENV_COORDINATOR_HOME);
             let prev_bin = std::env::var_os(ENV_GROK_BIN);
+            let prev_cursor = std::env::var_os(ENV_CURSOR_BIN);
             let prev_state = std::env::var_os(crate::config::ENV_COORDINATOR_STATE_DIR);
             let home = tempdir().unwrap();
             unsafe {
                 std::env::set_var(ENV_COORDINATOR_HOME, home.path());
                 std::env::remove_var(ENV_GROK_BIN);
+                std::env::remove_var(ENV_CURSOR_BIN);
                 std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
             }
             Self {
                 prev_home,
                 prev_bin,
+                prev_cursor,
                 prev_state,
                 _lock: lock,
                 _home: home,
@@ -179,6 +228,10 @@ mod tests {
                 match &self.prev_bin {
                     Some(v) => std::env::set_var(ENV_GROK_BIN, v),
                     None => std::env::remove_var(ENV_GROK_BIN),
+                }
+                match &self.prev_cursor {
+                    Some(v) => std::env::set_var(ENV_CURSOR_BIN, v),
+                    None => std::env::remove_var(ENV_CURSOR_BIN),
                 }
                 match &self.prev_state {
                     Some(v) => std::env::set_var(crate::config::ENV_COORDINATOR_STATE_DIR, v),
@@ -410,6 +463,21 @@ mod tests {
     }
 
     #[test]
+    fn cursor_bin_env_wins_for_cursor_harness() {
+        let home = IsolatedHome::enter();
+        let planner = dummy_bin(home._home.path(), "planner.exe");
+        let pin = dummy_bin(home._home.path(), "pinned-cursor.exe");
+        home.write_bindings(|b| {
+            b.get_mut(ROLE_PLANNER).unwrap().harness = "cursor".into();
+            b.get_mut(ROLE_PLANNER).unwrap().command = planner.to_string_lossy().into();
+        });
+        unsafe {
+            std::env::set_var(ENV_CURSOR_BIN, &pin);
+        }
+        assert_eq!(resolve_phase_binary(PHASE_PLAN).unwrap(), pin);
+    }
+
+    #[test]
     fn empty_command_is_error_no_spawn() {
         let home = IsolatedHome::enter();
         home.write_bindings(|b| {
@@ -449,5 +517,71 @@ mod tests {
         let err = resolve_phase_binary(PHASE_PLAN).unwrap_err().to_string();
         assert!(err.contains("planner"), "err={err}");
         assert!(err.contains("refusing to spawn shim"), "err={err}");
+    }
+
+    #[test]
+    fn roles_use_cursor_then_grok_round_trips_planner_implementor() {
+        let home = IsolatedHome::enter();
+        home.write_bindings(|b| {
+            b.get_mut(ROLE_PLANNER).unwrap().model = Some("grok-build".into());
+            b.get_mut(ROLE_IMPLEMENTOR).unwrap().model = Some("grok-build".into());
+        });
+        let after_cursor = roles_use("cursor").unwrap();
+        assert_eq!(after_cursor[ROLE_PLANNER].harness, "cursor");
+        assert_eq!(after_cursor[ROLE_PLANNER].command, "cursor-agent");
+        assert!(after_cursor[ROLE_PLANNER].model.is_none());
+        assert_eq!(after_cursor[ROLE_IMPLEMENTOR].harness, "cursor");
+        assert_eq!(after_cursor[ROLE_IMPLEMENTOR].command, "cursor-agent");
+        assert_eq!(after_cursor["plan_reviewer_agy"].harness, "antigravity");
+        assert_eq!(after_cursor["cross_model_primary"].harness, "codex");
+        let after_grok = roles_use("grok").unwrap();
+        assert_eq!(after_grok[ROLE_PLANNER].harness, "grok");
+        assert_eq!(after_grok[ROLE_PLANNER].command, "grok");
+        assert!(after_grok[ROLE_PLANNER].model.is_none());
+        assert_eq!(after_grok[ROLE_IMPLEMENTOR].harness, "grok");
+        assert_eq!(after_grok[ROLE_IMPLEMENTOR].command, "grok");
+        assert_eq!(roles_show().unwrap()[ROLE_PLANNER].harness, "grok");
+        let _ = home;
+    }
+
+    #[test]
+    fn roles_use_cursor_rewrites_present_fold_and_next() {
+        let home = IsolatedHome::enter();
+        home.write_bindings(|b| {
+            b.insert(
+                ROLE_FOLD.to_string(),
+                RoleBinding {
+                    harness: "grok".into(),
+                    command: "grok".into(),
+                    model: Some("leftover".into()),
+                },
+            );
+            b.insert(
+                ROLE_NEXT.to_string(),
+                RoleBinding {
+                    harness: "grok".into(),
+                    command: "grok".into(),
+                    model: None,
+                },
+            );
+        });
+        let after = roles_use("cursor").unwrap();
+        assert_eq!(after[ROLE_FOLD].harness, "cursor");
+        assert_eq!(after[ROLE_FOLD].command, "cursor-agent");
+        assert!(after[ROLE_FOLD].model.is_none());
+        assert_eq!(after[ROLE_NEXT].harness, "cursor");
+        assert_eq!(after[ROLE_NEXT].command, "cursor-agent");
+        let shown = roles_show().unwrap();
+        assert_eq!(shown[ROLE_FOLD].harness, "cursor");
+        let _ = home;
+    }
+
+    #[test]
+    fn roles_use_unknown_target_errors() {
+        let home = IsolatedHome::enter();
+        let err = roles_use("opencode").unwrap_err().to_string();
+        assert!(err.contains("opencode"), "err={err}");
+        assert!(err.contains("grok") && err.contains("cursor"), "err={err}");
+        let _ = home;
     }
 }

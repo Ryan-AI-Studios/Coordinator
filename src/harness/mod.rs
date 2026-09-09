@@ -13,8 +13,9 @@ pub mod roles;
 pub mod terminal;
 
 pub use grok::{
-    CancelHandle, ENV_GROK_BIN, ENV_GROK_LIVE, GrokSession, PromptResult, grok_agent_argv,
-    map_failure_class, resolve_command, resolve_grok_binary,
+    CancelHandle, ENV_ACP_HARNESS, ENV_CURSOR_BIN, ENV_GROK_BIN, ENV_GROK_LIVE, GrokSession,
+    PromptResult, grok_agent_argv, is_acp_session_harness, map_failure_class, resolve_command,
+    resolve_grok_binary,
 };
 pub use pool::{
     GrokHarnessStatus, HarnessPromptView, HarnessStatusBundle, SessionPool, global_pool,
@@ -46,15 +47,16 @@ pub async fn start(
     pool::start(project, in_process, infer_cwd).await
 }
 
-/// Start a new session with a phase-resolved binary and optional model.
+/// Start a new session with a phase-resolved binary, optional model, and ACP harness slug.
 pub async fn start_with_bin(
     project: Option<&str>,
     in_process: bool,
     bin: PathBuf,
     model: Option<String>,
     infer_cwd: bool,
+    harness: &str,
 ) -> Result<GrokHarnessStatus> {
-    pool::start_with_bin(project, in_process, bin, model, infer_cwd).await
+    pool::start_with_bin(project, in_process, bin, model, infer_cwd, harness).await
 }
 
 pub async fn prompt(

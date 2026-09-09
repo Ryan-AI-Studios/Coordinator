@@ -10,7 +10,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{CoordinatorError, Result};
-use crate::harness::grok::{ENV_GROK_BIN, GrokSession, PromptResult, map_failure_class};
+use crate::harness::grok::{
+    ENV_ACP_HARNESS, ENV_CURSOR_BIN, ENV_GROK_BIN, GrokSession, PromptResult, map_failure_class,
+    resolve_cursor_binary,
+};
 use crate::harness::terminal::SpawnTally;
 use crate::harness::{grok_cwd, resolve_grok_binary};
 
@@ -66,6 +69,7 @@ impl SessionPool {
             cwd: Some(s.cwd.clone()),
             supports_compact: s.supports_compact,
             pid: s.pid,
+            adapter: s.adapter.clone(),
         })
     }
 }
@@ -80,6 +84,8 @@ pub struct GrokHarnessStatus {
     pub supports_compact: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(default = "default_adapter")]
+    pub adapter: String,
 }
 
 impl GrokHarnessStatus {
@@ -90,8 +96,17 @@ impl GrokHarnessStatus {
             cwd: None,
             supports_compact: false,
             pid: None,
+            adapter: default_adapter(),
         }
     }
+}
+
+fn default_adapter() -> String {
+    "grok".into()
+}
+
+fn default_supports_compact() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,7 +148,9 @@ struct PersistedGrokHandle {
     holder_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     control_addr: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_adapter")]
+    adapter: String,
+    #[serde(default = "default_supports_compact")]
     supports_compact: bool,
     alive: bool,
     /// Mid-`session/prompt` (0027). Missing key = false. No persist version bump.
@@ -151,6 +168,7 @@ impl PersistedGrokHandle {
             cwd: self.cwd.clone(),
             supports_compact: self.supports_compact,
             pid: self.pid,
+            adapter: self.adapter.clone(),
         }
     }
 }
@@ -219,12 +237,47 @@ fn write_session_persist(
         pid: session.pid,
         holder_pid: Some(std::process::id()),
         control_addr,
+        adapter: session.adapter.clone(),
         supports_compact: session.supports_compact,
         alive: true,
         prompt_in_flight,
         error: None,
     };
     let _ = save_persist(record, &handle);
+}
+
+fn persist_adapter_name(harness: &str) -> String {
+    if harness.trim().is_empty() {
+        default_adapter()
+    } else {
+        harness.to_string()
+    }
+}
+
+fn save_attempt_persist(record: &ProjectRecord, harness: &str, error: Option<String>) {
+    let handle = PersistedGrokHandle {
+        version: 1,
+        project_id: record.id.clone(),
+        session_id: None,
+        cwd: None,
+        pid: None,
+        holder_pid: Some(std::process::id()),
+        control_addr: None,
+        adapter: persist_adapter_name(harness),
+        supports_compact: true,
+        alive: false,
+        prompt_in_flight: false,
+        error,
+    };
+    let _ = save_persist(record, &handle);
+}
+
+fn save_pending_start_persist(record: &ProjectRecord, harness: &str) {
+    save_attempt_persist(record, harness, None);
+}
+
+fn save_start_error_persist(record: &ProjectRecord, harness: &str, err: &CoordinatorError) {
+    save_attempt_persist(record, harness, Some(err.to_string()));
 }
 
 pub(crate) fn persist_prompt_in_flight(record: &ProjectRecord) -> bool {
@@ -430,14 +483,29 @@ async fn spawn_in_process(
     record: &ProjectRecord,
     bin: Option<PathBuf>,
     model: Option<String>,
+    harness: &str,
 ) -> Result<GrokHarnessStatus> {
     let cwd = grok_cwd(record);
-    let mut session = match bin {
+    save_pending_start_persist(record, harness);
+    let started = match bin {
         Some(b) => {
-            GrokSession::start_with_bin(cwd, prompt_timeout_for(record), b, model.as_deref())
-                .await?
+            GrokSession::start_with_harness(
+                cwd,
+                prompt_timeout_for(record),
+                b,
+                model.as_deref(),
+                harness,
+            )
+            .await
         }
-        None => GrokSession::start(cwd, prompt_timeout_for(record)).await?,
+        None => GrokSession::start(cwd, prompt_timeout_for(record)).await,
+    };
+    let mut session = match started {
+        Ok(s) => s,
+        Err(e) => {
+            save_start_error_persist(record, harness, &e);
+            return Err(e);
+        }
     };
     session.set_progress_record(record.clone());
     crate::harness::abort::register_cancel_handle(record.id.clone(), session.cancel_handle());
@@ -448,6 +516,7 @@ async fn spawn_in_process(
         cwd: Some(session.cwd.clone()),
         supports_compact: session.supports_compact,
         pid: session.pid,
+        adapter: session.adapter.clone(),
     };
     global_pool()
         .lock()
@@ -461,18 +530,19 @@ pub async fn start(
     in_process: bool,
     infer_cwd: bool,
 ) -> Result<GrokHarnessStatus> {
-    start_inner(project, in_process, None, None, infer_cwd).await
+    start_inner(project, in_process, None, None, infer_cwd, "grok").await
 }
 
-/// Adapter ticks pass the already-resolved phase bin / model. CLI start does not.
+/// Adapter ticks pass the already-resolved phase bin / model / harness. CLI start does not.
 pub async fn start_with_bin(
     project: Option<&str>,
     in_process: bool,
     bin: PathBuf,
     model: Option<String>,
     infer_cwd: bool,
+    harness: &str,
 ) -> Result<GrokHarnessStatus> {
-    start_inner(project, in_process, Some(bin), model, infer_cwd).await
+    start_inner(project, in_process, Some(bin), model, infer_cwd, harness).await
 }
 
 async fn start_inner(
@@ -481,6 +551,7 @@ async fn start_inner(
     bin: Option<PathBuf>,
     model: Option<String>,
     infer_cwd: bool,
+    harness: &str,
 ) -> Result<GrokHarnessStatus> {
     let rec = resolve_record(project, infer_cwd)?;
     let refuse = crate::harness::abort::should_refuse_reuse(&rec);
@@ -489,7 +560,7 @@ async fn start_inner(
         if let Some(s) = pool.status_of(&rec.id)
             && s.alive
         {
-            if refuse {
+            if refuse || !s.adapter.eq_ignore_ascii_case(harness) {
                 if let Some(mut session) = pool.remove(&rec.id) {
                     let _ = session.shutdown().await;
                 }
@@ -503,21 +574,24 @@ async fn start_inner(
         if let Ok(Some(existing)) = load_persist(&rec) {
             reap_stale_holder(&rec, &existing);
         }
-    } else if let Some(existing) = reuse_or_reap_existing(&rec).await? {
+    } else if let Some(existing) = reuse_or_reap_existing(&rec, harness).await? {
         return Ok(existing);
     }
 
     if in_process {
-        spawn_in_process(&rec, bin, model).await
+        spawn_in_process(&rec, bin, model, harness).await
     } else {
-        start_holder(&rec, project, bin, model).await
+        start_holder(&rec, project, bin, model, harness).await
     }
 }
 
 /// Reuse a live holder that still answers Ping. Otherwise treat leftover persist as
 /// dead (kill `pid` then `holder_pid`) so a new start never clobbers a holder file
 /// with an in-process persist (`control_addr: None`).
-async fn reuse_or_reap_existing(record: &ProjectRecord) -> Result<Option<GrokHarnessStatus>> {
+async fn reuse_or_reap_existing(
+    record: &ProjectRecord,
+    harness: &str,
+) -> Result<Option<GrokHarnessStatus>> {
     let Some(existing) = load_persist(record)? else {
         return Ok(None);
     };
@@ -525,6 +599,10 @@ async fn reuse_or_reap_existing(record: &ProjectRecord) -> Result<Option<GrokHar
         return Ok(None);
     }
     if crate::harness::abort::should_refuse_reuse(record) {
+        reap_stale_holder(record, &existing);
+        return Ok(None);
+    }
+    if !existing.adapter.eq_ignore_ascii_case(harness) {
         reap_stale_holder(record, &existing);
         return Ok(None);
     }
@@ -574,21 +652,35 @@ async fn start_holder(
     project: Option<&str>,
     bin: Option<PathBuf>,
     model: Option<String>,
+    harness: &str,
 ) -> Result<GrokHarnessStatus> {
     // CLI / HTTP start: implementor-first resolve. Adapter ticks pass the
     // already-resolved phase bin — do not call resolve_grok_binary() there
-    // (that would fail plan when implementor is broken).
+    // (that would fail plan when implementor is broken). Cursor CLI-none
+    // resolves COORDINATOR_CURSOR_BIN / PATH cursor-agent, never grok.
     if bin.is_none() {
-        let _ = resolve_grok_binary()?;
+        if harness.eq_ignore_ascii_case("cursor") {
+            let _ = resolve_cursor_binary()?;
+        } else {
+            let _ = resolve_grok_binary()?;
+        }
     }
     // A previous failed start writes `error` into harness-grok.json. Clear it
     // before spawn so we never return that stale error on retry.
     clear_stale_holder_persist(record)?;
-    spawn_holder_process(
+    save_pending_start_persist(record, harness);
+    let mut child = match spawn_holder_process(
         project.unwrap_or(record.path.to_str().unwrap_or(&record.id)),
         bin.as_deref(),
         model.as_deref(),
-    )?;
+        harness,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            save_start_error_persist(record, harness, &e);
+            return Err(e);
+        }
+    };
 
     let deadline = std::time::Instant::now() + Duration::from_secs(45);
     loop {
@@ -605,10 +697,27 @@ async fn start_holder(
                 PersistWait::Pending => {}
             }
         }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let err = CoordinatorError::Message(format!(
+                    "Grok holder exited before ready ({status})"
+                ));
+                save_start_error_persist(record, harness, &err);
+                return Err(err);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let err = CoordinatorError::Message(format!("failed to wait for Grok holder: {e}"));
+                save_start_error_persist(record, harness, &err);
+                return Err(err);
+            }
+        }
         if std::time::Instant::now() >= deadline {
-            return Err(CoordinatorError::Message(
+            let err = CoordinatorError::Message(
                 "timed out waiting for Grok holder to become ready".into(),
-            ));
+            );
+            save_start_error_persist(record, harness, &err);
+            return Err(err);
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
@@ -618,8 +727,15 @@ async fn start_holder(
 pub(crate) fn holder_child_env(
     bin: &std::path::Path,
     model: Option<&str>,
+    harness: &str,
 ) -> Vec<(String, String)> {
-    let mut env = vec![(ENV_GROK_BIN.to_string(), bin.to_string_lossy().into_owned())];
+    let mut env = vec![(ENV_ACP_HARNESS.to_string(), harness.to_string())];
+    let pin = bin.to_string_lossy().into_owned();
+    if harness.eq_ignore_ascii_case("cursor") {
+        env.push((ENV_CURSOR_BIN.to_string(), pin));
+    } else {
+        env.push((ENV_GROK_BIN.to_string(), pin));
+    }
     if let Some(m) = model {
         let t = m.trim();
         if !t.is_empty() {
@@ -633,11 +749,14 @@ fn apply_holder_child_env(
     cmd: &mut std::process::Command,
     bin: Option<&std::path::Path>,
     model: Option<&str>,
+    harness: &str,
 ) {
     if let Some(bin) = bin {
-        for (k, v) in holder_child_env(bin, model) {
+        for (k, v) in holder_child_env(bin, model, harness) {
             cmd.env(k, v);
         }
+    } else {
+        cmd.env(ENV_ACP_HARNESS, harness);
     }
 }
 
@@ -645,7 +764,8 @@ fn spawn_holder_process(
     project_spec: &str,
     bin: Option<&std::path::Path>,
     model: Option<&str>,
-) -> Result<()> {
+    harness: &str,
+) -> Result<std::process::Child> {
     let exe = std::env::current_exe().map_err(|e| {
         CoordinatorError::Message(format!("cannot resolve coordinator executable: {e}"))
     })?;
@@ -661,7 +781,7 @@ fn spawn_holder_process(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    apply_holder_child_env(&mut cmd, bin, model);
+    apply_holder_child_env(&mut cmd, bin, model, harness);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -669,8 +789,7 @@ fn spawn_holder_process(
         cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
     }
     cmd.spawn()
-        .map_err(|e| CoordinatorError::Message(format!("failed to spawn grok holder: {e}")))?;
-    Ok(())
+        .map_err(|e| CoordinatorError::Message(format!("failed to spawn grok holder: {e}")))
 }
 
 pub async fn hold_loop(project: Option<&str>) -> Result<()> {
@@ -682,33 +801,43 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
     let model = std::env::var(ENV_GROK_MODEL)
         .ok()
         .filter(|s| !s.trim().is_empty());
+    let harness = holder_harness_slug();
     let started = async {
-        let bin = resolve_grok_binary()?;
-        GrokSession::start_with_bin(cwd, prompt_timeout_for(&rec), bin, model.as_deref()).await
+        let bin = resolve_holder_binary(&harness)?;
+        GrokSession::start_with_harness(
+            cwd,
+            prompt_timeout_for(&rec),
+            bin,
+            model.as_deref(),
+            &harness,
+        )
+        .await
     }
     .await;
     let session = match started {
         Ok(s) => s,
         Err(e) => {
-            let handle = PersistedGrokHandle {
-                version: 1,
-                project_id: rec.id.clone(),
-                session_id: None,
-                cwd: None,
-                pid: None,
-                holder_pid: Some(std::process::id()),
-                control_addr: None,
-                supports_compact: true,
-                alive: false,
-                prompt_in_flight: false,
-                error: Some(e.to_string()),
-            };
-            let _ = save_persist(&rec, &handle);
+            save_start_error_persist(&rec, &harness, &e);
             return Err(e);
         }
     };
 
     hold_accept_loop(rec, session).await
+}
+
+fn holder_harness_slug() -> String {
+    std::env::var(ENV_ACP_HARNESS)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "grok".into())
+}
+
+fn resolve_holder_binary(harness: &str) -> Result<PathBuf> {
+    if harness.eq_ignore_ascii_case("cursor") {
+        resolve_cursor_binary()
+    } else {
+        resolve_grok_binary()
+    }
 }
 
 /// Scripted holder for tests (mock ACP session).
@@ -766,6 +895,7 @@ async fn hold_accept_loop(rec: ProjectRecord, mut session: GrokSession) -> Resul
         pid: session.pid,
         holder_pid: Some(std::process::id()),
         control_addr: None,
+        adapter: session.adapter.clone(),
         supports_compact: session.supports_compact,
         alive: false,
         prompt_in_flight: false,
@@ -980,6 +1110,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                         cwd: snapshot_status(&shared).cwd,
                         supports_compact: snapshot_status(&shared).supports_compact,
                         pid: snapshot_status(&shared).pid,
+                        adapter: snapshot_status(&shared).adapter,
                     }),
                     applied: None,
                     skipped: None,
@@ -1003,6 +1134,7 @@ fn session_status(session: &GrokSession) -> GrokHarnessStatus {
         cwd: Some(session.cwd.clone()),
         supports_compact: session.supports_compact,
         pid: session.pid,
+        adapter: session.adapter.clone(),
     }
 }
 
@@ -1228,6 +1360,7 @@ pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarn
             pid: session.pid,
             holder_pid: None,
             control_addr: None,
+            adapter: session.adapter.clone(),
             supports_compact: session.supports_compact,
             alive: false,
             prompt_in_flight: false,
@@ -1268,6 +1401,7 @@ fn persist_marked_dead(h: &PersistedGrokHandle) -> PersistedGrokHandle {
         pid: h.pid,
         holder_pid: h.holder_pid,
         control_addr: None,
+        adapter: h.adapter.clone(),
         supports_compact: h.supports_compact,
         alive: false,
         prompt_in_flight: false,
@@ -1289,26 +1423,7 @@ fn kill_persist_pids(h: &PersistedGrokHandle) {
 }
 
 fn kill_pid_best_effort(pid: u32) {
-    if pid == 0 || pid == std::process::id() {
-        return;
-    }
-    #[cfg(windows)]
-    {
-        // "The process … not found" is already-dead success. Missing taskkill is not an error.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
+    crate::harness::grok::tree_kill_pid(pid);
 }
 
 /// Insert a mock session (tests).
@@ -1334,15 +1449,32 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_GROK_BIN);
             std::env::remove_var(ENV_GROK_MODEL);
+            std::env::remove_var(ENV_ACP_HARNESS);
+            std::env::remove_var(ENV_CURSOR_BIN);
         }
         let env = holder_child_env(
             std::path::Path::new(r"C:\phase\grok.exe"),
             Some("grok-build"),
+            "grok",
         );
-        assert_eq!(env[0].0, ENV_GROK_BIN);
-        assert_eq!(env[0].1, r"C:\phase\grok.exe");
-        assert_eq!(env[1].0, ENV_GROK_MODEL);
-        assert_eq!(env[1].1, "grok-build");
+        assert!(
+            env.iter().any(|(k, v)| k == ENV_ACP_HARNESS && v == "grok"),
+            "env={env:?}"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == ENV_GROK_BIN && v == r"C:\phase\grok.exe"),
+            "env={env:?}"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == ENV_GROK_MODEL && v == "grok-build"),
+            "env={env:?}"
+        );
+        assert!(
+            env.iter().all(|(k, _)| k != ENV_CURSOR_BIN),
+            "grok holder must not pin COORDINATOR_CURSOR_BIN: {env:?}"
+        );
         assert!(
             std::env::var(ENV_GROK_BIN).is_err(),
             "must not set_var COORDINATOR_GROK_BIN on the parent"
@@ -1351,6 +1483,103 @@ mod tests {
             std::env::var(ENV_GROK_MODEL).is_err(),
             "must not set_var COORDINATOR_GROK_MODEL on the parent"
         );
+        assert!(
+            std::env::var(ENV_ACP_HARNESS).is_err(),
+            "must not set_var COORDINATOR_ACP_HARNESS on the parent"
+        );
+    }
+
+    #[test]
+    fn holder_child_env_cursor_pins_cursor_bin_not_grok() {
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::remove_var(ENV_GROK_BIN);
+            std::env::remove_var(ENV_CURSOR_BIN);
+            std::env::remove_var(ENV_ACP_HARNESS);
+            std::env::remove_var(ENV_GROK_MODEL);
+        }
+        let env = holder_child_env(
+            std::path::Path::new(r"C:\phase\cursor-agent.cmd"),
+            None,
+            "cursor",
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == ENV_ACP_HARNESS && v == "cursor"),
+            "env={env:?}"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == ENV_CURSOR_BIN && v == r"C:\phase\cursor-agent.cmd"),
+            "env={env:?}"
+        );
+        assert!(
+            env.iter().all(|(k, _)| k != ENV_GROK_BIN),
+            "cursor holder must not pin COORDINATOR_GROK_BIN: {env:?}"
+        );
+        assert!(
+            std::env::var(ENV_CURSOR_BIN).is_err(),
+            "must not set_var COORDINATOR_CURSOR_BIN on the parent"
+        );
+        assert!(
+            std::env::var(ENV_ACP_HARNESS).is_err(),
+            "must not set_var COORDINATOR_ACP_HARNESS on the parent"
+        );
+        assert!(
+            std::env::var(ENV_GROK_BIN).is_err(),
+            "must not set_var COORDINATOR_GROK_BIN on the parent"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn holder_cursor_env_spawn_path_is_yolo_trust_acp() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        let stub = home.path().join("cursor-holder.cmd");
+        std::fs::write(&stub, "@echo off\r\n>\"%~dp0argv.txt\" echo %*\r\n").unwrap();
+        let prev_home = std::env::var_os(ENV_COORDINATOR_HOME);
+        let prev_harness = std::env::var_os(ENV_ACP_HARNESS);
+        let prev_cursor = std::env::var_os(ENV_CURSOR_BIN);
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_ACP_HARNESS, "cursor");
+            std::env::set_var(ENV_CURSOR_BIN, &stub);
+            std::env::remove_var(ENV_GROK_BIN);
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+
+        let err = hold_loop(Some(&rec.id)).await.unwrap_err();
+        let _ = err;
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var(ENV_COORDINATOR_HOME, v),
+                None => std::env::remove_var(ENV_COORDINATOR_HOME),
+            }
+            match prev_harness {
+                Some(v) => std::env::set_var(ENV_ACP_HARNESS, v),
+                None => std::env::remove_var(ENV_ACP_HARNESS),
+            }
+            match prev_cursor {
+                Some(v) => std::env::set_var(ENV_CURSOR_BIN, v),
+                None => std::env::remove_var(ENV_CURSOR_BIN),
+            }
+        }
+        let text = std::fs::read_to_string(home.path().join("argv.txt"))
+            .unwrap_or_else(|e| panic!("argv.txt missing after hold_loop spawn path: {e}"));
+        assert!(text.contains("--yolo"), "argv={text:?}");
+        assert!(text.contains("--trust"), "argv={text:?}");
+        assert!(text.contains("acp"), "argv={text:?}");
+        assert!(!text.contains("agent"), "argv={text:?}");
+        assert!(!text.contains("stdio"), "argv={text:?}");
+        let persist = std::fs::read_to_string(persist_path(&rec).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&persist).unwrap();
+        assert_eq!(v["adapter"], "cursor");
+        assert_eq!(v["alive"], false);
     }
 
     #[tokio::test]
@@ -1594,6 +1823,7 @@ mod tests {
             pid: None,
             holder_pid: Some(1),
             control_addr: None,
+            adapter: "grok".into(),
             supports_compact: false,
             alive: false,
             prompt_in_flight: false,
@@ -1620,6 +1850,7 @@ mod tests {
             pid: Some(9),
             holder_pid: Some(2),
             control_addr: Some("127.0.0.1:9".into()),
+            adapter: "grok".into(),
             supports_compact: true,
             alive: true,
             prompt_in_flight: false,
@@ -1722,6 +1953,65 @@ mod tests {
         assert!(p.ends_with("harness-grok.json"));
     }
 
+    #[test]
+    fn persist_missing_supports_compact_loads_true() {
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: "p".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: Default::default(),
+            notify_progress: false,
+            created_at: chrono::Utc::now(),
+        };
+        ensure_state_dir(&rec).unwrap();
+        let path = persist_path(&rec).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"project_id":"p","alive":true,"session_id":"s"}"#,
+        )
+        .unwrap();
+        let h = load_persist(&rec).unwrap().expect("persist");
+        assert!(
+            h.supports_compact,
+            "legacy files without supports_compact must load true"
+        );
+    }
+
+    #[test]
+    fn persist_missing_adapter_loads_grok() {
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: "p".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: Default::default(),
+            notify_progress: false,
+            created_at: chrono::Utc::now(),
+        };
+        ensure_state_dir(&rec).unwrap();
+        let path = persist_path(&rec).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"project_id":"p","alive":true,"supports_compact":true}"#,
+        )
+        .unwrap();
+        let h = load_persist(&rec).unwrap().expect("persist");
+        assert_eq!(h.adapter, "grok");
+    }
+
     fn taskkill_on_path() -> bool {
         std::process::Command::new("taskkill")
             .arg("/?")
@@ -1790,6 +2080,7 @@ mod tests {
             pid: Some(pid),
             holder_pid: None,
             control_addr: None,
+            adapter: "grok".into(),
             supports_compact: true,
             alive: true,
             prompt_in_flight: false,
@@ -1845,6 +2136,7 @@ mod tests {
             pid: Some(child.id()),
             holder_pid: None,
             control_addr: Some("127.0.0.1:1".into()),
+            adapter: "grok".into(),
             supports_compact: true,
             alive: true,
             prompt_in_flight: false,
@@ -1852,7 +2144,7 @@ mod tests {
         };
         save_persist(&rec, &handle).unwrap();
 
-        let reused = reuse_or_reap_existing(&rec).await.unwrap();
+        let reused = reuse_or_reap_existing(&rec, "grok").await.unwrap();
         assert!(reused.is_none(), "dead control_addr must not reuse");
         assert!(
             load_persist(&rec).unwrap().is_none(),
@@ -1877,6 +2169,189 @@ mod tests {
     fn kill_missing_pid_is_success() {
         kill_pid_best_effort(u32::MAX);
         kill_pid_best_effort(std::process::id());
+    }
+
+    #[cfg(windows)]
+    fn pid_is_live(pid: u32) -> bool {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        match out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.contains(&pid.to_string()) && !s.to_ascii_lowercase().contains("no tasks")
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_pid_gone(pid: u32, budget_ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(budget_ms);
+        while std::time::Instant::now() < deadline {
+            if !pid_is_live(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        !pid_is_live(pid)
+    }
+
+    #[cfg(windows)]
+    fn spawn_cmd_tree_with_grandchild() -> (tempfile::TempDir, std::process::Child, u32) {
+        let dir = tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let vbs = dir.path().join("gc.vbs");
+        std::fs::write(
+            &vbs,
+            "Set sh = CreateObject(\"WScript.Shell\")\r\n\
+Set p = sh.Exec(\"ping -n 120 127.0.0.1\")\r\n\
+Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
+Set f = fso.CreateTextFile(WScript.Arguments(0), True)\r\n\
+f.Write p.ProcessID\r\n\
+f.Close\r\n\
+Do While p.Status = 0\r\n\
+  WScript.Sleep 200\r\n\
+Loop\r\n",
+        )
+        .unwrap();
+        let cmd = dir.path().join("tree.cmd");
+        std::fs::write(
+            &cmd,
+            "@echo off\r\ncscript //nologo \"%~dp0gc.vbs\" \"%COORDINATOR_TEST_PIDFILE%\"\r\n",
+        )
+        .unwrap();
+        let parent = std::process::Command::new("cmd.exe")
+            .arg("/C")
+            .arg(&cmd)
+            .env("COORDINATOR_TEST_PIDFILE", &pidfile)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cmd tree");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut pid = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&pidfile)
+                && let Ok(p) = s.trim().parse::<u32>()
+                && p != 0
+                && pid_is_live(p)
+            {
+                pid = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let gc = pid.expect("grandchild PID file should appear while child is live");
+        (dir, parent, gc)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kill_pid_best_effort_tree_kills_grandchild() {
+        if !taskkill_on_path() {
+            return;
+        }
+        let (_dir, mut parent, gc) = spawn_cmd_tree_with_grandchild();
+        kill_pid_best_effort(parent.id());
+        assert!(
+            wait_pid_gone(gc, 5000),
+            "grandchild PID {gc} should be gone after kill_pid_best_effort /T"
+        );
+        let _ = parent.wait();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn shutdown_tree_kills_cmd_grandchild() {
+        if !taskkill_on_path() {
+            return;
+        }
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+
+        let (_dir, mut parent, gc) = spawn_cmd_tree_with_grandchild();
+        let handle = PersistedGrokHandle {
+            version: 1,
+            project_id: rec.id.clone(),
+            session_id: Some("sess-tree".into()),
+            cwd: Some(proj.path().to_path_buf()),
+            pid: Some(parent.id()),
+            holder_pid: None,
+            control_addr: None,
+            adapter: "grok".into(),
+            supports_compact: true,
+            alive: true,
+            prompt_in_flight: false,
+            error: None,
+        };
+        save_persist(&rec, &handle).unwrap();
+        let _ = shutdown(Some(&rec.id), false).await;
+        assert!(
+            wait_pid_gone(gc, 5000),
+            "grandchild PID {gc} should be gone after persist shutdown tree-kill"
+        );
+        let _ = parent.wait();
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn reuse_recycle_adapter_mismatch_tree_kills_grandchild() {
+        if !taskkill_on_path() {
+            return;
+        }
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+
+        let (_dir, mut parent, gc) = spawn_cmd_tree_with_grandchild();
+        let handle = PersistedGrokHandle {
+            version: 1,
+            project_id: rec.id.clone(),
+            session_id: Some("sess-tree-mismatch".into()),
+            cwd: Some(proj.path().to_path_buf()),
+            pid: Some(parent.id()),
+            holder_pid: None,
+            control_addr: Some("127.0.0.1:1".into()),
+            adapter: "grok".into(),
+            supports_compact: true,
+            alive: true,
+            prompt_in_flight: false,
+            error: None,
+        };
+        save_persist(&rec, &handle).unwrap();
+        let reused = reuse_or_reap_existing(&rec, "cursor").await.unwrap();
+        assert!(
+            reused.is_none(),
+            "adapter mismatch must not reuse grok persist"
+        );
+        assert!(
+            wait_pid_gone(gc, 5000),
+            "grandchild PID {gc} should be gone after reuse-recycle tree-kill"
+        );
+        let _ = parent.wait();
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
     }
 
     #[test]
@@ -2101,6 +2576,7 @@ mod tests {
             pid: Some(child.id()),
             holder_pid: None,
             control_addr: None,
+            adapter: "grok".into(),
             supports_compact: true,
             alive: true,
             prompt_in_flight: true,
@@ -2211,6 +2687,7 @@ mod tests {
             pid: None,
             holder_pid: None,
             control_addr: Some("127.0.0.1:1".into()),
+            adapter: "grok".into(),
             supports_compact: true,
             alive: true,
             prompt_in_flight: true,
@@ -2218,7 +2695,7 @@ mod tests {
         };
         save_persist(&rec, &old).unwrap();
 
-        let reused = reuse_or_reap_existing(&rec).await.unwrap();
+        let reused = reuse_or_reap_existing(&rec, "grok").await.unwrap();
         assert!(reused.is_none());
         assert!(
             crate::harness::abort::should_refuse_reuse(&rec),
@@ -2279,6 +2756,7 @@ mod tests {
             cwd: None,
             supports_compact: false,
             pid: None,
+            adapter: "grok".into(),
         }
     }
 
