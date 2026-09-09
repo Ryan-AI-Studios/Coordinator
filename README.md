@@ -257,7 +257,7 @@ GateFail on `cross-model-review` with `address_findings_attempts < 2` does **not
 
 | Driver | CLI / env | Behavior |
 |--------|-----------|----------|
-| `adapter` | default | Inject the phase Role Binding once per phase for plan/fold/implement/advance (default Grok ACP). **plan-review** starts `agy --print` and `opencode run` once each (no operator role JSON). **`cross-model-review` and `ci-wait` never inject** (one-shot review CLIs / token-idle `gh`). Missing / non-Grok long-lived binding **fails** those phases with `permission`. |
+| `adapter` | default | Inject the phase Role Binding once per phase for plan/fold/implement/advance (default Grok ACP; Cursor ACP when Role Bindings say `harness: cursor`). **plan-review** starts `agy --print` and `opencode run` once each (no operator role JSON). **`cross-model-review` and `ci-wait` never inject** (one-shot review CLIs / token-idle `gh`). Missing / non-ACP long-lived binding (not grok/cursor) **fails** those phases with `permission`. |
 | `file_wait` | `--driver file_wait` | No inject; poll `current.json` / `outcomes/roles/*.json`. |
 | `stub` | `--driver stub` or `COORDINATOR_WORKFLOW_DRIVER=stub` | Synthesize success each tick so CI can walk the full graph. |
 
@@ -408,15 +408,15 @@ Long-lived **Grok Build** sessions use `grok agent stdio` (JSON-RPC 2.0, line-de
 
 | Item | Behavior |
 |------|----------|
-| Spawn | `grok agent [-m {model}] stdio` (`-m` only when the phase Role Binding has a non-empty `model`) — `initialize` → `authenticate` (`methodId`, `_meta.headless`) → `session/new` `{ cwd, mcpServers: [] }` |
+| Spawn | Grok: `grok agent [-m {model}] stdio` (never `--yolo`). Cursor: `cursor-agent --yolo --trust [--model M] acp`. Windows `.cmd`/`.bat` spawn via `cmd.exe /C`. Handshake: `initialize` → `authenticate` (`methodId`, `_meta.headless`) → `session/new` `{ cwd, mcpServers: [] }` |
 | Cwd | Layout-resolved `execution_repo` if set, else `workspace_root` |
 | Prompt | `session/prompt` with `sessionId` + content-block array; `session/update` chunks collected |
 | FS | `initialize` advertises `fs.readTextFile` / `fs.writeTextFile`. The adapter **replies** to agent `fs/read_text_file` and `fs/write_text_file` (absolute paths under session cwd, workspace root, or execution repo; parent dirs created on write). Unanswered fs RPCs hang Grok `read_file` until stall / phase timeout. |
 | Terminal | `initialize` advertises `terminal: true`. The adapter **replies** to `terminal/create|output|wait_for_exit|kill|release` (create `cwd` must be absolute and under the same roots as FS). Unanswered `terminal/create` hangs Grok `run_terminal_command` the same way unanswered fs hangs `read_file`. On Windows, empty-`args` one-liners wrap in `pwsh` if that file exists, else Windows PowerShell 5.1 `powershell.exe`, else `cmd.exe`. PowerShell 7 is optional; `doctor` **warns** when `pwsh` is missing and does not refuse `run`. If every `terminal/create` spawn fails this prompt, the grok-bound phase is `HarnessCrash` (Stopped) and the cross-model gate does not start. |
 | Permission | `session/request_permission` is answered with allow-once (or cancelled while aborting). Unanswered permission hangs the turn. |
-| Compact | Inject `/compact` via `session/prompt` (not a separate RPC). If unsupported: `supports_compact=false` and skip (ADR-0021), do not fail the run |
+| Compact | Inject stored `compact_command` via `session/prompt` (Grok `/compact`; Cursor `/summarize` when `availableCommands` is missing). If unsupported: `supports_compact=false` and skip (ADR-0021), do not fail the run |
 | Auth | Operator `grok login` (`cached_token`) or `XAI_API_KEY` (`xai.api_key`). Coordinator does **not** own OAuth |
-| Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` is teardown: in-process pool, then a quick holder `Shutdown` RPC, then `taskkill /F /PID` on persist `pid` then `holder_pid`. Persist is always written `alive: false`; returned status matches the file. `taskkill` “not found” is success. Missing `taskkill` is not a shutdown error. |
+| Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` is teardown: in-process pool, then a quick holder `Shutdown` RPC, then `taskkill /F /T /PID` on persist `pid` then `holder_pid`. Persist is always written `alive: false`; returned status matches the file. `taskkill` “not found” is success. Missing `taskkill` is not a shutdown error. |
 | Pause | New injects are refused while Paused; the child stays up |
 | Pool | One Grok ACP session per `project_id`. CLI `start`, HTTP `POST /v1/harness/grok/start`, and adapter ticks from `run` / `wait` / `serve` detach a localhost holder so a later `prompt` does not pin the poll loop. In-process spawn is for tests / `insert_test_session`. |
 | Persist | `{state_dir}/harness-grok.json` (session id / pid / holder pid / control addr / alive) — not a transcript |
@@ -430,9 +430,11 @@ Live tests are **not** required for CI:
 ```powershell
 $env:COORDINATOR_GROK_LIVE = "1"
 cargo test grok_live -- --ignored --nocapture
+$env:COORDINATOR_CURSOR_LIVE = "1"
+cargo test cursor_live -- --ignored --nocapture
 ```
 
-`COORDINATOR_GROK_BIN` overrides the `grok` executable (absolute path) for the **grok** harness. Adapter ticks for plan/fold/implement/advance resolve the **phase** Role Binding (`plan` → `planner`, `implement` → `implementor`, `fold`/`advance` inherit `planner` unless optional `fold`/`next` keys are present with a non-empty `command`). CLI / HTTP `harness grok start` still uses implementor-then-planner (no phase context). Default resolution walks `PATH` + Windows `PATHEXT` (no `which` crate). A non-empty binding `model` is passed as `grok agent -m {model} stdio` on **new** session start only; a reused live session keeps its model. Non-Grok `harness` values have no long-lived adapter yet and fail `permission`.
+`COORDINATOR_GROK_BIN` overrides the `grok` executable (absolute path) for the **grok** harness. `COORDINATOR_CURSOR_BIN` does the same for **cursor**. Adapter ticks for plan/fold/implement/advance resolve the **phase** Role Binding (`plan` → `planner`, `implement` → `implementor`, `fold`/`advance` inherit `planner` unless optional `fold`/`next` keys are present with a non-empty `command`). CLI / HTTP `harness grok start` still uses implementor-then-planner (no phase context). Default resolution walks `PATH` + Windows `PATHEXT` (no `which` crate). A non-empty binding `model` is passed on **new** session start only (`grok agent -m {model} stdio`, or cursor `--model` before `acp`); a reused live session keeps its model. Role Binding `harness: cursor` / `command: cursor-agent` is a long-lived ACP adapter (`--yolo --trust acp`, auth `cursor_login`, compact `/summarize`). Toggle planner+implementor (and present `fold`/`next`) with `coordinator roles use grok|cursor` without editing `config.json`. Defaults stay Grok. Non-ACP `harness` values (OpenCode, agy, …) still fail `permission`.
 
 Default `role_bindings` in `config.json`:
 
@@ -517,6 +519,8 @@ coordinator harness grok prompt --text <…> | --file <path> [--project …]
 coordinator harness grok compact [--project …]
 coordinator harness grok status [--project …]
 coordinator harness grok shutdown [--project …]
+coordinator roles show
+coordinator roles use grok|cursor
 coordinator serve [--port <u16>] [--check]   # default 7420, 127.0.0.1 only
 ```
 
@@ -533,6 +537,7 @@ HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1
 | opencode | `--version` | `auth list` (any credential line) | `opencode auth login` |
 | codex | `--version` | `login status` exit 0 | `codex login` |
 | claude | `--version` | `auth status --json` `loggedIn: true` | `claude auth login` |
+| cursor | `--version` (8s probe) | `status --format json` `isAuthenticated: true` (never prints email/`userId`) | `cursor-agent login` |
 | gh | `--version` | `auth status --active --hostname github.com` | `gh auth login` |
 
 Required rows (`planner`, `implementor`, `plan_reviewer_agy`, `plan_reviewer_opencode`, `cross_model_primary`, `ci`) with `missing`/`auth` refuse adapter `run`. `unknown` does not. Warn-only: `cross_model_secondary` / `cross_model_tertiary` (and optional `fold` / `next`). CLI `doctor` omit `--project` works with 0 or N projects. Status JSON includes additive `layout_profile`, `execution_repo`, `conductor_dir` (resolved), `workflow` (`id`, `driver`, `pending_roles`), `ci` (watch object or `null`), `failure_artifact` (path or `null`), optional `harness.grok` (`alive`, `session_id`, `cwd`, `supports_compact`) when a session exists, and additive `ticker` (`owner` `serve` + `port`, or `owner` `none`).

@@ -14,10 +14,19 @@ use crate::config::{
     ENV_COORDINATOR_GH_BIN, ENV_COORDINATOR_OPENCODE_BIN, RoleBinding,
 };
 use crate::error::Result;
-use crate::harness::grok::{ENV_GROK_BIN, reject_or_replace_ps1, resolve_command};
+use crate::harness::grok::{ENV_CURSOR_BIN, ENV_GROK_BIN, reject_or_replace_ps1, resolve_command};
 use crate::harness::roles::{ROLE_FOLD, ROLE_NEXT, load_role_bindings};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const CURSOR_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn probe_timeout(harness: &str) -> Duration {
+    if harness.eq_ignore_ascii_case("cursor") {
+        CURSOR_PROBE_TIMEOUT
+    } else {
+        PROBE_TIMEOUT
+    }
+}
 
 const REQUIRED_ROLES: &[&str] = &[
     "planner",
@@ -96,19 +105,19 @@ struct RawOut {
 }
 
 trait Probe: Send + Sync {
-    fn run(&self, bin: &Path, args: &[String]) -> RawOut;
+    fn run(&self, bin: &Path, args: &[String], timeout: Duration) -> RawOut;
 }
 
 struct DefaultProbe;
 
 impl Probe for DefaultProbe {
-    fn run(&self, bin: &Path, args: &[String]) -> RawOut {
+    fn run(&self, bin: &Path, args: &[String], timeout: Duration) -> RawOut {
         match crate::review::spawn::run_process(
             bin,
             args,
             &std::env::temp_dir(),
             crate::review::spawn::ProcessWait {
-                timeout: PROBE_TIMEOUT,
+                timeout,
                 stall: None,
                 watch_paths: &[],
             },
@@ -137,6 +146,7 @@ impl Probe for DefaultProbe {
 pub struct RecordedCall {
     pub bin: PathBuf,
     pub args: Vec<String>,
+    pub timeout: Duration,
 }
 
 /// Scripted spawn stand-in. Default `cargo test` must not talk to a live CLI.
@@ -245,7 +255,7 @@ impl ScriptedProbe {
 
 #[cfg(test)]
 impl Probe for ScriptedProbe {
-    fn run(&self, bin: &Path, args: &[String]) -> RawOut {
+    fn run(&self, bin: &Path, args: &[String], timeout: Duration) -> RawOut {
         self.inner
             .calls
             .lock()
@@ -253,6 +263,7 @@ impl Probe for ScriptedProbe {
             .push(RecordedCall {
                 bin: bin.to_path_buf(),
                 args: args.to_vec(),
+                timeout,
             });
         let stem = bin
             .file_stem()
@@ -379,7 +390,9 @@ fn probe_row(
 
     let version = version_cache
         .entry(path.clone())
-        .or_insert_with(|| sanitize_out(probe.run(&path, &["--version".into()])))
+        .or_insert_with(|| {
+            sanitize_out(probe.run(&path, &["--version".into()], probe_timeout(&harness)))
+        })
         .clone();
 
     if version.timed_out {
@@ -456,9 +469,10 @@ fn classify_auth(
                 return (RowStatus::Ready, None);
             };
             let cache_key = (path.to_path_buf(), other.to_string());
+            let timeout = probe_timeout(other);
             let out = auth_cache
                 .entry(cache_key)
-                .or_insert_with(|| sanitize_out(probe.run(path, &args)))
+                .or_insert_with(|| sanitize_out(probe.run(path, &args, timeout)))
                 .clone();
             classify_auth_out(other, &out)
         }
@@ -496,6 +510,14 @@ fn classify_auth_out(harness: &str, out: &RawOut) -> (RowStatus, Option<String>)
             },
             Err(_) => (RowStatus::Unknown, Some("auth probe failed".into())),
         },
+        "cursor" => match serde_json::from_str::<serde_json::Value>(&out.stdout) {
+            Ok(v) => match v.get("isAuthenticated").and_then(|x| x.as_bool()) {
+                Some(true) => (RowStatus::Ready, None),
+                Some(false) => (RowStatus::Auth, Some("logged out".into())),
+                None => (RowStatus::Unknown, Some("auth probe failed".into())),
+            },
+            Err(_) => (RowStatus::Unknown, Some("auth probe failed".into())),
+        },
         _ => {
             if out.exit == 0 {
                 (RowStatus::Ready, None)
@@ -511,6 +533,7 @@ fn auth_args(harness: &str) -> Option<Vec<String>> {
         "opencode" => Some(vec!["auth".into(), "list".into()]),
         "codex" => Some(vec!["login".into(), "status".into()]),
         "claude" => Some(vec!["auth".into(), "status".into(), "--json".into()]),
+        "cursor" => Some(vec!["status".into(), "--format".into(), "json".into()]),
         "gh" => Some(vec![
             "auth".into(),
             "status".into(),
@@ -533,6 +556,7 @@ fn login_for(harness: &str) -> Option<&'static str> {
         "opencode" => Some("opencode auth login"),
         "codex" => Some("codex login"),
         "claude" => Some("claude auth login"),
+        "cursor" => Some("cursor-agent login"),
         "gh" => Some("gh auth login"),
         _ => None,
     }
@@ -541,6 +565,7 @@ fn login_for(harness: &str) -> Option<&'static str> {
 fn env_pin_for_harness(harness: &str) -> Option<&'static str> {
     match harness.to_ascii_lowercase().as_str() {
         "grok" => Some(ENV_GROK_BIN),
+        "cursor" => Some(ENV_CURSOR_BIN),
         "antigravity" | "agy" => Some(ENV_COORDINATOR_AGY_BIN),
         "opencode" => Some(ENV_COORDINATOR_OPENCODE_BIN),
         "claude" => Some(ENV_COORDINATOR_CLAUDE_BIN),
@@ -661,6 +686,7 @@ mod tests {
             let prev_xai = std::env::var_os("XAI_API_KEY");
             let bin_keys = [
                 ENV_GROK_BIN,
+                ENV_CURSOR_BIN,
                 ENV_COORDINATOR_AGY_BIN,
                 ENV_COORDINATOR_OPENCODE_BIN,
                 ENV_COORDINATOR_CLAUDE_BIN,
@@ -839,6 +865,121 @@ mod tests {
             })
             .count();
         assert_eq!(grok_versions, 1, "planner+implementor must share one spawn");
+    }
+
+    #[test]
+    fn doctor_cursor_authenticated_ready_no_pii() {
+        let iso = IsolatedDoctor::enter();
+        let cursor = iso.dummy_bin("cursor-agent.exe");
+        iso.point_all_to_dummies();
+        let mut cfg = crate::config::load_machine_config().unwrap();
+        cfg.role_bindings.get_mut("planner").unwrap().harness = "cursor".into();
+        cfg.role_bindings.get_mut("planner").unwrap().command = cursor.to_string_lossy().into();
+        cfg.role_bindings.get_mut("implementor").unwrap().harness = "cursor".into();
+        cfg.role_bindings.get_mut("implementor").unwrap().command = cursor.to_string_lossy().into();
+        save_machine_config(&cfg).unwrap();
+        iso.grok_ready_via_key();
+        let probe = ScriptedProbe::ready().with_auth(
+            "cursor-agent",
+            0,
+            r#"{"status":"authenticated","isAuthenticated":true,"userInfo":{"email":"ryan@example.com","userId":1}}"#,
+            "",
+            false,
+        );
+        let _g = install_test_probe(probe.clone());
+        let report = probe_machine().unwrap();
+        let planner = row(&report, "planner");
+        assert_eq!(planner.status, RowStatus::Ready);
+        assert_eq!(planner.login.as_deref(), Some("cursor-agent login"));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("ryan@example.com"), "{json}");
+        assert!(!json.contains("userId"), "{json}");
+        assert!(
+            planner.detail.as_ref().is_none_or(|d| !d.contains("ryan@")),
+            "detail={:?}",
+            planner.detail
+        );
+        let cursor_calls: Vec<_> = probe
+            .calls()
+            .into_iter()
+            .filter(|c| c.bin.file_stem().and_then(|s| s.to_str()) == Some("cursor-agent"))
+            .collect();
+        assert!(
+            cursor_calls
+                .iter()
+                .any(|c| c.args == ["status".to_string(), "--format".into(), "json".into()]),
+            "calls={cursor_calls:?}"
+        );
+        assert!(
+            cursor_calls
+                .iter()
+                .all(|c| c.timeout == Duration::from_secs(8)),
+            "cursor probe must be 8s: {cursor_calls:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_cursor_logged_out_is_auth() {
+        let iso = IsolatedDoctor::enter();
+        let cursor = iso.dummy_bin("cursor-agent.exe");
+        iso.point_all_to_dummies();
+        let mut cfg = crate::config::load_machine_config().unwrap();
+        cfg.role_bindings.get_mut("planner").unwrap().harness = "cursor".into();
+        cfg.role_bindings.get_mut("planner").unwrap().command = cursor.to_string_lossy().into();
+        save_machine_config(&cfg).unwrap();
+        iso.grok_ready_via_key();
+        let probe = ScriptedProbe::ready().with_auth(
+            "cursor-agent",
+            0,
+            r#"{"isAuthenticated":false}"#,
+            "",
+            false,
+        );
+        let _g = install_test_probe(probe);
+        let report = probe_machine().unwrap();
+        let planner = row(&report, "planner");
+        assert_eq!(planner.status, RowStatus::Auth);
+        assert_eq!(planner.detail.as_deref(), Some("logged out"));
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn doctor_cursor_bin_env_pin_wins() {
+        let iso = IsolatedDoctor::enter();
+        let command = iso.dummy_bin("command-cursor.exe");
+        let pin = iso.dummy_bin("pinned-cursor.exe");
+        iso.point_all_to_dummies();
+        let mut cfg = crate::config::load_machine_config().unwrap();
+        cfg.role_bindings.get_mut("planner").unwrap().harness = "cursor".into();
+        cfg.role_bindings.get_mut("planner").unwrap().command = command.to_string_lossy().into();
+        save_machine_config(&cfg).unwrap();
+        iso.grok_ready_via_key();
+        unsafe {
+            std::env::set_var(ENV_CURSOR_BIN, &pin);
+        }
+        let probe = ScriptedProbe::ready().with_auth(
+            "pinned-cursor",
+            0,
+            r#"{"isAuthenticated":true}"#,
+            "",
+            false,
+        );
+        let _g = install_test_probe(probe.clone());
+        let report = probe_machine().unwrap();
+        assert_eq!(row(&report, "planner").status, RowStatus::Ready);
+        assert!(
+            probe.calls().iter().any(|c| c.bin == pin),
+            "calls={:?}",
+            probe.calls()
+        );
+    }
+
+    #[test]
+    fn probe_timeout_cursor_is_eight_seconds() {
+        assert_eq!(probe_timeout("cursor"), Duration::from_secs(8));
+        assert_eq!(probe_timeout("CURSOR"), Duration::from_secs(8));
+        assert_eq!(probe_timeout("grok"), Duration::from_secs(2));
+        assert_eq!(probe_timeout("codex"), Duration::from_secs(2));
     }
 
     #[test]

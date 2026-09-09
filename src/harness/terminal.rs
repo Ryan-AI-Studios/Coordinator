@@ -52,6 +52,7 @@ pub struct TerminalHub {
     probe_ok: Arc<AtomicBool>,
     record: Arc<Mutex<Option<crate::registry::ProjectRecord>>>,
     journal: Arc<Mutex<JournalHub>>,
+    adapter: Arc<Mutex<String>>,
     running: Arc<AtomicU64>,
     wait_count: Arc<AtomicU64>,
     tool_ids: Arc<Mutex<HashSet<String>>>,
@@ -98,6 +99,7 @@ impl TerminalHub {
             probe_ok: Arc::new(AtomicBool::new(false)),
             record: Arc::new(Mutex::new(None)),
             journal: Arc::new(Mutex::new(JournalHub::new())),
+            adapter: Arc::new(Mutex::new("grok".into())),
             running: Arc::new(AtomicU64::new(0)),
             wait_count: Arc::new(AtomicU64::new(0)),
             tool_ids: Arc::new(Mutex::new(HashSet::new())),
@@ -109,6 +111,25 @@ impl TerminalHub {
         if let Ok(mut g) = self.record.lock() {
             *g = Some(record);
         }
+    }
+
+    /// Journal `harness` slug (session adapter). Empty → grok.
+    pub fn set_adapter(&self, harness: &str) {
+        let slug = if harness.trim().is_empty() {
+            "grok".into()
+        } else {
+            harness.to_string()
+        };
+        if let Ok(mut g) = self.adapter.lock() {
+            *g = slug;
+        }
+    }
+
+    fn adapter_slug(&self) -> String {
+        self.adapter
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "grok".into())
     }
 
     pub fn reset_prompt_counters(&self) {
@@ -207,6 +228,7 @@ impl TerminalHub {
         let Some(snap) = snap else {
             return;
         };
+        let harness = self.adapter_slug();
         if let Ok(mut g) = self.journal.lock() {
             g.record(JournalEvent {
                 snap,
@@ -216,6 +238,7 @@ impl TerminalHub {
                 ok: false,
                 signal: None,
                 spawn_fail: true,
+                harness: &harness,
             });
         }
     }
@@ -420,6 +443,7 @@ impl TerminalHub {
         let journal = self.journal.clone();
         let hub = self.clone();
         let started = Instant::now();
+        let harness = self.adapter_slug();
         tokio::spawn(async move {
             let mut killed = false;
             let status = tokio::select! {
@@ -450,6 +474,7 @@ impl TerminalHub {
                     ok: exit_code == Some(0),
                     signal: journal_signal,
                     spawn_fail: false,
+                    harness: &harness,
                 });
             }
             let _ = hub

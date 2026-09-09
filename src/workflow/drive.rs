@@ -189,7 +189,7 @@ fn drive_adapter(
             );
         }
     };
-    if !binding.harness.eq_ignore_ascii_case("grok") {
+    if !crate::harness::is_acp_session_harness(&binding.harness) {
         return fail_phase(
             record,
             state,
@@ -201,6 +201,32 @@ fn drive_adapter(
             OutcomeSource::Adapter,
         );
     }
+
+    let phase_bin = match resolve_phase_binary(&state.phase) {
+        Ok(p) => p,
+        Err(e) => {
+            return fail_phase(
+                record,
+                state,
+                FailureClass::Permission,
+                e.to_string(),
+                OutcomeSource::Adapter,
+            );
+        }
+    };
+
+    let live = crate::harness::status_bundle_sync(record).and_then(|b| b.grok);
+    let recycle_mismatch = live.as_ref().is_some_and(|g| {
+        if !g.alive {
+            return false;
+        }
+        let adapter = if g.adapter.trim().is_empty() {
+            "grok"
+        } else {
+            g.adapter.as_str()
+        };
+        !adapter.eq_ignore_ascii_case(&binding.harness)
+    });
 
     mark_driven(record, &state.phase)?;
     // Inject-start heartbeat so a slow ACP start is not an immediate stall.
@@ -227,49 +253,29 @@ fn drive_adapter(
         }
     }
 
-    let has_live_session = crate::harness::status_bundle_sync(record)
-        .and_then(|b| b.grok)
-        .is_some_and(|g| g.alive);
-
-    let phase_bin = if has_live_session {
-        None
-    } else {
-        match resolve_phase_binary(&state.phase) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                return fail_phase(
-                    record,
-                    state,
-                    FailureClass::Permission,
-                    e.to_string(),
-                    OutcomeSource::Adapter,
-                );
-            }
-        }
-    };
-
     let prompt = prompts::phase_prompt(record, &state.phase, state.track_id.as_deref());
     let selector = record.path.to_string_lossy().to_string();
     let rec = record.clone();
     let model = binding.model.clone();
+    let harness = binding.harness.clone();
     // First tick starts the holder Prompt without blocking poll_once. Later ticks
     // are no-ops (`mark_driven`). The holder / pool apply path writes the outcome.
     std::thread::Builder::new()
         .name(format!("adapter-inject-{}", rec.id))
         .spawn(move || {
             let result = block_on_async(async {
-                if let Some(bin) = phase_bin {
-                    crate::harness::start_with_bin(
-                        Some(&selector),
-                        ADAPTER_START_IN_PROCESS,
-                        bin,
-                        model,
-                        false,
-                    )
-                    .await?;
-                } else {
-                    crate::harness::start(Some(&selector), ADAPTER_START_IN_PROCESS, false).await?;
+                if recycle_mismatch {
+                    let _ = crate::harness::pool::recycle_without_pool_lock(&rec).await;
                 }
+                crate::harness::start_with_bin(
+                    Some(&selector),
+                    ADAPTER_START_IN_PROCESS,
+                    phase_bin,
+                    model,
+                    false,
+                    &harness,
+                )
+                .await?;
                 crate::harness::prompt(Some(&selector), prompt, false).await
             });
             match result {
@@ -567,10 +573,12 @@ where
 mod tests {
     use super::*;
     use crate::config::{
-        ENV_COORDINATOR_HOME, MachineConfig, RoleBinding, save_machine_config, test_env_lock,
+        ENV_COORDINATOR_HOME, MachineConfig, RoleBinding, registry_path, save_machine_config,
+        test_env_lock,
     };
-    use crate::harness::grok::{ENV_GROK_BIN, mock_handshake_ok};
+    use crate::harness::grok::{ENV_CURSOR_BIN, ENV_GROK_BIN, mock_handshake_ok};
     use crate::harness::roles::{ROLE_FOLD, ROLE_NEXT};
+    use crate::registry::{ProjectAddOptions, Registry};
     use crate::run::run_with_driver;
     use crate::state::load_run_state;
     use crate::watch::poll_once;
@@ -584,6 +592,7 @@ mod tests {
     struct IsolatedHome {
         prev_home: Option<OsString>,
         prev_bin: Option<OsString>,
+        prev_cursor: Option<OsString>,
         prev_state: Option<OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
         _home: tempfile::TempDir,
@@ -594,16 +603,19 @@ mod tests {
             let lock = test_env_lock();
             let prev_home = std::env::var_os(ENV_COORDINATOR_HOME);
             let prev_bin = std::env::var_os(ENV_GROK_BIN);
+            let prev_cursor = std::env::var_os(ENV_CURSOR_BIN);
             let prev_state = std::env::var_os(crate::config::ENV_COORDINATOR_STATE_DIR);
             let home = tempdir().unwrap();
             unsafe {
                 std::env::set_var(ENV_COORDINATOR_HOME, home.path());
                 std::env::remove_var(ENV_GROK_BIN);
+                std::env::remove_var(ENV_CURSOR_BIN);
                 std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
             }
             Self {
                 prev_home,
                 prev_bin,
+                prev_cursor,
                 prev_state,
                 _lock: lock,
                 _home: home,
@@ -630,6 +642,10 @@ mod tests {
                 match &self.prev_bin {
                     Some(v) => std::env::set_var(ENV_GROK_BIN, v),
                     None => std::env::remove_var(ENV_GROK_BIN),
+                }
+                match &self.prev_cursor {
+                    Some(v) => std::env::set_var(ENV_CURSOR_BIN, v),
+                    None => std::env::remove_var(ENV_CURSOR_BIN),
                 }
                 match &self.prev_state {
                     Some(v) => std::env::set_var(crate::config::ENV_COORDINATOR_STATE_DIR, v),
@@ -756,6 +772,118 @@ mod tests {
         assert_eq!(
             written_before, written_after,
             "must not session/prompt the existing Grok session"
+        );
+    }
+
+    #[test]
+    fn is_acp_session_harness_cursor_is_true() {
+        assert!(crate::harness::is_acp_session_harness("cursor"));
+        assert!(crate::harness::is_acp_session_harness("CURSOR"));
+        assert!(crate::harness::is_acp_session_harness("grok"));
+        assert!(!crate::harness::is_acp_session_harness("opencode"));
+    }
+
+    #[test]
+    fn cursor_unresolvable_is_permission_without_no_adapter() {
+        let home = IsolatedHome::enter();
+        home.write_bindings(|b| {
+            b.get_mut(ROLE_PLANNER).unwrap().harness = "cursor".into();
+            b.get_mut(ROLE_PLANNER).unwrap().command =
+                r"C:\this\does\not\exist-cursor-planner.exe".into();
+        });
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0038".into()), WorkflowDriver::Adapter).unwrap();
+        let view = tick(&r).unwrap().expect("permission");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert!(
+            !view.last_event.contains("no long-lived adapter"),
+            "cursor resolve failure must not use the non-ACP adapter sentence: {}",
+            view.last_event
+        );
+        assert!(
+            view.last_event.contains("planner")
+                || view.last_event.contains("not resolvable")
+                || view.last_event.contains("not found"),
+            "last_event={}",
+            view.last_event
+        );
+        let state = load_run_state(&r).unwrap();
+        assert!(
+            state.last_driven_phase.is_none(),
+            "unresolvable cursor must not mark_driven"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cursor_live_grok_mismatch_does_not_prompt() {
+        let home = IsolatedHome::enter();
+        let stub = home._home.path().join("cursor-dummy.cmd");
+        std::fs::write(&stub, "@echo off\r\nexit /b 1\r\n").unwrap();
+        home.write_bindings(|b| {
+            b.get_mut(ROLE_PLANNER).unwrap().harness = "cursor".into();
+            b.get_mut(ROLE_PLANNER).unwrap().command = stub.to_string_lossy().into();
+        });
+        let dir = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let r = reg.add(dir.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&registry_path().unwrap()).unwrap();
+        run_with_driver(&r, Some("0038".into()), WorkflowDriver::Adapter).unwrap();
+        let session = crate::harness::GrokSession::start_mock(
+            crate::harness::grok_cwd(&r),
+            mock_handshake_ok("sess-live-grok-mismatch"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        crate::harness::pool::insert_test_session(r.id.clone(), session).await;
+        let written_before = {
+            let mut pool = crate::harness::global_pool().lock().await;
+            let s = pool.get_mut(&r.id).unwrap();
+            s.mock_written().unwrap().len()
+        };
+        assert!(
+            written_before > 0,
+            "mock grok handshake should have written ACP lines"
+        );
+        let first = tick(&r).unwrap();
+        assert!(first.is_none(), "inject is fire-and-forget after recycle");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut recycled = false;
+        while std::time::Instant::now() < deadline {
+            if !crate::harness::global_pool().lock().await.contains(&r.id) {
+                recycled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            recycled,
+            "cursor tick must recycle the in-process grok mock (no session/prompt)"
+        );
+        let persist_path = crate::harness::persist_path(&r).unwrap();
+        let persist_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut adapter = String::new();
+        while std::time::Instant::now() < persist_deadline {
+            if let Ok(text) = std::fs::read_to_string(&persist_path)
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            {
+                adapter = v
+                    .get("adapter")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if adapter.eq_ignore_ascii_case("cursor") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            adapter.eq_ignore_ascii_case("cursor"),
+            "persist adapter must flip to cursor after mismatch recycle, got {adapter:?}"
         );
     }
 
