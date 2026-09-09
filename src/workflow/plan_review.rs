@@ -1,6 +1,7 @@
-//! Adapter plan-review: one-shot `agy --print` (0017) and `opencode run` (0018).
+//! Adapter plan-review: one-shot `agy --print` (0017) and `opencode run` (0018 / 0037).
 //!
 //! Not the 0011 cross-model Verdict gate. File is source of truth; stdout is fallback.
+//! OpenCode prompt is stdin, not argv (cmd.exe `%*` truncates `<LF>`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,6 +25,11 @@ use crate::workflow::graph::{
 use crate::workflow::timeouts::timeout_for_phase;
 
 const MIN_SPAWN_BUDGET: Duration = Duration::from_secs(60);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RETRY_REMAINING: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
 
 /// One-shot plan-review CLI (scripted in default tests; live CLI otherwise).
 pub trait PlanReviewBackend: Send + Sync {
@@ -96,7 +102,7 @@ impl PlanReviewBackend for OpenCodeCli {
             &req.workspace_root,
             req.remaining,
             &extra,
-            None,
+            Some(req.prompt.as_bytes()),
         )?;
         Ok(PlanReviewResult {
             exit: out.exit,
@@ -135,16 +141,16 @@ pub fn agy_argv(
     args
 }
 
-/// Plan-review OpenCode argv. Never `--auto` / `--yolo` / `--dangerously-skip-permissions`.
+/// Plan-review OpenCode argv. Prompt is stdin (see [`OpenCodeCli`]), never a
+/// positional — npm `opencode.cmd` forwards `%*` and cmd.exe truncates at `<LF>`.
+/// Never `--auto` / `--yolo` / `--dangerously-skip-permissions`.
 pub fn opencode_argv(
-    prompt: &str,
     workspace_root: &Path,
     model: Option<&str>,
     title: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
         "run".into(),
-        prompt.to_string(),
         "--dir".into(),
         workspace_root.to_string_lossy().into_owned(),
         "--format".into(),
@@ -311,6 +317,16 @@ fn remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
         .saturating_sub(state.effective_running_elapsed(chrono::Utc::now()))
 }
 
+fn retry_remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = TEST_RETRY_REMAINING.with(|c| c.get()) {
+            return d;
+        }
+    }
+    remaining_budget(record, state)
+}
+
 /// Fire-and-forget spawn of the agy slot. Does not block `poll_once`.
 pub fn maybe_spawn_agy(record: &ProjectRecord, state: &RunState) -> Result<()> {
     maybe_spawn_slot(record, state, REVIEW_SLUG_AGY)
@@ -407,7 +423,6 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
                 .as_deref()
                 .map(|id| format!("plan-review {id}"));
             opencode_argv(
-                &prompt,
                 &paths.workspace_root,
                 binding.model.as_deref(),
                 title.as_deref(),
@@ -494,6 +509,16 @@ fn apply_slot_result(
     req: &PlanReviewRequest,
 ) {
     let result = backend.run(req);
+    finish_slot(record, backend, req, result, false);
+}
+
+fn finish_slot(
+    record: &ProjectRecord,
+    backend: &dyn PlanReviewBackend,
+    req: &PlanReviewRequest,
+    result: Result<PlanReviewResult>,
+    retried: bool,
+) {
     let Ok(state) = load_run_state(record) else {
         return;
     };
@@ -501,7 +526,35 @@ fn apply_slot_result(
         return;
     }
     match result {
-        Ok(out) => adopt_or_fail(record, &state, req, &out),
+        Ok(out) => {
+            if !retried && req.slug == REVIEW_SLUG_OPENCODE && opencode_should_retry(req, &out) {
+                let retry_remaining = with_run_state_lock(record, || {
+                    let latest = load_run_state(record)?;
+                    if !apply_allowed(&latest, req) {
+                        return Ok(None);
+                    }
+                    let remaining = retry_remaining_budget(record, &latest);
+                    if remaining >= MIN_SPAWN_BUDGET {
+                        Ok(Some(remaining))
+                    } else {
+                        Ok(None)
+                    }
+                });
+                match retry_remaining {
+                    Ok(Some(remaining)) => {
+                        unlink_track_review(req);
+                        let mut retry_req = req.clone();
+                        retry_req.remaining = remaining;
+                        let second = backend.run(&retry_req);
+                        finish_slot(record, backend, &retry_req, second, true);
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(_) => return,
+                }
+            }
+            adopt_or_fail(record, &state, req, &out);
+        }
         Err(e) => {
             let class = classify_spawn_err(&e);
             let _ = write_role_outcome(
@@ -536,8 +589,15 @@ fn adopt_or_fail(
         return;
     }
     if let Some(body) = track_review_body(req.track_dir.as_deref(), &req.slug) {
-        let _ = write_review_markdown(record, &req.slug, Some(&body));
-        let _ = write_role_outcome(record, state, &req.slug, OutcomeStatus::Success, None, None);
+        if req.slug != REVIEW_SLUG_OPENCODE
+            || opencode_review_looks_complete(&body, req.spawn_track_id.as_deref())
+        {
+            let _ = write_review_markdown(record, &req.slug, Some(&body));
+            let _ =
+                write_role_outcome(record, state, &req.slug, OutcomeStatus::Success, None, None);
+            return;
+        }
+        write_degenerate_failure(record, state, req, out);
         return;
     }
     if req.slug == REVIEW_SLUG_OPENCODE {
@@ -589,10 +649,15 @@ fn adopt_opencode_stdout(
     out: &PlanReviewResult,
 ) {
     match parse_opencode_stdout(&out.stdout) {
-        OpencodeStdout::Text(body) | OpencodeStdout::Raw(body) => {
+        OpencodeStdout::Text(body) | OpencodeStdout::Raw(body)
+            if opencode_review_looks_complete(&body, req.spawn_track_id.as_deref()) =>
+        {
             let _ = write_review_markdown(record, &req.slug, Some(&body));
             let _ =
                 write_role_outcome(record, state, &req.slug, OutcomeStatus::Success, None, None);
+        }
+        OpencodeStdout::Text(_) | OpencodeStdout::Raw(_) => {
+            write_degenerate_failure(record, state, req, out);
         }
         OpencodeStdout::Error(msg) => {
             let class = classify_agy_status("ERROR", Some(&msg), out.exit);
@@ -609,6 +674,64 @@ fn adopt_opencode_stdout(
             write_empty_failure(record, state, req, out);
         }
     }
+}
+
+fn opencode_review_looks_complete(body: &str, track_id: Option<&str>) -> bool {
+    if body.trim().is_empty() {
+        return false;
+    }
+    if !body.to_ascii_lowercase().contains("# track review:") {
+        return false;
+    }
+    match track_id {
+        Some(id) if !id.is_empty() => body.contains(id),
+        _ => true,
+    }
+}
+
+fn opencode_should_retry(req: &PlanReviewRequest, out: &PlanReviewResult) -> bool {
+    if let Some(body) = track_review_body(req.track_dir.as_deref(), &req.slug) {
+        return !opencode_review_looks_complete(&body, req.spawn_track_id.as_deref());
+    }
+    match parse_opencode_stdout(&out.stdout) {
+        OpencodeStdout::Text(body) | OpencodeStdout::Raw(body) => {
+            !opencode_review_looks_complete(&body, req.spawn_track_id.as_deref())
+        }
+        OpencodeStdout::Empty => true,
+        OpencodeStdout::Error(_) => false,
+    }
+}
+
+fn unlink_track_review(req: &PlanReviewRequest) {
+    if let Some(dir) = req.track_dir.as_deref() {
+        let _ = std::fs::remove_file(dir.join(format!("{}-review.md", req.slug)));
+    }
+}
+
+fn write_degenerate_failure(
+    record: &ProjectRecord,
+    state: &RunState,
+    req: &PlanReviewRequest,
+    out: &PlanReviewResult,
+) {
+    unlink_track_review(req);
+    let class = if out.exit == 124 {
+        FailureClass::Timeout
+    } else {
+        FailureClass::Permission
+    };
+    let msg = format!(
+        "plan-review: {} review missing required '# Track review:' header or track id",
+        req.slug
+    );
+    let _ = write_role_outcome(
+        record,
+        state,
+        &req.slug,
+        OutcomeStatus::Failure,
+        Some(class),
+        Some(msg),
+    );
 }
 
 fn write_empty_failure(
@@ -1081,7 +1204,11 @@ impl PlanReviewBackend for ScriptedBackend {
     fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
         if let (Some(body), Some(dir)) = (&self.write_track, &req.track_dir) {
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(dir.join(format!("{}-review.md", req.slug)), body);
+            let rendered = match req.spawn_track_id.as_deref() {
+                Some(id) => body.replace("{track}", id),
+                None => body.clone(),
+            };
+            let _ = std::fs::write(dir.join(format!("{}-review.md", req.slug)), rendered);
         }
         Ok(self.result.clone())
     }
@@ -1119,6 +1246,25 @@ impl PlanReviewBackend for GatedBackend {
             g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
         }
         self.inner.run(req)
+    }
+}
+
+#[cfg(test)]
+struct OpencodeSequenceBackend {
+    opencode: Mutex<Vec<ScriptedBackend>>,
+    other: ScriptedBackend,
+}
+
+#[cfg(test)]
+impl PlanReviewBackend for OpencodeSequenceBackend {
+    fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
+        if req.slug == REVIEW_SLUG_OPENCODE {
+            let mut q = self.opencode.lock().unwrap_or_else(|p| p.into_inner());
+            if !q.is_empty() {
+                return q.remove(0).run(req);
+            }
+        }
+        self.other.run(req)
     }
 }
 
@@ -1276,6 +1422,14 @@ mod tests {
             .join(format!("{slug}-review.md"))
     }
 
+    fn ok_review_body(_track_id: &str) -> String {
+        "# Track review: {track}-Example\n\n**Track:** `{track}`\n\nreview body is sound\n".into()
+    }
+
+    fn degenerate_review_body() -> String {
+        "Which track should I review?\n".into()
+    }
+
     #[test]
     fn argv_table_pins_print_flags() {
         let args = agy_argv(
@@ -1325,7 +1479,6 @@ mod tests {
     #[test]
     fn opencode_argv_pins_run_dir_json_and_forbids_auto() {
         let args = opencode_argv(
-            "review please",
             Path::new(r"C:\dev\proj"),
             Some("provider/model"),
             Some("plan-review 0001"),
@@ -1354,13 +1507,40 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--session" || a == "-s"));
         assert!(!args.iter().any(|a| a == "--attach"));
         assert!(!args.iter().any(|a| a == "--interactive" || a == "-i"));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("review please") || a.contains('\n')),
+            "prompt must be stdin, not argv: {args:?}"
+        );
     }
 
     #[test]
     fn opencode_argv_omits_empty_model_and_title() {
-        let args = opencode_argv("p", Path::new(r"C:\dev\proj"), Some("  "), None);
+        let args = opencode_argv(Path::new(r"C:\dev\proj"), Some("  "), None);
         assert!(!args.iter().any(|a| a == "--model" || a == "-m"));
         assert!(!args.iter().any(|a| a == "--title"));
+    }
+
+    #[test]
+    fn opencode_review_looks_complete_heading_and_id() {
+        assert!(opencode_review_looks_complete(
+            "# Track review: 0001-Example\n",
+            Some("0001")
+        ));
+        assert!(opencode_review_looks_complete(
+            "# Track Review: 0001-Example\n",
+            Some("0001")
+        ));
+        assert!(!opencode_review_looks_complete(
+            "# Track review: 0001-Example\n",
+            Some("0037")
+        ));
+        assert!(!opencode_review_looks_complete(
+            "Which track should I review?\n",
+            Some("0001")
+        ));
+        assert!(!opencode_review_looks_complete("   \n", Some("0001")));
     }
 
     #[test]
@@ -1440,7 +1620,7 @@ mod tests {
         let r = rec(dir.path());
         enter_plan_review(&r, "0001");
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
-            "review body is sound\n",
+            ok_review_body("0001"),
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
@@ -1474,6 +1654,14 @@ mod tests {
         );
         assert_eq!(oc.argv[0], "run");
         assert!(!oc.argv.iter().any(|a| a == "--auto"));
+        assert!(
+            !oc.argv
+                .iter()
+                .any(|a| a.contains('\n') || a.contains("review-track")),
+            "plan-review prompt must be stdin, not argv: {:?}",
+            oc.argv
+        );
+        assert!(oc.prompt.contains("review-track"));
         let perm = oc
             .extra_env
             .iter()
@@ -1495,7 +1683,7 @@ mod tests {
         let r = rec(dir.path());
         enter_plan_review(&r, "0001");
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
-            "once\n",
+            ok_review_body("0001"),
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
@@ -1522,7 +1710,7 @@ mod tests {
             save_run_state(&r, &state).unwrap();
         }
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
-            "atomic\n",
+            ok_review_body("0001"),
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
@@ -1569,7 +1757,7 @@ mod tests {
             save_run_state(&r, &state).unwrap();
         }
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
-            "atomic-oc\n",
+            ok_review_body("0001"),
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
@@ -1611,7 +1799,7 @@ mod tests {
         let r = rec(dir.path());
         enter_plan_review(&r, "0001");
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
-            "both\n",
+            ok_review_body("0001"),
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
@@ -1858,7 +2046,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
         let r = rec(dir.path());
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
-            "review body\n",
+            ok_review_body("0001"),
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
@@ -2071,7 +2259,9 @@ mod tests {
         save_run_state(&r, &state).unwrap();
         let _hook = install_test_backend(
             &r.id,
-            Arc::new(ScriptedBackend::ok_ndjson("ndjson review body\n")),
+            Arc::new(ScriptedBackend::ok_ndjson(
+                "# Track review: 0001-Example\n\n**Track:** `0001`\n\nndjson review body\n",
+            )),
         );
         tick(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
@@ -2153,7 +2343,10 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(GatedBackend {
             release: gate.clone(),
-            inner: Arc::new(ScriptedBackend::ok_file("paused still writes\n")),
+            inner: Arc::new(ScriptedBackend::ok_file(format!(
+                "{}\npaused still writes\n",
+                ok_review_body("0001").trim_end()
+            ))),
         })));
         let _hook = install_test_backend(&r.id, rec_backend);
         tick(&r).unwrap();
@@ -2201,6 +2394,182 @@ mod tests {
                 .iter()
                 .any(|x| x == "agy")
         );
+    }
+
+    #[test]
+    fn degenerate_opencode_file_fails_unlinks_and_degrades() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            degenerate_review_body(),
+        ))));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_both_consumed(&r);
+        let oc_runs = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(oc_runs, 2, "degenerate opencode should retry once");
+        assert!(
+            !track_file(dir.path(), "0001", "opencode").exists(),
+            "leftover degenerate opencode-review.md must be unlinked"
+        );
+        let oc_state = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
+        assert!(
+            !oc_state.is_file()
+                || std::fs::read_to_string(&oc_state)
+                    .unwrap()
+                    .trim()
+                    .is_empty()
+        );
+        let mut joined = false;
+        for _ in 0..20 {
+            let _ = tick(&r);
+            let s = load_run_state(&r).unwrap();
+            if s.phase == graph::PHASE_FOLD || s.last_event.contains("degraded") {
+                joined = true;
+                break;
+            }
+        }
+        assert!(
+            joined,
+            "agy success + opencode degenerate should degrade, phase={} event={}",
+            load_run_state(&r).unwrap().phase,
+            load_run_state(&r).unwrap().last_event
+        );
+    }
+
+    #[test]
+    fn opencode_retry_then_complete_is_success() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["opencode".into()];
+        state.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &state).unwrap();
+        let seq = OpencodeSequenceBackend {
+            opencode: Mutex::new(vec![
+                ScriptedBackend::ok_file(degenerate_review_body()),
+                ScriptedBackend::ok_file(ok_review_body("0001")),
+            ]),
+            other: ScriptedBackend::ok_file(ok_review_body("0001")),
+        };
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_slots_consumed(&r, &["opencode"]);
+        let oc_runs = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(oc_runs, 2);
+        let body = std::fs::read_to_string(track_file(dir.path(), "0001", "opencode")).unwrap();
+        assert!(body.contains("# Track review:"));
+        assert!(body.contains("0001"));
+    }
+
+    #[test]
+    fn two_degenerate_opencode_runs_fail_and_unlink() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["opencode".into()];
+        state.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &state).unwrap();
+        let seq = OpencodeSequenceBackend {
+            opencode: Mutex::new(vec![
+                ScriptedBackend::ok_file(degenerate_review_body()),
+                ScriptedBackend::ok_file(degenerate_review_body()),
+            ]),
+            other: ScriptedBackend::empty(),
+        };
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_slots_consumed(&r, &["opencode"]);
+        let oc_runs = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(oc_runs, 2);
+        assert!(!track_file(dir.path(), "0001", "opencode").exists());
+        let path = outcome_roles_dir(&r).unwrap().join("opencode.json");
+        if path.is_file() {
+            let o: PhaseOutcome =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let msg = o.message.unwrap_or_default();
+            assert!(
+                msg.contains("# Track review:"),
+                "degenerate failure must name the missing header, got {msg}"
+            );
+            assert!(!msg.contains("produced no review file and no stdout"));
+        }
+    }
+
+    struct RetryRemainingGuard;
+    impl Drop for RetryRemainingGuard {
+        fn drop(&mut self) {
+            TEST_RETRY_REMAINING.with(|c| c.set(None));
+        }
+    }
+
+    #[test]
+    fn remaining_under_60s_after_first_does_not_retry() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let state = load_run_state(&r).unwrap();
+        TEST_RETRY_REMAINING.with(|c| c.set(Some(Duration::from_secs(10))));
+        let _reset = RetryRemainingGuard;
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            degenerate_review_body(),
+        ))));
+        let counts = rec_backend.counts.clone();
+        let req = PlanReviewRequest {
+            slug: REVIEW_SLUG_OPENCODE.into(),
+            command: "opencode".into(),
+            model: None,
+            workspace_root: dir.path().to_path_buf(),
+            execution_repo: None,
+            track_dir: Some(dir.path().join("conductor").join("0001-Example")),
+            prompt: "review-track prompt".into(),
+            remaining: Duration::from_secs(1200),
+            argv: opencode_argv(dir.path(), None, None),
+            extra_env: Vec::new(),
+            spawn_epoch: state.run_epoch,
+            spawn_track_id: Some("0001".into()),
+        };
+        apply_slot_result(&r, rec_backend.as_ref(), &req);
+        assert_eq!(counts.n(), 1, "retry skipped when remaining < 60s");
+        assert!(!track_file(dir.path(), "0001", "opencode").exists());
+        let path = outcome_roles_dir(&r).unwrap().join("opencode.json");
+        let o: PhaseOutcome =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(o.status, OutcomeStatus::Failure);
+        let msg = o.message.unwrap_or_default();
+        assert!(
+            msg.contains("# Track review:"),
+            "degenerate failure must name the missing header, got {msg}"
+        );
+        assert!(!msg.contains("produced no review file and no stdout"));
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //! First stall recycles unless sidecar `tool_in_flight` (`session/update` is not mid-tool): track **0035**.
 //! Plan-review Antigravity one-shot (`agy --print`): track **0017**.
 //! Plan-review OpenCode one-shot (`opencode run`): track **0018**.
+//! OpenCode prompt on stdin (plan-review + 0011); degenerate `opencode-review.md` retry: track **0037**.
 //! Role-bound plan/fold/implement/advance drive: track **0019**.
 
 pub mod api;
