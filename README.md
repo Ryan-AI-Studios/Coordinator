@@ -280,7 +280,7 @@ Hard failure (apply `status=failure`, including timeout synthesis and adapter fa
 | Artifact | Atomic markdown: project/track/phase/class/epoch + fenced `last_event` / message + `recommended_action` (advisory — no auto-retry) |
 | Toast | `tauri-winrt-notification` 0.8.1, PowerShell AUMID (no installer). Title `Coordinator: {class}`. Disabled with `COORDINATOR_NOTIFY=off` |
 | Adapters | `NotifyAdapter` trait: Artifact + Toast + Log + **opt-in Hermes** (HMAC V2 POST of unchanged `NotifyEvent` JSON). Default **off**. Adapter errors never undo `FAILURE.md` or skip toast. |
-| Surfaces | `coordinator failure show` prints the markdown; `GET /v1/failure` returns `{path, body}` or **404**. `coordinator notify hermes-test` probes Hermes only (no artifact, no toast). `hermes-test --progress` probes a synthetic progress event. |
+| Surfaces | `coordinator failure show` prints the raw markdown; `GET /v1/failure` returns `{path, body, superseded?}` or **404**. `coordinator failure resolve` (Idle/Stopped) deletes the file and drops `failure_class` (does not re-arm omit-`--track`). `coordinator notify hermes-test` probes Hermes only (no artifact, no toast). `hermes-test --progress` probes a synthetic progress event. |
 | Status | Additive `failure_artifact` path (`null` when the file is absent). Existing `failure_class` / `run_epoch` / `phase_started_at` / `next_track` are also on status JSON |
 
 ### Hermes notify (opt-in)
@@ -512,6 +512,7 @@ coordinator outcome write --phase <id> --status success|failure
     [--next-track <id>] [--source cli]
 coordinator outcome show [--project …]
 coordinator failure show [--project …]
+coordinator failure resolve [--project …]
 coordinator notify hermes-test [--project …] [--progress]
 coordinator wait [--project …] [--timeout-secs N]
 coordinator harness grok start [--project …]

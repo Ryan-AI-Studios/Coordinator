@@ -742,6 +742,11 @@ fn project_card(
     } else {
         None
     };
+    let artifact_title = if failure.as_ref().is_some_and(|p| p.superseded.is_some()) {
+        "Failure Artifact [SUPERSEDED]"
+    } else {
+        "Failure Artifact"
+    };
 
     rsx! {
         article {
@@ -877,7 +882,7 @@ fn project_card(
             }
             if let Some(panel) = failure {
                 div { class: "artifact", "data-region": "failure-artifact",
-                    h3 { "Failure Artifact" }
+                    h3 { "{artifact_title}" }
                     div { class: "meta",
                         span {
                             span { class: "k", "Path" }
@@ -919,10 +924,19 @@ fn note_for(card: &ProjectCard) -> Option<(&'static str, String)> {
                 .unwrap_or_else(|| "CI outside model sessions — no token burn.".into());
             Some(("note", summary))
         }
-        CardState::Idle => Some((
-            "note",
-            "Idle / no active track. Stop on a running project aborts the phase, blocks merge, and leaves sessions for attach.".into(),
-        )),
+        CardState::Idle => {
+            if let Some(reason) = &card.view.failure_superseded {
+                Some((
+                    "note",
+                    format!("Superseded failure note ({reason}). See Failure Artifact."),
+                ))
+            } else {
+                Some((
+                    "note",
+                    "Idle / no active track. Stop on a running project aborts the phase, blocks merge, and leaves sessions for attach.".into(),
+                ))
+            }
+        }
         CardState::ParallelPlanReview => Some((
             "note",
             "Parallel plan reviewers (agy + opencode). Not a single waiting reviewer.".into(),

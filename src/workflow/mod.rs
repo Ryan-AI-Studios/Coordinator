@@ -188,6 +188,26 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
             state.last_event = LAST_EVENT_BACKLOG_CLEAR.into();
             state.phase_started_at = None;
             state.pause_started_at = None;
+            // Defense-in-depth (0040): same-track leftover. Incident fix is
+            // `failure resolve` + SUPERSEDED display — this branch is
+            // fixture-reachable after a failure apply (Stopped rejects apply,
+            // so a new `run` already cleared the file).
+            if let Ok(Some(shown)) = crate::notify::artifact::read(record)
+                && let Some(ref track) = state.track_id
+            {
+                let meta = crate::notify::artifact::parse_metadata(&shown.body);
+                if let Some(ref art_track) = meta.track_id
+                    && crate::notify::artifact::track_ids_match(art_track, track)
+                {
+                    crate::notify::clear_artifact(record);
+                    state.failure_class = None;
+                    crate::progress_log::append(
+                        record,
+                        "advance",
+                        crate::notify::AUTO_CLEAR_DETAIL,
+                    );
+                }
+            }
         }
         Some(id) => {
             let id = id.to_string();
@@ -816,6 +836,65 @@ mod tests {
         let view = write_and_apply(&r, o).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         assert!(view.last_event.contains("backlog clear"));
+    }
+
+    fn write_failure_md(r: &crate::registry::ProjectRecord, track: &str, epoch: u64) {
+        let event = crate::notify::NotifyEvent {
+            project_id: r.id.clone(),
+            track_id: Some(track.into()),
+            phase: "plan".into(),
+            failure_class: FailureClass::HarnessCrash,
+            message: Some("fixture".into()),
+            last_event: "fixture".into(),
+            artifact_path: crate::notify::artifact::path(r).unwrap(),
+            written_at: chrono::Utc::now(),
+            run_epoch: epoch,
+        };
+        crate::notify::artifact::write(r, &event).unwrap();
+    }
+
+    #[test]
+    fn advance_backlog_clear_same_track_clears_artifact() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0040".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        state.failure_class = Some(FailureClass::HarnessCrash);
+        state.next_track = None;
+        save_run_state(&r, &state).unwrap();
+        write_failure_md(&r, "0040", state.run_epoch);
+        let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
+        let view = write_and_apply(&r, o).unwrap();
+        assert!(
+            crate::notify::artifact::existing_path(&r).is_none(),
+            "same-track artifact must clear"
+        );
+        assert!(view.failure_class.is_none());
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert!(should_pick_next_ready(&ReadyPickState::from(&view)));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains(crate::notify::AUTO_CLEAR_DETAIL));
+    }
+
+    #[test]
+    fn advance_backlog_clear_cross_track_keeps_artifact() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0040".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        state.failure_class = Some(FailureClass::HarnessCrash);
+        state.next_track = None;
+        save_run_state(&r, &state).unwrap();
+        write_failure_md(&r, "0038", state.run_epoch);
+        let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
+        let view = write_and_apply(&r, o).unwrap();
+        assert!(
+            crate::notify::artifact::existing_path(&r).is_some(),
+            "cross-track leftover must stay"
+        );
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
     }
 
     #[test]

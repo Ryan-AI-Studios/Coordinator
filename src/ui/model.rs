@@ -74,6 +74,7 @@ pub struct SessionRow {
 pub struct FailurePanel {
     pub path: PathBuf,
     pub body: String,
+    pub superseded: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +105,8 @@ pub fn card_state(view: &StatusView) -> CardState {
         RunStatus::Running => CardState::Running,
         RunStatus::Paused => CardState::Paused,
         RunStatus::Stopped | RunStatus::Idle
-            if view.failure_class.is_some() || view.failure_artifact.is_some() =>
+            if (view.failure_class.is_some() || view.failure_artifact.is_some())
+                && view.failure_superseded.is_none() =>
         {
             CardState::HardFailure
         }
@@ -271,11 +273,16 @@ pub fn failure_panel(view: &StatusView) -> Option<FailurePanel> {
         return Some(FailurePanel {
             path: shown.path,
             body: shown.body,
+            superseded: shown.superseded,
         });
     }
     let path = view.failure_artifact.clone()?;
     let body = std::fs::read_to_string(&path).unwrap_or_default();
-    Some(FailurePanel { path, body })
+    Some(FailurePanel {
+        path,
+        body,
+        superseded: view.failure_superseded.clone(),
+    })
 }
 
 pub fn build_fleet(views: Vec<StatusView>, selected: Option<&str>) -> FleetSnapshot {
@@ -503,6 +510,7 @@ mod tests {
             harness: None,
             workflow: None,
             failure_artifact,
+            failure_superseded: None,
             ci: None,
             review: None,
             last_progress_at: None,
@@ -724,7 +732,123 @@ mod tests {
         let panel = snap.failure.expect("panel");
         assert_eq!(panel.path, path);
         assert!(panel.body.contains("quota exhausted"));
+        assert!(panel.superseded.is_none());
         assert_eq!(snap.cards[0].card_state, CardState::HardFailure);
+    }
+
+    fn fixture_record(path: &std::path::Path) -> crate::registry::ProjectRecord {
+        crate::registry::ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: path.to_path_buf(),
+            display_name: Some("FailProj".into()),
+            layout_profile: LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn write_failure(rec: &crate::registry::ProjectRecord, track: &str, epoch: u64) {
+        let event = crate::notify::NotifyEvent {
+            project_id: rec.id.clone(),
+            track_id: Some(track.into()),
+            phase: "plan".into(),
+            failure_class: FailureClass::HarnessCrash,
+            message: Some("incident".into()),
+            last_event: "incident".into(),
+            artifact_path: artifact::path(rec).unwrap(),
+            written_at: chrono::Utc::now(),
+            run_epoch: epoch,
+        };
+        artifact::write(rec, &event).unwrap();
+    }
+
+    fn write_row(ws: &std::path::Path, status: &str) {
+        let cond = ws.join("conductor");
+        std::fs::create_dir_all(cond.join("0038-Done")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            format!(
+                "| Track | Execution path | Status | Summary |\n\
+                 | --- | --- | --- | --- |\n\
+                 | 0038-Done | `.` | {status} | row |\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn superseded_completed_row_drops_hard_failure() {
+        let dir = tempdir().unwrap();
+        let rec = fixture_record(dir.path());
+        write_row(dir.path(), "**Completed**");
+        write_failure(&rec, "0038", 2);
+        let mut state = crate::state::RunState::idle(&rec.id);
+        state.status = RunStatus::Stopped;
+        state.track_id = Some("0038".into());
+        state.run_epoch = 2;
+        state.failure_class = Some(FailureClass::HarnessCrash);
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let live = crate::state::StatusView::from_record(&rec, &state);
+        assert_eq!(
+            live.failure_superseded.as_deref(),
+            Some(crate::notify::SUPERSEDED_COMPLETED)
+        );
+        let sibling = view(RunStatus::Idle, STUB_PHASE_IDLE, None, None);
+        let snap = build_fleet(vec![live, sibling], None);
+        assert_eq!(snap.cards[0].card_state, CardState::Idle);
+        assert_eq!(snap.counts.attention, 0);
+        let panel = snap.failure.expect("panel");
+        assert_eq!(
+            panel.superseded.as_deref(),
+            Some(crate::notify::SUPERSEDED_COMPLETED)
+        );
+    }
+
+    #[test]
+    fn live_failure_ready_row_stays_hard_failure() {
+        let dir = tempdir().unwrap();
+        let rec = fixture_record(dir.path());
+        write_row(dir.path(), "**Ready — not started**");
+        write_failure(&rec, "0038", 2);
+        let mut state = crate::state::RunState::idle(&rec.id);
+        state.status = RunStatus::Stopped;
+        state.track_id = Some("0038".into());
+        state.run_epoch = 2;
+        state.failure_class = Some(FailureClass::HarnessCrash);
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let live = crate::state::StatusView::from_record(&rec, &state);
+        assert!(live.failure_superseded.is_none());
+        let snap = build_fleet(vec![live], None);
+        assert_eq!(snap.cards[0].card_state, CardState::HardFailure);
+        assert_eq!(snap.counts.attention, 1);
+    }
+
+    #[test]
+    fn epoch_mismatch_ready_row_is_superseded() {
+        let dir = tempdir().unwrap();
+        let rec = fixture_record(dir.path());
+        write_row(dir.path(), "**Ready — not started**");
+        write_failure(&rec, "0038", 2);
+        let mut state = crate::state::RunState::idle(&rec.id);
+        state.status = RunStatus::Stopped;
+        state.track_id = Some("0038".into());
+        state.run_epoch = 9;
+        state.failure_class = Some(FailureClass::HarnessCrash);
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let live = crate::state::StatusView::from_record(&rec, &state);
+        assert_eq!(
+            live.failure_superseded.as_deref(),
+            Some(crate::notify::SUPERSEDED_MISMATCH)
+        );
+        let snap = build_fleet(vec![live], None);
+        assert_eq!(snap.cards[0].card_state, CardState::Idle);
+        assert_eq!(snap.counts.attention, 0);
     }
 
     #[test]

@@ -260,6 +260,9 @@ pub struct StatusView {
     /// Path to `{state_dir}/FAILURE.md` when present; `null` when absent.
     #[serde(default)]
     pub failure_artifact: Option<PathBuf>,
+    /// Read-time SUPERSEDED reason (0040). Omitted when the failure is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_superseded: Option<String>,
     /// Token-idle CI watch; `null` when phase ≠ `ci-wait` and no persisted state.
     #[serde(default)]
     pub ci: Option<CiStatusView>,
@@ -367,6 +370,7 @@ impl StatusView {
                 address_findings_attempts: state.address_findings_attempts,
             }),
             failure_artifact: crate::notify::artifact::existing_path(record),
+            failure_superseded: failure_superseded_for(record, state),
             ci: ci_status_view(record, state),
             review: review_status_view(state),
             last_progress_at: if state.status == RunStatus::Running {
@@ -378,6 +382,17 @@ impl StatusView {
             ticker: None,
         }
     }
+}
+
+fn failure_superseded_for(record: &ProjectRecord, state: &RunState) -> Option<String> {
+    if state.failure_class.is_none() && crate::notify::artifact::existing_path(record).is_none() {
+        return None;
+    }
+    let body = crate::notify::artifact::read(record)
+        .ok()
+        .flatten()
+        .map(|s| s.body);
+    crate::workflow::conductor_md::failure_superseded(record, state, body.as_deref())
 }
 
 fn stall_status_view(record: &ProjectRecord, state: &RunState) -> Option<StallView> {

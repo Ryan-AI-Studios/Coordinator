@@ -337,6 +337,11 @@ pub enum FailureCommands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Acknowledge and remove a leftover Failure Artifact (Idle/Stopped only)
+    Resolve {
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 /// Parse args and dispatch; returns process exit code.
@@ -557,6 +562,10 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                         return Err(CoordinatorError::Message("no failure artifact".into()));
                     }
                 }
+            }
+            FailureCommands::Resolve { project } => {
+                let view = api::cmd_failure_resolve(project.as_deref(), true)?;
+                println!("{}", serde_json::to_string_pretty(&view)?);
             }
         },
         Commands::Wait {
@@ -998,5 +1007,28 @@ mod tests {
             Cli::try_parse_from(["coordinator", "roles", "use", "opencode"]).is_err(),
             "unknown token must be clap error"
         );
+    }
+
+    #[test]
+    fn failure_resolve_is_subcommand_not_flag() {
+        let parsed = Cli::try_parse_from(["coordinator", "failure", "resolve"]).unwrap();
+        match parsed.command {
+            Commands::Failure {
+                action: FailureCommands::Resolve { project },
+            } => assert!(project.is_none()),
+            other => panic!("expected failure resolve, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["coordinator", "failure", "--resolve"]).is_err(),
+            "legacy --resolve flag must not parse"
+        );
+        assert!(
+            Cli::try_parse_from(["coordinator", "failure"]).is_err(),
+            "bare failure still requires a subcommand"
+        );
+        let cmd = Cli::command();
+        let failure = cmd.find_subcommand("failure").expect("failure");
+        assert!(failure.find_subcommand("show").is_some());
+        assert!(failure.find_subcommand("resolve").is_some());
     }
 }
