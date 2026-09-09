@@ -239,7 +239,7 @@ pub enum ProjectCommands {
         /// true | false (omit = default on)
         #[arg(long = "auto-merge", value_parser = parse_auto_merge)]
         auto_merge: Option<bool>,
-        /// Repeatable. Canonical phase id = seconds (>0).
+        /// Repeatable. Canonical phase id or `plan_review_slot` = seconds (>0).
         #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
         phase_timeouts: Vec<(String, u64)>,
     },
@@ -275,10 +275,10 @@ pub enum ProjectCommands {
         /// true | false (omit = leave unchanged). Opt-in Hermes progress POSTs.
         #[arg(long = "notify-progress", value_parser = parse_auto_merge)]
         notify_progress: Option<bool>,
-        /// Repeatable. Canonical phase id = seconds (>0).
+        /// Repeatable. Canonical phase id or `plan_review_slot` = seconds (>0).
         #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
         phase_timeouts: Vec<(String, u64)>,
-        /// Repeatable. Drop one stored project override.
+        /// Repeatable. Drop one stored project override (canonical phase id or `plan_review_slot`).
         #[arg(long = "clear-phase-timeout", value_name = "PHASE")]
         clear_phase_timeout: Vec<String>,
         /// Wipe the project phase-timeout map.
@@ -928,6 +928,26 @@ mod tests {
             } => {
                 let map: BTreeMap<_, _> = phase_timeouts.into_iter().collect();
                 assert_eq!(map.get("plan"), Some(&3600));
+            }
+            other => panic!("expected project set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_set_phase_timeout_accepts_plan_review_slot() {
+        let cli = Cli::try_parse_from([
+            "coordinator",
+            "project",
+            "set",
+            "--phase-timeout",
+            "plan_review_slot=600",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Project {
+                action: ProjectCommands::Set { phase_timeouts, .. },
+            } => {
+                assert_eq!(phase_timeouts, vec![("plan_review_slot".into(), 600)]);
             }
             other => panic!("expected project set, got {other:?}"),
         }

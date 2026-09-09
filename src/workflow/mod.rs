@@ -374,7 +374,7 @@ pub fn mark_driven(record: &ProjectRecord, phase: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ENV_OUTCOME_POLL_MS, test_env_lock};
+    use crate::config::{ENV_COORDINATOR_HOME, ENV_OUTCOME_POLL_MS, test_env_lock};
     use crate::outcome::{FailureClass, OutcomeSource, write_and_apply};
     use crate::run::{self, run_stub, run_with_driver};
     use crate::state::{STUB_PHASE_STOPPED, StatusView};
@@ -993,6 +993,84 @@ mod tests {
         assert!(view.last_event.contains("degraded"));
         unsafe {
             std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+        }
+    }
+
+    #[test]
+    fn join_timeout_table_default_does_not_degrade_at_1300s() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let prev_home = std::env::var_os(ENV_COORDINATOR_HOME);
+        let prev_timeout = std::env::var_os(ENV_PHASE_TIMEOUT_SECS);
+        unsafe {
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, None, WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_PLAN_REVIEW.into();
+        state.pending_roles = vec!["opencode".into()];
+        state.phase_started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1300));
+        save_run_state(&r, &state).unwrap();
+        drive::write_review_markdown(&r, "agy", Some("agy done\n")).unwrap();
+        let none = crate::outcome::try_timeout_under_lock(&r).unwrap();
+        assert!(
+            none.is_none(),
+            "table 2400s join must not degrade leftover at 1300s, got {none:?}"
+        );
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var(ENV_COORDINATOR_HOME, v),
+                None => std::env::remove_var(ENV_COORDINATOR_HOME),
+            }
+            match prev_timeout {
+                Some(v) => std::env::set_var(ENV_PHASE_TIMEOUT_SECS, v),
+                None => std::env::remove_var(ENV_PHASE_TIMEOUT_SECS),
+            }
+        }
+    }
+
+    #[test]
+    fn join_timeout_plan_review_1200_overlay_still_degrades_at_1300s() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let prev_home = std::env::var_os(ENV_COORDINATOR_HOME);
+        let prev_timeout = std::env::var_os(ENV_PHASE_TIMEOUT_SECS);
+        unsafe {
+            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path());
+        r.phase_timeouts_secs
+            .insert(graph::PHASE_PLAN_REVIEW.into(), 1200);
+        run_with_driver(&r, None, WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_PLAN_REVIEW.into();
+        state.pending_roles = vec!["opencode".into()];
+        state.phase_started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1300));
+        save_run_state(&r, &state).unwrap();
+        drive::write_review_markdown(&r, "agy", Some("agy done\n")).unwrap();
+        let view = crate::outcome::try_timeout_under_lock(&r)
+            .unwrap()
+            .expect("degrade join under 1200 overlay");
+        assert_eq!(view.status, RunStatus::Running);
+        assert!(
+            view.last_event.contains("degraded"),
+            "last_event={}",
+            view.last_event
+        );
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var(ENV_COORDINATOR_HOME, v),
+                None => std::env::remove_var(ENV_COORDINATOR_HOME),
+            }
+            match prev_timeout {
+                Some(v) => std::env::set_var(ENV_PHASE_TIMEOUT_SECS, v),
+                None => std::env::remove_var(ENV_PHASE_TIMEOUT_SECS),
+            }
         }
     }
 

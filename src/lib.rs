@@ -25,6 +25,7 @@
 //! OpenCode prompt on stdin (plan-review + 0011); degenerate `opencode-review.md` retry: track **0037**.
 //! Role-bound plan/fold/implement/advance drive: track **0019**.
 //! Adaptive ACP spawn (cursor `--yolo --trust acp`, `cursor_login`, `/summarize`, `roles use`): track **0038**.
+//! Plan-review join wall 2400s + OpenCode `plan_review_slot` clock and pin-OOS prompt: track **0039**.
 
 pub mod api;
 pub mod ci;

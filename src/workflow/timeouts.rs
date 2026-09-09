@@ -12,6 +12,9 @@ use super::graph::{self, is_canonical, is_stub_phase};
 /// Uniform override for every canonical phase (tests).
 pub const ENV_PHASE_TIMEOUT_SECS: &str = "COORDINATOR_PHASE_TIMEOUT_SECS";
 
+/// Extra spawn clock for the plan-review OpenCode slot (not a DAG phase).
+pub const TIMEOUT_KEY_PLAN_REVIEW_SLOT: &str = "plan_review_slot";
+
 /// Where `timeout_for_phase` took the budget from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,7 +42,8 @@ impl TimeoutSource {
 pub fn default_timeout_secs(phase: &str) -> u64 {
     match phase {
         graph::PHASE_PLAN => 1800,
-        graph::PHASE_PLAN_REVIEW => 1200,
+        graph::PHASE_PLAN_REVIEW => 2400,
+        TIMEOUT_KEY_PLAN_REVIEW_SLOT => 2400,
         graph::PHASE_FOLD => 1200,
         graph::PHASE_IMPLEMENT => 7200,
         graph::PHASE_CROSS_MODEL => 2700,
@@ -65,10 +69,8 @@ pub fn parse_phase_timeout(s: &str) -> Result<(String, u64)> {
             "phase timeout key must not be empty".into(),
         ));
     }
-    if !is_canonical(key) {
-        return Err(CoordinatorError::Message(format!(
-            "unknown phase '{key}'; expected a canonical phase id (plan, plan-review, fold, implement, cross-model-review, ci-wait, compact, advance, address-findings)"
-        )));
+    if !is_timeout_key(key) {
+        return Err(CoordinatorError::Message(unknown_timeout_key_msg(key)));
     }
     let secs = val.parse::<u64>().map_err(|_| {
         CoordinatorError::Message(format!(
@@ -97,25 +99,34 @@ pub fn validate_phase_timeout_map(map: &BTreeMap<String, u64>) -> Result<()> {
     Ok(())
 }
 
-/// Canonical, non-empty phase id (clear flags / map keys).
+/// Canonical phase id or [`TIMEOUT_KEY_PLAN_REVIEW_SLOT`] (clear flags / map keys).
 pub fn validate_phase_timeout_key(phase: &str) -> Result<()> {
     if phase.is_empty() {
         return Err(CoordinatorError::Message(
             "phase timeout key must not be empty".into(),
         ));
     }
-    if !is_canonical(phase) {
-        return Err(CoordinatorError::Message(format!(
-            "unknown phase '{phase}'; expected a canonical phase id (plan, plan-review, fold, implement, cross-model-review, ci-wait, compact, advance, address-findings)"
-        )));
+    if !is_timeout_key(phase) {
+        return Err(CoordinatorError::Message(unknown_timeout_key_msg(phase)));
     }
     Ok(())
+}
+
+/// Canonical phase id **or** [`TIMEOUT_KEY_PLAN_REVIEW_SLOT`].
+pub fn is_timeout_key(key: &str) -> bool {
+    is_canonical(key) || key == TIMEOUT_KEY_PLAN_REVIEW_SLOT
+}
+
+fn unknown_timeout_key_msg(key: &str) -> String {
+    format!(
+        "unknown phase '{key}'; expected a canonical phase id (plan, plan-review, fold, implement, cross-model-review, ci-wait, compact, advance, address-findings) or plan_review_slot"
+    )
 }
 
 /// Resolve the wall budget for `phase`.
 ///
 /// 1. `stub:*` → `COORDINATOR_STUB_PHASE_TIMEOUT_SECS` / 300s
-/// 2. `COORDINATOR_PHASE_TIMEOUT_SECS` uniform override (canonical only)
+/// 2. `COORDINATOR_PHASE_TIMEOUT_SECS` uniform override (timeout keys)
 /// 3. project `phase_timeouts_secs`
 /// 4. machine `phase_timeouts_secs`
 /// 5. table `default_timeout_secs`
@@ -132,7 +143,7 @@ fn resolve_timeout(record: &ProjectRecord, phase: &str) -> (u64, TimeoutSource) 
     if is_stub_phase(phase) {
         return (stub_phase_timeout().as_secs(), TimeoutSource::Stub);
     }
-    if is_canonical(phase)
+    if is_timeout_key(phase)
         && let Ok(s) = std::env::var(ENV_PHASE_TIMEOUT_SECS)
         && let Ok(secs) = s.parse::<u64>()
     {
@@ -257,10 +268,20 @@ mod tests {
         unsafe {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "7");
         }
+        rec.phase_timeouts_secs
+            .insert(TIMEOUT_KEY_PLAN_REVIEW_SLOT.into(), 600);
         for phase in graph::canonical_phases() {
             assert_eq!(timeout_for_phase(&rec, phase), Duration::from_secs(7));
             assert_eq!(timeout_source(&rec, phase), TimeoutSource::Env);
         }
+        assert_eq!(
+            timeout_for_phase(&rec, TIMEOUT_KEY_PLAN_REVIEW_SLOT),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            timeout_source(&rec, TIMEOUT_KEY_PLAN_REVIEW_SLOT),
+            TimeoutSource::Env
+        );
         clear_home();
     }
 
@@ -330,19 +351,32 @@ mod tests {
             parse_phase_timeout("address-findings=3600").unwrap(),
             ("address-findings".into(), 3600)
         );
+        assert_eq!(
+            parse_phase_timeout("plan_review_slot=600").unwrap(),
+            (TIMEOUT_KEY_PLAN_REVIEW_SLOT.into(), 600)
+        );
     }
 
     #[test]
     fn parse_phase_timeout_rejects_zero_unknown_and_malformed() {
         assert!(parse_phase_timeout("plan=0").is_err());
+        assert!(parse_phase_timeout("plan_review_slot=0").is_err());
         let unknown = parse_phase_timeout("nope=1").unwrap_err().to_string();
         assert!(
             unknown.contains("address-findings"),
             "parse error={unknown}"
         );
+        assert!(
+            unknown.contains("plan_review_slot"),
+            "parse error={unknown}"
+        );
         let unknown_key = validate_phase_timeout_key("nope").unwrap_err().to_string();
         assert!(
             unknown_key.contains("address-findings"),
+            "validate error={unknown_key}"
+        );
+        assert!(
+            unknown_key.contains("plan_review_slot"),
             "validate error={unknown_key}"
         );
         assert!(parse_phase_timeout("planner=1").is_err());
@@ -351,5 +385,40 @@ mod tests {
         assert!(parse_phase_timeout("=1").is_err());
         assert!(validate_phase_timeout_map(&BTreeMap::from([("plan".into(), 0)])).is_err());
         assert!(validate_phase_timeout_map(&BTreeMap::from([("planner".into(), 1)])).is_err());
+    }
+
+    #[test]
+    fn plan_review_and_slot_table_defaults_are_2400() {
+        assert_eq!(default_timeout_secs(graph::PHASE_PLAN_REVIEW), 2400);
+        assert_eq!(default_timeout_secs(TIMEOUT_KEY_PLAN_REVIEW_SLOT), 2400);
+        assert!(!graph::is_canonical(TIMEOUT_KEY_PLAN_REVIEW_SLOT));
+        assert!(is_timeout_key(TIMEOUT_KEY_PLAN_REVIEW_SLOT));
+        assert!(is_timeout_key(graph::PHASE_PLAN_REVIEW));
+    }
+
+    #[test]
+    fn project_slot_overlay_wins_table_without_env() {
+        let _guard = test_env_lock();
+        let _home = isolate_home();
+        let mut rec = empty_record();
+        rec.phase_timeouts_secs
+            .insert(TIMEOUT_KEY_PLAN_REVIEW_SLOT.into(), 600);
+        assert_eq!(
+            timeout_for_phase(&rec, TIMEOUT_KEY_PLAN_REVIEW_SLOT),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            timeout_source(&rec, TIMEOUT_KEY_PLAN_REVIEW_SLOT),
+            TimeoutSource::Project
+        );
+        assert_eq!(
+            timeout_for_phase(&rec, graph::PHASE_PLAN_REVIEW),
+            Duration::from_secs(2400)
+        );
+        assert_eq!(
+            timeout_source(&rec, graph::PHASE_PLAN_REVIEW),
+            TimeoutSource::Table
+        );
+        clear_home();
     }
 }
