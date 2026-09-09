@@ -595,18 +595,16 @@ mod tests {
     #[test]
     fn chatty_stderr_child_exits_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let args = vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            "1..15 | ForEach-Object { [Console]::Error.WriteLine('tick'); Start-Sleep -Milliseconds 200 }"
-                .into(),
-        ];
-        let out = run_process(
-            Path::new("powershell.exe"),
-            &args,
+        let cmd = write_cmd(
             dir.path(),
-            wait(Duration::from_secs(10), Some(Duration::from_secs(1)), &[]),
+            "chatty.cmd",
+            "@echo off\r\nfor /L %%i in (1,1,6) do (\r\n  echo chatter %%i 1>&2\r\n  ping -n 2 127.0.0.1 >nul\r\n)\r\n",
+        );
+        let out = run_process(
+            &cmd,
+            &[],
+            dir.path(),
+            wait(Duration::from_secs(20), Some(Duration::from_secs(2)), &[]),
             &[],
             None,
         )
@@ -620,20 +618,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let watch = dir.path().join("watch.txt");
         std::fs::write(&watch, "start\n").unwrap();
-        let args = vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            "$ErrorActionPreference='Stop'; 1..15 | ForEach-Object { Set-Content -LiteralPath $env:COORDINATOR_TEST_WATCH -Value $_; Start-Sleep -Milliseconds 200 }".into(),
-        ];
+        let cmd = write_cmd(
+            dir.path(),
+            "touch.cmd",
+            "@echo off\r\nfor /L %%i in (1,1,6) do (\r\n  >\"%COORDINATOR_TEST_WATCH%\" echo n=%%i\r\n  ping -n 2 127.0.0.1 >nul\r\n)\r\n",
+        );
         let watch_paths = vec![watch.clone()];
         let out = run_process(
-            Path::new("powershell.exe"),
-            &args,
+            &cmd,
+            &[],
             dir.path(),
             wait(
-                Duration::from_secs(10),
-                Some(Duration::from_secs(1)),
+                Duration::from_secs(20),
+                Some(Duration::from_secs(2)),
                 &watch_paths,
             ),
             &[(
@@ -703,10 +700,24 @@ mod tests {
     fn cmd_tree_kill_reaps_grandchild_pid() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("grandchild.pid");
+        let vbs = dir.path().join("gc.vbs");
+        std::fs::write(
+            &vbs,
+            "Set sh = CreateObject(\"WScript.Shell\")\r\n\
+Set p = sh.Exec(\"ping -n 120 127.0.0.1\")\r\n\
+Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
+Set f = fso.CreateTextFile(WScript.Arguments(0), True)\r\n\
+f.Write p.ProcessID\r\n\
+f.Close\r\n\
+Do While p.Status = 0\r\n\
+  WScript.Sleep 200\r\n\
+Loop\r\n",
+        )
+        .unwrap();
         let cmd = write_cmd(
             dir.path(),
             "tree.cmd",
-            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"$p = Start-Process -FilePath ping.exe -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru; Set-Content -LiteralPath $env:COORDINATOR_TEST_PIDFILE -Value $p.Id; Wait-Process -Id $p.Id\"\r\n",
+            "@echo off\r\ncscript //nologo \"%~dp0gc.vbs\" \"%COORDINATOR_TEST_PIDFILE%\"\r\n",
         );
         let pidfile_s = pidfile.to_string_lossy().into_owned();
         let handle = std::thread::spawn({
@@ -718,13 +729,13 @@ mod tests {
                     &cmd,
                     &[],
                     &cwd,
-                    wait(Duration::from_secs(30), Some(Duration::from_secs(2)), &[]),
+                    wait(Duration::from_secs(30), Some(Duration::from_secs(3)), &[]),
                     &[("COORDINATOR_TEST_PIDFILE", pidfile_s)],
                     None,
                 )
             }
         });
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut pid = None;
         while Instant::now() < deadline {
             if let Ok(s) = std::fs::read_to_string(&pidfile)
