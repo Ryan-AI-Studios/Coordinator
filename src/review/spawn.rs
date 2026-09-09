@@ -30,8 +30,11 @@ impl ReviewBackend for LiveCli {
         crate::persist::atomic_write(&schema_path, VERDICT_SCHEMA_JSON.as_bytes())?;
 
         let args = argv_for(req, &last_path, &schema_path);
-        // Codex: prompt on stdin (`exec -`) so cmd.exe /C cannot strip TRACK:.
-        let stdin = if req.harness.eq_ignore_ascii_case("codex") {
+        // Codex (`exec -`) and OpenCode (`run` with empty positional): prompt on
+        // stdin so cmd.exe /C + npm `.cmd` `%*` cannot strip TRACK: / newlines.
+        let stdin = if req.harness.eq_ignore_ascii_case("codex")
+            || req.harness.eq_ignore_ascii_case("opencode")
+        {
             Some(req.prompt.as_bytes())
         } else {
             None
@@ -121,6 +124,8 @@ fn claude_argv(req: &ReviewRequest, _schema_path: &Path) -> Vec<String> {
     args
 }
 
+/// 0011 OpenCode argv. Prompt is stdin (see LiveCli), never a positional —
+/// npm `opencode.cmd` forwards `%*` and cmd.exe truncates at `<LF>`.
 fn opencode_argv(req: &ReviewRequest) -> Vec<String> {
     let mut args = vec![
         "run".into(),
@@ -135,7 +140,6 @@ fn opencode_argv(req: &ReviewRequest) -> Vec<String> {
         args.push("--model".into());
         args.push(model.clone());
     }
-    args.push(req.prompt.clone());
     args
 }
 
@@ -366,6 +370,10 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--format" && w[1] == "default")
+        );
+        assert!(
+            !args.iter().any(|a| a == "audit please" || a.contains('\n')),
+            "prompt must be stdin, not argv: {args:?}"
         );
     }
 
