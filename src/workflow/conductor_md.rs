@@ -10,6 +10,42 @@ use super::graph::resolve_track_dir;
 
 const READY_NORMALIZED: &str = "Ready - not started";
 
+/// Default conveyor phrase (em dash). Empty `ProjectRecord.ready_aliases` uses this only.
+pub const DEFAULT_READY_PHRASE: &str = "Ready — not started";
+
+/// Default alias list for omit-`--track` when the project has not opted in extras.
+pub fn default_ready_aliases() -> &'static [&'static str] {
+    &[DEFAULT_READY_PHRASE]
+}
+
+/// Effective aliases: default phrase plus stored extras (dedup after `status_clean`).
+pub fn ready_aliases_for(record: &ProjectRecord) -> Vec<String> {
+    let mut out: Vec<String> = default_ready_aliases()
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    extend_ready_aliases(&mut out, &record.ready_aliases);
+    out
+}
+
+/// Append operator-typed aliases; skip empty and `status_clean` duplicates.
+pub fn extend_ready_aliases(existing: &mut Vec<String>, incoming: &[String]) {
+    for alias in incoming {
+        let trimmed = alias.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = status_clean(trimmed);
+        if key == READY_NORMALIZED {
+            continue;
+        }
+        if existing.iter().any(|e| status_clean(e) == key) {
+            continue;
+        }
+        existing.push(trimmed.to_string());
+    }
+}
+
 /// Five fields shared by `cmd_run` pick and the Status Surface card label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyPickState {
@@ -113,6 +149,12 @@ fn strip_leading_non_alnum(s: &str) -> &str {
 
 pub fn is_eligible_ready(status_raw: &str) -> bool {
     status_clean(status_raw) == READY_NORMALIZED
+}
+
+/// Exact `status_clean` equality against any alias (no prefix).
+pub fn is_eligible_ready_in<S: AsRef<str>>(status_raw: &str, aliases: &[S]) -> bool {
+    let cleaned = status_clean(status_raw);
+    aliases.iter().any(|a| status_clean(a.as_ref()) == cleaned)
 }
 
 /// Registry `**Completed**` (and the same after status_clean).
@@ -471,6 +513,17 @@ fn is_id_lookahead(rest: &str) -> bool {
     false
 }
 
+fn empty_ready_pick_error(record: &ProjectRecord) -> String {
+    if record.ready_aliases.is_empty() {
+        "no Ready — not started track in conductor.md; pass --track <id>".into()
+    } else {
+        format!(
+            "no eligible Ready track (aliases: {}); pass --track <id>",
+            ready_aliases_for(record).join(", ")
+        )
+    }
+}
+
 /// Read `{conductor_dir}/conductor.md` and return the first eligible Ready id
 /// whose track directory exists.
 pub fn pick_next_ready(record: &ProjectRecord) -> Result<String> {
@@ -486,17 +539,16 @@ pub fn pick_next_ready(record: &ProjectRecord) -> Result<String> {
     let text = std::fs::read_to_string(&path)?;
     let rows = parse_conductor_md(&text)?;
     let order = parse_execution_order(&text);
+    let aliases = ready_aliases_for(record);
     let mut eligible: Vec<&TrackRow> = rows
         .iter()
         .filter(|r| {
-            is_eligible_ready(&r.status_raw)
+            is_eligible_ready_in(&r.status_raw, &aliases)
                 && !is_hitl_marked(&r.id, &r.slug, &r.status_raw, &r.summary)
         })
         .collect();
     if eligible.is_empty() {
-        return Err(CoordinatorError::Message(
-            "no Ready — not started track in conductor.md; pass --track <id>".into(),
-        ));
+        return Err(CoordinatorError::Message(empty_ready_pick_error(record)));
     }
     if !order.is_empty() {
         eligible.sort_by_key(|r| {
@@ -554,6 +606,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            ready_aliases: Vec::new(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -956,5 +1009,106 @@ mod tests {
         write_ready_fixture(dir.path(), "0030").unwrap();
         let r = rec(dir.path());
         assert_eq!(pick_next_ready(&r).unwrap(), "0030");
+    }
+
+    #[test]
+    fn custom_ready_alias_picks_exact_row() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0042-Custom | `.` | **Ready — full plan @ 072399b6** | go |\n\
+             | 0030-Default | `.` | **Ready — not started** | default still eligible |\n",
+        );
+        mkdir_track(ws, "0042-Custom");
+        mkdir_track(ws, "0030-Default");
+        let mut r = rec(ws);
+        r.ready_aliases = vec!["Ready — full plan @ 072399b6".into()];
+        assert_eq!(pick_next_ready(&r).unwrap(), "0042");
+    }
+
+    #[test]
+    fn unknown_status_is_ignored_not_parse_error() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0007-Draft | `.` | **Draft** | ignore |\n\
+             | 0030-Ok | `.` | **Ready — not started** | go |\n",
+        );
+        mkdir_track(ws, "0007-Draft");
+        mkdir_track(ws, "0030-Ok");
+        let r = rec(ws);
+        assert_eq!(pick_next_ready(&r).unwrap(), "0030");
+    }
+
+    #[test]
+    fn configured_aliases_empty_pick_mentions_list() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-Done | `.` | **Completed** | done |\n",
+        );
+        mkdir_track(ws, "0001-Done");
+        let mut r = rec(ws);
+        r.ready_aliases = vec!["Ready — full plan @ 072399b6".into()];
+        let err = pick_next_ready(&r).unwrap_err().to_string();
+        assert!(err.contains("no eligible Ready track"), "{err}");
+        assert!(err.contains("Ready — full plan @ 072399b6"), "{err}");
+    }
+
+    #[test]
+    fn default_empty_pick_keeps_legacy_wording() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-Done | `.` | **Completed** | done |\n",
+        );
+        mkdir_track(ws, "0001-Done");
+        let err = pick_next_ready(&rec(ws)).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "no Ready — not started track in conductor.md; pass --track <id>"
+        );
+    }
+
+    #[test]
+    fn hitl_skipped_even_when_alias_matches() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0042-Hitl | `.` | **Ready — full plan @ 072399b6** | owner only |\n\
+             | 0030-Ok | `.` | **Ready — not started** | go |\n",
+        );
+        mkdir_track(ws, "0042-Hitl");
+        mkdir_track(ws, "0030-Ok");
+        let mut r = rec(ws);
+        r.ready_aliases = vec!["Ready — full plan @ 072399b6".into()];
+        assert_eq!(pick_next_ready(&r).unwrap(), "0030");
+    }
+
+    #[test]
+    fn prefix_does_not_match_alias() {
+        assert!(!is_eligible_ready_in(
+            "Ready — full plan @ 072399b6",
+            &["Ready — full plan"]
+        ));
+        assert!(is_eligible_ready_in(
+            "Ready — full plan @ 072399b6",
+            &["Ready — full plan @ 072399b6"]
+        ));
     }
 }

@@ -69,6 +69,10 @@ pub struct ProjectSetRequest {
     pub clear_phase_timeouts: Option<bool>,
     #[serde(default)]
     pub clear_phase_timeout: Option<Vec<String>>,
+    #[serde(default)]
+    pub ready_aliases: Option<Vec<String>>,
+    #[serde(default)]
+    pub clear_ready_aliases: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +293,8 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         phase_timeouts_secs: req.phase_timeouts_secs,
         clear_phase_timeouts: req.clear_phase_timeouts.unwrap_or(false),
         clear_phase_timeout: req.clear_phase_timeout.unwrap_or_default(),
+        ready_aliases: req.ready_aliases,
+        clear_ready_aliases: req.clear_ready_aliases.unwrap_or(false),
     };
     project_set(req.project.as_deref(), opts, false)
 }

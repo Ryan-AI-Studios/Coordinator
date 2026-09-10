@@ -56,6 +56,10 @@ pub struct ProjectSetOptions {
     pub clear_phase_timeouts: bool,
     /// Drop these stored keys (repeatable) before overlay.
     pub clear_phase_timeout: Vec<String>,
+    /// Overlay ready-status aliases (None = no overlay). Additive; skip after `status_clean` dup.
+    pub ready_aliases: Option<Vec<String>>,
+    /// Wipe stored ready aliases (back to default phrase) before overlay.
+    pub clear_ready_aliases: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +89,9 @@ pub struct ProjectRecord {
     /// Opt-in Hermes progress POSTs (track 0033). Missing field on old records = off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notify_progress: bool,
+    /// Extra omit-`--track` Ready phrases (0042). Empty = default `Ready — not started`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ready_aliases: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -202,6 +209,7 @@ impl Registry {
             auto_merge: opts.auto_merge.unwrap_or(true),
             phase_timeouts_secs: opts.phase_timeouts_secs,
             notify_progress: false,
+            ready_aliases: Vec::new(),
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
@@ -272,6 +280,12 @@ impl Registry {
         }
         if let Some(map) = opts.phase_timeouts_secs {
             rec.phase_timeouts_secs.extend(map);
+        }
+        if opts.clear_ready_aliases {
+            rec.ready_aliases.clear();
+        }
+        if let Some(incoming) = opts.ready_aliases {
+            crate::workflow::conductor_md::extend_ready_aliases(&mut rec.ready_aliases, &incoming);
         }
         Ok(rec.clone())
     }
@@ -613,6 +627,10 @@ mod tests {
         assert!(
             !loaded.projects[0].notify_progress,
             "missing notify_progress on old registry JSON defaults false"
+        );
+        assert!(
+            loaded.projects[0].ready_aliases.is_empty(),
+            "missing ready_aliases on old registry JSON defaults empty"
         );
         let _guard = crate::config::test_env_lock();
         let isolated = tempdir().unwrap();
@@ -1274,5 +1292,69 @@ mod tests {
         assert!(!missing.exists());
         let resolved = reg.resolve_project_in(None, Some(&missing), None).unwrap();
         assert_eq!(resolved.id, id_b);
+    }
+
+    #[test]
+    fn set_ready_aliases_additive_dedup_and_clear() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        assert!(rec.ready_aliases.is_empty());
+        let updated = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    ready_aliases: Some(vec![
+                        "Ready — full plan @ 072399b6".into(),
+                        "Ready — not started".into(),
+                        "Ready - not started".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            updated.ready_aliases,
+            vec!["Ready — full plan @ 072399b6".to_string()]
+        );
+        let more = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    ready_aliases: Some(vec!["Ready — implement on GO".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            more.ready_aliases,
+            vec![
+                "Ready — full plan @ 072399b6".to_string(),
+                "Ready — implement on GO".to_string(),
+            ]
+        );
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let json = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(json.contains("ready_aliases"));
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert_eq!(loaded.projects[0].ready_aliases, more.ready_aliases);
+        let cleared = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    clear_ready_aliases: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(cleared.ready_aliases.is_empty());
+        reg.save(&reg_path).unwrap();
+        let after = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(
+            !after.contains("ready_aliases"),
+            "empty aliases omit the key"
+        );
     }
 }

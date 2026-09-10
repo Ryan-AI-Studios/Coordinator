@@ -58,6 +58,7 @@ mod tests {
             auto_merge: false,
             phase_timeouts_secs: BTreeMap::new(),
             notify_progress: false,
+            ready_aliases: Vec::new(),
             created_at: ChronoUtc::now(),
         }
     }
