@@ -482,6 +482,15 @@ pub fn clear_plan_review_artifacts(record: &ProjectRecord) {
     }
 }
 
+fn degrade_message(missing: &[&str], duds: &[String]) -> String {
+    let mut msg = format!("plan-review: degraded {}", missing.join(","));
+    if !duds.is_empty() {
+        msg.push_str("; slot: dud ");
+        msg.push_str(&duds.join(", "));
+    }
+    msg
+}
+
 fn try_join(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> {
     let state = load_run_state(record)?;
     if state.phase != PHASE_PLAN_REVIEW {
@@ -513,7 +522,14 @@ fn try_join(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
     let msg = if missing.is_empty() {
         None
     } else {
-        Some(format!("plan-review: degraded {}", missing.join(",")))
+        Some(degrade_message(
+            &missing,
+            state
+                .review
+                .as_ref()
+                .map(|r| r.duds.as_slice())
+                .unwrap_or(&[]),
+        ))
     };
     synth_success(record, &state, msg, OutcomeSource::Test)
 }
@@ -543,7 +559,14 @@ pub fn timeout_plan_review_outcome(
     Ok(Some(PhaseOutcome::success(
         state.phase.clone(),
         OutcomeSource::Timeout,
-        Some(format!("plan-review: degraded {leftover}")),
+        Some(degrade_message(
+            &[leftover.as_str()],
+            state
+                .review
+                .as_ref()
+                .map(|r| r.duds.as_slice())
+                .unwrap_or(&[]),
+        )),
         None,
         Some(state.run_epoch),
     )))

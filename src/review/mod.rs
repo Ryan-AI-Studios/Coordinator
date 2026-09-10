@@ -6,6 +6,7 @@
 pub mod backend;
 pub mod parse;
 pub mod prompt;
+pub mod slot_quality;
 pub mod spawn;
 
 use std::time::{Duration, Instant};
@@ -193,59 +194,29 @@ pub fn drive_with(
 
         any_started = true;
         let t0 = Instant::now();
-        let class = match backend.run(&req) {
-            Ok(result) => {
-                let class = classify_result(&result);
-                if result.exit == 124 && spawn::is_reviewer_stall(&result.stderr) {
-                    crate::harness::journal::record_reviewer_stall(
-                        record,
-                        slug,
-                        &crate::harness::journal::argv_head(&req.command, &[] as &[&str]),
-                        t0.elapsed().as_millis() as u64,
-                    );
-                    persist_review_state(record, |s, rv| {
-                        if !rv.stalled.iter().any(|x| x == slug) {
-                            rv.stalled.push(slug.to_string());
-                        }
-                        rv.active = None;
-                        s.last_event = truncate_msg(&format!("reviewer stall ({slug})"));
-                    })?;
-                }
-                if matches!(
-                    class,
-                    TierClass::Pass | TierClass::PassWithLows | TierClass::GateFail
-                ) {
-                    let body = if result.last_message.trim().is_empty() {
-                        &result.stdout
-                    } else {
-                        &result.last_message
-                    };
-                    write_reports(record, state, slug, body)?;
-                    let (verdict, event) = match class {
-                        TierClass::Pass => ("PASS", format!("cross-model: pass ({slug})")),
-                        TierClass::PassWithLows => (
-                            "PASS_WITH_LOWS",
-                            format!("cross-model: pass with lows ({slug})"),
-                        ),
-                        _ => ("FAIL", format!("cross-model: gate failed ({slug})")),
-                    };
-                    persist_review(record, |rv| {
-                        rv.active = Some(slug.to_string());
-                        rv.verdict = Some(verdict.into());
-                        rv.report = Some(format!("review.{slug}.md"));
-                    })?;
-                    return if class == TierClass::GateFail {
-                        apply_failure(record, state, FailureClass::Difficulty, event)
-                    } else {
-                        apply_success(record, state, event, OutcomeSource::Adapter)
-                    };
-                }
-                last_note = truncate_msg(&format!("{slug}: {}", classify_note(&result, class)));
-                class
+        let class = match run_tier(record, state, backend, &req, slug, t0)? {
+            TierEval::Finished(class) => {
+                let (verdict, event) = match class {
+                    TierClass::Pass => ("PASS", format!("cross-model: pass ({slug})")),
+                    TierClass::PassWithLows => (
+                        "PASS_WITH_LOWS",
+                        format!("cross-model: pass with lows ({slug})"),
+                    ),
+                    _ => ("FAIL", format!("cross-model: gate failed ({slug})")),
+                };
+                persist_review(record, |rv| {
+                    rv.active = Some(slug.to_string());
+                    rv.verdict = Some(verdict.into());
+                    rv.report = Some(format!("review.{slug}.md"));
+                })?;
+                return if class == TierClass::GateFail {
+                    apply_failure(record, state, FailureClass::Difficulty, event)
+                } else {
+                    apply_success(record, state, event, OutcomeSource::Adapter)
+                };
             }
-            Err(e) => {
-                let class = classify_error(&e.to_string());
-                last_note = truncate_msg(&format!("{slug}: {e}"));
+            TierEval::FallThrough { class, note } => {
+                last_note = note;
                 class
             }
         };
@@ -332,6 +303,132 @@ fn class_name(class: TierClass) -> &'static str {
         TierClass::Exhaustion => "exhaustion",
         TierClass::Permission => "permission",
         TierClass::Crash => "crash",
+    }
+}
+
+enum TierEval {
+    Finished(TierClass),
+    FallThrough { class: TierClass, note: String },
+}
+
+fn review_body(result: &ReviewResult) -> &str {
+    if result.last_message.trim().is_empty() {
+        &result.stdout
+    } else {
+        &result.last_message
+    }
+}
+
+pub(crate) fn record_slot_dud(record: &ProjectRecord, file: &str, bytes: usize) -> Result<()> {
+    let note = format!("{file} ({bytes})");
+    persist_review_state(record, |s, rv| {
+        if !rv.duds.iter().any(|d| d == &note) {
+            rv.duds.push(note);
+        }
+        s.last_event = truncate_msg(&slot_quality::dud_message(file, bytes));
+    })
+}
+
+fn unlink_cross_model_reports(record: &ProjectRecord, state: &RunState, slug: &str) {
+    if let Ok(dir) = crate::workflow::bundle::reviews_dir(record) {
+        let _ = std::fs::remove_file(dir.join(format!("cross-model-{slug}.md")));
+    }
+    if let Some(ref track_id) = state.track_id
+        && let Some(track_dir) = graph::resolve_track_dir(record, track_id)
+    {
+        let _ = std::fs::remove_file(track_dir.join(format!("review.{slug}.md")));
+    }
+}
+
+fn archive_cross_model_dud(state: &RunState, record: &ProjectRecord, slug: &str, body: &str) {
+    if let Some(ref track_id) = state.track_id
+        && let Some(track_dir) = graph::resolve_track_dir(record, track_id)
+    {
+        let _ = std::fs::write(track_dir.join(format!("review.{slug}.dud1.md")), body);
+    }
+}
+
+fn run_tier(
+    record: &ProjectRecord,
+    state: &RunState,
+    backend: &dyn ReviewBackend,
+    req: &ReviewRequest,
+    slug: &str,
+    t0: Instant,
+) -> Result<TierEval> {
+    let mut current = req.clone();
+    let mut retried = false;
+    loop {
+        let result = match backend.run(&current) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(TierEval::FallThrough {
+                    class: classify_error(&e.to_string()),
+                    note: truncate_msg(&format!("{slug}: {e}")),
+                });
+            }
+        };
+        if result.exit == 124 && spawn::is_reviewer_stall(&result.stderr) {
+            crate::harness::journal::record_reviewer_stall(
+                record,
+                slug,
+                &crate::harness::journal::argv_head(&current.command, &[] as &[&str]),
+                t0.elapsed().as_millis() as u64,
+            );
+            persist_review_state(record, |s, rv| {
+                if !rv.stalled.iter().any(|x| x == slug) {
+                    rv.stalled.push(slug.to_string());
+                }
+                rv.active = None;
+                s.last_event = truncate_msg(&format!("reviewer stall ({slug})"));
+            })?;
+        }
+        if result.exit == 124 || spawn::is_reviewer_stall(&result.stderr) {
+            let class = classify_result(&result);
+            return Ok(TierEval::FallThrough {
+                class,
+                note: truncate_msg(&format!("{slug}: {}", classify_note(&result, class))),
+            });
+        }
+
+        let class = classify_result(&result);
+        let body = review_body(&result);
+        let would_persist = matches!(
+            class,
+            TierClass::Pass | TierClass::PassWithLows | TierClass::GateFail
+        );
+        let schema_dud = crate::review::parse::is_schema_only_json(body);
+        if (schema_dud || would_persist)
+            && let Err(dud) = slot_quality::check(
+                slot_quality::SlotFamily::CrossModel,
+                body,
+                state.track_id.as_deref(),
+            )
+        {
+            let file = format!("review.{slug}.md");
+            archive_cross_model_dud(state, record, slug, body);
+            unlink_cross_model_reports(record, state, slug);
+            record_slot_dud(record, &file, dud.bytes)?;
+            let latest = load_run_state(record).unwrap_or_else(|_| state.clone());
+            let remaining = remaining_budget(record, &latest);
+            if !retried && remaining >= MIN_TIER_BUDGET {
+                retried = true;
+                current.remaining_timeout = remaining;
+                continue;
+            }
+            return Ok(TierEval::FallThrough {
+                class: TierClass::Crash,
+                note: truncate_msg(&slot_quality::dud_message(&file, dud.bytes)),
+            });
+        }
+        if would_persist {
+            write_reports(record, state, slug, body)?;
+            return Ok(TierEval::Finished(class));
+        }
+        return Ok(TierEval::FallThrough {
+            class,
+            note: truncate_msg(&format!("{slug}: {}", classify_note(&result, class))),
+        });
     }
 }
 
@@ -469,7 +566,8 @@ mod tests {
             exit: 0,
             stdout: String::new(),
             stderr: String::new(),
-            last_message: "## Verdict: PASS WITH DEFERRED P3\n".into(),
+            last_message: "## Verdict: PASS WITH DEFERRED P3\n\n## Findings\n\nP3 leftover\n"
+                .into(),
         }
     }
 
@@ -743,9 +841,9 @@ mod tests {
         jump_cross_model(&r, WorkflowDriver::Adapter);
         let token = "UNIQUE_TOKEN_fresh_gate_body";
         let mut fail = fail_text();
-        fail.last_message = format!("## Verdict: FAIL\n\n{token}\n");
+        fail.last_message = format!("## Verdict: FAIL\n\n## Findings\n\n{token}\n");
         let mut pass = pass_text();
-        pass.last_message = "## Verdict: PASS\n\nsecond gate body\n".into();
+        pass.last_message = "## Verdict: PASS\n\n## Findings\n\nsecond gate body\n".into();
         let scripted = ScriptedBackend::new().push_ok(fail).push_ok(pass);
         let (_hook, counts) = hook(scripted);
         let bounce = crate::workflow::tick(&r).unwrap().expect("bounce");
@@ -1000,6 +1098,118 @@ mod tests {
         assert_eq!(view.phase, graph::PHASE_CI_WAIT);
         assert_eq!(view.status, RunStatus::Paused);
         assert_eq!(counts.n(), 1);
+        clear_env();
+    }
+
+    fn schema_only_pass() -> ReviewResult {
+        ReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: r#"{"verdict":"PASS","highest":"None"}"#.into(),
+        }
+    }
+
+    fn schema_only_deferred() -> ReviewResult {
+        ReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: r#"{"verdict":"PASS_WITH_DEFERRED_P3","highest":"low"}"#.into(),
+        }
+    }
+
+    #[test]
+    fn cross_model_dud_retries_then_pass() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conductor").join("0011-Example")).unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new()
+            .push_ok(schema_only_pass())
+            .push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("pass");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(view.last_event.contains("cross-model: pass (codex)"));
+        assert_eq!(counts.n(), 2);
+        assert_eq!(counts.slugs(), vec!["codex", "codex"]);
+        let st = load_run_state(&r).unwrap();
+        let duds = st
+            .review
+            .as_ref()
+            .map(|x| x.duds.clone())
+            .unwrap_or_default();
+        assert!(
+            duds.iter().any(|d| d.contains("review.codex.md")),
+            "duds={duds:?}"
+        );
+        assert!(
+            !dir.path()
+                .join("conductor")
+                .join("0011-Example")
+                .join("review.codex.md")
+                .exists()
+                || std::fs::read_to_string(
+                    dir.path()
+                        .join("conductor")
+                        .join("0011-Example")
+                        .join("review.codex.md")
+                )
+                .unwrap()
+                .contains("## Verdict:")
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn cross_model_dud_dud_falls_through_to_next_tier() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new()
+            .push_ok(schema_only_pass())
+            .push_ok(schema_only_pass())
+            .push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("pass");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(view.last_event.contains("cross-model: pass (claude)"));
+        assert_eq!(counts.n(), 3);
+        assert_eq!(counts.slugs(), vec!["codex", "codex", "claude"]);
+        let st = load_run_state(&r).unwrap();
+        let duds = st
+            .review
+            .as_ref()
+            .map(|x| x.duds.clone())
+            .unwrap_or_default();
+        assert!(
+            duds.iter().any(|d| d.contains("review.codex.md")),
+            "duds={duds:?}"
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn schema_only_pass_json_is_dud_not_pass() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new()
+            .push_ok(schema_only_pass())
+            .push_ok(schema_only_pass())
+            .push_ok(schema_only_deferred())
+            .push_ok(schema_only_deferred())
+            .push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("pass");
+        assert!(view.last_event.contains("cross-model: pass (opencode)"));
+        assert_eq!(counts.n(), 5);
+        assert!(!view.last_event.contains("cross-model: pass (codex)"));
+        assert!(!view.last_event.contains("cross-model: pass (claude)"));
         clear_env();
     }
 

@@ -15,6 +15,7 @@
 //! Infer `--project` from unique cwd containment else last-used: track **0029**.
 //! Omit `--track` starts first exact Ready row (`status_clean` vs `ready_aliases`;
 //! default `Ready — not started`) when unset or backlog-clear: track **0030** / **0042**.
+//! Slot-quality admission (plan-review + cross-model; schema-only JSON is dud): track **0043**.
 //! Address-findings side loop after GateFail (cap 2 then difficulty Stop): track **0031**.
 //! Windows Grok `terminal/create` pwsh→powershell.exe→cmd.exe fallback + spawn-fail `HarnessCrash`: track **0032**.
 //! Opt-in Hermes progress POSTs on phase advance (failure JSON unchanged): track **0033**.
