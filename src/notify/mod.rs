@@ -152,6 +152,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: Utc::now(),
         }
     }
@@ -733,7 +734,8 @@ mod tests {
             hermes::install_recording("http://127.0.0.1:8644/webhooks/coordinator-progress", "s");
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("conductor").join("0040-Next")).unwrap();
-        let r = rec(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = crate::registry::AutoStartPolicy::Full;
         jump_phase(&r, crate::workflow::graph::PHASE_ADVANCE, "0033");
         let mut s = crate::state::load_run_state(&r).unwrap();
         s.next_track = Some("0040".into());

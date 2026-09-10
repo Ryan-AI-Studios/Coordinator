@@ -58,6 +58,7 @@ pub(crate) fn run_with_origin(
                 state.pause_started_at = None;
                 state.failure_class = None;
                 state.next_track = None;
+                state.parked_next = None;
                 state.last_applied_outcome_hash = None;
                 state.ci = None;
                 state.review = None;
@@ -285,6 +286,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: Utc::now(),
         }
     }

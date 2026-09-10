@@ -85,6 +85,9 @@ pub struct RunState {
     /// Planner handoff from outcome `metadata.next_track`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_track: Option<String>,
+    /// Parked advance candidate (0044). Cleared on the next successful start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_next: Option<String>,
     /// Content hash of last successfully applied outcome (consume marker).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_applied_outcome_hash: Option<String>,
@@ -193,6 +196,7 @@ impl RunState {
             pause_started_at: None,
             failure_class: None,
             next_track: None,
+            parked_next: None,
             last_applied_outcome_hash: None,
             workflow: None,
             driver: crate::workflow::WorkflowDriver::default(),
@@ -245,6 +249,15 @@ pub struct StatusView {
     pub failure_class: Option<FailureClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_track: Option<String>,
+    /// Copied from `ProjectRecord` (0044). Missing JSON = hitl.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::registry::AutoStartPolicy::is_hitl"
+    )]
+    pub auto_start: crate::registry::AutoStartPolicy,
+    /// Parked advance candidate (0044). Omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_next: Option<String>,
     /// Layout profile (nested | multi_sibling | single_root).
     #[serde(default)]
     pub layout_profile: crate::layout::LayoutProfile,
@@ -364,6 +377,8 @@ impl StatusView {
             phase_started_at: state.phase_started_at,
             failure_class: state.failure_class,
             next_track: state.next_track.clone(),
+            auto_start: record.auto_start,
+            parked_next: state.parked_next.clone(),
             layout_profile: record.layout_profile,
             execution_repo: paths.execution_repo,
             conductor_dir: Some(paths.conductor_dir),
@@ -582,6 +597,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: Utc::now(),
         }
     }

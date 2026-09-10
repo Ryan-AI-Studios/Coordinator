@@ -722,6 +722,8 @@ fn project_card(
     let track = card.view.track_id.clone().unwrap_or_else(|| "—".into());
     let phase = card.view.phase.clone();
     let next = card.view.next_track.clone().unwrap_or_else(|| "—".into());
+    let policy = card.view.auto_start.as_str().to_string();
+    let parked = card.view.parked_next.clone();
     let layout = card.view.layout_profile.as_str().to_string();
     let (pill_class, pill_label) = status_pill(card.card_state);
     let primary = card_primary_action(&card.view);
@@ -850,6 +852,18 @@ fn project_card(
                     span { class: "label", "Next" }
                     span { class: "value", "{next}" }
                     span { class: "pill idle", "queued" }
+                }
+                div { class: "row",
+                    span { class: "label", "Policy" }
+                    span { class: "value", "{policy}" }
+                    span { class: "pill idle", "auto-start" }
+                }
+                if let Some(parked) = parked {
+                    div { class: "row",
+                        span { class: "label", "Parked" }
+                        span { class: "value", "{parked}" }
+                        span { class: "pill idle", "parked" }
+                    }
                 }
                 div { class: "row",
                     span { class: "label", "Layout" }
@@ -990,6 +1004,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);
@@ -1034,6 +1049,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);

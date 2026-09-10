@@ -39,6 +39,8 @@ pub struct ProjectAddRequest {
     pub auto_merge: Option<bool>,
     #[serde(default)]
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
+    #[serde(default)]
+    pub auto_start: Option<crate::registry::AutoStartPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +75,8 @@ pub struct ProjectSetRequest {
     pub ready_aliases: Option<Vec<String>>,
     #[serde(default)]
     pub clear_ready_aliases: Option<bool>,
+    #[serde(default)]
+    pub auto_start: Option<crate::registry::AutoStartPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +192,7 @@ fn opts_from_add_request(req: &ProjectAddRequest) -> Result<ProjectAddOptions> {
         execution_repos: req.execution_repos.clone().unwrap_or_default(),
         auto_merge: req.auto_merge,
         phase_timeouts_secs: req.phase_timeouts_secs.clone().unwrap_or_default(),
+        auto_start: req.auto_start,
     })
 }
 
@@ -295,6 +300,7 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         clear_phase_timeout: req.clear_phase_timeout.unwrap_or_default(),
         ready_aliases: req.ready_aliases,
         clear_ready_aliases: req.clear_ready_aliases.unwrap_or(false),
+        auto_start: req.auto_start,
     };
     project_set(req.project.as_deref(), opts, false)
 }
@@ -393,7 +399,17 @@ pub fn resolve_run_track(
         return Ok((Some(t), false));
     }
     let state = crate::state::load_run_state(record)?;
-    let pick = crate::workflow::ReadyPickState::from(&state);
+    let mut pick = crate::workflow::ReadyPickState::from(&state);
+    pick.auto_start = record.auto_start;
+    if record.auto_start == crate::registry::AutoStartPolicy::Never {
+        let mut no_policy = pick.clone();
+        no_policy.auto_start = crate::registry::AutoStartPolicy::Hitl;
+        if crate::workflow::should_pick_next_ready(&no_policy) {
+            return Err(CoordinatorError::Message(
+                "auto_start=never; pass --track".into(),
+            ));
+        }
+    }
     if !crate::workflow::should_pick_next_ready(&pick) {
         return Ok((None, false));
     }
@@ -687,6 +703,22 @@ mod tests {
         assert_eq!(req.notify_progress, Some(true));
         let omitted: ProjectSetRequest = serde_json::from_str(r#"{"project":"abc"}"#).unwrap();
         assert_eq!(omitted.notify_progress, None);
+    }
+
+    #[test]
+    fn project_add_set_request_auto_start_round_trip() {
+        let add: ProjectAddRequest =
+            serde_json::from_str(r#"{"path":"C:\\dev\\x","auto_start":"full"}"#).unwrap();
+        assert_eq!(add.auto_start, Some(crate::registry::AutoStartPolicy::Full));
+        let omitted_add: ProjectAddRequest =
+            serde_json::from_str(r#"{"path":"C:\\dev\\x"}"#).unwrap();
+        assert_eq!(omitted_add.auto_start, None);
+        let set: ProjectSetRequest =
+            serde_json::from_str(r#"{"project":"abc","auto_start":"never"}"#).unwrap();
+        assert_eq!(
+            set.auto_start,
+            Some(crate::registry::AutoStartPolicy::Never)
+        );
     }
 
     fn add_isolated_project() -> (tempfile::TempDir, tempfile::TempDir, ProjectRecord) {
