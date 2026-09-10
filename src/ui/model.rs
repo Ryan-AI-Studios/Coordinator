@@ -207,7 +207,13 @@ pub fn phase_caption(view: &StatusView) -> String {
     }
 }
 
-/// Session table: Grok from `harness.grok`; plan-review pending roles as agy/opencode.
+/// Session table: ACP row from `harness.grok`; plan-review pending roles as agy/opencode.
+///
+/// Role is the phase role (`Planner` / `Implementor`), never a harness brand.
+/// Harness is the live `adapter` (empty → grok). Suffix ` via grok holder` only
+/// when adapter is not grok. Label = live adapter (post-spawn truth): a CLI
+/// `harness grok start` under a cursor binding stays `grok` until the next
+/// adapter tick recycles; no JSON for that window.
 /// Do not invent live ACP rows for Claude/Codex/OpenCode.
 pub fn session_rows(view: &StatusView) -> Vec<SessionRow> {
     let mut rows = Vec::new();
@@ -226,8 +232,8 @@ pub fn session_rows(view: &StatusView) -> Vec<SessionRow> {
                 "compact: no".into()
             });
             rows.push(SessionRow {
-                role: "Grok".into(),
-                harness: "grok".into(),
+                role: acp_role_cell(&view.phase),
+                harness: acp_harness_cell(&g.adapter),
                 state: if g.alive {
                     "alive".into()
                 } else {
@@ -237,7 +243,7 @@ pub fn session_rows(view: &StatusView) -> Vec<SessionRow> {
             });
         }
         None => rows.push(SessionRow {
-            role: "Grok".into(),
+            role: acp_role_cell(&view.phase),
             harness: "grok".into(),
             state: "no grok session".into(),
             detail: String::new(),
@@ -266,6 +272,34 @@ pub fn session_rows(view: &StatusView) -> Vec<SessionRow> {
     }
 
     rows
+}
+
+fn acp_role_cell(phase: &str) -> String {
+    match crate::harness::roles::phase_role_key(phase) {
+        Some("planner") => "Planner".into(),
+        Some("implementor") => "Implementor".into(),
+        Some(other) => {
+            let mut s = other.to_string();
+            if let Some(c) = s.get_mut(0..1) {
+                c.make_ascii_uppercase();
+            }
+            s
+        }
+        None => "Session".into(),
+    }
+}
+
+fn acp_harness_cell(adapter: &str) -> String {
+    let exec = if adapter.trim().is_empty() {
+        "grok"
+    } else {
+        adapter.trim()
+    };
+    if exec.eq_ignore_ascii_case("grok") {
+        exec.to_string()
+    } else {
+        format!("{exec} via grok holder")
+    }
 }
 
 pub fn failure_panel(view: &StatusView) -> Option<FailurePanel> {
@@ -664,6 +698,7 @@ mod tests {
     fn missing_grok_is_no_session_row() {
         let rows = session_rows(&view(RunStatus::Idle, STUB_PHASE_IDLE, None, None));
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].role, "Session");
         assert_eq!(rows[0].harness, "grok");
         assert_eq!(rows[0].state, "no grok session");
     }
@@ -688,6 +723,8 @@ mod tests {
             }),
         });
         let rows = session_rows(&v);
+        assert_eq!(rows[0].role, "Session");
+        assert_eq!(rows[0].harness, "grok");
         assert_eq!(rows[0].state, "alive");
         assert!(rows[0].detail.contains("pid 42"));
         assert!(rows[0].detail.contains("compact: yes"));
@@ -704,6 +741,26 @@ mod tests {
                 .any(|r| r.harness == "claude" || r.harness == "codex"),
             "must not invent live ACP rows"
         );
+    }
+
+    #[test]
+    fn cursor_adapter_implement_row_shows_suffix() {
+        let mut v = view(RunStatus::Running, PHASE_IMPLEMENT, None, None);
+        v.harness = Some(HarnessStatusBundle {
+            grok: Some(GrokHarnessStatus {
+                alive: true,
+                session_id: Some("s".into()),
+                cwd: Some(PathBuf::from(r"C:\dev\demo")),
+                supports_compact: true,
+                pid: Some(42),
+                adapter: "cursor".into(),
+            }),
+        });
+        let rows = session_rows(&v);
+        assert_eq!(rows[0].role, "Implementor");
+        assert_eq!(rows[0].harness, "cursor via grok holder");
+        assert!(rows[0].detail.contains("pid 42"));
+        assert!(rows[0].detail.contains("compact: yes"));
     }
 
     #[test]

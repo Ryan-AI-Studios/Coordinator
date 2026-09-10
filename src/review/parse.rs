@@ -115,16 +115,31 @@ fn parse_json(text: &str) -> Option<ParsedVerdict> {
         Err(_) => return None,
     };
     let verdict = value.get("verdict")?.as_str()?;
-    let mut parsed = match normalize_verdict_token(verdict) {
+    let from_verdict = match normalize_verdict_token(verdict) {
         Some(v) => v,
         None => return Some(ParsedVerdict::Unparseable),
     };
+    let mut parsed = from_verdict;
     if let Some(highest) = value.get("highest").and_then(|h| h.as_str())
         && is_blocking_severity_token(highest.trim())
     {
         parsed = ParsedVerdict::GateFail;
     }
+    // Claude `--json-schema` is verdict+highest only (`additionalProperties:
+    // false`). A 2-key FAIL dump has no Findings body — 0011 empty/unparseable
+    // fallback, not a dirty Verdict. Markdown `## Verdict: FAIL` still gates.
+    // PASS / PASS+blocking-highest schema objects stay as parsed (Codex path).
+    if from_verdict == ParsedVerdict::GateFail && schema_only_verdict_object(&value) {
+        return Some(ParsedVerdict::Unparseable);
+    }
     Some(parsed)
+}
+
+/// True when JSON has only `verdict` / `highest` (Claude `--json-schema` dump).
+fn schema_only_verdict_object(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|obj| !obj.is_empty() && obj.keys().all(|k| k == "verdict" || k == "highest"))
 }
 
 fn parse_markdown(text: &str) -> ParsedVerdict {
@@ -353,6 +368,27 @@ mod tests {
     #[test]
     fn json_highest_medium_overrides_pass() {
         let j = r#"{"verdict":"PASS","highest":"medium"}"#;
+        assert_eq!(parse_report(j, ""), ParsedVerdict::GateFail);
+    }
+
+    #[test]
+    fn schema_only_fail_json_is_unparseable() {
+        let j = r#"{"verdict":"FAIL","highest":"P1"}"#;
+        assert_eq!(parse_report(j, ""), ParsedVerdict::Unparseable);
+        assert_eq!(classify_result(&res(j)), TierClass::Crash);
+    }
+
+    #[test]
+    fn schema_only_fail_without_highest_is_unparseable() {
+        assert_eq!(
+            parse_report(r#"{"verdict":"FAIL"}"#, ""),
+            ParsedVerdict::Unparseable
+        );
+    }
+
+    #[test]
+    fn json_fail_with_findings_array_is_gate_fail() {
+        let j = r#"{"verdict":"FAIL","highest":"P1","findings":[{"sev":"P1","item":"x"}]}"#;
         assert_eq!(parse_report(j, ""), ParsedVerdict::GateFail);
     }
 
