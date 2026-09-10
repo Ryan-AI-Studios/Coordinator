@@ -307,6 +307,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            ready_aliases: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         crate::run::run_stub(&rec, None).unwrap();

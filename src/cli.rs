@@ -284,6 +284,12 @@ pub enum ProjectCommands {
         /// Wipe the project phase-timeout map.
         #[arg(long = "clear-phase-timeouts")]
         clear_phase_timeouts: bool,
+        /// Repeatable. Extra exact Ready phrases for omit-`--track` pick.
+        #[arg(long = "status-word-ready", value_name = "PHRASE")]
+        status_words_ready: Vec<String>,
+        /// Clear stored ready aliases (back to `Ready — not started`).
+        #[arg(long = "clear-status-words-ready")]
+        clear_status_words_ready: bool,
     },
     /// Scan roots for conductor/conductor.md markers
     Scan {
@@ -412,6 +418,8 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 phase_timeouts,
                 clear_phase_timeout,
                 clear_phase_timeouts,
+                status_words_ready,
+                clear_status_words_ready,
             } => {
                 let layout_profile = match profile {
                     Some(s) => Some(LayoutProfile::parse(&s)?),
@@ -425,6 +433,11 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     None
                 } else {
                     Some(phase_timeouts.into_iter().collect())
+                };
+                let ready_aliases = if status_words_ready.is_empty() {
+                    None
+                } else {
+                    Some(status_words_ready)
                 };
                 let opts = ProjectSetOptions {
                     layout_profile,
@@ -442,6 +455,8 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     phase_timeouts_secs,
                     clear_phase_timeouts,
                     clear_phase_timeout,
+                    ready_aliases,
+                    clear_ready_aliases: clear_status_words_ready,
                 };
                 let rec = api::project_set(project.as_deref(), opts, true)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
@@ -917,6 +932,47 @@ mod tests {
             add.get_arguments().any(|a| a.get_id() == "phase_timeouts"),
             "add --phase-timeout"
         );
+        assert!(
+            set.get_arguments()
+                .any(|a| a.get_id() == "status_words_ready"),
+            "set --status-word-ready"
+        );
+        assert!(
+            set.get_arguments()
+                .any(|a| a.get_id() == "clear_status_words_ready"),
+            "set --clear-status-words-ready"
+        );
+    }
+
+    #[test]
+    fn project_set_status_word_ready_is_repeatable() {
+        let cli = Cli::try_parse_from([
+            "coordinator",
+            "project",
+            "set",
+            "--status-word-ready",
+            "Ready — full plan @ 072399b6",
+            "--status-word-ready",
+            "Ready — implement on GO",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Project {
+                action:
+                    ProjectCommands::Set {
+                        status_words_ready, ..
+                    },
+            } => {
+                assert_eq!(
+                    status_words_ready,
+                    vec![
+                        "Ready — full plan @ 072399b6".to_string(),
+                        "Ready — implement on GO".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected project set, got {other:?}"),
+        }
     }
 
     #[test]

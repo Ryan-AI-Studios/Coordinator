@@ -436,6 +436,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            ready_aliases: Vec::new(),
             created_at: Utc::now(),
         }
     }

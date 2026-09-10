@@ -466,6 +466,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            ready_aliases: Vec::new(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -509,6 +510,7 @@ mod tests {
                 auto_merge: true,
                 phase_timeouts_secs: std::collections::BTreeMap::new(),
                 notify_progress: false,
+                ready_aliases: Vec::new(),
                 created_at: chrono::Utc::now(),
             };
             let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::File, None, None, None);

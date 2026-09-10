@@ -989,6 +989,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            ready_aliases: Vec::new(),
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);
@@ -1032,6 +1033,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            ready_aliases: Vec::new(),
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);
