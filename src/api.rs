@@ -373,6 +373,7 @@ pub fn cmd_run(
     infer_cwd: bool,
 ) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
+    let _ = settle_if_conductor_completed(&rec);
     let driver = crate::workflow::resolve_driver(driver)?;
     let (track, picked) = resolve_run_track(&rec, track)?;
     if driver == crate::workflow::WorkflowDriver::Adapter && !skip_preflight {
@@ -541,12 +542,48 @@ pub fn cmd_failure_resolve(project: Option<&str>, infer_cwd: bool) -> Result<Sta
                 from: state.status.to_string(),
             });
         }
-        crate::notify::clear_artifact(&rec);
-        state.failure_class = None;
-        state.last_event = crate::notify::LAST_EVENT_FAILURE_RESOLVED.into();
-        crate::progress_log::append(&rec, "resolve", crate::notify::LAST_EVENT_FAILURE_RESOLVED);
+        if !crate::notify::settle_failure(
+            &rec,
+            &mut state,
+            crate::notify::LAST_EVENT_FAILURE_RESOLVED,
+            true,
+        ) {
+            state.last_event = crate::notify::LAST_EVENT_FAILURE_RESOLVED.into();
+            crate::progress_log::append(
+                &rec,
+                "resolve",
+                crate::notify::LAST_EVENT_FAILURE_RESOLVED,
+            );
+        }
         crate::state::save_run_state(&rec, &state)?;
         Ok(StatusView::from_record(&rec, &state))
+    })
+}
+
+/// Idle/Stopped + conductor row Completed → settle stored failure (0045).
+pub(crate) fn settle_if_conductor_completed(
+    record: &crate::registry::ProjectRecord,
+) -> Result<bool> {
+    crate::state::with_run_state_lock(record, || {
+        let mut state = crate::state::load_run_state(record)?;
+        if !matches!(
+            state.status,
+            crate::state::RunStatus::Idle | crate::state::RunStatus::Stopped
+        ) {
+            return Ok(false);
+        }
+        let body = crate::notify::artifact::read(record)?.map(|s| s.body);
+        let reason =
+            crate::workflow::conductor_md::failure_superseded(record, &state, body.as_deref());
+        if reason.as_deref() != Some(crate::notify::SUPERSEDED_COMPLETED) {
+            return Ok(false);
+        }
+        let changed =
+            crate::notify::settle_failure(record, &mut state, crate::notify::SETTLED_DETAIL, true);
+        if changed {
+            crate::state::save_run_state(record, &state)?;
+        }
+        Ok(changed)
     })
 }
 
@@ -1568,6 +1605,146 @@ mod tests {
             Some(crate::notify::SUPERSEDED_COMPLETED)
         );
         assert!(shown.body.contains("track_id: 0038"));
+        clear_home();
+    }
+
+    fn write_conductor_rows(proj: &std::path::Path, rows: &str) {
+        let cond = proj.join("conductor");
+        std::fs::create_dir_all(cond.join("0045-Done")).unwrap();
+        std::fs::create_dir_all(cond.join("0046-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            format!(
+                "| Track | Execution path | Status | Summary |\n\
+                 | --- | --- | --- | --- |\n\
+                 {rows}"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn stopped_failure(rec: &ProjectRecord, track: &str, epoch: u64) {
+        let mut state = crate::state::load_run_state(rec).unwrap();
+        state.status = RunStatus::Stopped;
+        state.track_id = Some(track.into());
+        state.run_epoch = epoch;
+        state.failure_class = Some(crate::outcome::FailureClass::Timeout);
+        crate::state::save_run_state(rec, &state).unwrap();
+        write_failure(rec, track, epoch);
+    }
+
+    #[test]
+    fn settle_completed_row_keeps_stopped_and_omit_retains() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_conductor_rows(
+            proj.path(),
+            "| [0045-Done](0045-Done/spec.md) | `.` | **Completed** | shipped |\n\
+             | [0046-Next](0046-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        );
+        stopped_failure(&rec, "0045", 3);
+        assert!(settle_if_conductor_completed(&rec).unwrap());
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(state.status, RunStatus::Stopped);
+        assert!(state.failure_class.is_none());
+        assert!(artifact::existing_path(&rec).is_none());
+        assert_eq!(state.last_event, crate::notify::SETTLED_DETAIL);
+        assert_eq!(state.track_id.as_deref(), Some("0045"));
+        assert_eq!(state.run_epoch, 3);
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
+        assert!(log.contains(crate::notify::SETTLED_DETAIL));
+        assert!(cmd_failure_show(Some(&rec.id), false).unwrap().is_none());
+        let (track, picked) = resolve_run_track(&rec, None).unwrap();
+        assert!(track.is_none());
+        assert!(!picked);
+        assert!(!settle_if_conductor_completed(&rec).unwrap());
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
+        assert_eq!(log.matches(crate::notify::SETTLED_DETAIL).count(), 1);
+        let _ = proj;
+        clear_home();
+    }
+
+    #[test]
+    fn settle_then_explicit_track_starts_without_resolve() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_conductor_rows(
+            proj.path(),
+            "| [0045-Done](0045-Done/spec.md) | `.` | **Completed** | shipped |\n\
+             | [0046-Next](0046-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        );
+        stopped_failure(&rec, "0045", 3);
+        let view = cmd_run(
+            Some(&rec.id),
+            Some("0046".into()),
+            Some("file_wait"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0046"));
+        assert!(view.failure_class.is_none());
+        assert!(artifact::existing_path(&rec).is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
+        assert!(log.contains(crate::notify::SETTLED_DETAIL));
+        let _ = proj;
+        clear_home();
+    }
+
+    #[test]
+    fn settle_skips_mismatched_and_uncompleted_tracks() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_conductor_rows(
+            proj.path(),
+            "| [0045-Done](0045-Done/spec.md) | `.` | **Completed** | shipped |\n\
+             | [0046-Next](0046-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        );
+        stopped_failure(&rec, "0046", 1);
+        assert!(!settle_if_conductor_completed(&rec).unwrap());
+        assert!(artifact::existing_path(&rec).is_some());
+        assert_eq!(
+            crate::state::load_run_state(&rec)
+                .unwrap()
+                .failure_class
+                .as_ref()
+                .map(|c| c.to_string())
+                .as_deref(),
+            Some("timeout")
+        );
+        let loaded = crate::state::load_run_state(&rec).unwrap();
+        let view = crate::state::StatusView::from_record(&rec, &loaded);
+        assert_eq!(
+            crate::ui::model::card_state(&view),
+            crate::ui::model::CardState::HardFailure
+        );
+        let _ = proj;
+        clear_home();
+    }
+
+    #[test]
+    fn run_start_journals_unsettled_leftover_clear() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_conductor_rows(
+            proj.path(),
+            "| [0045-Done](0045-Done/spec.md) | `.` | **In progress** | wip |\n",
+        );
+        stopped_failure(&rec, "0045", 2);
+        cmd_run(
+            Some(&rec.id),
+            Some("0045".into()),
+            Some("file_wait"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(artifact::existing_path(&rec).is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
+        assert!(log.contains(crate::notify::START_CLEAR_DETAIL));
+        assert!(!log.contains(crate::notify::SETTLED_DETAIL));
+        let _ = proj;
         clear_home();
     }
 }

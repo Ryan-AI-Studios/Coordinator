@@ -41,6 +41,33 @@ pub const SUPERSEDED_COMPLETED: &str = "conductor row Completed";
 pub const SUPERSEDED_MISMATCH: &str = "track/epoch mismatch";
 /// progress_log detail for backlog-clear same-track auto-clear (last_event unchanged).
 pub const AUTO_CLEAR_DETAIL: &str = "failure: auto-cleared on backlog clear";
+/// Auto-settle when the conductor row is Completed (0045).
+pub const SETTLED_DETAIL: &str = "failure: settled (conductor row Completed)";
+/// Fresh `run` cleared a leftover that was not conductor-Completed.
+pub const START_CLEAR_DETAIL: &str = "failure: cleared on run start";
+
+/// Clear a stored failure and journal `detail`. Returns whether a record existed.
+///
+/// When `touch_last_event` is false, `last_event` is left as-is (backlog-clear).
+/// Does not change `track_id`, `status`, or `run_epoch`.
+pub fn settle_failure(
+    record: &ProjectRecord,
+    state: &mut crate::state::RunState,
+    detail: &str,
+    touch_last_event: bool,
+) -> bool {
+    let had = existing_path(record).is_some() || state.failure_class.is_some();
+    if !had {
+        return false;
+    }
+    clear(record);
+    state.failure_class = None;
+    if touch_last_event {
+        state.last_event = detail.to_string();
+    }
+    crate::progress_log::append(record, "resolve", detail);
+    true
+}
 
 /// Parsed FAILURE.md bullets (`- track_id:` / `- run_epoch:`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -315,5 +342,49 @@ mod tests {
             Some(SUPERSEDED_MISMATCH)
         );
         assert_eq!(compute_superseded(None, Some("0038"), 2, false), None);
+    }
+
+    #[test]
+    fn settle_failure_absent_is_false() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        let mut state = crate::state::load_run_state(&r).unwrap();
+        assert!(!settle_failure(&r, &mut state, SETTLED_DETAIL, true));
+        assert!(state.failure_class.is_none());
+    }
+
+    #[test]
+    fn settle_failure_clears_and_second_call_is_noop() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        let mut state = crate::state::load_run_state(&r).unwrap();
+        state.failure_class = Some(FailureClass::Timeout);
+        state.track_id = Some("0045".into());
+        state.run_epoch = 3;
+        let event = NotifyEvent {
+            project_id: r.id.clone(),
+            track_id: Some("0045".into()),
+            phase: "ci-wait".into(),
+            failure_class: FailureClass::Timeout,
+            message: Some("stale".into()),
+            last_event: "timeout".into(),
+            artifact_path: path(&r).unwrap(),
+            written_at: Utc::now(),
+            run_epoch: 3,
+        };
+        write(&r, &event).unwrap();
+        assert!(settle_failure(&r, &mut state, SETTLED_DETAIL, true));
+        assert!(existing_path(&r).is_none());
+        assert!(state.failure_class.is_none());
+        assert_eq!(state.last_event, SETTLED_DETAIL);
+        assert_eq!(state.track_id.as_deref(), Some("0045"));
+        assert_eq!(state.run_epoch, 3);
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert_eq!(log.matches(SETTLED_DETAIL).count(), 1);
+        assert!(!settle_failure(&r, &mut state, SETTLED_DETAIL, true));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert_eq!(log.matches(SETTLED_DETAIL).count(), 1);
     }
 }
