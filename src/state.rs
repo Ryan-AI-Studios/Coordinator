@@ -149,6 +149,9 @@ pub struct ReviewWatchState {
     /// One-shot slugs killed by reviewer stall (0036). Never `RunState.stalled_at`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stalled: Vec<String>,
+    /// Slot-quality duds (`file (bytes)`). Additive; empty omits from JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duds: Vec<String>,
 }
 
 /// Persisted `ci-wait` watcher (additive; old run-state.json loads as None).
@@ -308,6 +311,8 @@ pub struct ReviewStatusView {
     pub report: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stalled: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duds: Vec<String>,
 }
 
 /// Status JSON `ci` object (0010).
@@ -444,15 +449,16 @@ fn review_status_view(state: &RunState) -> Option<ReviewStatusView> {
     if state.phase != crate::workflow::graph::PHASE_CROSS_MODEL && state.review.is_none() {
         return None;
     }
-    let (attempted, active, verdict, report, stalled) = match state.review.as_ref() {
+    let (attempted, active, verdict, report, stalled, duds) = match state.review.as_ref() {
         Some(r) => (
             r.attempted.clone(),
             r.active.clone(),
             r.verdict.clone(),
             r.report.clone(),
             r.stalled.clone(),
+            r.duds.clone(),
         ),
-        None => (Vec::new(), None, None, None, Vec::new()),
+        None => (Vec::new(), None, None, None, Vec::new(), Vec::new()),
     };
     Some(ReviewStatusView {
         attempted,
@@ -460,6 +466,7 @@ fn review_status_view(state: &RunState) -> Option<ReviewStatusView> {
         verdict,
         report,
         stalled,
+        duds,
     })
 }
 

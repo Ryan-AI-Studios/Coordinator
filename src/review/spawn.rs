@@ -126,9 +126,6 @@ fn claude_argv(req: &ReviewRequest, _schema_path: &Path) -> Vec<String> {
         "text".into(),
         "--add-dir".into(),
         req.workspace_root.to_string_lossy().into_owned(),
-        "--json-schema".into(),
-        // Claude wants the schema JSON inline, not a path (file path parses as "C").
-        super::prompt::VERDICT_SCHEMA_JSON.to_string(),
     ];
     if let Some(ref model) = req.model
         && !model.trim().is_empty()
@@ -475,21 +472,12 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--bare"));
         assert!(args.iter().any(|a| a == "--permission-mode"));
         assert!(args.iter().any(|a| a == "--add-dir"));
-        assert!(args.iter().any(|a| a == "--json-schema"));
+        assert!(
+            !args.iter().any(|a| a == "--json-schema"),
+            "Claude --json-schema forces schema-only stubs; markdown prompt must land"
+        );
         assert!(args.iter().any(|a| a == "-p"));
-        let schema = args
-            .windows(2)
-            .find(|w| w[0] == "--json-schema")
-            .map(|w| w[1].as_str())
-            .expect("schema arg");
-        assert!(
-            schema.trim_start().starts_with('{'),
-            "Claude --json-schema must be inline JSON, got {schema}"
-        );
-        assert!(
-            !schema.ends_with(".json"),
-            "Claude --json-schema must not be a file path: {schema}"
-        );
+        assert!(args.iter().any(|a| a == "--output-format"));
     }
 
     #[test]

@@ -135,8 +135,20 @@ fn parse_json(text: &str) -> Option<ParsedVerdict> {
     Some(parsed)
 }
 
+/// True when the body is a JSON object with only `verdict` / `highest`.
+pub(crate) fn is_schema_only_json(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return false;
+    };
+    schema_only_verdict_object(&value)
+}
+
 /// True when JSON has only `verdict` / `highest` (Claude `--json-schema` dump).
-fn schema_only_verdict_object(value: &serde_json::Value) -> bool {
+pub(crate) fn schema_only_verdict_object(value: &serde_json::Value) -> bool {
     value
         .as_object()
         .is_some_and(|obj| !obj.is_empty() && obj.keys().all(|k| k == "verdict" || k == "highest"))

@@ -81,9 +81,10 @@ Do not put a skill legend under ## Findings.
     )
 }
 
-/// JSON schema shipped to Codex `--output-schema` (file) and Claude `--json-schema`
-/// (inline JSON string). OpenAI structured outputs require
-/// `additionalProperties: false` and every `properties` key in `required`.
+/// JSON schema shipped to Codex `--output-schema` (file). Claude no longer
+/// receives `--json-schema` (0043); the markdown prompt is the contract.
+/// OpenAI structured outputs require `additionalProperties: false` and every
+/// `properties` key in `required`.
 pub const VERDICT_SCHEMA_JSON: &str = r#"{
   "type": "object",
   "additionalProperties": false,
