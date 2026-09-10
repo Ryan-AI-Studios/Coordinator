@@ -225,9 +225,7 @@ fn apply_backlog_clear(record: &ProjectRecord, state: &mut RunState) {
         if let Some(ref art_track) = meta.track_id
             && crate::notify::artifact::track_ids_match(art_track, track)
         {
-            crate::notify::clear_artifact(record);
-            state.failure_class = None;
-            crate::progress_log::append(record, "advance", crate::notify::AUTO_CLEAR_DETAIL);
+            crate::notify::settle_failure(record, state, crate::notify::AUTO_CLEAR_DETAIL, false);
         }
     }
 }

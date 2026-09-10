@@ -390,11 +390,17 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
-                    if !matches!(state.status, RunStatus::Running | RunStatus::Paused) {
+                    if matches!(state.status, RunStatus::Running | RunStatus::Paused) {
+                        let rec = rec.clone();
+                        let _ = poll_once_async(&rec).await;
                         continue;
                     }
-                    let rec = rec.clone();
-                    let _ = poll_once_async(&rec).await;
+                    if state.failure_class.is_some()
+                        || crate::notify::artifact::existing_path(rec).is_some()
+                    {
+                        let rec = rec.clone();
+                        let _ = crate::api::settle_if_conductor_completed(&rec);
+                    }
                 }
             }
             Err(_) => {
@@ -470,6 +476,47 @@ mod tests {
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn stopped_completed_sweep_settles_without_poll_once() {
+        let dir = tempdir().unwrap();
+        let cond = dir.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0045-Done")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0045-Done](0045-Done/spec.md) | `.` | **Completed** | shipped |\n",
+        )
+        .unwrap();
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        let mut state = crate::state::load_run_state(&r).unwrap();
+        state.status = RunStatus::Stopped;
+        state.track_id = Some("0045".into());
+        state.run_epoch = 3;
+        state.failure_class = Some(FailureClass::Timeout);
+        crate::state::save_run_state(&r, &state).unwrap();
+        let event = crate::notify::NotifyEvent {
+            project_id: r.id.clone(),
+            track_id: Some("0045".into()),
+            phase: "ci-wait".into(),
+            failure_class: FailureClass::Timeout,
+            message: Some("stale".into()),
+            last_event: "timeout".into(),
+            artifact_path: crate::notify::artifact::path(&r).unwrap(),
+            written_at: chrono::Utc::now(),
+            run_epoch: 3,
+        };
+        crate::notify::artifact::write(&r, &event).unwrap();
+        assert!(crate::api::settle_if_conductor_completed(&r).unwrap());
+        let loaded = crate::state::load_run_state(&r).unwrap();
+        assert_eq!(loaded.status, RunStatus::Stopped);
+        assert!(loaded.failure_class.is_none());
+        assert_eq!(loaded.last_event, crate::notify::SETTLED_DETAIL);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert_eq!(loaded.phase, crate::state::STUB_PHASE_IDLE);
     }
 
     #[test]

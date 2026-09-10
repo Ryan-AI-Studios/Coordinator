@@ -43,6 +43,9 @@ pub(crate) fn run_with_origin(
         let mut state = load_run_state(record)?;
         match state.status {
             RunStatus::Idle | RunStatus::Stopped => {
+                let leftover = state.failure_class.is_some()
+                    || crate::notify::artifact::existing_path(record).is_some();
+                let already_settled = state.last_event == crate::notify::SETTLED_DETAIL;
                 state.status = RunStatus::Running;
                 state.phase = workflow::graph::PHASE_PLAN.into();
                 state.workflow = Some(WORKFLOW_ID.into());
@@ -80,6 +83,9 @@ pub(crate) fn run_with_origin(
                 crate::workflow::drive::clear_plan_review_artifacts(record);
                 crate::notify::clear_artifact(record);
                 crate::workflow::watchdog::clear_progress(record);
+                if leftover && !already_settled {
+                    crate::progress_log::append(record, "start", crate::notify::START_CLEAR_DETAIL);
+                }
                 save_run_state(record, &state)?;
                 let track = state.track_id.as_deref().unwrap_or("-");
                 crate::progress_log::append(
@@ -105,6 +111,9 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
         let mut state = load_run_state(record)?;
         match state.status {
             RunStatus::Idle | RunStatus::Stopped => {
+                let leftover = state.failure_class.is_some()
+                    || crate::notify::artifact::existing_path(record).is_some();
+                let already_settled = state.last_event == crate::notify::SETTLED_DETAIL;
                 state.status = RunStatus::Running;
                 state.phase = STUB_PHASE_ACTIVE.into();
                 state.workflow = None;
@@ -131,6 +140,9 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 clear_active_outcome_file(record);
                 crate::notify::clear_artifact(record);
                 crate::workflow::watchdog::clear_progress(record);
+                if leftover && !already_settled {
+                    crate::progress_log::append(record, "start", crate::notify::START_CLEAR_DETAIL);
+                }
                 save_run_state(record, &state)?;
                 Ok(StatusView::from_record(record, &state))
             }
@@ -389,6 +401,21 @@ mod tests {
         stop(&r).unwrap();
         let s = run(&r, None).unwrap();
         assert_eq!(s.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn run_stub_journals_start_clear_for_leftover() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        let mut state = crate::state::RunState::idle(&r.id);
+        state.status = RunStatus::Stopped;
+        state.failure_class = Some(crate::outcome::FailureClass::Timeout);
+        crate::state::save_run_state(&r, &state).unwrap();
+        run_stub(&r, None).unwrap();
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains(crate::notify::START_CLEAR_DETAIL));
+        assert!(!log.contains(crate::notify::SETTLED_DETAIL));
     }
 
     #[test]
