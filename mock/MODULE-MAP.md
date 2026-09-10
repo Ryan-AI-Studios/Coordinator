@@ -15,7 +15,7 @@ Use this when implementing Control Plane shells (0004+) and real Status Surface 
 | Ops help (Stop vs Pause) | Clarify abort-vs-hold without reading ADRs | Static help or inline docs from product copy |
 | Phase strip (selected project) | Pipeline position at a glance | Conductor state + phase list + `next_track` |
 | Project card | Per-project run health | Project session pool + track state |
-| Track / phase / next / layout rows | Position + Layout Profile awareness | Conductor state; layout profiles (nested / multi-sibling / single-root) |
+| Track / phase / next / policy / parked / layout rows | Position + auto-start policy + Layout Profile | Conductor state; `auto_start` / `parked_next`; layout profiles (nested / multi-sibling / single-root) |
 | Session table | Role × harness × idle | Role bindings + harness adapters |
 | Notes strip | Recover / contextual guidance | Soft status, pause/stop copy |
 | Failure Artifact panel | Hard-fail recover path | Failure Artifact (path/class) + notify toast (ADR-0020) |
@@ -32,6 +32,7 @@ Use this when implementing Control Plane shells (0004+) and real Status Surface 
 | Hard failure + artifact | `article[data-state="hard-failure"]` · `[data-region="failure-artifact"]` |
 | Superseded failure note | `article[data-state="idle"]` · `[data-region="failure-artifact"]` titled `[SUPERSEDED]` (0040) |
 | Idle / no active track | `article[data-state="idle"]` |
+| Auto-start policy + parked next | `article[data-state="idle"]` Policy / Parked KV rows |
 | Stop semantics | Header `.ops-help`, Stop button `title` attributes, idle card Stop note |
 | Multi-project overview | `main#projects` grid (2-col desktop, 1-col ≤980px) |
 | Layout profiles | rows labeled nested / multi-sibling / single-root |

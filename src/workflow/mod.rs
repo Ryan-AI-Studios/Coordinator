@@ -1056,6 +1056,27 @@ mod tests {
         let (track, picked) = crate::api::resolve_run_track(&r, None).unwrap();
         assert!(picked);
         assert_eq!(track.as_deref(), Some("0002"));
+        let started = run_with_driver(&r, Some("0002".into()), WorkflowDriver::FileWait).unwrap();
+        assert!(started.parked_next.is_none());
+    }
+
+    #[test]
+    fn from_run_state_defaults_hitl_resolve_overlays_never() {
+        let dir = tempdir().unwrap();
+        write_two_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Never;
+        crate::state::ensure_state_dir(&r).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.last_event = LAST_EVENT_BACKLOG_CLEAR.into();
+        save_run_state(&r, &state).unwrap();
+        let pick = ReadyPickState::from(&state);
+        assert_eq!(pick.auto_start, AutoStartPolicy::Hitl);
+        assert!(should_pick_next_ready(&pick));
+        let err = crate::api::resolve_run_track(&r, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("auto_start=never; pass --track"), "{err}");
     }
 
     #[test]

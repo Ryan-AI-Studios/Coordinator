@@ -249,11 +249,8 @@ pub struct StatusView {
     pub failure_class: Option<FailureClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_track: Option<String>,
-    /// Copied from `ProjectRecord` (0044). Missing JSON = hitl.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::registry::AutoStartPolicy::is_hitl"
-    )]
+    /// Copied from `ProjectRecord` (0044). Missing JSON = hitl. Always serialized.
+    #[serde(default)]
     pub auto_start: crate::registry::AutoStartPolicy,
     /// Parked advance candidate (0044). Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -769,6 +766,16 @@ mod tests {
             last.is_none() || last.is_some_and(|v| v.is_null()),
             "idle last_progress_at must be omitted or null"
         );
+    }
+
+    #[test]
+    fn status_view_hitl_serializes_auto_start() {
+        let dir = tempdir().unwrap();
+        let rec = sample_record(dir.path());
+        assert_eq!(rec.auto_start, crate::registry::AutoStartPolicy::Hitl);
+        let view = StatusView::from_record(&rec, &RunState::idle(&rec.id));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["auto_start"], "hitl");
     }
 
     #[test]

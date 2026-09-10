@@ -57,6 +57,10 @@ pub struct ReadyPickState {
     pub auto_start: AutoStartPolicy,
 }
 
+/// Defaults `auto_start` to Hitl — `RunState` has no policy field.
+/// Callers that enforce `never` must overlay `record.auto_start`
+/// (`resolve_run_track` does). Prefer `From<&StatusView>` when the view
+/// already copied the record.
 impl From<&RunState> for ReadyPickState {
     fn from(s: &RunState) -> Self {
         Self {
