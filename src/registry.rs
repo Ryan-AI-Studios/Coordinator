@@ -31,6 +31,8 @@ pub struct ProjectAddOptions {
     pub auto_merge: Option<bool>,
     /// Initial per-project phase wall clocks (seconds). Empty = table/machine.
     pub phase_timeouts_secs: BTreeMap<String, u64>,
+    /// Omit = default hitl (0044).
+    pub auto_start: Option<AutoStartPolicy>,
 }
 
 /// Fields mutatable via `project set` (workspace `path` is immutable this track).
@@ -60,6 +62,8 @@ pub struct ProjectSetOptions {
     pub ready_aliases: Option<Vec<String>>,
     /// Wipe stored ready aliases (back to default phrase) before overlay.
     pub clear_ready_aliases: bool,
+    /// Omit = leave unchanged.
+    pub auto_start: Option<AutoStartPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,11 +96,56 @@ pub struct ProjectRecord {
     /// Extra omit-`--track` Ready phrases (0042). Empty = default `Ready — not started`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ready_aliases: Vec<String>,
+    /// Advance + omit-`--track` conveyor gate (0044). Missing key = hitl.
+    #[serde(
+        default = "default_auto_start_hitl",
+        skip_serializing_if = "AutoStartPolicy::is_hitl"
+    )]
+    pub auto_start: AutoStartPolicy,
     pub created_at: DateTime<Utc>,
+}
+
+/// Per-project conveyor policy (0044). Default `hitl` parks; `full` chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoStartPolicy {
+    Full,
+    #[default]
+    Hitl,
+    Never,
+}
+
+impl AutoStartPolicy {
+    pub fn is_hitl(&self) -> bool {
+        *self == Self::Hitl
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Hitl => "hitl",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim() {
+            "full" => Ok(Self::Full),
+            "hitl" => Ok(Self::Hitl),
+            "never" => Ok(Self::Never),
+            other => Err(CoordinatorError::Message(format!(
+                "unknown auto-start '{other}'; expected full | hitl | never"
+            ))),
+        }
+    }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_auto_start_hitl() -> AutoStartPolicy {
+    AutoStartPolicy::Hitl
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,6 +259,7 @@ impl Registry {
             phase_timeouts_secs: opts.phase_timeouts_secs,
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: opts.auto_start.unwrap_or_default(),
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
@@ -286,6 +336,9 @@ impl Registry {
         }
         if let Some(incoming) = opts.ready_aliases {
             crate::workflow::conductor_md::extend_ready_aliases(&mut rec.ready_aliases, &incoming);
+        }
+        if let Some(v) = opts.auto_start {
+            rec.auto_start = v;
         }
         Ok(rec.clone())
     }
@@ -632,6 +685,11 @@ mod tests {
             loaded.projects[0].ready_aliases.is_empty(),
             "missing ready_aliases on old registry JSON defaults empty"
         );
+        assert_eq!(
+            loaded.projects[0].auto_start,
+            AutoStartPolicy::Hitl,
+            "missing auto_start on old registry JSON defaults hitl"
+        );
         let _guard = crate::config::test_env_lock();
         let isolated = tempdir().unwrap();
         unsafe {
@@ -709,6 +767,80 @@ mod tests {
         assert!(
             !text.contains("notify_progress"),
             "false notify_progress must omit the key: {text}"
+        );
+    }
+
+    #[test]
+    fn set_auto_start_full_never_round_trip_hitl_omits_key() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        assert_eq!(rec.auto_start, AutoStartPolicy::Hitl);
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let text = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(
+            !text.contains("auto_start"),
+            "hitl auto_start must omit the key: {text}"
+        );
+        let full = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    auto_start: Some(AutoStartPolicy::Full),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(full.auto_start, AutoStartPolicy::Full);
+        reg.save(&reg_path).unwrap();
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert_eq!(loaded.projects[0].auto_start, AutoStartPolicy::Full);
+        let text = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(
+            text.contains("\"auto_start\"") && text.contains("full"),
+            "{text}"
+        );
+        let never = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    auto_start: Some(AutoStartPolicy::Never),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(never.auto_start, AutoStartPolicy::Never);
+        let other = tempdir().unwrap();
+        let added = reg
+            .add(
+                other.path(),
+                ProjectAddOptions {
+                    auto_start: Some(AutoStartPolicy::Full),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(added.auto_start, AutoStartPolicy::Full);
+    }
+
+    #[test]
+    fn auto_start_parse_rejects_unknown_word() {
+        let err = AutoStartPolicy::parse("maybe").unwrap_err().to_string();
+        assert!(err.contains("unknown auto-start 'maybe'"));
+        assert!(err.contains("full | hitl | never"));
+        assert_eq!(
+            AutoStartPolicy::parse("full").unwrap(),
+            AutoStartPolicy::Full
+        );
+        assert_eq!(
+            AutoStartPolicy::parse("hitl").unwrap(),
+            AutoStartPolicy::Hitl
+        );
+        assert_eq!(
+            AutoStartPolicy::parse("never").unwrap(),
+            AutoStartPolicy::Never
         );
     }
 

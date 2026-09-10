@@ -1501,6 +1501,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -2424,7 +2425,8 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("conductor").join("0001-Example")).unwrap();
         std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
-        let r = rec(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = crate::registry::AutoStartPolicy::Full;
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
             ok_review_body("0001"),
         ))));

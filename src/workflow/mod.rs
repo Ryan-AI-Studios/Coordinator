@@ -13,10 +13,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoordinatorError, Result};
 use crate::outcome::{FailureClass, LAST_EVENT_MESSAGE_CAP, PhaseOutcome};
-use crate::registry::ProjectRecord;
+use crate::registry::{AutoStartPolicy, ProjectRecord};
 use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock};
 
-pub use conductor_md::{ReadyPickState, pick_next_ready, should_pick_next_ready};
+pub use conductor_md::{
+    ReadyPickState, pick_next_ready, should_pick_next_ready, track_row_nostart,
+};
 pub use drive::tick;
 pub use graph::{WORKFLOW_ID, is_canonical, is_stub_phase, resolve_track_dir, successor};
 pub use timeouts::{ENV_PHASE_TIMEOUT_SECS, TimeoutSource, timeout_for_phase, timeout_source};
@@ -166,7 +168,8 @@ pub fn reset_phase_clock(state: &mut RunState) {
     }
 }
 
-/// `advance` success: auto-start valid track, Idle on null/invalid; Pause holds.
+/// `advance` success: `full` auto-starts a valid track; hitl/never/`nostart` park.
+/// Idle on null/invalid. Pause holds until resume.
 pub fn apply_advance(record: &ProjectRecord, state: &mut RunState) {
     if state.status == RunStatus::Paused {
         state.last_driven_phase = Some(graph::PHASE_ADVANCE.into());
@@ -183,40 +186,19 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        None => {
-            state.status = RunStatus::Idle;
-            state.last_event = LAST_EVENT_BACKLOG_CLEAR.into();
-            state.phase_started_at = None;
-            state.pause_started_at = None;
-            // Defense-in-depth (0040): same-track leftover. Incident fix is
-            // `failure resolve` + SUPERSEDED display — this branch is
-            // fixture-reachable after a failure apply (Stopped rejects apply,
-            // so a new `run` already cleared the file).
-            if let Ok(Some(shown)) = crate::notify::artifact::read(record)
-                && let Some(ref track) = state.track_id
-            {
-                let meta = crate::notify::artifact::parse_metadata(&shown.body);
-                if let Some(ref art_track) = meta.track_id
-                    && crate::notify::artifact::track_ids_match(art_track, track)
-                {
-                    crate::notify::clear_artifact(record);
-                    state.failure_class = None;
-                    crate::progress_log::append(
-                        record,
-                        "advance",
-                        crate::notify::AUTO_CLEAR_DETAIL,
-                    );
-                }
-            }
-        }
+        None => apply_backlog_clear(record, state),
         Some(id) => {
             let id = id.to_string();
             if resolve_track_dir(record, &id).is_some() {
-                auto_start(state, &id);
-                crate::outcome::clear_active_outcome_file(record);
-                crate::workflow::drive::clear_plan_review_artifacts(record);
-                crate::notify::clear_artifact(record);
-                crate::workflow::watchdog::clear_progress(record);
+                if let Some(policy) = park_policy(record, &id) {
+                    park_next(record, state, &id, policy);
+                } else {
+                    auto_start(state, &id);
+                    crate::outcome::clear_active_outcome_file(record);
+                    crate::workflow::drive::clear_plan_review_artifacts(record);
+                    crate::notify::clear_artifact(record);
+                    crate::workflow::watchdog::clear_progress(record);
+                }
             } else {
                 state.status = RunStatus::Idle;
                 state.last_event = format!("workflow: invalid next_track {id}");
@@ -225,6 +207,52 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
             }
         }
     }
+}
+
+fn apply_backlog_clear(record: &ProjectRecord, state: &mut RunState) {
+    state.status = RunStatus::Idle;
+    state.last_event = LAST_EVENT_BACKLOG_CLEAR.into();
+    state.phase_started_at = None;
+    state.pause_started_at = None;
+    // Defense-in-depth (0040): same-track leftover. Incident fix is
+    // `failure resolve` + SUPERSEDED display — this branch is
+    // fixture-reachable after a failure apply (Stopped rejects apply,
+    // so a new `run` already cleared the file).
+    if let Ok(Some(shown)) = crate::notify::artifact::read(record)
+        && let Some(ref track) = state.track_id
+    {
+        let meta = crate::notify::artifact::parse_metadata(&shown.body);
+        if let Some(ref art_track) = meta.track_id
+            && crate::notify::artifact::track_ids_match(art_track, track)
+        {
+            crate::notify::clear_artifact(record);
+            state.failure_class = None;
+            crate::progress_log::append(record, "advance", crate::notify::AUTO_CLEAR_DETAIL);
+        }
+    }
+}
+
+/// `None` = in-process `auto_start`. `Some` = park reason word.
+fn park_policy(record: &ProjectRecord, id: &str) -> Option<&'static str> {
+    if track_row_nostart(record, id) {
+        return Some("nostart");
+    }
+    match record.auto_start {
+        AutoStartPolicy::Full => None,
+        AutoStartPolicy::Hitl => Some("hitl"),
+        AutoStartPolicy::Never => Some("never"),
+    }
+}
+
+fn park_next(record: &ProjectRecord, state: &mut RunState, id: &str, policy: &str) {
+    apply_backlog_clear(record, state);
+    state.next_track = None;
+    state.parked_next = Some(id.to_string());
+    crate::progress_log::append(
+        record,
+        "advance",
+        &format!("parked-next {id} (policy={policy})"),
+    );
 }
 
 /// Bounce only GateFail (`difficulty`) from `cross-model-review` under the cap.
@@ -357,6 +385,7 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.run_epoch = state.run_epoch.saturating_add(1);
     state.track_id = Some(track_id.to_string());
     state.next_track = None;
+    state.parked_next = None;
     state.phase = graph::PHASE_PLAN.into();
     state.workflow = Some(WORKFLOW_ID.into());
     state.status = RunStatus::Running;
@@ -416,6 +445,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -904,7 +934,8 @@ mod tests {
         let cond = dir.path().join("conductor");
         std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
         std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
-        let r = rec(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
         let mut state = load_run_state(&r).unwrap();
         state.phase = graph::PHASE_ADVANCE.into();
@@ -959,7 +990,8 @@ mod tests {
     fn pause_holds_auto_start_until_resume() {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
-        let r = rec(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
         run::pause(&r).unwrap();
         let mut state = load_run_state(&r).unwrap();
@@ -980,6 +1012,165 @@ mod tests {
         assert_eq!(resumed.status, RunStatus::Running);
         assert_eq!(resumed.phase, graph::PHASE_PLAN);
         assert_eq!(resumed.track_id.as_deref(), Some("0002"));
+    }
+
+    fn write_two_ready(dir: &std::path::Path) {
+        let cond = dir.join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Completed** | done |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn default_hitl_parks_valid_next_and_omit_still_picks() {
+        let dir = tempdir().unwrap();
+        write_two_ready(dir.path());
+        let r = rec(dir.path());
+        assert_eq!(r.auto_start, AutoStartPolicy::Hitl);
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0002".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert!(view.next_track.is_none());
+        assert_eq!(view.parked_next.as_deref(), Some("0002"));
+        assert_eq!(view.auto_start, AutoStartPolicy::Hitl);
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("parked-next 0002 (policy=hitl)"), "{log}");
+        let (track, picked) = crate::api::resolve_run_track(&r, None).unwrap();
+        assert!(picked);
+        assert_eq!(track.as_deref(), Some("0002"));
+        let started = run_with_driver(&r, Some("0002".into()), WorkflowDriver::FileWait).unwrap();
+        assert!(started.parked_next.is_none());
+    }
+
+    #[test]
+    fn from_run_state_defaults_hitl_resolve_overlays_never() {
+        let dir = tempdir().unwrap();
+        write_two_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Never;
+        crate::state::ensure_state_dir(&r).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.last_event = LAST_EVENT_BACKLOG_CLEAR.into();
+        save_run_state(&r, &state).unwrap();
+        let pick = ReadyPickState::from(&state);
+        assert_eq!(pick.auto_start, AutoStartPolicy::Hitl);
+        assert!(should_pick_next_ready(&pick));
+        let err = crate::api::resolve_run_track(&r, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("auto_start=never; pass --track"), "{err}");
+    }
+
+    #[test]
+    fn never_parks_and_omit_errors() {
+        let dir = tempdir().unwrap();
+        write_two_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Never;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0002".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.parked_next.as_deref(), Some("0002"));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("parked-next 0002 (policy=never)"), "{log}");
+        let err = crate::api::resolve_run_track(&r, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("auto_start=never; pass --track"), "{err}");
+        let (track, picked) = crate::api::resolve_run_track(&r, Some("0002".into())).unwrap();
+        assert!(!picked);
+        assert_eq!(track.as_deref(), Some("0002"));
+    }
+
+    #[test]
+    fn nostart_row_parks_even_under_full() {
+        let dir = tempdir().unwrap();
+        let cond = dir.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0002-Next](0002-Next/spec.md) <!-- nostart --> | `.` | **Ready — not started** | lock |\n",
+        )
+        .unwrap();
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0002".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.parked_next.as_deref(), Some("0002"));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("parked-next 0002 (policy=nostart)"), "{log}");
+        let (track, picked) = crate::api::resolve_run_track(&r, Some("0002".into())).unwrap();
+        assert!(!picked);
+        assert_eq!(track.as_deref(), Some("0002"));
+    }
+
+    #[test]
+    fn paused_hitl_parks_on_resume() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        run::pause(&r).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0002".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Paused);
+        assert_eq!(view.next_track.as_deref(), Some("0002"));
+        let resumed = run::resume(&r).unwrap();
+        assert_eq!(resumed.status, RunStatus::Idle);
+        assert_eq!(resumed.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert!(resumed.next_track.is_none());
+        assert_eq!(resumed.parked_next.as_deref(), Some("0002"));
+        assert_eq!(resumed.track_id.as_deref(), Some("0001"));
     }
 
     #[test]

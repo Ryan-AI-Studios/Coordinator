@@ -58,6 +58,7 @@ pub(crate) fn run_with_origin(
                 state.pause_started_at = None;
                 state.failure_class = None;
                 state.next_track = None;
+                state.parked_next = None;
                 state.last_applied_outcome_hash = None;
                 state.ci = None;
                 state.review = None;
@@ -118,6 +119,7 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.total_paused_ms = 0;
                 state.pause_started_at = None;
                 state.failure_class = None;
+                state.parked_next = None;
                 state.last_applied_outcome_hash = None;
                 state.stalled_at = None;
                 state.pause_spans.clear();
@@ -285,6 +287,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: Utc::now(),
         }
     }
@@ -386,5 +389,18 @@ mod tests {
         stop(&r).unwrap();
         let s = run(&r, None).unwrap();
         assert_eq!(s.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn run_stub_clears_parked_next() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        let mut state = crate::state::RunState::idle(&r.id);
+        state.parked_next = Some("0002".into());
+        crate::state::save_run_state(&r, &state).unwrap();
+        let view = run_stub(&r, Some("0002".into())).unwrap();
+        assert!(view.parked_next.is_none());
+        assert_eq!(view.track_id.as_deref(), Some("0002"));
     }
 }

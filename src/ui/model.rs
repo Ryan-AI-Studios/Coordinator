@@ -550,6 +550,8 @@ mod tests {
             last_progress_at: None,
             stall: None,
             ticker: None,
+            auto_start: Default::default(),
+            parked_next: None,
         }
     }
 
@@ -807,6 +809,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -980,6 +983,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         };
         run::run_with_driver(&rec, Some("0014".into()), WorkflowDriver::FileWait).unwrap();
@@ -1060,6 +1064,9 @@ mod tests {
             card_primary_action(&backlog),
             CardPrimaryAction::StartNextReady
         );
+        let mut never = backlog.clone();
+        never.auto_start = crate::registry::AutoStartPolicy::Never;
+        assert_eq!(card_primary_action(&never), CardPrimaryAction::Run);
     }
 
     #[test]

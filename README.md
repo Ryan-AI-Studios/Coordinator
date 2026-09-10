@@ -261,13 +261,21 @@ GateFail on `cross-model-review` with `address_findings_attempts < 2` does **not
 | `file_wait` | `--driver file_wait` | No inject; poll `current.json` / `outcomes/roles/*.json`. |
 | `stub` | `--driver stub` or `COORDINATOR_WORKFLOW_DRIVER=stub` | Synthesize success each tick so CI can walk the full graph. |
 
-Status JSON includes additive `workflow` `{ id, driver, pending_roles, address_findings_attempts }` (`address_findings_attempts` omitted when 0), additive `ci` (`pr`, `pr_url`, `head_sha`, `last_summary`, `interval_ms`, `auto_merge`, `merge`) — `null` when phase is not `ci-wait` and no watch state is persisted — and additive `review` (`attempted`, `active`, `verdict`, `report`, `stalled`) — `stalled` omitted when empty; `null` when phase is not `cross-model-review` and no review state is persisted. Existing additive fields include `failure_class`, `next_track`, `phase_started_at`, `run_epoch`, `failure_artifact`. CLI `status` / `GET /v1/status` also attach additive `ticker` (`{ owner: "serve", port }` when coordinator health answers, or `{ owner: "none" }`). Poll-path `run::status` / `from_record` omit `ticker`.
+Status JSON includes additive `workflow` `{ id, driver, pending_roles, address_findings_attempts }` (`address_findings_attempts` omitted when 0), additive `ci` (`pr`, `pr_url`, `head_sha`, `last_summary`, `interval_ms`, `auto_merge`, `merge`) — `null` when phase is not `ci-wait` and no watch state is persisted — and additive `review` (`attempted`, `active`, `verdict`, `report`, `stalled`) — `stalled` omitted when empty; `null` when phase is not `cross-model-review` and no review state is persisted. Existing additive fields include `failure_class`, `next_track`, `auto_start`, `parked_next` (omitted when none), `phase_started_at`, `run_epoch`, `failure_artifact`. CLI `status` / `GET /v1/status` also attach additive `ticker` (`{ owner: "serve", port }` when coordinator health answers, or `{ owner: "none" }`). Poll-path `run::status` / `from_record` omit `ticker`.
 
 **Plan-review:** adapter starts `agy --print` and `opencode run` once each (cwd = workspace root). Agy uses `--print-timeout` = remaining budget, `--dangerously-skip-permissions`, `--output-format json`. OpenCode uses `--dir` = workspace root, `--format json`, **prompt on stdin** (not argv — npm `.cmd` `%*` truncates newlines), no `--auto`. A degenerate `opencode-review.md` (missing `# Track review:` + track id) is not Success: one in-thread retry, then role failure. Review files are source of truth (`agy-review.md` / `opencode-review.md` on the track, copied into `{state_dir}/reviews/`). Join assembles `{workspace}/AI-review.md`. One reviewer may degrade; **both** missing/fail → Stopped. Line endings normalized to `\n`. Override binaries with `COORDINATOR_AGY_BIN` / `COORDINATOR_OPENCODE_BIN` (else Role Binding `command`, else PATH). Optional ignored live smokes: `COORDINATOR_AGY_LIVE=1` and `COORDINATOR_OPENCODE_LIVE=1` (do not reuse `COORDINATOR_REVIEW_LIVE`). The 0011 cross-model gate still uses `opencode run --dir {execution_repo} --format default` with **prompt on stdin** and no `--auto`.
 
 **Injected prompt contract:** adapter injects a **per-phase** body (not one shared blurb). Each Grok-bound phase (`plan` / `fold` / `implement` / `address-findings` / `advance`) and each plan-review slot names that phase’s skill as an absolute `{workspace|execution}/.agents/skills/<name>/SKILL.md` path (planning skills live above the product git root and are not auto-discovered from `grok_cwd`). `plan`, plan-review, and `implement` include a live-research line (verify pins/APIs against primary sources). Adapter-driven Grok turns complete by **ending the turn** — do **not** run `coordinator outcome write` during that inject (file_wait / hooks still use the CLI). Mid-inject CLI writes that change `state.phase` are ignored when the turn returns (`apply_turn` skips if the live phase drifted from the injected phase).
 
-**`next_track`:** On adapter `advance`, the Planner’s last matching reply line `next_track: <id>` or `next_track: null` is copied into outcome metadata (`null` / `none` / empty clears a stale id; omitting the line leaves `state.next_track` untouched). CLI `--next-track` remains the file_wait path. On `advance` success: valid track dir → auto-start at `plan`; null/empty → Idle (`workflow: backlog clear`); unknown id → Idle (does not fail the completed track). Pause holds auto-start until resume.
+**`next_track`:** On adapter `advance`, the Planner’s last matching reply line `next_track: <id>` or `next_track: null` is copied into outcome metadata (`null` / `none` / empty clears a stale id; omitting the line leaves `state.next_track` untouched). CLI `--next-track` remains the file_wait path. On `advance` success the project `auto_start` policy gates the chain (models still emit `next_track: <id>` freely):
+
+| Policy | Valid next id (row not `<!-- nostart -->`) | Omit `--track` pick |
+|--------|--------------------------------------------|---------------------|
+| `full` | In-process auto-start at `plan` | Unchanged (first Ready) |
+| `hitl` (default) | **Park** — Idle + `workflow: backlog clear`, `next_track` cleared, `parked_next` set, journal `advance: parked-next <id> (policy=…)` | Unchanged (first Ready) |
+| `never` | Same park | Error `auto_start=never; pass --track` |
+
+A per-row `<!-- nostart -->` (exact literal, inside a cell) parks that id and skips omit-pick; explicit `run --track N` always starts. Null/empty next → Idle (backlog clear). Unknown id → Idle (does not fail the completed track). Pause holds the pending next until resume, then the same policy gate runs.
 
 **Compact:** capability-gated; timeout/failure **skips** (not a hard gate). Adapter errors surface as `compact: skipped — {reason}` (still no Failure Artifact).
 
@@ -398,7 +406,7 @@ After a successful Review Gate, Coordinator watches CI **outside** any model Ses
 | Fail | `failure_class=ci_failed` → Stopped + Failure Artifact + toast. No auto-retry of the workflow |
 | Process cap | Each `gh`/`git` spawn: 30s then kill (transient, `ci-wait: gh timed out`) |
 
-`project add` / `project set` accept `--auto-merge true|false` (omit = default on / leave unchanged). HTTP `POST /v1/projects` and `/v1/projects/set` take optional `auto_merge`. Old `registry.json` records without the field load as **true**. `project set --notify-progress true|false` is additive (omit = leave unchanged; missing JSON field = **false**). HTTP set takes optional `notify_progress`.
+`project add` / `project set` accept `--auto-merge true|false` (omit = default on / leave unchanged) and `--auto-start full|hitl|never` (add omit = hitl; set omit = leave unchanged). HTTP `POST /v1/projects` and `/v1/projects/set` take optional `auto_merge` and `auto_start`. Old `registry.json` records without `auto_start` load as **hitl** (the key is omitted on save when hitl). `project set --notify-progress true|false` is additive (omit = leave unchanged; missing JSON field = **false**). HTTP set takes optional `notify_progress`.
 
 Default `cargo test` uses a scripted `CiBackend` and never needs `gh` auth. Optional live smoke: `$env:COORDINATOR_GH_LIVE='1'; cargo test ci_live -- --ignored --nocapture`.
 
@@ -490,14 +498,14 @@ coordinator project add <path>
     [--profile nested|multi_sibling|single_root]
     [--execution-repo <path>] [--conductor-dir <path>] [--state-dir <path>]
     [--display-name <name>] [--execution-repo-name <name>]
-    [--auto-merge true|false]
+    [--auto-merge true|false] [--auto-start full|hitl|never]
     [--phase-timeout PHASE=SECS]...
 coordinator project list
 coordinator project show [--project <path|id>]
 coordinator project set [--project …]
     [--profile …] [--execution-repo …] [--conductor-dir …] [--state-dir …]
     [--display-name …] [--execution-repos-json <json>] [--execution-repo-name …]
-    [--auto-merge true|false] [--notify-progress true|false]
+    [--auto-merge true|false] [--auto-start full|hitl|never] [--notify-progress true|false]
     [--phase-timeout PHASE=SECS]... [--clear-phase-timeout PHASE]...
     [--clear-phase-timeouts]
 coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]

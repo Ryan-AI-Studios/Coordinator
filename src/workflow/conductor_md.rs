@@ -2,7 +2,7 @@
 
 use crate::error::{CoordinatorError, Result};
 use crate::outcome::FailureClass;
-use crate::registry::ProjectRecord;
+use crate::registry::{AutoStartPolicy, ProjectRecord};
 use crate::state::{RunState, RunStatus, StatusView};
 
 use super::LAST_EVENT_BACKLOG_CLEAR;
@@ -46,7 +46,7 @@ pub fn extend_ready_aliases(existing: &mut Vec<String>, incoming: &[String]) {
     }
 }
 
-/// Five fields shared by `cmd_run` pick and the Status Surface card label.
+/// Fields shared by `cmd_run` pick and the Status Surface card label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyPickState {
     pub track_id: Option<String>,
@@ -54,8 +54,13 @@ pub struct ReadyPickState {
     pub next_track: Option<String>,
     pub failure_class: Option<FailureClass>,
     pub last_event: String,
+    pub auto_start: AutoStartPolicy,
 }
 
+/// Defaults `auto_start` to Hitl — `RunState` has no policy field.
+/// Callers that enforce `never` must overlay `record.auto_start`
+/// (`resolve_run_track` does). Prefer `From<&StatusView>` when the view
+/// already copied the record.
 impl From<&RunState> for ReadyPickState {
     fn from(s: &RunState) -> Self {
         Self {
@@ -64,6 +69,7 @@ impl From<&RunState> for ReadyPickState {
             next_track: s.next_track.clone(),
             failure_class: s.failure_class,
             last_event: s.last_event.clone(),
+            auto_start: AutoStartPolicy::Hitl,
         }
     }
 }
@@ -76,6 +82,7 @@ impl From<&StatusView> for ReadyPickState {
             next_track: v.next_track.clone(),
             failure_class: v.failure_class,
             last_event: v.last_event.clone(),
+            auto_start: v.auto_start,
         }
     }
 }
@@ -86,6 +93,9 @@ impl From<&StatusView> for ReadyPickState {
 /// `track_id`, **or** Idle + backlog-clear + no failure + no `next_track`.
 /// Do not special-case `invalid next_track` last_event text.
 pub fn should_pick_next_ready(s: &ReadyPickState) -> bool {
+    if s.auto_start == AutoStartPolicy::Never {
+        return false;
+    }
     if matches!(s.status, RunStatus::Running | RunStatus::Paused) {
         return false;
     }
@@ -110,6 +120,7 @@ pub struct TrackRow {
     pub slug: String,
     pub status_raw: String,
     pub summary: String,
+    pub nostart: bool,
 }
 
 /// Trim → unwrap wrapping emphasis → strip leading emoji/punct (stop at alnum or
@@ -247,6 +258,31 @@ fn contains_owner_only(lower: &str) -> bool {
     false
 }
 
+const NOSTART_LITERAL: &str = "<!-- nostart -->";
+
+/// Strip the exact `<!-- nostart -->` literal. No general HTML-comment parser.
+pub fn strip_nostart_literal(line: &str) -> (String, bool) {
+    if line.contains(NOSTART_LITERAL) {
+        (line.replace(NOSTART_LITERAL, ""), true)
+    } else {
+        (line.to_string(), false)
+    }
+}
+
+/// True when the matching conductor row carries `<!-- nostart -->`.
+pub fn track_row_nostart(record: &ProjectRecord, id: &str) -> bool {
+    load_track_rows(record)
+        .and_then(|rows| rows.into_iter().find(|r| row_matches_track(r, id)))
+        .map(|r| r.nostart)
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone)]
+struct PipeRow {
+    cells: Vec<String>,
+    nostart: bool,
+}
+
 /// First GFM table with Track/Id + Status columns, by header name.
 pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -255,7 +291,11 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
         if table.len() < 2 {
             continue;
         }
-        let headers: Vec<String> = table[0].iter().map(|c| c.trim().to_string()).collect();
+        let headers: Vec<String> = table[0]
+            .cells
+            .iter()
+            .map(|c| c.trim().to_string())
+            .collect();
         let Some(track_col) = headers.iter().position(|h| is_track_or_id_header(h)) else {
             continue;
         };
@@ -265,23 +305,24 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
         let summary_col = headers.iter().position(|h| is_summary_header(h));
         let ncols = headers.len();
         let mut rows = Vec::new();
-        for cells in table.iter().skip(1) {
-            if cells.len() != ncols {
+        for row in table.iter().skip(1) {
+            if row.cells.len() != ncols {
                 continue;
             }
-            let track_cell = unwrap_md_link(cells[track_col].trim());
+            let track_cell = unwrap_md_link(row.cells[track_col].trim());
             let Some((id, slug)) = parse_leading_id(&track_cell) else {
                 continue;
             };
-            let status_raw = cells[status_col].trim().to_string();
+            let status_raw = row.cells[status_col].trim().to_string();
             let summary = summary_col
-                .map(|i| cells[i].trim().to_string())
+                .map(|i| row.cells[i].trim().to_string())
                 .unwrap_or_default();
             rows.push(TrackRow {
                 id,
                 slug,
                 status_raw,
                 summary,
+                nostart: row.nostart,
             });
         }
         if rows.is_empty() {
@@ -374,7 +415,7 @@ fn looks_like_row(line: &str) -> bool {
     !t.is_empty() && t.contains('|') && !t.starts_with("```") && !t.starts_with("~~~")
 }
 
-fn collect_pipe_tables(text: &str) -> Vec<Vec<Vec<String>>> {
+fn collect_pipe_tables(text: &str) -> Vec<Vec<PipeRow>> {
     let lines: Vec<&str> = text.lines().collect();
     let mut tables = Vec::new();
     let mut i = 0;
@@ -383,16 +424,25 @@ fn collect_pipe_tables(text: &str) -> Vec<Vec<Vec<String>>> {
             i += 1;
             continue;
         }
-        let header = split_unescaped_pipes(lines[i]);
-        let delim = split_unescaped_pipes(lines[i + 1]);
+        let (header_line, header_nostart) = strip_nostart_literal(lines[i]);
+        let header = split_unescaped_pipes(&header_line);
+        let (delim_line, _) = strip_nostart_literal(lines[i + 1]);
+        let delim = split_unescaped_pipes(&delim_line);
         if delim.is_empty() || !delim.iter().all(|c| is_delimiter_cell(c)) {
             i += 1;
             continue;
         }
-        let mut rows = vec![header];
+        let mut rows = vec![PipeRow {
+            cells: header,
+            nostart: header_nostart,
+        }];
         i += 2;
         while i < lines.len() && looks_like_row(lines[i]) {
-            rows.push(split_unescaped_pipes(lines[i]));
+            let (stripped, nostart) = strip_nostart_literal(lines[i]);
+            rows.push(PipeRow {
+                cells: split_unescaped_pipes(&stripped),
+                nostart,
+            });
             i += 1;
         }
         tables.push(rows);
@@ -545,6 +595,7 @@ pub fn pick_next_ready(record: &ProjectRecord) -> Result<String> {
         .filter(|r| {
             is_eligible_ready_in(&r.status_raw, &aliases)
                 && !is_hitl_marked(&r.id, &r.slug, &r.status_raw, &r.summary)
+                && !r.nostart
         })
         .collect();
     if eligible.is_empty() {
@@ -607,6 +658,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -624,6 +676,7 @@ mod tests {
             next_track: next_track.map(str::to_string),
             failure_class: failure,
             last_event: last_event.into(),
+            auto_start: AutoStartPolicy::Hitl,
         }
     }
 
@@ -1110,5 +1163,86 @@ mod tests {
             "Ready — full plan @ 072399b6",
             &["Ready — full plan @ 072399b6"]
         ));
+    }
+
+    #[test]
+    fn nostart_comment_in_each_column_parses_ready() {
+        let cases = [
+            "| [0030-Ok](0030-Ok/spec.md) <!-- nostart --> | `.` | **Ready — not started** | go |",
+            "| [0030-Ok](0030-Ok/spec.md) | `.` | **Ready — not started** <!-- nostart --> | go |",
+            "| [0030-Ok](0030-Ok/spec.md) | `.` | **Ready — not started** | go <!-- nostart --> |",
+            "| [0030-Ok](0030-Ok/spec.md) | `.` <!-- nostart --> | **Ready — not started** | go |",
+        ];
+        for row in cases {
+            let md = format!(
+                "| Track | Execution path | Status | Summary |\n\
+                 | --- | --- | --- | --- |\n\
+                 {row}\n"
+            );
+            let rows = parse_conductor_md(&md).unwrap();
+            assert_eq!(rows.len(), 1, "{row}");
+            assert_eq!(rows[0].id, "0030");
+            assert!(rows[0].nostart, "{row}");
+            assert!(is_eligible_ready(&rows[0].status_raw), "{row}");
+        }
+        let plain = "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0030-Ok](0030-Ok/spec.md) | `.` | **Ready — not started** | go |\n";
+        let rows = parse_conductor_md(plain).unwrap();
+        assert!(!rows[0].nostart);
+    }
+
+    #[test]
+    fn nostart_own_line_ends_table() {
+        let md = "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0030-Ok](0030-Ok/spec.md) | `.` | **Ready — not started** | go |\n\
+<!-- nostart -->\n\
+| [0031-Later](0031-Later/spec.md) | `.` | **Ready — not started** | after |\n";
+        let rows = parse_conductor_md(md).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "0030");
+        assert!(!rows[0].nostart);
+    }
+
+    #[test]
+    fn nostart_row_skipped_by_pick_completed_ignores_flag() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0029-Lock](0029-Lock/spec.md) | `.` | **Ready — not started** <!-- nostart --> | skip |\n\
+             | [0030-Ok](0030-Ok/spec.md) | `.` | **Ready — not started** | go |\n\
+             | [0028-Done](0028-Done/spec.md) | `.` | **Completed** <!-- nostart --> | done |\n",
+        );
+        mkdir_track(ws, "0029-Lock");
+        mkdir_track(ws, "0030-Ok");
+        mkdir_track(ws, "0028-Done");
+        let r = rec(ws);
+        assert_eq!(pick_next_ready(&r).unwrap(), "0030");
+        let rows = parse_conductor_md(
+            &std::fs::read_to_string(ws.join("conductor").join("conductor.md")).unwrap(),
+        )
+        .unwrap();
+        assert!(track_row_completed(&rows, "0028"));
+        assert!(track_row_nostart(&r, "0029"));
+        assert!(!track_row_nostart(&r, "0030"));
+    }
+
+    #[test]
+    fn should_pick_never_is_false() {
+        let mut s = pick_state(
+            Some("0001"),
+            RunStatus::Idle,
+            None,
+            None,
+            LAST_EVENT_BACKLOG_CLEAR,
+        );
+        s.auto_start = AutoStartPolicy::Never;
+        assert!(!should_pick_next_ready(&s));
     }
 }

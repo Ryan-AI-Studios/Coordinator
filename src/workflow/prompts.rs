@@ -275,6 +275,7 @@ mod tests {
             phase_timeouts_secs: BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: Utc::now(),
         }
     }
@@ -342,6 +343,7 @@ mod tests {
             phase_timeouts_secs: BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: Utc::now(),
         }
     }
@@ -558,6 +560,7 @@ mod tests {
             phase_timeouts_secs: BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: Utc::now(),
         };
         run_with_driver(&rec, Some("0031".into()), WorkflowDriver::FileWait).unwrap();

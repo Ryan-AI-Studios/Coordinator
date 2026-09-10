@@ -10,7 +10,7 @@ use crate::api;
 use crate::config::DEFAULT_SERVE_PORT;
 use crate::error::CoordinatorError;
 use crate::layout::LayoutProfile;
-use crate::registry::{ProjectAddOptions, ProjectSetOptions};
+use crate::registry::{AutoStartPolicy, ProjectAddOptions, ProjectSetOptions};
 use crate::server;
 use crate::workflow::timeouts::parse_phase_timeout;
 
@@ -20,6 +20,10 @@ fn parse_auto_merge(s: &str) -> std::result::Result<bool, String> {
         "false" => Ok(false),
         other => Err(format!("expected true|false, got {other}")),
     }
+}
+
+fn parse_auto_start(s: &str) -> std::result::Result<AutoStartPolicy, String> {
+    AutoStartPolicy::parse(s).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Parser)]
@@ -239,6 +243,9 @@ pub enum ProjectCommands {
         /// true | false (omit = default on)
         #[arg(long = "auto-merge", value_parser = parse_auto_merge)]
         auto_merge: Option<bool>,
+        /// full | hitl | never (omit = hitl)
+        #[arg(long = "auto-start", value_parser = parse_auto_start)]
+        auto_start: Option<AutoStartPolicy>,
         /// Repeatable. Canonical phase id or `plan_review_slot` = seconds (>0).
         #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
         phase_timeouts: Vec<(String, u64)>,
@@ -290,6 +297,9 @@ pub enum ProjectCommands {
         /// Clear stored ready aliases (back to `Ready — not started`).
         #[arg(long = "clear-status-words-ready")]
         clear_status_words_ready: bool,
+        /// full | hitl | never (omit = leave unchanged)
+        #[arg(long = "auto-start", value_parser = parse_auto_start)]
+        auto_start: Option<AutoStartPolicy>,
     },
     /// Scan roots for conductor/conductor.md markers
     Scan {
@@ -379,6 +389,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 display_name,
                 execution_repo_name,
                 auto_merge,
+                auto_start,
                 phase_timeouts,
             } => {
                 let layout_profile = LayoutProfile::parse(&profile)?;
@@ -392,6 +403,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     execution_repos: BTreeMap::new(),
                     auto_merge,
                     phase_timeouts_secs: phase_timeouts.into_iter().collect(),
+                    auto_start,
                 };
                 let rec = api::project_add(&path, opts)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
@@ -420,6 +432,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 clear_phase_timeouts,
                 status_words_ready,
                 clear_status_words_ready,
+                auto_start,
             } => {
                 let layout_profile = match profile {
                     Some(s) => Some(LayoutProfile::parse(&s)?),
@@ -457,6 +470,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     clear_phase_timeout,
                     ready_aliases,
                     clear_ready_aliases: clear_status_words_ready,
+                    auto_start,
                 };
                 let rec = api::project_set(project.as_deref(), opts, true)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
@@ -905,6 +919,22 @@ mod tests {
         assert!(
             set.get_arguments().any(|a| a.get_id() == "notify_progress"),
             "set --notify-progress"
+        );
+    }
+
+    #[test]
+    fn project_add_and_set_have_auto_start_flag() {
+        let cmd = Cli::command();
+        let project = cmd.find_subcommand("project").expect("project");
+        let set = project.find_subcommand("set").expect("set");
+        let add = project.find_subcommand("add").expect("add");
+        assert!(
+            set.get_arguments().any(|a| a.get_id() == "auto_start"),
+            "set --auto-start"
+        );
+        assert!(
+            add.get_arguments().any(|a| a.get_id() == "auto_start"),
+            "add --auto-start"
         );
     }
 

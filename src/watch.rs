@@ -467,6 +467,7 @@ mod tests {
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -511,6 +512,7 @@ mod tests {
                 phase_timeouts_secs: std::collections::BTreeMap::new(),
                 notify_progress: false,
                 ready_aliases: Vec::new(),
+                auto_start: Default::default(),
                 created_at: chrono::Utc::now(),
             };
             let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::File, None, None, None);

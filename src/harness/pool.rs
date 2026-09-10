@@ -1814,6 +1814,7 @@ mod tests {
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         };
         let stale = PersistedGrokHandle {
@@ -1884,6 +1885,7 @@ mod tests {
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(&rec, None, crate::workflow::WorkflowDriver::FileWait).unwrap();
@@ -1922,6 +1924,7 @@ mod tests {
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         };
         let t = prompt_timeout_for(&rec);
@@ -1951,6 +1954,7 @@ mod tests {
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         };
         let p = persist_path(&rec).unwrap();
@@ -1973,6 +1977,7 @@ mod tests {
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         };
         ensure_state_dir(&rec).unwrap();
@@ -2005,6 +2010,7 @@ mod tests {
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         };
         ensure_state_dir(&rec).unwrap();
@@ -2378,6 +2384,7 @@ Loop\r\n",
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         };
         assert_eq!(grok_cwd(&rec), exec);
@@ -2730,6 +2737,7 @@ Loop\r\n",
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(
@@ -2882,7 +2890,15 @@ Loop\r\n",
             std::env::set_var(ENV_COORDINATOR_HOME, home.path());
         }
         let mut reg = Registry::default();
-        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let rec = reg
+            .add(
+                proj.path(),
+                ProjectAddOptions {
+                    auto_start: Some(crate::registry::AutoStartPolicy::Full),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
         crate::run::run_with_driver(
             &rec,
@@ -2981,7 +2997,15 @@ Loop\r\n",
             std::env::set_var(ENV_COORDINATOR_HOME, home.path());
         }
         let mut reg = Registry::default();
-        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        let rec = reg
+            .add(
+                proj.path(),
+                ProjectAddOptions {
+                    auto_start: Some(crate::registry::AutoStartPolicy::Full),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
         crate::run::run_with_driver(
             &rec,

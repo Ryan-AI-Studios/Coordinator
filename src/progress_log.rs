@@ -59,6 +59,7 @@ mod tests {
             phase_timeouts_secs: BTreeMap::new(),
             notify_progress: false,
             ready_aliases: Vec::new(),
+            auto_start: Default::default(),
             created_at: ChronoUtc::now(),
         }
     }

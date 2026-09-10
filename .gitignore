@@ -6,6 +6,10 @@ Cargo.lock.bak
 # Accidental local Control Plane state under a registered project path
 .coordinator/
 
+# Workspace progress log + plan-review join (workspace may equal this repo)
+/status.md
+/AI-review.md
+
 # Local tool / agent state (never ship)
 .ledgerful/
 .env
