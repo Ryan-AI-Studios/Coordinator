@@ -31,7 +31,7 @@ pub use backend::{
     CallCounts, CheckBucket, CheckItem, CheckSnapshot, CiBackend, CiTarget, MergeResult, PrHint,
     RecordingBackend, ScriptedBackend,
 };
-pub use gh::GhCli;
+pub use gh::{GhCli, GhMergedTrackProbe};
 
 const TWO_MIN: Duration = Duration::from_secs(120);
 const TEN_MIN: Duration = Duration::from_secs(600);

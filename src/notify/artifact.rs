@@ -112,7 +112,7 @@ pub fn track_ids_match(a: &str, b: &str) -> bool {
     }
 }
 
-fn numeric_track_id(s: &str) -> Option<&str> {
+pub(crate) fn numeric_track_id(s: &str) -> Option<&str> {
     if s.len() >= 4 && s.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
         let rest = &s[4..];
         if rest.is_empty() || rest.starts_with('-') {

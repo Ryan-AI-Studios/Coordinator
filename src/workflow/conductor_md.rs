@@ -1,12 +1,14 @@
 //! Parse `conductor/conductor.md` and pick the first exact Ready track (0030).
 
 use crate::error::{CoordinatorError, Result};
+use crate::notify::artifact::{numeric_track_id, track_ids_match};
 use crate::outcome::FailureClass;
 use crate::registry::{AutoStartPolicy, ProjectRecord};
 use crate::state::{RunState, RunStatus, StatusView};
 
 use super::LAST_EVENT_BACKLOG_CLEAR;
 use super::graph::resolve_track_dir;
+use super::shipped::MergedTrackProbe;
 
 const READY_NORMALIZED: &str = "Ready - not started";
 
@@ -577,6 +579,15 @@ fn empty_ready_pick_error(record: &ProjectRecord) -> String {
 /// Read `{conductor_dir}/conductor.md` and return the first eligible Ready id
 /// whose track directory exists.
 pub fn pick_next_ready(record: &ProjectRecord) -> Result<String> {
+    pick_next_ready_excluding(record, &[], None)
+}
+
+/// `pick_next_ready` plus skip list / optional merged-PR probe (0046).
+pub fn pick_next_ready_excluding(
+    record: &ProjectRecord,
+    skip: &[String],
+    probe: Option<&dyn MergedTrackProbe>,
+) -> Result<String> {
     let path = crate::layout::resolve(record)
         .conductor_dir
         .join("conductor.md");
@@ -609,12 +620,29 @@ pub fn pick_next_ready(record: &ProjectRecord) -> Result<String> {
                 .unwrap_or(usize::MAX)
         });
     }
+    let exec = crate::layout::resolve(record).execution_repo;
     let mut missing = Vec::new();
     for row in eligible {
-        if resolve_track_dir(record, &row.id).is_some() {
-            return Ok(row.id.clone());
+        if skip.iter().any(|s| track_ids_match(&row.id, s)) {
+            continue;
         }
-        missing.push(row.id.clone());
+        if track_row_completed(&rows, &row.id) {
+            continue;
+        }
+        if resolve_track_dir(record, &row.id).is_none() {
+            missing.push(row.id.clone());
+            continue;
+        }
+        if let (Some(probe), Some(cwd)) = (probe, exec.as_ref())
+            && let Some(nid) = numeric_track_id(&row.id)
+            && probe.merged_pr_for_track(cwd, nid).ok().flatten().is_some()
+        {
+            continue;
+        }
+        return Ok(row.id.clone());
+    }
+    if missing.is_empty() {
+        return Err(CoordinatorError::Message(empty_ready_pick_error(record)));
     }
     Err(CoordinatorError::Message(format!(
         "Ready track(s) {} have no matching conductor directory; pass --track <id>",
@@ -1244,5 +1272,71 @@ mod tests {
         );
         s.auto_start = AutoStartPolicy::Never;
         assert!(!should_pick_next_ready(&s));
+    }
+
+    fn two_ready_ws(ws: &Path) -> ProjectRecord {
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-One | `.` | **Ready — not started** | a |\n\
+             | 0002-Two | `.` | **Ready — not started** | b |\n",
+        );
+        mkdir_track(ws, "0001-One");
+        mkdir_track(ws, "0002-Two");
+        let mut r = rec(ws);
+        r.execution_repo = Some(ws.to_path_buf());
+        r
+    }
+
+    #[test]
+    fn pick_excluding_probe_skips_merged_title() {
+        let dir = tempdir().unwrap();
+        let r = two_ready_ws(dir.path());
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0001", 56);
+        assert_eq!(
+            pick_next_ready_excluding(&r, &[], Some(&probe)).unwrap(),
+            "0002"
+        );
+    }
+
+    #[test]
+    fn pick_excluding_probe_err_fail_opens() {
+        let dir = tempdir().unwrap();
+        let r = two_ready_ws(dir.path());
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::err("0001", "gh auth required");
+        assert_eq!(
+            pick_next_ready_excluding(&r, &[], Some(&probe)).unwrap(),
+            "0001"
+        );
+    }
+
+    #[test]
+    fn pick_excluding_skip_list() {
+        let dir = tempdir().unwrap();
+        let r = two_ready_ws(dir.path());
+        assert_eq!(
+            pick_next_ready_excluding(&r, &["0001".into()], None).unwrap(),
+            "0002"
+        );
+    }
+
+    #[test]
+    fn pick_excluding_only_merged_ready_is_empty() {
+        let dir = tempdir().unwrap();
+        write_md(
+            dir.path(),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-One | `.` | **Ready — not started** | a |\n",
+        );
+        mkdir_track(dir.path(), "0001-One");
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(dir.path().to_path_buf());
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0001", 56);
+        let err = pick_next_ready_excluding(&r, &[], Some(&probe))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no Ready"), "{err}");
     }
 }

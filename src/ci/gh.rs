@@ -422,6 +422,65 @@ fn run_process(bin: &Path, args: &[&str], cwd: &Path) -> Result<ProcOut> {
     }
 }
 
+/// Production Adapter omit-pick probe. Default branch is resolved once per instance.
+#[derive(Default)]
+pub struct GhMergedTrackProbe {
+    cached_base: std::cell::RefCell<Option<String>>,
+}
+
+impl crate::workflow::MergedTrackProbe for GhMergedTrackProbe {
+    fn merged_pr_for_track(&self, cwd: &Path, numeric_id: &str) -> Result<Option<u64>> {
+        let base = self.default_branch(cwd)?;
+        let search = crate::workflow::merged_search_query(numeric_id);
+        let out = gh_capture(
+            cwd,
+            &[
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--base",
+                &base,
+                "--search",
+                &search,
+                "--limit",
+                "10",
+                "--json",
+                "number,title,mergedAt,baseRefName",
+            ],
+        )?;
+        if out.exit == 4 {
+            return Err(CoordinatorError::Message("gh auth required".into()));
+        }
+        if !out.ok {
+            return Err(CoordinatorError::Message("gh pr list failed".into()));
+        }
+        crate::workflow::shipped::first_merged_pr_for_track(&out.stdout, numeric_id, Some(&base))
+    }
+}
+
+impl GhMergedTrackProbe {
+    fn default_branch(&self, cwd: &Path) -> Result<String> {
+        if let Some(b) = self.cached_base.borrow().clone() {
+            return Ok(b);
+        }
+        let resolved = resolve_omit_pick_default_branch(cwd)?;
+        *self.cached_base.borrow_mut() = Some(resolved.clone());
+        Ok(resolved)
+    }
+}
+
+/// Git `symbolic-ref` first, then `gh repo view` (once per omit-pick instance).
+fn resolve_omit_pick_default_branch(cwd: &Path) -> Result<String> {
+    if let Ok(sym) = git_stdout(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
+        let name = sym.trim().rsplit('/').next().unwrap_or("").trim();
+        if !name.is_empty() {
+            return Ok(name.to_string());
+        }
+    }
+    gh_default_branch(cwd)
+}
+
 fn truncate(s: &str) -> String {
     let t = s.trim();
     if t.chars().count() <= 200 {
