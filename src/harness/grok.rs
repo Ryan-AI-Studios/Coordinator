@@ -2082,8 +2082,18 @@ mod tests {
         )
         .await;
         let argv_path = dir.path().join("argv.txt");
-        let text = std::fs::read_to_string(&argv_path)
-            .unwrap_or_else(|e| panic!("argv.txt missing after spawn: {e}"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let text = loop {
+            if let Ok(text) = std::fs::read_to_string(&argv_path)
+                && (!text.trim().is_empty() || text.contains("--yolo"))
+            {
+                break text;
+            }
+            if Instant::now() >= deadline {
+                panic!("argv.txt missing or empty after spawn");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
         assert!(text.contains("--yolo"), "argv={text:?}");
         assert!(text.contains("--trust"), "argv={text:?}");
         assert!(text.contains("acp"), "argv={text:?}");
