@@ -382,8 +382,8 @@ After implement, Coordinator runs a **fresh, read-only CLI exec** (not a Grok Se
 | OpenCode | `run --dir {exec} --format default` — **no `--auto`**. Hang backstop = remaining phase budget |
 | Windows | `resolve_command` (PATH + `PATHEXT`). Never spawn `.ps1`. `.cmd`/`.bat` via `cmd.exe /C`. Env: `NO_COLOR=1` |
 | Budget | Do not start a tier if remaining **&lt; 60s** → `timeout`. Process timeout = remaining budget (not the 30s `gh` cap) |
-| Verdict | `## Verdict: PASS \| PASS WITH DEFERRED P3 \| FAIL` (or JSON `verdict`). Findings P0/P1/P2/critical/high/medium override PASS. Unparseable falls through |
-| Fallback | Exhaustion / missing binary / auth / crash / unparseable → next tier. **FAIL / &gt;low = `difficulty`, no fallback** |
+| Verdict | `## Verdict: PASS \| PASS WITH DEFERRED P3 \| FAIL` (or JSON `verdict`). Findings P0/P1/P2/critical/high/medium override PASS. Unparseable falls through. A publish-only FAIL (no blocking Findings + nonempty `evidence.md` + clean execution-repo tree) degrades to `ci-wait` (`DEGRADED_PUBLISH`) and is not `difficulty`. Missing evidence or a dirty tree (Gate2) still FAILs |
+| Fallback | Exhaustion / missing binary / auth / crash / unparseable → next tier. **FAIL / &gt;low = `difficulty`, no fallback** (except the publish-only degrade above) |
 | Empty chain | All exhausted → `model_exhaustion`. All missing/auth → `permission`. Else `harness_crash` |
 | Pause / stop | Pause **finishes** this phase then holds at `ci-wait` Paused. Stop aborts; does not apply success; not a Failure Class |
 | Reports | `{state_dir}/reviews/cross-model-{slug}.md` and `{track_dir}/review.{slug}.md`. Stub last_event: `cross-model: stub (no review)` |

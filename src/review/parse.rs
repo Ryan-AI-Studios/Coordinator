@@ -204,6 +204,104 @@ fn normalize_verdict_token(raw: &str) -> Option<ParsedVerdict> {
     None
 }
 
+/// True when a FAIL report claims no product blockers (0314 publish-DoD shape
+/// or every blocking Findings line is lifecycle-only). Does not remap
+/// `parse_report` / `classify_result`. Schema-only JSON and bare FAIL
+/// (no `## Findings`) stay false.
+pub fn is_publish_only_fail(text: &str) -> bool {
+    if is_schema_only_json(text) {
+        return false;
+    }
+    if parse_report(text, "") != ParsedVerdict::GateFail {
+        return false;
+    }
+    let Some(_) = findings_slice(text) else {
+        return false;
+    };
+    let blockers = extract_blocking_findings(text);
+    if blockers.is_empty() {
+        return true;
+    }
+    blockers
+        .iter()
+        .all(|line| is_lifecycle_or_publish_finding(line) && !is_gate2_finding(line))
+}
+
+pub(crate) fn extract_blocking_findings(text: &str) -> Vec<String> {
+    let Some(slice) = findings_slice(text) else {
+        return Vec::new();
+    };
+    slice
+        .lines()
+        .filter(|line| line_has_blocking_severity(line))
+        .map(|line| line.to_string())
+        .collect()
+}
+
+pub(crate) fn is_lifecycle_or_publish_finding(line: &str) -> bool {
+    let t = line.to_ascii_lowercase();
+    const PUBLISH: &[&str] = &[
+        "squash-merge",
+        "squash merge",
+        "not squash-merged",
+        "pr not merged",
+        "not merged into",
+        "merge has not",
+        "merge pending",
+        "ci still running",
+        "ci pending",
+        "required ci",
+        "ci not independently",
+        "actions in progress",
+        "could not independently confirm",
+        "denied by the harness",
+        "permission mode",
+    ];
+    if PUBLISH.iter().any(|p| t.contains(p)) {
+        return true;
+    }
+    if t.contains("gh pr view") && t.contains("denied") {
+        return true;
+    }
+    const REGS: &[&str] = &[
+        "conductor.md",
+        "conductor2.md",
+        "sequencing2.md",
+        "registries",
+        "registry",
+    ];
+    const REG_STATE: &[&str] = &[
+        "completed",
+        "ready — not started",
+        "not been flipped",
+        "not flipped",
+    ];
+    REGS.iter().any(|p| t.contains(p)) && REG_STATE.iter().any(|p| t.contains(p))
+}
+
+pub(crate) fn is_gate2_finding(line: &str) -> bool {
+    let t = line.to_ascii_lowercase();
+    if t.contains("evidence.md")
+        && (t.contains("absent")
+            || t.contains("missing")
+            || t.contains("not present")
+            || t.contains("empty"))
+    {
+        return true;
+    }
+    const GATE2: &[&str] = &[
+        "dirty worktree",
+        "dirty tree",
+        "working tree not clean",
+        "uncommitted working-tree",
+        "no commit exists",
+        "no exec commit",
+        "no pr exists",
+        "pr does not exist",
+    ];
+    GATE2.iter().any(|p| t.contains(p))
+}
+
 fn findings_block(text: &str) -> bool {
     let Some(slice) = findings_slice(text) else {
         return false;
@@ -514,5 +612,65 @@ mod tests {
         let mut r = res("## Verdict: FAIL\n");
         r.exit = 1;
         assert_eq!(classify_result(&r), TierClass::GateFail);
+    }
+
+    #[test]
+    fn publish_only_fail_empty_blockers_0314_shape() {
+        let text = r#"## Verdict: FAIL
+
+## Findings
+
+None at P0–P2 against the DoD-1–5 implementation itself.
+"#;
+        assert!(is_publish_only_fail(text));
+        assert_eq!(parse_report(text, ""), ParsedVerdict::GateFail);
+        assert_eq!(classify_result(&res(text)), TierClass::GateFail);
+    }
+
+    #[test]
+    fn bare_fail_without_findings_is_not_publish_only() {
+        assert!(!is_publish_only_fail("## Verdict: FAIL\n"));
+        assert_eq!(
+            parse_report("## Verdict: FAIL\n", ""),
+            ParsedVerdict::GateFail
+        );
+    }
+
+    #[test]
+    fn schema_only_fail_is_not_publish_only() {
+        let j = r#"{"verdict":"FAIL","highest":"P1"}"#;
+        assert!(!is_publish_only_fail(j));
+        assert_eq!(parse_report(j, ""), ParsedVerdict::Unparseable);
+        assert_eq!(classify_result(&res(j)), TierClass::Crash);
+    }
+
+    #[test]
+    fn product_p1_is_not_publish_only() {
+        let text = "## Verdict: FAIL\n\n## Findings\n\n| P1 | broken |\n";
+        assert!(!is_publish_only_fail(text));
+    }
+
+    #[test]
+    fn lifecycle_p1_line_is_publish_only() {
+        let text = "## Verdict: FAIL\n\n## Findings\n\n| P1 | PR not squash-merged |\n";
+        assert!(is_publish_only_fail(text));
+        assert!(is_lifecycle_or_publish_finding(
+            "| P1 | PR not squash-merged |"
+        ));
+        assert!(!is_gate2_finding("| P1 | PR not squash-merged |"));
+    }
+
+    #[test]
+    fn evidence_missing_p1_is_gate2_not_publish() {
+        let text = "## Verdict: FAIL\n\n## Findings\n\n| P1 | evidence.md missing |\n";
+        assert!(!is_publish_only_fail(text));
+        assert!(is_gate2_finding("| P1 | evidence.md missing |"));
+    }
+
+    #[test]
+    fn no_evidence_pr_squash_merged_is_not_gate2() {
+        assert!(!is_gate2_finding(
+            "No evidence the PR has been squash-merged"
+        ));
     }
 }

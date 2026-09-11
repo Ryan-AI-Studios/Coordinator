@@ -143,7 +143,7 @@ pub struct ReviewWatchState {
     pub attempted: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
-    /// `PASS` | `PASS_WITH_LOWS` | `FAIL`
+    /// `PASS` | `PASS_WITH_LOWS` | `FAIL` | `DEGRADED_PUBLISH`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<String>,
     /// Relative name e.g. `review.codex.md`
