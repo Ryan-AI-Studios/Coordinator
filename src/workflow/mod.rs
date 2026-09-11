@@ -6,6 +6,7 @@ pub mod drive;
 pub mod graph;
 pub mod plan_review;
 pub mod prompts;
+pub mod shipped;
 pub mod timeouts;
 pub mod watchdog;
 
@@ -17,10 +18,14 @@ use crate::registry::{AutoStartPolicy, ProjectRecord};
 use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock};
 
 pub use conductor_md::{
-    ReadyPickState, pick_next_ready, should_pick_next_ready, track_row_nostart,
+    ReadyPickState, pick_next_ready, pick_next_ready_excluding, should_pick_next_ready,
+    track_row_nostart,
 };
 pub use drive::tick;
 pub use graph::{WORKFLOW_ID, is_canonical, is_stub_phase, resolve_track_dir, successor};
+pub use shipped::{
+    MergedTrackProbe, merged_search_query, pr_title_is_track, track_is_shipped_local,
+};
 pub use timeouts::{ENV_PHASE_TIMEOUT_SECS, TimeoutSource, timeout_for_phase, timeout_source};
 
 /// `finish_advance` null/`next_track` Idle last_event (0030 pick trigger).
@@ -189,28 +194,65 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
         None => apply_backlog_clear(record, state),
         Some(id) => {
             let id = id.to_string();
-            if resolve_track_dir(record, &id).is_some() {
-                if let Some(policy) = park_policy(record, &id) {
-                    park_next(record, state, &id, policy);
-                } else {
-                    auto_start(state, &id);
-                    crate::outcome::clear_active_outcome_file(record);
-                    crate::workflow::drive::clear_plan_review_artifacts(record);
-                    crate::notify::clear_artifact(record);
-                    crate::workflow::watchdog::clear_progress(record);
-                }
-            } else {
+            if resolve_track_dir(record, &id).is_none() {
                 state.status = RunStatus::Idle;
                 state.last_event = format!("workflow: invalid next_track {id}");
                 state.phase_started_at = None;
                 state.pause_started_at = None;
+                return;
             }
+            if shipped::track_is_shipped_local(record, state, &id) {
+                crate::progress_log::append(record, "advance", &skip_merged_detail(state, &id));
+                let mut excluded = vec![id];
+                loop {
+                    match conductor_md::pick_next_ready_excluding(record, &excluded, None) {
+                        Ok(cand) => {
+                            if shipped::track_is_shipped_local(record, state, &cand) {
+                                crate::progress_log::append(
+                                    record,
+                                    "advance",
+                                    &skip_merged_detail(state, &cand),
+                                );
+                                excluded.push(cand);
+                                continue;
+                            }
+                            start_or_park(record, state, &cand);
+                            return;
+                        }
+                        Err(_) => {
+                            apply_backlog_clear(record, state);
+                            return;
+                        }
+                    }
+                }
+            }
+            start_or_park(record, state, &id);
         }
+    }
+}
+
+fn skip_merged_detail(state: &RunState, id: &str) -> String {
+    match state.ci.as_ref().and_then(|c| c.pr_number) {
+        Some(n) => format!("skip merged {id} #{n}"),
+        None => format!("skip merged {id}"),
+    }
+}
+
+fn start_or_park(record: &ProjectRecord, state: &mut RunState, id: &str) {
+    if let Some(policy) = park_policy(record, id) {
+        park_next(record, state, id, policy);
+    } else {
+        auto_start(state, id);
+        crate::outcome::clear_active_outcome_file(record);
+        crate::workflow::drive::clear_plan_review_artifacts(record);
+        crate::notify::clear_artifact(record);
+        crate::workflow::watchdog::clear_progress(record);
     }
 }
 
 fn apply_backlog_clear(record: &ProjectRecord, state: &mut RunState) {
     state.status = RunStatus::Idle;
+    state.next_track = None;
     state.last_event = LAST_EVENT_BACKLOG_CLEAR.into();
     state.phase_started_at = None;
     state.pause_started_at = None;
@@ -424,7 +466,7 @@ mod tests {
     use crate::config::{ENV_COORDINATOR_HOME, ENV_OUTCOME_POLL_MS, test_env_lock};
     use crate::outcome::{FailureClass, OutcomeSource, write_and_apply};
     use crate::run::{self, run_stub, run_with_driver};
-    use crate::state::{STUB_PHASE_STOPPED, StatusView};
+    use crate::state::{CiWatchState, STUB_PHASE_STOPPED, StatusView};
     use crate::watch::{poll_once, wait_for_outcome};
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -1024,6 +1066,197 @@ mod tests {
              | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n",
         )
         .unwrap();
+    }
+
+    fn write_both_ready(dir: &std::path::Path) {
+        let cond = dir.join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Ready — not started** | one |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
+    }
+
+    fn write_only_ready(dir: &std::path::Path, id: &str, slug: &str) {
+        let cond = dir.join("conductor");
+        std::fs::create_dir_all(cond.join(format!("{id}-{slug}"))).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            format!(
+                "| Track | Execution path | Status | Summary |\n\
+                 | --- | --- | --- | --- |\n\
+                 | [{id}-{slug}]({id}-{slug}/spec.md) | `.` | **Ready — not started** | only |\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn merge_done_on(state: &mut crate::state::RunState, pr: Option<u64>) {
+        state.ci = Some(CiWatchState {
+            merge: Some("done".into()),
+            pr_number: pr,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn advance_skips_same_track_merge_done_auto_starts_next() {
+        let dir = tempdir().unwrap();
+        write_both_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        merge_done_on(&mut state, Some(56));
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0001".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0002"));
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, graph::PHASE_PLAN);
+        assert!(view.run_epoch >= 2);
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("skip merged 0001"), "{log}");
+        assert!(
+            log.contains("#56") || log.contains("skip merged 0001 #56"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn advance_skips_same_track_hitl_parks_next() {
+        let dir = tempdir().unwrap();
+        write_both_ready(dir.path());
+        let r = rec(dir.path());
+        assert_eq!(r.auto_start, AutoStartPolicy::Hitl);
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        merge_done_on(&mut state, None);
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0001".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert_eq!(view.parked_next.as_deref(), Some("0002"));
+        assert!(view.next_track.is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("skip merged 0001"), "{log}");
+    }
+
+    #[test]
+    fn advance_skips_completed_local_not_0001() {
+        let dir = tempdir().unwrap();
+        write_two_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0001".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0002"));
+        assert_ne!(view.track_id.as_deref(), Some("0001"));
+        assert_eq!(view.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn advance_skip_last_ready_backlog_clears_next_track() {
+        let dir = tempdir().unwrap();
+        write_only_ready(dir.path(), "0001", "Example");
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        merge_done_on(&mut state, None);
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0001".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert!(view.next_track.is_none());
+        assert!(should_pick_next_ready(&ReadyPickState::from(&view)));
+    }
+
+    #[test]
+    fn advance_unshipped_next_still_auto_starts() {
+        let dir = tempdir().unwrap();
+        write_both_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        merge_done_on(&mut state, None);
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0002".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0002"));
+        assert_eq!(view.status, RunStatus::Running);
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(!log.contains("skip merged 0002"), "{log}");
+    }
+
+    #[test]
+    fn advance_missing_dir_still_invalid_next_track() {
+        let dir = tempdir().unwrap();
+        write_only_ready(dir.path(), "0001", "Example");
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        merge_done_on(&mut state, None);
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0099".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert!(view.last_event.contains("invalid next_track 0099"));
+        assert_eq!(view.track_id.as_deref(), Some("0001"));
     }
 
     #[test]

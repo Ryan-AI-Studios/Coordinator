@@ -375,7 +375,7 @@ pub fn cmd_run(
     let rec = resolve_selected(project, infer_cwd)?;
     let _ = settle_if_conductor_completed(&rec);
     let driver = crate::workflow::resolve_driver(driver)?;
-    let (track, picked) = resolve_run_track(&rec, track)?;
+    let (track, picked) = resolve_run_track_for_driver(&rec, track, driver)?;
     if driver == crate::workflow::WorkflowDriver::Adapter && !skip_preflight {
         let report = crate::harness::preflight::probe_machine()?;
         if !report.ok {
@@ -389,9 +389,19 @@ pub fn cmd_run(
 
 /// Explicit nonempty `--track` wins (no Ready check). Else pick when
 /// [`crate::workflow::should_pick_next_ready`]; otherwise retain (`None`).
+/// Probeless (Stub / FileWait / existing tests).
 pub fn resolve_run_track(
     record: &crate::registry::ProjectRecord,
     explicit: Option<String>,
+) -> Result<(Option<String>, bool)> {
+    resolve_run_track_with_probe(record, explicit, None)
+}
+
+/// Adapter omit-pick: optional merged-PR probe. Explicit `--track` still wins.
+pub fn resolve_run_track_with_probe(
+    record: &crate::registry::ProjectRecord,
+    explicit: Option<String>,
+    probe: Option<&dyn crate::workflow::MergedTrackProbe>,
 ) -> Result<(Option<String>, bool)> {
     let trimmed = explicit
         .map(|s| s.trim().to_string())
@@ -414,7 +424,43 @@ pub fn resolve_run_track(
     if !crate::workflow::should_pick_next_ready(&pick) {
         return Ok((None, false));
     }
-    Ok((Some(crate::workflow::pick_next_ready(record)?), true))
+    Ok((
+        Some(crate::workflow::pick_next_ready_excluding(
+            record,
+            &[],
+            probe,
+        )?),
+        true,
+    ))
+}
+
+fn resolve_run_track_for_driver(
+    record: &crate::registry::ProjectRecord,
+    explicit: Option<String>,
+    driver: crate::workflow::WorkflowDriver,
+) -> Result<(Option<String>, bool)> {
+    if driver != crate::workflow::WorkflowDriver::Adapter {
+        return resolve_run_track(record, explicit);
+    }
+    adapter_omit_pick(record, explicit)
+}
+
+#[cfg(test)]
+fn adapter_omit_pick(
+    record: &crate::registry::ProjectRecord,
+    explicit: Option<String>,
+) -> Result<(Option<String>, bool)> {
+    let hooked = crate::workflow::shipped::installed_merged_probe();
+    resolve_run_track_with_probe(record, explicit, hooked.as_deref())
+}
+
+#[cfg(not(test))]
+fn adapter_omit_pick(
+    record: &crate::registry::ProjectRecord,
+    explicit: Option<String>,
+) -> Result<(Option<String>, bool)> {
+    let probe = crate::ci::GhMergedTrackProbe::default();
+    resolve_run_track_with_probe(record, explicit, Some(&probe))
 }
 
 /// Probe machine Role Bindings + `gh`. Optional `--project` only validates the selector.
@@ -1328,6 +1374,88 @@ mod tests {
             "{}",
             view.last_event
         );
+        clear_home();
+    }
+
+    fn write_two_ready_tracks(ws: &std::path::Path) {
+        let cond = ws.join("conductor");
+        std::fs::create_dir_all(cond.join("0001-One")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Two")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-One | `.` | **Ready — not started** | a |\n\
+             | 0002-Two | `.` | **Ready — not started** | b |\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_run_track_with_probe_omit_skips_merged() {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        write_two_ready_tracks(proj.path());
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0001", 56);
+        let (track, picked) = resolve_run_track_with_probe(&rec, None, Some(&probe)).unwrap();
+        assert!(picked);
+        assert_eq!(track.as_deref(), Some("0002"));
+        clear_home();
+    }
+
+    #[test]
+    fn resolve_run_track_with_probe_explicit_wins() {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        write_two_ready_tracks(proj.path());
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0001", 56);
+        let (track, picked) =
+            resolve_run_track_with_probe(&rec, Some("0001".into()), Some(&probe)).unwrap();
+        assert!(!picked);
+        assert_eq!(track.as_deref(), Some("0001"));
+        let (plain, _) = resolve_run_track(&rec, None).unwrap();
+        assert_eq!(plain.as_deref(), Some("0001"));
+        clear_home();
+    }
+
+    #[test]
+    fn resolve_run_track_with_probe_err_fail_opens() {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        write_two_ready_tracks(proj.path());
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::err("0001", "boom");
+        let (track, picked) = resolve_run_track_with_probe(&rec, None, Some(&probe)).unwrap();
+        assert!(picked);
+        assert_eq!(track.as_deref(), Some("0001"));
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_stub_omit_ignores_installed_probe() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_two_ready_tracks(proj.path());
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0001", 56);
+        let _g = crate::workflow::shipped::install_test_merged_probe(std::sync::Arc::new(probe));
+        let view = cmd_run(Some(&rec.id), None, Some("stub"), false, false).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0001"));
+        clear_home();
+    }
+
+    #[test]
+    fn resolve_run_track_with_probe_only_merged_ready_errors() {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        crate::workflow::conductor_md::write_ready_fixture(proj.path(), "0001").unwrap();
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0001", 56);
+        let err = resolve_run_track_with_probe(&rec, None, Some(&probe))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pass --track"), "{err}");
         clear_home();
     }
 

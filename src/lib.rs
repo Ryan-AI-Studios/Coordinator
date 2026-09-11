@@ -15,6 +15,7 @@
 //! Infer `--project` from unique cwd containment else last-used: track **0029**.
 //! Omit `--track` starts first exact Ready row (`status_clean` vs `ready_aliases`;
 //! default `Ready — not started`) when unset or backlog-clear: track **0030** / **0042**.
+//! Skip already-merged `track(NNNN):` at omit-pick / local shipped at advance: track **0046**.
 //! Slot-quality admission (plan-review + cross-model; schema-only JSON is dud): track **0043**.
 //! Per-project `AutoStartPolicy` (full|hitl|never) + `<!-- nostart -->`: track **0044**.
 //! Address-findings side loop after GateFail (cap 2 then difficulty Stop): track **0031**.
