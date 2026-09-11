@@ -17,6 +17,7 @@
 //! default `Ready — not started`) when unset or backlog-clear: track **0030** / **0042**.
 //! Skip already-merged `track(NNNN):` at omit-pick / local shipped at advance: track **0046**.
 //! Deterministic advance successor from Ready rows (planner `next_track` recorded, not authoritative): track **0047**.
+//! `parse_conductor_md` keeps rows after intra-table blanks and later Track+Status tables: track **0050**.
 //! ci-wait resolves immediately when the awaited PR is already GitHub MERGED (`--head` merged list + title probe): track **0048**.
 //! ci-wait fail-set is required GitHub checks only (`--required` + `mergeStateStatus` backstop + all-checks fallback): track **0049**.
 //! Slot-quality admission (plan-review + cross-model; schema-only JSON is dud): track **0043**.
