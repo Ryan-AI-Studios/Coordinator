@@ -414,8 +414,43 @@ fn looks_like_row(line: &str) -> bool {
     !t.is_empty() && t.contains('|') && !t.starts_with("```") && !t.starts_with("~~~")
 }
 
+/// CommonMark 0.31.2 / GFM §4.1 thematic break, and not a pipe row.
+/// Indent is at most three spaces (four-space / tab-indented lines stay
+/// non-separators so a code-block `---` still ends the table).
+fn is_thematic_break(line: &str) -> bool {
+    if line.contains('|') {
+        return false;
+    }
+    let mut rest = line.trim_end();
+    for _ in 0..3 {
+        if let Some(stripped) = rest.strip_prefix(' ') {
+            rest = stripped;
+        } else {
+            break;
+        }
+    }
+    if rest.starts_with(' ') || rest.starts_with('\t') {
+        return false;
+    }
+    let mut chars = rest.chars().filter(|c| *c != ' ' && *c != '\t');
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '-' && first != '*' && first != '_' {
+        return false;
+    }
+    let mut n = 1;
+    for c in chars {
+        if c != first {
+            return false;
+        }
+        n += 1;
+    }
+    n >= 3
+}
+
 fn is_table_start(lines: &[&str], i: usize) -> bool {
-    if i + 1 >= lines.len() || !looks_like_row(lines[i]) {
+    if i + 1 >= lines.len() || !looks_like_row(lines[i]) || !looks_like_row(lines[i + 1]) {
         return false;
     }
     let (delim_line, _) = strip_nostart_literal(lines[i + 1]);
@@ -440,7 +475,7 @@ fn collect_pipe_tables(text: &str) -> Vec<Vec<PipeRow>> {
         }];
         i += 2;
         while i < lines.len() {
-            if lines[i].trim().is_empty() {
+            if lines[i].trim().is_empty() || is_thematic_break(lines[i]) {
                 i += 1;
                 continue;
             }
@@ -570,6 +605,16 @@ fn is_id_lookahead(rest: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Track+Status rows `parse_conductor_md` can see. `None` if the file is
+/// missing or not a parseable registry (honest empty vs parser-blind).
+pub fn parsed_track_row_count(record: &ProjectRecord) -> Option<usize> {
+    let path = crate::layout::resolve(record)
+        .conductor_dir
+        .join("conductor.md");
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_conductor_md(&text).ok().map(|rows| rows.len())
 }
 
 fn empty_ready_pick_error(record: &ProjectRecord) -> String {
@@ -850,6 +895,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_thematic_break_between_rows_keeps_later_ready() {
+        for hr in ["---", "***", "___", "- - -", "   ---"] {
+            let md = format!(
+                "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0001-Done](0001-Done/spec.md) | `.` | **Completed** | shipped |\n\
+{hr}\n\
+| [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | pick me |\n\
+"
+            );
+            let rows = parse_conductor_md(&md).unwrap();
+            assert_eq!(rows.len(), 2, "{hr}");
+            assert_eq!(rows[1].id, "0002", "{hr}");
+            assert!(is_eligible_ready(&rows[1].status_raw), "{hr}");
+        }
+    }
+
+    #[test]
+    fn parse_four_space_indented_hr_closes_table() {
+        let md = format!(
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Done](0001-Done/spec.md) | `.` | **Completed** | shipped |\n\
+             {}\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | hidden |\n",
+            "    ---"
+        );
+        let rows = parse_conductor_md(&md).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].id, "0001");
+    }
+
+    #[test]
     fn parse_concatenates_later_track_status_table() {
         let md = "\
 | Track | Execution path | Status | Summary |\n\
@@ -881,6 +960,31 @@ mod tests {
 | --- | --- | --- | --- |\n\
 | [0001-Done](0001-Done/spec.md) | `.` | **Completed** | shipped |\n\
 \n\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0008-Ready](0008-Ready/spec.md) | `.` | **Ready — not started** | pick me |\n\
+";
+        let rows = parse_conductor_md(md).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].id, "0001");
+        assert_eq!(rows[1].id, "0008");
+        assert!(rows.iter().all(|r| r.id != "Track"));
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(ws, md);
+        mkdir_track(ws, "0001-Done");
+        mkdir_track(ws, "0008-Ready");
+        let r = rec(ws);
+        assert_eq!(pick_next_ready(&r).unwrap(), "0008");
+    }
+
+    #[test]
+    fn parse_new_table_after_thematic_break_not_swallowed() {
+        let md = "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0001-Done](0001-Done/spec.md) | `.` | **Completed** | shipped |\n\
+---\n\
 | Track | Execution path | Status | Summary |\n\
 | --- | --- | --- | --- |\n\
 | [0008-Ready](0008-Ready/spec.md) | `.` | **Ready — not started** | pick me |\n\
