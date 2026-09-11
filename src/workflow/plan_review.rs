@@ -2425,6 +2425,14 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("conductor").join("0001-Example")).unwrap();
         std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
+        std::fs::write(
+            dir.path().join("conductor").join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Ready — not started** | one |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
         let mut r = rec(dir.path());
         r.auto_start = crate::registry::AutoStartPolicy::Full;
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(

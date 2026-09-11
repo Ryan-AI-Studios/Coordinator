@@ -2886,6 +2886,14 @@ Loop\r\n",
         let proj = tempdir().unwrap();
         std::fs::create_dir_all(proj.path().join("conductor").join("0001-Example")).unwrap();
         std::fs::create_dir_all(proj.path().join("conductor").join("0002-Next")).unwrap();
+        std::fs::write(
+            proj.path().join("conductor").join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Ready — not started** | one |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
         unsafe {
             std::env::set_var(ENV_COORDINATOR_HOME, home.path());
         }
@@ -2992,7 +3000,16 @@ Loop\r\n",
         let _guard = test_env_lock();
         let home = tempdir().unwrap();
         let proj = tempdir().unwrap();
+        std::fs::create_dir_all(proj.path().join("conductor").join("0001-Example")).unwrap();
         std::fs::create_dir_all(proj.path().join("conductor").join("0002-Next")).unwrap();
+        std::fs::write(
+            proj.path().join("conductor").join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Ready — not started** | one |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
         unsafe {
             std::env::set_var(ENV_COORDINATOR_HOME, home.path());
         }

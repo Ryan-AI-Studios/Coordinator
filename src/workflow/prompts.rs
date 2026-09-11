@@ -214,8 +214,9 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
             let path = workspace_skill(record, "plan");
             format!(
                 "{}\n\
-                 Pick the next natural track, or none. The last line of your reply must be \
-                 `next_track: <id>` or `next_track: null`.\n\
+                 Coordinator derives the next Ready row from `conductor.md`. \
+                 The last line of your reply must be `next_track: <id>` or `next_track: null` \
+                 (recorded; Coordinator may override).\n\
                  {END_TURN}\n",
                 honor_skill("plan", &path)
             )

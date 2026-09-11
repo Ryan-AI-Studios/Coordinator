@@ -267,15 +267,15 @@ Status JSON includes additive `workflow` `{ id, driver, pending_roles, address_f
 
 **Injected prompt contract:** adapter injects a **per-phase** body (not one shared blurb). Each Grok-bound phase (`plan` / `fold` / `implement` / `address-findings` / `advance`) and each plan-review slot names that phase’s skill as an absolute `{workspace|execution}/.agents/skills/<name>/SKILL.md` path (planning skills live above the product git root and are not auto-discovered from `grok_cwd`). `plan`, plan-review, and `implement` include a live-research line (verify pins/APIs against primary sources). Adapter-driven Grok turns complete by **ending the turn** — do **not** run `coordinator outcome write` during that inject (file_wait / hooks still use the CLI). Mid-inject CLI writes that change `state.phase` are ignored when the turn returns (`apply_turn` skips if the live phase drifted from the injected phase).
 
-**`next_track`:** On adapter `advance`, the Planner’s last matching reply line `next_track: <id>` or `next_track: null` is copied into outcome metadata (`null` / `none` / empty clears a stale id; omitting the line leaves `state.next_track` untouched). CLI `--next-track` remains the file_wait path. On `advance` success the project `auto_start` policy gates the chain (models still emit `next_track: <id>` freely):
+**`next_track`:** On adapter `advance`, the Planner’s last matching reply line `next_track: <id>` or `next_track: null` is copied into outcome metadata (`null` / `none` / empty clears a stale id; omitting the line leaves `state.next_track` untouched). CLI `--next-track` remains the file_wait path. Coordinator **derives** the successor from `conductor.md` Ready rows using the same walk as omit-`--track` (table / suggested-order fence; skip HITL / `nostart` / Completed / current `track_id`; **no `gh`** on advance). The planner line is recorded and journaled on mismatch (`override next_track …`); it does **not** select. Proposed rows are never started from advance even if their directory exists. `auto_start` still gates park vs in-process chain after a candidate is accepted:
 
-| Policy | Valid next id (row not `<!-- nostart -->`) | Omit `--track` pick |
+| Policy | Eligible Ready successor (row not `<!-- nostart -->`) | Omit `--track` pick |
 |--------|--------------------------------------------|---------------------|
 | `full` | In-process auto-start at `plan` | Unchanged (first Ready) |
-| `hitl` (default) | **Park** — Idle + `workflow: backlog clear`, `next_track` cleared, `parked_next` set, journal `advance: parked-next <id> (policy=…)` | Unchanged (first Ready) |
+| `hitl` (default) | **Park** — Idle + `workflow: backlog clear`, `next_track` cleared, `parked_next` set, journal `parked-next <id> (policy=…)` | Unchanged (first Ready) |
 | `never` | Same park | Error `auto_start=never; pass --track` |
 
-A per-row `<!-- nostart -->` (exact literal, inside a cell) parks that id and skips omit-pick; explicit `run --track N` always starts. Null/empty next → Idle (backlog clear). Unknown id → Idle (does not fail the completed track). Pause holds the pending next until resume, then the same policy gate runs.
+A per-row `<!-- nostart -->` (exact literal, inside a cell) skips that id for advance and omit-pick; explicit `run --track N` always starts. No eligible Ready → Idle (backlog clear). Unknown or missing planner id is **not** a sticky Idle — the Ready walk still runs. Pause holds until resume, then the same Ready walk + policy gate run (registry may have moved). Probe 0099 / Helping Hands 0001–0013 safety is **row eligibility** (`nostart` / HITL / not Ready), not planner `null`.
 
 **Compact:** capability-gated; timeout/failure **skips** (not a hard gate). Adapter errors surface as `compact: skipped — {reason}` (still no Failure Artifact).
 
