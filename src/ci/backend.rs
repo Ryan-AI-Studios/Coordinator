@@ -7,6 +7,47 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{CoordinatorError, Result};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergeStateStatus {
+    /// Scripted / HeadSha / test helpers — interpret items as the 0010 fail-set.
+    #[default]
+    Unspecified,
+    Unknown,
+    Clean,
+    Unstable,
+    Blocked,
+    Behind,
+    Dirty,
+    Draft,
+    HasHooks,
+}
+
+impl MergeStateStatus {
+    /// Live `gh pr view` JSON. Missing / unknown strings → [`Self::Unknown`].
+    pub fn parse_live(s: &str) -> Self {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "CLEAN" => Self::Clean,
+            "UNSTABLE" => Self::Unstable,
+            "BLOCKED" => Self::Blocked,
+            "BEHIND" => Self::Behind,
+            "DIRTY" => Self::Dirty,
+            "DRAFT" => Self::Draft,
+            "HAS_HOOKS" => Self::HasHooks,
+            "UNKNOWN" => Self::Unknown,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckView {
+    /// `items` are the fail-set (0010 / HeadSha / old tests).
+    #[default]
+    Unspecified,
+    /// Live PR path: `items` = `--required` (maybe empty); `advisory` holds the rest.
+    Required,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CiTarget {
     PullRequest {
@@ -15,6 +56,7 @@ pub enum CiTarget {
         is_draft: bool,
         merged: bool,
         head_oid: Option<String>,
+        merge_state: MergeStateStatus,
     },
     HeadSha {
         sha: String,
@@ -63,14 +105,26 @@ pub struct CheckItem {
 pub struct CheckSnapshot {
     pub items: Vec<CheckItem>,
     pub raw_exit: i32,
+    pub merge_state: MergeStateStatus,
+    pub view: CheckView,
+    pub advisory: Vec<CheckItem>,
+}
+
+impl Default for CheckSnapshot {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            raw_exit: 0,
+            merge_state: MergeStateStatus::Unspecified,
+            view: CheckView::Unspecified,
+            advisory: Vec::new(),
+        }
+    }
 }
 
 impl CheckSnapshot {
     pub fn empty() -> Self {
-        Self {
-            items: Vec::new(),
-            raw_exit: 0,
-        }
+        Self::default()
     }
 }
 
