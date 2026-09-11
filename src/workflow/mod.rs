@@ -239,10 +239,12 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
         Err(e) => {
             journal_advance_override(record, planner.as_deref(), None);
             let msg = e.to_string();
-            if msg.contains("no matching conductor directory") {
-                let detail = msg.split("; pass --track").next().unwrap_or(&msg);
-                crate::progress_log::append(record, "advance", detail);
-            }
+            let gist = msg.split("; pass --track").next().unwrap_or(&msg);
+            let detail = match conductor_md::parsed_track_row_count(record) {
+                Some(n) => format!("{gist} ({n} rows parsed)"),
+                None => gist.to_string(),
+            };
+            crate::progress_log::append(record, "advance", &detail);
             apply_backlog_clear(record, state);
         }
     }
@@ -1095,6 +1097,35 @@ mod tests {
         .unwrap();
     }
 
+    fn write_thematic_break_completed_and_ready(dir: &std::path::Path) {
+        let cond = dir.join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Completed** | done |\n\
+             ---\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
+    }
+
+    fn write_completed_and_proposed(dir: &std::path::Path) {
+        let cond = dir.join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Completed** | done |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Proposed — placeholder, needs full spec/plan pass** | later |\n",
+        )
+        .unwrap();
+    }
+
     fn write_two_ready(dir: &std::path::Path) {
         let cond = dir.join("conductor");
         std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
@@ -1232,6 +1263,53 @@ mod tests {
         assert!(!view.last_event.contains("backlog clear"), "{view:?}");
         let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
         assert!(log.contains("override next_track null → 0002"), "{log}");
+    }
+
+    #[test]
+    fn advance_full_thematic_break_table_starts_ready() {
+        let dir = tempdir().unwrap();
+        write_thematic_break_completed_and_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        state.next_track = None;
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0002"));
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, graph::PHASE_PLAN);
+        assert!(view.last_event.contains("auto-start 0002"), "{view:?}");
+        assert!(!view.last_event.contains("backlog clear"), "{view:?}");
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("override next_track null → 0002"), "{log}");
+    }
+
+    #[test]
+    fn advance_empty_ready_walk_journals_row_count() {
+        let dir = tempdir().unwrap();
+        write_completed_and_proposed(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        state.next_track = None;
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert_eq!(view.track_id.as_deref(), Some("0001"));
+        assert!(view.next_track.is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(
+            log.contains("no Ready — not started track in conductor.md"),
+            "{log}"
+        );
+        assert!(log.contains("2 rows parsed"), "{log}");
     }
 
     #[test]
