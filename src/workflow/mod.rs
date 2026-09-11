@@ -173,8 +173,8 @@ pub fn reset_phase_clock(state: &mut RunState) {
     }
 }
 
-/// `advance` success: `full` auto-starts a valid track; hitl/never/`nostart` park.
-/// Idle on null/invalid. Pause holds until resume.
+/// `advance` success: Ready-walk successor, then `full` auto-starts;
+/// hitl/never/`nostart` park. Idle when no eligible Ready. Pause holds until resume.
 pub fn apply_advance(record: &ProjectRecord, state: &mut RunState) {
     if state.status == RunStatus::Paused {
         state.last_driven_phase = Some(graph::PHASE_ADVANCE.into());
@@ -184,49 +184,66 @@ pub fn apply_advance(record: &ProjectRecord, state: &mut RunState) {
     finish_advance(record, state);
 }
 
-fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
-    match state
+/// First eligible Ready after excluding `state.track_id` (0030 sequencer, no `gh`).
+fn advance_successor(record: &ProjectRecord, state: &RunState) -> crate::error::Result<String> {
+    let excluded: Vec<String> = state
+        .track_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .into_iter()
+        .collect();
+    conductor_md::pick_next_ready_excluding(record, &excluded, None)
+}
+
+fn planner_recorded_id(state: &RunState) -> Option<String> {
+    state
         .next_track
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn journal_advance_override(record: &ProjectRecord, planner_id: Option<&str>, cand: Option<&str>) {
+    let detail = match (planner_id, cand) {
+        (Some(p), Some(c)) if !crate::notify::artifact::track_ids_match(p, c) => {
+            Some(format!("override next_track {p} → {c}"))
+        }
+        (None, Some(c)) => Some(format!("override next_track null → {c}")),
+        (Some(p), None) => Some(format!("override next_track {p} → (none)")),
+        _ => None,
+    };
+    if let Some(detail) = detail {
+        crate::progress_log::append(record, "advance", &detail);
+    }
+}
+
+fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
+    if let Some(id) = state
+        .track_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && shipped::track_is_shipped_local(record, state, id)
     {
-        None => apply_backlog_clear(record, state),
-        Some(id) => {
-            let id = id.to_string();
-            if resolve_track_dir(record, &id).is_none() {
-                state.status = RunStatus::Idle;
-                state.last_event = format!("workflow: invalid next_track {id}");
-                state.phase_started_at = None;
-                state.pause_started_at = None;
-                return;
+        crate::progress_log::append(record, "advance", &skip_merged_detail(state, id));
+    }
+    let planner = planner_recorded_id(state);
+    match advance_successor(record, state) {
+        Ok(cand) => {
+            journal_advance_override(record, planner.as_deref(), Some(cand.as_str()));
+            start_or_park(record, state, &cand);
+        }
+        Err(e) => {
+            journal_advance_override(record, planner.as_deref(), None);
+            let msg = e.to_string();
+            if msg.contains("no matching conductor directory") {
+                let detail = msg.split("; pass --track").next().unwrap_or(&msg);
+                crate::progress_log::append(record, "advance", detail);
             }
-            if shipped::track_is_shipped_local(record, state, &id) {
-                crate::progress_log::append(record, "advance", &skip_merged_detail(state, &id));
-                let mut excluded = vec![id];
-                loop {
-                    match conductor_md::pick_next_ready_excluding(record, &excluded, None) {
-                        Ok(cand) => {
-                            if shipped::track_is_shipped_local(record, state, &cand) {
-                                crate::progress_log::append(
-                                    record,
-                                    "advance",
-                                    &skip_merged_detail(state, &cand),
-                                );
-                                excluded.push(cand);
-                                continue;
-                            }
-                            start_or_park(record, state, &cand);
-                            return;
-                        }
-                        Err(_) => {
-                            apply_backlog_clear(record, state);
-                            return;
-                        }
-                    }
-                }
-            }
-            start_or_park(record, state, &id);
+            apply_backlog_clear(record, state);
         }
     }
 }
@@ -907,6 +924,11 @@ mod tests {
         let view = write_and_apply(&r, o).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         assert!(view.last_event.contains("backlog clear"));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap_or_default();
+        assert!(
+            !log.contains("override next_track"),
+            "planner-null + no Ready must not journal override: {log}"
+        );
     }
 
     fn write_failure_md(r: &crate::registry::ProjectRecord, track: &str, epoch: u64) {
@@ -971,9 +993,7 @@ mod tests {
     #[test]
     fn advance_valid_auto_starts() {
         let dir = tempdir().unwrap();
-        let cond = dir.path().join("conductor");
-        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
-        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        write_both_ready(dir.path());
         let mut r = rec(dir.path());
         r.auto_start = AutoStartPolicy::Full;
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
@@ -1005,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_invalid_idles_without_fail() {
+    fn advance_unknown_id_backlog_clears_without_fail() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
@@ -1022,14 +1042,20 @@ mod tests {
         let view = write_and_apply(&r, o).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         assert!(view.failure_class.is_none());
-        assert!(view.last_event.contains("invalid next_track"));
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert!(!view.last_event.contains("invalid next_track"));
         assert_eq!(view.track_id.as_deref(), Some("0001"));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(
+            log.contains("override next_track does-not-exist → (none)"),
+            "{log}"
+        );
     }
 
     #[test]
     fn pause_holds_auto_start_until_resume() {
         let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
+        write_two_ready(dir.path());
         let mut r = rec(dir.path());
         r.auto_start = AutoStartPolicy::Full;
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
@@ -1094,6 +1120,112 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    fn write_completed_and_two_ready(dir: &std::path::Path) {
+        let cond = dir.join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::create_dir_all(cond.join("0003-Later")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Completed** | done |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n\
+             | [0003-Later](0003-Later/spec.md) | `.` | **Ready — not started** | skip |\n",
+        )
+        .unwrap();
+    }
+
+    fn write_ready_row_without_dir(dir: &std::path::Path) {
+        let cond = dir.join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Completed** | done |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | ghost |\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn advance_planner_skip_starts_first_ready() {
+        let dir = tempdir().unwrap();
+        write_completed_and_two_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0003".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0002"));
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, graph::PHASE_PLAN);
+        assert!(view.last_event.contains("auto-start 0002"), "{view:?}");
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("override next_track 0003 → 0002"), "{log}");
+    }
+
+    #[test]
+    fn advance_planner_null_starts_ready() {
+        let dir = tempdir().unwrap();
+        write_two_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        state.next_track = None;
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0002"));
+        assert_eq!(view.status, RunStatus::Running);
+        assert!(view.last_event.contains("auto-start 0002"));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("override next_track null → 0002"), "{log}");
+    }
+
+    #[test]
+    fn advance_missing_planner_id_parks_or_starts_ready() {
+        let dir = tempdir().unwrap();
+        write_two_ready(dir.path());
+        let r = rec(dir.path());
+        assert_eq!(r.auto_start, AutoStartPolicy::Hitl);
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0099".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert!(!view.last_event.contains("invalid next_track"));
+        assert_eq!(view.parked_next.as_deref(), Some("0002"));
+        assert!(should_pick_next_ready(&ReadyPickState::from(&view)));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("override next_track 0099 → 0002"), "{log}");
+        assert!(log.contains("parked-next 0002 (policy=hitl)"), "{log}");
+        let (track, picked) = crate::api::resolve_run_track(&r, None).unwrap();
+        assert!(picked);
+        assert_eq!(track.as_deref(), Some("0002"));
     }
 
     fn merge_done_on(state: &mut crate::state::RunState, pr: Option<u64>) {
@@ -1236,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_missing_dir_still_invalid_next_track() {
+    fn advance_missing_dir_backlog_clears() {
         let dir = tempdir().unwrap();
         write_only_ready(dir.path(), "0001", "Example");
         let mut r = rec(dir.path());
@@ -1255,8 +1387,36 @@ mod tests {
         );
         let view = write_and_apply(&r, o).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
-        assert!(view.last_event.contains("invalid next_track 0099"));
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert!(!view.last_event.contains("invalid next_track"));
         assert_eq!(view.track_id.as_deref(), Some("0001"));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("override next_track 0099 → (none)"), "{log}");
+    }
+
+    #[test]
+    fn advance_ready_missing_dir_journals_miss() {
+        let dir = tempdir().unwrap();
+        write_ready_row_without_dir(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(
+            graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            Some("0099".into()),
+            None,
+        );
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("no matching conductor directory"), "{log}");
+        assert!(log.contains("override next_track 0099 → (none)"), "{log}");
     }
 
     #[test]
@@ -1273,7 +1433,7 @@ mod tests {
             graph::PHASE_ADVANCE,
             OutcomeSource::Test,
             None,
-            Some("0002".into()),
+            Some("0003".into()),
             None,
         );
         let view = write_and_apply(&r, o).unwrap();
@@ -1284,6 +1444,7 @@ mod tests {
         assert_eq!(view.auto_start, AutoStartPolicy::Hitl);
         let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
         assert!(log.contains("parked-next 0002 (policy=hitl)"), "{log}");
+        assert!(log.contains("override next_track 0003 → 0002"), "{log}");
         let (track, picked) = crate::api::resolve_run_track(&r, None).unwrap();
         assert!(picked);
         assert_eq!(track.as_deref(), Some("0002"));
@@ -1342,15 +1503,18 @@ mod tests {
     }
 
     #[test]
-    fn nostart_row_parks_even_under_full() {
+    fn nostart_row_skipped_full_starts_next_ready() {
         let dir = tempdir().unwrap();
         let cond = dir.path().join("conductor");
         std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::create_dir_all(cond.join("0003-Later")).unwrap();
         std::fs::write(
             cond.join("conductor.md"),
             "| Track | Execution path | Status | Summary |\n\
              | --- | --- | --- | --- |\n\
-             | [0002-Next](0002-Next/spec.md) <!-- nostart --> | `.` | **Ready — not started** | lock |\n",
+             | [0001-Example](0001-Example/spec.md) | `.` | **Completed** | done |\n\
+             | [0002-Next](0002-Next/spec.md) <!-- nostart --> | `.` | **Ready — not started** | lock |\n\
+             | [0003-Later](0003-Later/spec.md) | `.` | **Ready — not started** | next |\n",
         )
         .unwrap();
         let mut r = rec(dir.path());
@@ -1367,10 +1531,13 @@ mod tests {
             None,
         );
         let view = write_and_apply(&r, o).unwrap();
-        assert_eq!(view.status, RunStatus::Idle);
-        assert_eq!(view.parked_next.as_deref(), Some("0002"));
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0003"));
+        assert!(view.last_event.contains("auto-start 0003"));
+        assert!(view.parked_next.is_none());
         let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
-        assert!(log.contains("parked-next 0002 (policy=nostart)"), "{log}");
+        assert!(log.contains("override next_track 0002 → 0003"), "{log}");
+        assert!(!log.contains("parked-next 0002"), "{log}");
         let (track, picked) = crate::api::resolve_run_track(&r, Some("0002".into())).unwrap();
         assert!(!picked);
         assert_eq!(track.as_deref(), Some("0002"));
@@ -1379,7 +1546,7 @@ mod tests {
     #[test]
     fn paused_hitl_parks_on_resume() {
         let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
+        write_two_ready(dir.path());
         let r = rec(dir.path());
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
         run::pause(&r).unwrap();

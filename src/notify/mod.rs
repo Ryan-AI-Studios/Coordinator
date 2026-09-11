@@ -733,7 +733,16 @@ mod tests {
         let rec_h =
             hermes::install_recording("http://127.0.0.1:8644/webhooks/coordinator-progress", "s");
         let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conductor").join("0033-Example")).unwrap();
         std::fs::create_dir_all(dir.path().join("conductor").join("0040-Next")).unwrap();
+        std::fs::write(
+            dir.path().join("conductor").join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0033-Example](0033-Example/spec.md) | `.` | **Completed** | done |\n\
+             | [0040-Next](0040-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
         let mut r = rec(dir.path());
         r.auto_start = crate::registry::AutoStartPolicy::Full;
         jump_phase(&r, crate::workflow::graph::PHASE_ADVANCE, "0033");
