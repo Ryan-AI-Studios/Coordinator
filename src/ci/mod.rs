@@ -25,7 +25,7 @@ use crate::registry::ProjectRecord;
 use crate::state::{
     CiWatchState, RunState, StatusView, load_run_state, save_run_state, with_run_state_lock,
 };
-use crate::workflow::WorkflowDriver;
+use crate::workflow::{MergedTrackProbe, WorkflowDriver};
 
 pub use backend::{
     CallCounts, CheckBucket, CheckItem, CheckSnapshot, CiBackend, CiTarget, MergeResult, PrHint,
@@ -104,6 +104,8 @@ pub fn drive_with(
         Ok(t) => t,
         Err(e) => return classify_backend_err(record, state, e),
     };
+    // Probe after resolve (outside the apply lock). Err / missing → fail-open wait.
+    let target = target.or_else(|| try_merged_track_target(state, &cwd));
 
     let Some(target) = target else {
         persist_watch(record, Some("ci-wait: waiting for PR"), |ci| {
@@ -445,14 +447,42 @@ fn resolve_target(
             if let Some(t) = backend.resolve_pr(cwd, Some(&hinted))? {
                 return Ok(Some(t));
             }
-            // Do not invent is_draft=false on a transient view miss.
-            return Ok(None);
+            // Hinted view miss is not sticky. Unhinted walks open then merged --head.
+            // Do not invent is_draft=false. Do not map the persisted PR oid to HeadSha.
+            return backend.resolve_pr(cwd, None);
         }
         if let Some(ref sha) = ci.head_sha {
             return Ok(Some(CiTarget::HeadSha { sha: sha.clone() }));
         }
     }
     backend.resolve_pr(cwd, hint)
+}
+
+/// Adapter merged-PR probe. Tests never construct a live `GhMergedTrackProbe`.
+#[cfg(test)]
+fn ci_merged_probe() -> Option<Arc<dyn MergedTrackProbe>> {
+    crate::workflow::shipped::installed_merged_probe()
+}
+
+#[cfg(not(test))]
+fn ci_merged_probe() -> Option<GhMergedTrackProbe> {
+    Some(GhMergedTrackProbe::default())
+}
+
+/// Title-probe fallback when `resolve_pr` is still `None`. Fail-open on Err.
+fn try_merged_track_target(state: &RunState, cwd: &Path) -> Option<CiTarget> {
+    let numeric = state
+        .track_id
+        .as_deref()
+        .and_then(crate::notify::artifact::numeric_track_id)?;
+    let n = ci_merged_probe().and_then(|p| p.merged_pr_for_track(cwd, numeric).ok().flatten())?;
+    Some(CiTarget::PullRequest {
+        number: n,
+        url: String::new(),
+        is_draft: false,
+        merged: true,
+        head_oid: None,
+    })
 }
 
 fn set_key(target: &CiTarget, items: &[CheckItem]) -> String {
@@ -1103,6 +1133,167 @@ mod tests {
         run_with_driver(&r, None, WorkflowDriver::FileWait).unwrap();
         let st = load_run_state(&r).unwrap();
         assert!(st.ci.is_none());
+    }
+
+    #[test]
+    fn waiting_for_pr_merged_track_probe_succeeds() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        let (_hook, counts) = hook(s);
+        let _pg = crate::workflow::shipped::install_test_merged_probe(Arc::new(
+            crate::workflow::shipped::ScriptedMergedProbe::found("0010", 66),
+        ));
+        let view = crate::workflow::tick(&r)
+            .unwrap()
+            .expect("merged via title probe");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert!(
+            view.last_event.contains("ci-wait: merged #66"),
+            "last_event={}",
+            view.last_event
+        );
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(
+            st.ci.as_ref().and_then(|c| c.merge.as_deref()),
+            Some("done")
+        );
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn waiting_for_pr_stays_pending_when_unresolved() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("waiting for PR"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn waiting_for_pr_probe_err_fail_open() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        let (_hook, counts) = hook(s);
+        let _pg = crate::workflow::shipped::install_test_merged_probe(Arc::new(
+            crate::workflow::shipped::ScriptedMergedProbe::err("0010", "gh pr list failed"),
+        ));
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("waiting for PR"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_ne!(st.failure_class, Some(FailureClass::Permission));
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn hinted_pr_view_miss_falls_through_to_merged_target() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let mut st = load_run_state(&r).unwrap();
+        st.ci = Some(CiWatchState {
+            pr_number: Some(66),
+            ..Default::default()
+        });
+        save_run_state(&r, &st).unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_resolve(Ok(Some(pr(66, false, true))));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r)
+            .unwrap()
+            .expect("hinted miss → merged");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert!(
+            view.last_event.contains("ci-wait: merged #66"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(counts.resolve_n() >= 2, "resolve_n={}", counts.resolve_n());
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn hinted_miss_does_not_headsha_pr_oid() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let mut st = load_run_state(&r).unwrap();
+        st.ci = Some(CiWatchState {
+            pr_number: Some(66),
+            head_sha: Some("pr-oid-not-on-default".into()),
+            ..Default::default()
+        });
+        save_run_state(&r, &st).unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_resolve(Ok(None));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("waiting for PR"),
+            "last_event={}",
+            st.last_event
+        );
+        assert!(
+            !st.last_event.contains("default branch, no PR"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
     }
 
     #[test]
