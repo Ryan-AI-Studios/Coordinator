@@ -216,7 +216,7 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                 "{}\n\
                  Coordinator derives the next Ready row from `conductor.md`. \
                  The last line of your reply must be `next_track: <id>` or `next_track: null` \
-                 (recorded; Coordinator may override).\n\
+                 (recorded; Coordinator overrides). Soft-next / `null` is not backlog-clear.\n\
                  {END_TURN}\n",
                 honor_skill("plan", &path)
             )
@@ -605,6 +605,14 @@ mod tests {
         assert!(text.contains("Honor project skills"));
         assert!(text.contains("next_track:"));
         assert!(text.contains("null"));
+        assert!(
+            text.contains("recorded") && text.contains("overrides"),
+            "advance records next_track and overrides: {text}"
+        );
+        assert!(
+            text.contains("not backlog-clear"),
+            "soft-next / null is not backlog-clear: {text}"
+        );
         assert!(text.contains("end this turn") || text.contains("end the turn"));
         assert!(text.contains("Do not") && text.contains("outcome write"));
         let n = text.replace('\\', "/");

@@ -1080,6 +1080,21 @@ mod tests {
         assert_eq!(resumed.track_id.as_deref(), Some("0002"));
     }
 
+    fn write_blank_line_completed_and_ready(dir: &std::path::Path) {
+        let cond = dir.join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Completed** | done |\n\
+             \n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
+    }
+
     fn write_two_ready(dir: &std::path::Path) {
         let cond = dir.join("conductor");
         std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
@@ -1193,6 +1208,28 @@ mod tests {
         assert_eq!(view.track_id.as_deref(), Some("0002"));
         assert_eq!(view.status, RunStatus::Running);
         assert!(view.last_event.contains("auto-start 0002"));
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(log.contains("override next_track null → 0002"), "{log}");
+    }
+
+    #[test]
+    fn advance_full_blank_line_table_starts_ready() {
+        let dir = tempdir().unwrap();
+        write_blank_line_completed_and_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        state.next_track = None;
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0002"));
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, graph::PHASE_PLAN);
+        assert!(view.last_event.contains("auto-start 0002"), "{view:?}");
+        assert!(!view.last_event.contains("backlog clear"), "{view:?}");
         let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
         assert!(log.contains("override next_track null → 0002"), "{log}");
     }

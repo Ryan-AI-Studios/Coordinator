@@ -285,10 +285,11 @@ struct PipeRow {
     nostart: bool,
 }
 
-/// First GFM table with Track/Id + Status columns, by header name.
+/// Every GFM table with Track/Id + Status columns, concatenated, by header name.
 pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let tables = collect_pipe_tables(text);
+    let mut rows = Vec::new();
     for table in tables {
         if table.len() < 2 {
             continue;
@@ -306,7 +307,6 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
         };
         let summary_col = headers.iter().position(|h| is_summary_header(h));
         let ncols = headers.len();
-        let mut rows = Vec::new();
         for row in table.iter().skip(1) {
             if row.cells.len() != ncols {
                 continue;
@@ -327,16 +327,13 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
                 nostart: row.nostart,
             });
         }
-        if rows.is_empty() {
-            return Err(CoordinatorError::Message(
-                "could not parse track registry in conductor.md; pass --track <id>".into(),
-            ));
-        }
-        return Ok(rows);
     }
-    Err(CoordinatorError::Message(
-        "could not parse track registry in conductor.md; pass --track <id>".into(),
-    ))
+    if rows.is_empty() {
+        return Err(CoordinatorError::Message(
+            "could not parse track registry in conductor.md; pass --track <id>".into(),
+        ));
+    }
+    Ok(rows)
 }
 
 fn is_track_or_id_header(h: &str) -> bool {
@@ -417,29 +414,39 @@ fn looks_like_row(line: &str) -> bool {
     !t.is_empty() && t.contains('|') && !t.starts_with("```") && !t.starts_with("~~~")
 }
 
+fn is_table_start(lines: &[&str], i: usize) -> bool {
+    if i + 1 >= lines.len() || !looks_like_row(lines[i]) {
+        return false;
+    }
+    let (delim_line, _) = strip_nostart_literal(lines[i + 1]);
+    let delim = split_unescaped_pipes(&delim_line);
+    !delim.is_empty() && delim.iter().all(|c| is_delimiter_cell(c))
+}
+
 fn collect_pipe_tables(text: &str) -> Vec<Vec<PipeRow>> {
     let lines: Vec<&str> = text.lines().collect();
     let mut tables = Vec::new();
     let mut i = 0;
-    while i + 1 < lines.len() {
-        if !looks_like_row(lines[i]) {
+    while i < lines.len() {
+        if !is_table_start(&lines, i) {
             i += 1;
             continue;
         }
         let (header_line, header_nostart) = strip_nostart_literal(lines[i]);
         let header = split_unescaped_pipes(&header_line);
-        let (delim_line, _) = strip_nostart_literal(lines[i + 1]);
-        let delim = split_unescaped_pipes(&delim_line);
-        if delim.is_empty() || !delim.iter().all(|c| is_delimiter_cell(c)) {
-            i += 1;
-            continue;
-        }
         let mut rows = vec![PipeRow {
             cells: header,
             nostart: header_nostart,
         }];
         i += 2;
-        while i < lines.len() && looks_like_row(lines[i]) {
+        while i < lines.len() {
+            if lines[i].trim().is_empty() {
+                i += 1;
+                continue;
+            }
+            if !looks_like_row(lines[i]) || is_table_start(&lines, i) {
+                break;
+            }
             let (stripped, nostart) = strip_nostart_literal(lines[i]);
             rows.push(PipeRow {
                 cells: split_unescaped_pipes(&stripped),
@@ -828,6 +835,71 @@ mod tests {
     }
 
     #[test]
+    fn parse_blank_line_between_rows_keeps_later_ready() {
+        let md = "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0001-Done](0001-Done/spec.md) | `.` | **Completed** | shipped |\n\
+\n\
+| [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | pick me |\n\
+";
+        let rows = parse_conductor_md(md).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].id, "0002");
+        assert!(is_eligible_ready(&rows[1].status_raw));
+    }
+
+    #[test]
+    fn parse_concatenates_later_track_status_table() {
+        let md = "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0001-Done](0001-Done/spec.md) | `.` | **Completed** | shipped |\n\
+\n\
+## Later cluster\n\
+\n\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0009-Ready](0009-Ready/spec.md) | `.` | **Ready — not started** | pick me |\n\
+";
+        let rows = parse_conductor_md(md).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].id, "0009");
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(ws, md);
+        mkdir_track(ws, "0001-Done");
+        mkdir_track(ws, "0009-Ready");
+        let r = rec(ws);
+        assert_eq!(pick_next_ready(&r).unwrap(), "0009");
+    }
+
+    #[test]
+    fn parse_new_table_after_blank_not_swallowed() {
+        let md = "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0001-Done](0001-Done/spec.md) | `.` | **Completed** | shipped |\n\
+\n\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0008-Ready](0008-Ready/spec.md) | `.` | **Ready — not started** | pick me |\n\
+";
+        let rows = parse_conductor_md(md).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].id, "0001");
+        assert_eq!(rows[1].id, "0008");
+        assert!(rows.iter().all(|r| r.id != "Track"));
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(ws, md);
+        mkdir_track(ws, "0001-Done");
+        mkdir_track(ws, "0008-Ready");
+        let r = rec(ws);
+        assert_eq!(pick_next_ready(&r).unwrap(), "0008");
+    }
+
+    #[test]
     fn parse_5col_orca_status_by_header_name() {
         let md = "\
 | Track | Kind | Execution | Status | Summary |\n\
@@ -1069,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn first_qualifying_table_zero_valid_rows_is_parse_error() {
+    fn first_qualifying_table_zero_valid_rows_continues() {
         let md = "\
 | Track | Execution path | Status | Summary |\n\
 | --- | --- | --- | --- |\n\
@@ -1078,10 +1150,47 @@ mod tests {
 \n\
 | Track | Execution path | Status | Summary |\n\
 | --- | --- | --- | --- |\n\
-| 0030-Later | `.` | **Ready — not started** | must not win |\n\
+| 0030-Later | `.` | **Ready — not started** | later table wins |\n\
+";
+        let rows = parse_conductor_md(md).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "0030");
+    }
+
+    #[test]
+    fn all_track_tables_zero_valid_rows_is_parse_error() {
+        let md = "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| not-an-id | `.` | **Ready — not started** | skip |\n\
+\n\
+| Status | Meaning |\n\
+|--------|--------|\n\
+| Ready — not started | Full spec |\n\
 ";
         let err = parse_conductor_md(md).unwrap_err().to_string();
         assert!(err.contains("could not parse"), "{err}");
+    }
+
+    #[test]
+    fn pick_ready_without_plan_md_still_starts() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0050-EmptyDir | `.` | **Ready — not started** | no plan.md |\n",
+        );
+        mkdir_track(ws, "0050-EmptyDir");
+        assert!(
+            !ws.join("conductor")
+                .join("0050-EmptyDir")
+                .join("plan.md")
+                .exists()
+        );
+        let r = rec(ws);
+        assert_eq!(pick_next_ready(&r).unwrap(), "0050");
     }
 
     #[test]
