@@ -51,6 +51,18 @@ execution-repo git tree). Do not treat missing AI_BRAINS_KEY as a gate fail.
 Do not select or review sibling tracks (do not pick Helping Hands 0001–0013).
 
 Audit every Definition of Done item in the track spec against the product tree.
+Downstream lifecycle is not this gate. Do NOT fail the gate and do NOT log
+P0/P1/P2 findings for steps owned by later phases (ci-wait, auto-merge,
+advance): PR squash-merge not landed; conductor.md / cluster registry not
+Completed; required CI pending or in progress. In a read-only session, do
+not fail solely because gh or cargo was denied if local product code, tests,
+and evidence.md are present. Still FAIL when implement has not shipped:
+missing or empty evidence.md, dirty execution-repo worktree, or no EXEC
+commit. Put merge, CI, and registry state only under ## Publish Status
+(never scored, never P0–P2). If the only remaining gaps are
+publish/lifecycle, the verdict is PASS or PASS WITH DEFERRED P3 — never FAIL.
+Do not treat conductor.md or cluster registry Completed as a review-gate
+blocker.
 Flag planning docs committed into the product repo.
 Ignore training-data guesses — verify against the files.
 
@@ -63,6 +75,7 @@ Also include:
 ## Scope Reviewed
 ## Requirement and DoD Matrix
 ## Findings
+## Publish Status
 ## Completeness Sweep
 ## Wiring and Regression Review
 ## Verification Evidence
@@ -155,6 +168,30 @@ mod tests {
             prompt.contains("TRACK: (no track directory resolved)"),
             "missing unresolved TRACK:\n{prompt}"
         );
+    }
+
+    #[test]
+    fn audit_prompt_forbids_publish_dod_as_gate_fail() {
+        let prompt = audit_prompt(
+            Path::new(r"C:\dev\Helping-Hands"),
+            Path::new(r"C:\dev\Helping-Hands\hands"),
+            Some(Path::new(
+                r"C:\dev\Helping-Hands\conductor\0099-AutonomousPipelineProbe",
+            )),
+            Some("0099"),
+            Path::new(r"C:\dev\Helping-Hands\conductor\deferred.md"),
+        );
+        assert!(prompt.contains("## Verdict: PASS | PASS WITH DEFERRED P3 | FAIL"));
+        assert!(prompt.contains("Do not treat missing AI_BRAINS_KEY as a gate fail"));
+        assert!(prompt.contains("do not pick Helping Hands 0001–0013"));
+        assert!(prompt.contains("## Findings"));
+        assert!(prompt.contains("## Publish Status"));
+        assert!(prompt.contains("squash-merge"));
+        assert!(prompt.contains("Completed"));
+        assert!(prompt.contains("required CI"));
+        assert!(prompt.contains("never FAIL"));
+        assert!(prompt.contains("dirty execution-repo worktree"));
+        assert!(prompt.contains("Do not treat conductor.md or cluster registry Completed"));
     }
 
     #[test]

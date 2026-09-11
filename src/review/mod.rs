@@ -9,6 +9,8 @@ pub mod prompt;
 pub mod slot_quality;
 pub mod spawn;
 
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -195,21 +197,31 @@ pub fn drive_with(
         any_started = true;
         let t0 = Instant::now();
         let class = match run_tier(record, state, backend, &req, slug, t0)? {
-            TierEval::Finished(class) => {
-                let (verdict, event) = match class {
-                    TierClass::Pass => ("PASS", format!("cross-model: pass ({slug})")),
-                    TierClass::PassWithLows => (
-                        "PASS_WITH_LOWS",
-                        format!("cross-model: pass with lows ({slug})"),
-                    ),
-                    _ => ("FAIL", format!("cross-model: gate failed ({slug})")),
+            TierEval::Finished { class, body } => {
+                let degrade = class == TierClass::GateFail
+                    && parse::is_publish_only_fail(&body)
+                    && publish_preconditions_ok(track_dir.as_deref(), &exec_repo);
+                let (verdict, event) = if degrade {
+                    (
+                        "DEGRADED_PUBLISH",
+                        format!("cross-model: degraded to ci-wait (publish-only ({slug}))"),
+                    )
+                } else {
+                    match class {
+                        TierClass::Pass => ("PASS", format!("cross-model: pass ({slug})")),
+                        TierClass::PassWithLows => (
+                            "PASS_WITH_LOWS",
+                            format!("cross-model: pass with lows ({slug})"),
+                        ),
+                        _ => ("FAIL", format!("cross-model: gate failed ({slug})")),
+                    }
                 };
                 persist_review(record, |rv| {
                     rv.active = Some(slug.to_string());
                     rv.verdict = Some(verdict.into());
                     rv.report = Some(format!("review.{slug}.md"));
                 })?;
-                return if class == TierClass::GateFail {
+                return if class == TierClass::GateFail && !degrade {
                     apply_failure(record, state, FailureClass::Difficulty, event)
                 } else {
                     apply_success(record, state, event, OutcomeSource::Adapter)
@@ -307,7 +319,7 @@ fn class_name(class: TierClass) -> &'static str {
 }
 
 enum TierEval {
-    Finished(TierClass),
+    Finished { class: TierClass, body: String },
     FallThrough { class: TierClass, note: String },
 }
 
@@ -423,7 +435,10 @@ fn run_tier(
         }
         if would_persist {
             write_reports(record, state, slug, body)?;
-            return Ok(TierEval::Finished(class));
+            return Ok(TierEval::Finished {
+                class,
+                body: body.to_string(),
+            });
         }
         return Ok(TierEval::FallThrough {
             class,
@@ -445,6 +460,29 @@ fn write_reports(record: &ProjectRecord, state: &RunState, slug: &str, body: &st
         crate::persist::atomic_write(&copy, text.as_bytes())?;
     }
     Ok(())
+}
+
+fn publish_preconditions_ok(track_dir: Option<&Path>, exec_repo: &Path) -> bool {
+    let Some(dir) = track_dir else {
+        return false;
+    };
+    let evidence = match std::fs::read_to_string(dir.join("evidence.md")) {
+        Ok(s) => !s.trim().is_empty(),
+        Err(_) => false,
+    };
+    evidence && git_worktree_clean(exec_repo)
+}
+
+fn git_worktree_clean(exec_repo: &Path) -> bool {
+    let out = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(exec_repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        _ => false,
+    }
 }
 
 fn persist_review(record: &ProjectRecord, f: impl FnOnce(&mut ReviewWatchState)) -> Result<()> {
@@ -1276,6 +1314,187 @@ mod tests {
         run_with_driver(&r, None, WorkflowDriver::FileWait).unwrap();
         let st = load_run_state(&r).unwrap();
         assert!(st.review.is_none());
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_clean_git(dir: &std::path::Path) {
+        run_git(dir, &["init"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+        run_git(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README"), "x").unwrap();
+        run_git(dir, &["add", "-A"]);
+        run_git(dir, &["-c", "commit.gpgsign=false", "commit", "-m", "init"]);
+    }
+
+    fn write_evidence(workspace: &std::path::Path) {
+        let track = workspace.join("conductor").join("0011-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join("evidence.md"), "coordinator 0.1.0\n").unwrap();
+    }
+
+    fn rec_clean_exec(workspace: &std::path::Path, with_evidence: bool) -> ProjectRecord {
+        let exec = workspace.join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        std::fs::create_dir_all(workspace.join("conductor").join("0011-Example")).unwrap();
+        if with_evidence {
+            write_evidence(workspace);
+        }
+        init_clean_git(&exec);
+        let mut r = rec(workspace);
+        r.execution_repo = Some(exec);
+        r
+    }
+
+    fn publish_fail_body() -> ReviewResult {
+        ReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: "## Verdict: FAIL\n\n## Findings\n\nNone at P0–P2 against the implementation itself.\n\n## Publish Status\n\nPR not squash-merged; registry still Ready; CI pending.\n".into(),
+        }
+    }
+
+    #[test]
+    fn publish_only_fail_degrades_to_ci_wait() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new().push_ok(publish_fail_body());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("degrade");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert_ne!(view.status, RunStatus::Stopped);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert!(
+            view.last_event
+                .contains("degraded to ci-wait (publish-only"),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(
+            view.review.as_ref().and_then(|rv| rv.verdict.as_deref()),
+            Some("DEGRADED_PUBLISH")
+        );
+        assert_eq!(counts.n(), 1);
+        clear_env();
+    }
+
+    #[test]
+    fn publish_plus_p1_still_gate_fail() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let mut body = publish_fail_body();
+        body.last_message = "## Verdict: FAIL\n\n## Findings\n\nNone at P0–P2 against the implementation itself.\n| P1 | broken |\n\n## Publish Status\n\nPR not squash-merged.\n".into();
+        let scripted = ScriptedBackend::new().push_ok(body);
+        let (_hook, _counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("fail");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert!(
+            view.last_event.contains("address-findings 1/2"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(!view.last_event.contains("degraded"));
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        clear_env();
+    }
+
+    #[test]
+    fn publish_shape_without_preconditions_stays_gate_fail() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), false);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new().push_ok(publish_fail_body());
+        let (_hook, _counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("no evidence");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert!(view.last_event.contains("address-findings 1/2"));
+
+        let dir2 = tempdir().unwrap();
+        let r2 = rec_clean_exec(dir2.path(), true);
+        std::fs::write(dir2.path().join("exec").join("dirty.txt"), "uncommitted").unwrap();
+        jump_cross_model(&r2, WorkflowDriver::Adapter);
+        let scripted2 = ScriptedBackend::new().push_ok(publish_fail_body());
+        let (_hook2, _c2) = hook(scripted2);
+        let view2 = crate::workflow::tick(&r2).unwrap().expect("dirty");
+        assert_eq!(view2.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert!(view2.last_event.contains("address-findings 1/2"));
+        clear_env();
+    }
+
+    #[test]
+    fn lifecycle_p1_only_degrades() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let body = ReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: "## Verdict: FAIL\n\n## Findings\n\n| P1 | PR not squash-merged |\n"
+                .into(),
+        };
+        let scripted = ScriptedBackend::new().push_ok(body);
+        let (_hook, _counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("degrade");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(
+            view.review.as_ref().and_then(|rv| rv.verdict.as_deref()),
+            Some("DEGRADED_PUBLISH")
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn gate2_p1_never_degrades() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let body = ReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: "## Verdict: FAIL\n\n## Findings\n\n| P1 | evidence.md missing |\n"
+                .into(),
+        };
+        let scripted = ScriptedBackend::new().push_ok(body);
+        let (_hook, _counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("gate2");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert!(!view.last_event.contains("degraded"));
+        clear_env();
+    }
+
+    #[test]
+    fn publish_status_with_findings_is_not_slot_dud() {
+        let body = "## Verdict: FAIL\n\n## Findings\n\nnone\n\n## Publish Status\n\nCI pending.\n";
+        assert!(
+            crate::review::slot_quality::check(
+                crate::review::slot_quality::SlotFamily::CrossModel,
+                body,
+                Some("0011"),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
