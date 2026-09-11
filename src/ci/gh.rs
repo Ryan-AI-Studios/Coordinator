@@ -9,7 +9,8 @@ use crate::config::ENV_COORDINATOR_GH_BIN;
 use crate::error::{CoordinatorError, Result};
 
 use super::backend::{
-    CheckBucket, CheckItem, CheckSnapshot, CiBackend, CiTarget, MergeResult, PrHint,
+    CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend, CiTarget, MergeResult,
+    MergeStateStatus, PrHint,
 };
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -17,7 +18,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// `gh pr view --json` fields. `mergedAt` is requested so `parse_pr_view` can
 /// see it; `state == MERGED` remains the primary shipped signal.
 const PR_VIEW_JSON_FIELDS: &str =
-    "number,url,isDraft,state,headRefName,mergeable,headRefOid,mergedAt";
+    "number,url,isDraft,state,headRefName,mergeable,headRefOid,mergedAt,mergeStateStatus";
 
 /// Pure argv for `gh pr list --head` (no spawn). `state` is `open` then `merged`.
 fn pr_list_head_args(branch: &str, state: &str) -> Vec<String> {
@@ -65,7 +66,11 @@ impl CiBackend for GhCli {
 
     fn checks(&self, cwd: &Path, target: &CiTarget) -> Result<CheckSnapshot> {
         match target {
-            CiTarget::PullRequest { number, .. } => pr_checks(cwd, *number),
+            CiTarget::PullRequest {
+                number,
+                merge_state,
+                ..
+            } => pr_checks_required_and_all(cwd, *number, *merge_state),
             CiTarget::HeadSha { sha } => run_list(cwd, sha),
         }
     }
@@ -153,12 +158,18 @@ fn parse_pr_view(stdout: &str) -> Result<Option<CiTarget>> {
         .get("headRefOid")
         .and_then(|x| x.as_str())
         .map(str::to_string);
+    let merge_state = v
+        .get("mergeStateStatus")
+        .and_then(|x| x.as_str())
+        .map(MergeStateStatus::parse_live)
+        .unwrap_or(MergeStateStatus::Unknown);
     Ok(Some(CiTarget::PullRequest {
         number,
         url,
         is_draft,
         merged,
         head_oid,
+        merge_state,
     }))
 }
 
@@ -187,16 +198,69 @@ fn pr_list_head(cwd: &Path, branch: &str) -> Result<Option<CiTarget>> {
     Ok(None)
 }
 
-fn pr_checks(cwd: &Path, number: u64) -> Result<CheckSnapshot> {
-    let n = number.to_string();
-    let out = gh_capture(
-        cwd,
-        &["pr", "checks", n.as_str(), "--json", "bucket,name,state"],
-    )?;
+/// Pure argv for `gh pr checks` (no spawn).
+fn pr_checks_args(number: u64, required: bool) -> Vec<String> {
+    let mut args = vec![
+        "pr".into(),
+        "checks".into(),
+        number.to_string(),
+        "--json".into(),
+        "bucket,name,state".into(),
+    ];
+    if required {
+        args.insert(3, "--required".into());
+    }
+    args
+}
+
+fn pr_checks_required_and_all(
+    cwd: &Path,
+    number: u64,
+    merge_state: MergeStateStatus,
+) -> Result<CheckSnapshot> {
+    let required = pr_checks(cwd, number, true)?;
+    let all = pr_checks(cwd, number, false)?;
+    Ok(compose_required_snapshot(required, all, merge_state))
+}
+
+fn compose_required_snapshot(
+    required: CheckSnapshot,
+    all: CheckSnapshot,
+    merge_state: MergeStateStatus,
+) -> CheckSnapshot {
+    if required.items.is_empty() {
+        return CheckSnapshot {
+            items: Vec::new(),
+            raw_exit: required.raw_exit,
+            merge_state,
+            view: CheckView::Required,
+            advisory: all.items,
+        };
+    }
+    let required_names: std::collections::HashSet<String> =
+        required.items.iter().map(|i| i.name.clone()).collect();
+    let advisory = all
+        .items
+        .into_iter()
+        .filter(|i| !required_names.contains(&i.name))
+        .collect();
+    CheckSnapshot {
+        items: required.items,
+        raw_exit: required.raw_exit,
+        merge_state,
+        view: CheckView::Required,
+        advisory,
+    }
+}
+
+fn pr_checks(cwd: &Path, number: u64, required: bool) -> Result<CheckSnapshot> {
+    let args = pr_checks_args(number, required);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = gh_capture(cwd, &refs)?;
     if out.exit == 4 {
         return Err(CoordinatorError::Message("gh auth required".into()));
     }
-    // exit 8 = checks pending — still parse JSON
+    // exit 1 = no checks / no required; exit 8 = pending — still parse JSON
     parse_pr_checks(&out.stdout, out.exit)
 }
 
@@ -205,6 +269,7 @@ fn parse_pr_checks(stdout: &str, raw_exit: i32) -> Result<CheckSnapshot> {
         return Ok(CheckSnapshot {
             items: Vec::new(),
             raw_exit,
+            ..CheckSnapshot::empty()
         });
     }
     let arr: Vec<serde_json::Value> = serde_json::from_str(stdout)
@@ -225,7 +290,11 @@ fn parse_pr_checks(stdout: &str, raw_exit: i32) -> Result<CheckSnapshot> {
             CheckItem { name, bucket }
         })
         .collect();
-    Ok(CheckSnapshot { items, raw_exit })
+    Ok(CheckSnapshot {
+        items,
+        raw_exit,
+        ..CheckSnapshot::empty()
+    })
 }
 
 fn run_list(cwd: &Path, sha: &str) -> Result<CheckSnapshot> {
@@ -249,6 +318,7 @@ fn run_list(cwd: &Path, sha: &str) -> Result<CheckSnapshot> {
         return Ok(CheckSnapshot {
             items: Vec::new(),
             raw_exit: out.exit,
+            ..CheckSnapshot::empty()
         });
     }
     parse_run_list(&out.stdout, out.exit)
@@ -259,6 +329,7 @@ fn parse_run_list(stdout: &str, raw_exit: i32) -> Result<CheckSnapshot> {
         return Ok(CheckSnapshot {
             items: Vec::new(),
             raw_exit,
+            ..CheckSnapshot::empty()
         });
     }
     let arr: Vec<serde_json::Value> = serde_json::from_str(stdout).unwrap_or_default();
@@ -286,7 +357,11 @@ fn parse_run_list(stdout: &str, raw_exit: i32) -> Result<CheckSnapshot> {
             CheckItem { name, bucket }
         })
         .collect();
-    Ok(CheckSnapshot { items, raw_exit })
+    Ok(CheckSnapshot {
+        items,
+        raw_exit,
+        ..CheckSnapshot::empty()
+    })
 }
 
 fn head_is_default_branch(cwd: &Path) -> Result<bool> {
@@ -523,6 +598,32 @@ mod parse_tests {
             PR_VIEW_JSON_FIELDS.split(',').any(|f| f == "mergedAt"),
             "{PR_VIEW_JSON_FIELDS}"
         );
+        assert!(
+            PR_VIEW_JSON_FIELDS
+                .split(',')
+                .any(|f| f == "mergeStateStatus"),
+            "{PR_VIEW_JSON_FIELDS}"
+        );
+    }
+
+    #[test]
+    fn pr_checks_args_required_and_all() {
+        let required = pr_checks_args(329, true);
+        let all = pr_checks_args(329, false);
+        let required: Vec<&str> = required.iter().map(String::as_str).collect();
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        assert!(required.windows(2).any(|w| w == ["checks", "329"]));
+        assert!(required.contains(&"--required"));
+        assert!(
+            required
+                .windows(2)
+                .any(|w| w == ["--json", "bucket,name,state"])
+        );
+        assert!(all.windows(2).any(|w| w == ["--json", "bucket,name,state"]));
+        assert!(
+            !all.contains(&"--required"),
+            "all-checks argv must not contain --required: {all:?}"
+        );
     }
 
     #[test]
@@ -552,6 +653,30 @@ mod parse_tests {
             CiTarget::PullRequest { number, merged, .. } => {
                 assert_eq!(number, 66);
                 assert!(merged);
+            }
+            _ => panic!("expected PR"),
+        }
+    }
+
+    #[test]
+    fn parse_pr_view_merge_state_unstable() {
+        let json = r#"{"number":329,"url":"https://example/pr/329","isDraft":false,"state":"OPEN","headRefOid":"abc","mergeStateStatus":"UNSTABLE"}"#;
+        let t = parse_pr_view(json).unwrap().unwrap();
+        match t {
+            CiTarget::PullRequest { merge_state, .. } => {
+                assert_eq!(merge_state, MergeStateStatus::Unstable);
+            }
+            _ => panic!("expected PR"),
+        }
+    }
+
+    #[test]
+    fn parse_pr_view_missing_merge_state_is_unknown() {
+        let json = r#"{"number":7,"url":"https://example/pr/7","isDraft":true,"state":"OPEN","headRefOid":"abc"}"#;
+        let t = parse_pr_view(json).unwrap().unwrap();
+        match t {
+            CiTarget::PullRequest { merge_state, .. } => {
+                assert_eq!(merge_state, MergeStateStatus::Unknown);
             }
             _ => panic!("expected PR"),
         }

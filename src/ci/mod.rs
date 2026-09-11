@@ -28,8 +28,8 @@ use crate::state::{
 use crate::workflow::{MergedTrackProbe, WorkflowDriver};
 
 pub use backend::{
-    CallCounts, CheckBucket, CheckItem, CheckSnapshot, CiBackend, CiTarget, MergeResult, PrHint,
-    RecordingBackend, ScriptedBackend,
+    CallCounts, CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend, CiTarget, MergeResult,
+    MergeStateStatus, PrHint, RecordingBackend, ScriptedBackend,
 };
 pub use gh::{GhCli, GhMergedTrackProbe};
 
@@ -180,11 +180,11 @@ pub fn drive_with(
 
     let phase_elapsed = elapsed(state, now);
     let decision = match &target {
-        CiTarget::PullRequest { .. } => interpret_pr(&snap),
+        CiTarget::PullRequest { .. } => interpret_pr(&snap, record.auto_merge),
         CiTarget::HeadSha { .. } => interpret_runs(&snap, phase_elapsed),
     };
     let summary = decision.summary();
-    let key = set_key(&target, &snap.items);
+    let key = set_key(&target, fail_set(&snap, record.auto_merge));
     let changed = state.ci.as_ref().and_then(|c| c.set_key.as_deref()) != Some(key.as_str());
     let interval = next_interval_ms(phase_elapsed, changed);
 
@@ -294,10 +294,60 @@ impl Decision {
 }
 
 /// PR buckets. Caller must already have rejected draft / already-merged.
-fn interpret_pr(snap: &CheckSnapshot) -> Decision {
-    let summary = summarize(&snap.items);
-    if snap
-        .items
+fn interpret_pr(snap: &CheckSnapshot, auto_merge: bool) -> Decision {
+    match snap.view {
+        CheckView::Unspecified => interpret_items(snap, &snap.items),
+        CheckView::Required if !snap.items.is_empty() => {
+            let d = interpret_items(snap, &snap.items);
+            match d {
+                Decision::Green { summary } => {
+                    apply_required_merge_gate(snap.merge_state, auto_merge, summary)
+                }
+                other => other,
+            }
+        }
+        CheckView::Required => match snap.merge_state {
+            MergeStateStatus::Clean | MergeStateStatus::Unstable | MergeStateStatus::HasHooks => {
+                interpret_items(snap, &snap.advisory)
+            }
+            MergeStateStatus::Blocked if !auto_merge && !snap.advisory.is_empty() => {
+                interpret_items(snap, &snap.advisory)
+            }
+            MergeStateStatus::Unspecified => interpret_items(snap, &snap.items),
+            _ => required_pending(snap),
+        },
+    }
+}
+
+fn apply_required_merge_gate(
+    merge_state: MergeStateStatus,
+    auto_merge: bool,
+    summary: String,
+) -> Decision {
+    match merge_state {
+        MergeStateStatus::Clean | MergeStateStatus::Unstable | MergeStateStatus::HasHooks => {
+            Decision::Green { summary }
+        }
+        MergeStateStatus::Unspecified => Decision::Green { summary },
+        MergeStateStatus::Blocked if !auto_merge => Decision::Green { summary },
+        _ => Decision::Pending {
+            event: format!("ci-wait: waiting ({summary})"),
+            summary,
+        },
+    }
+}
+
+fn required_pending(snap: &CheckSnapshot) -> Decision {
+    let summary = decision_summary(snap);
+    Decision::Pending {
+        event: format!("ci-wait: waiting ({summary})"),
+        summary,
+    }
+}
+
+fn interpret_items(snap: &CheckSnapshot, items: &[CheckItem]) -> Decision {
+    let summary = decision_summary(snap);
+    if items
         .iter()
         .any(|i| matches!(i.bucket, CheckBucket::Fail | CheckBucket::Cancel))
     {
@@ -306,8 +356,7 @@ fn interpret_pr(snap: &CheckSnapshot) -> Decision {
             summary,
         };
     }
-    if snap
-        .items
+    if items
         .iter()
         .any(|i| matches!(i.bucket, CheckBucket::Pending))
     {
@@ -317,6 +366,66 @@ fn interpret_pr(snap: &CheckSnapshot) -> Decision {
         };
     }
     Decision::Green { summary }
+}
+
+fn uses_advisory_fallback(snap: &CheckSnapshot, auto_merge: bool) -> bool {
+    if snap.view != CheckView::Required || !snap.items.is_empty() {
+        return false;
+    }
+    match snap.merge_state {
+        MergeStateStatus::Clean | MergeStateStatus::Unstable | MergeStateStatus::HasHooks => true,
+        MergeStateStatus::Blocked if !auto_merge && !snap.advisory.is_empty() => true,
+        _ => false,
+    }
+}
+
+fn fail_set(snap: &CheckSnapshot, auto_merge: bool) -> &[CheckItem] {
+    if uses_advisory_fallback(snap, auto_merge) {
+        &snap.advisory
+    } else {
+        &snap.items
+    }
+}
+
+fn decision_summary(snap: &CheckSnapshot) -> String {
+    if snap.view == CheckView::Required && !snap.advisory.is_empty() {
+        let required = if snap.items.is_empty() {
+            "0 required".into()
+        } else {
+            summarize(&snap.items)
+        };
+        return format!("{required}; {}", advisory_tail(&snap.advisory));
+    }
+    summarize(&snap.items)
+}
+
+fn advisory_tail(items: &[CheckItem]) -> String {
+    let mut fail = 0u32;
+    let mut pending = 0u32;
+    let mut cancel = 0u32;
+    for i in items {
+        match i.bucket {
+            CheckBucket::Fail => fail += 1,
+            CheckBucket::Pending => pending += 1,
+            CheckBucket::Cancel => cancel += 1,
+            _ => {}
+        }
+    }
+    let mut parts = Vec::new();
+    if fail > 0 {
+        parts.push(format!("{fail} advisory fail"));
+    }
+    if pending > 0 {
+        parts.push(format!("{pending} advisory pending"));
+    }
+    if cancel > 0 {
+        parts.push(format!("{cancel} advisory cancel"));
+    }
+    if parts.is_empty() {
+        "advisory".into()
+    } else {
+        parts.join(", ")
+    }
 }
 
 /// HeadSha run-list mapping. Empty list: pending for &lt; 2 min, then green.
@@ -331,7 +440,7 @@ fn interpret_runs(snap: &CheckSnapshot, elapsed: Duration) -> Decision {
         }
         return Decision::Green { summary };
     }
-    interpret_pr(snap)
+    interpret_pr(snap, true)
 }
 
 pub fn summarize(items: &[CheckItem]) -> String {
@@ -482,6 +591,7 @@ fn try_merged_track_target(state: &RunState, cwd: &Path) -> Option<CiTarget> {
         is_draft: false,
         merged: true,
         head_oid: None,
+        merge_state: MergeStateStatus::Unspecified,
     })
 }
 
@@ -682,19 +792,39 @@ mod tests {
             is_draft: draft,
             merged,
             head_oid: Some("abc".into()),
+            merge_state: MergeStateStatus::Unspecified,
         }
+    }
+
+    fn pair_items(pairs: &[(&str, CheckBucket)]) -> Vec<CheckItem> {
+        pairs
+            .iter()
+            .map(|(n, b)| CheckItem {
+                name: (*n).into(),
+                bucket: *b,
+            })
+            .collect()
     }
 
     fn items(pairs: &[(&str, CheckBucket)]) -> CheckSnapshot {
         CheckSnapshot {
-            items: pairs
-                .iter()
-                .map(|(n, b)| CheckItem {
-                    name: (*n).into(),
-                    bucket: *b,
-                })
-                .collect(),
+            items: pair_items(pairs),
             raw_exit: 0,
+            ..CheckSnapshot::empty()
+        }
+    }
+
+    fn required_snap(
+        pairs: &[(&str, CheckBucket)],
+        advisory: &[(&str, CheckBucket)],
+        merge: MergeStateStatus,
+    ) -> CheckSnapshot {
+        CheckSnapshot {
+            items: pair_items(pairs),
+            raw_exit: 0,
+            merge_state: merge,
+            view: CheckView::Required,
+            advisory: pair_items(advisory),
         }
     }
 
@@ -708,29 +838,29 @@ mod tests {
     #[test]
     fn interpret_fail_cancel_pending_green_empty() {
         assert!(matches!(
-            interpret_pr(&items(&[("a", CheckBucket::Fail)])),
+            interpret_pr(&items(&[("a", CheckBucket::Fail)]), true),
             Decision::Fail { .. }
         ));
         assert!(matches!(
-            interpret_pr(&items(&[("a", CheckBucket::Cancel)])),
+            interpret_pr(&items(&[("a", CheckBucket::Cancel)]), true),
             Decision::Fail { .. }
         ));
         assert!(matches!(
-            interpret_pr(&items(&[
-                ("a", CheckBucket::Pass),
-                ("b", CheckBucket::Pending)
-            ])),
+            interpret_pr(
+                &items(&[("a", CheckBucket::Pass), ("b", CheckBucket::Pending)]),
+                true
+            ),
             Decision::Pending { .. }
         ));
         assert!(matches!(
-            interpret_pr(&items(&[
-                ("a", CheckBucket::Pass),
-                ("b", CheckBucket::Skipping)
-            ])),
+            interpret_pr(
+                &items(&[("a", CheckBucket::Pass), ("b", CheckBucket::Skipping)]),
+                true
+            ),
             Decision::Green { .. }
         ));
         assert!(matches!(
-            interpret_pr(&CheckSnapshot::empty()),
+            interpret_pr(&CheckSnapshot::empty(), true),
             Decision::Green { .. }
         ));
     }
@@ -745,6 +875,56 @@ mod tests {
             interpret_runs(&CheckSnapshot::empty(), Duration::from_secs(120)),
             Decision::Green { .. }
         ));
+    }
+
+    #[test]
+    fn interpret_required_empty_unknown_is_pending() {
+        let snap = required_snap(&[], &[], MergeStateStatus::Unknown);
+        assert!(matches!(
+            interpret_pr(&snap, true),
+            Decision::Pending { .. }
+        ));
+        assert!(matches!(
+            interpret_pr(&snap, false),
+            Decision::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn interpret_required_empty_clean_falls_back_to_advisory() {
+        assert!(matches!(
+            interpret_pr(&required_snap(&[], &[], MergeStateStatus::Clean), true),
+            Decision::Green { .. }
+        ));
+        assert!(matches!(
+            interpret_pr(
+                &required_snap(
+                    &[],
+                    &[("ci", CheckBucket::Pending)],
+                    MergeStateStatus::Clean
+                ),
+                true
+            ),
+            Decision::Pending { .. }
+        ));
+        assert!(matches!(
+            interpret_pr(&required_snap(&[], &[], MergeStateStatus::Blocked), true),
+            Decision::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn interpret_required_green_blocked_depends_on_auto_merge() {
+        let snap = required_snap(
+            &[("fmt", CheckBucket::Pass)],
+            &[],
+            MergeStateStatus::Blocked,
+        );
+        assert!(matches!(
+            interpret_pr(&snap, true),
+            Decision::Pending { .. }
+        ));
+        assert!(matches!(interpret_pr(&snap, false), Decision::Green { .. }));
     }
 
     #[test]
@@ -862,6 +1042,261 @@ mod tests {
         assert_eq!(view.phase, graph::PHASE_COMPACT);
         assert!(view.last_event.contains("merge skipped (auto_merge=false)"));
         assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_green_advisory_fail_does_not_ci_failed() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(329, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[
+                ("fmt", CheckBucket::Pass),
+                ("clippy", CheckBucket::Pass),
+                ("test", CheckBucket::Pass),
+                ("deny", CheckBucket::Pass),
+                ("semgrep", CheckBucket::Pass),
+                ("windows", CheckBucket::Pass),
+            ],
+            &[("risk", CheckBucket::Fail)],
+            MergeStateStatus::Unstable,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r)
+            .unwrap()
+            .expect("advisory ignored");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_ne!(view.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            view.last_event.contains("ci-wait: merged #329"),
+            "last_event={}",
+            view.last_event
+        );
+        let st = load_run_state(&r).unwrap();
+        let summary = st
+            .ci
+            .as_ref()
+            .and_then(|c| c.last_summary.as_deref())
+            .unwrap_or("");
+        assert!(summary.contains("advisory fail"), "last_summary={summary}");
+        assert!(
+            !summary.starts_with("6 pass, 1 fail"),
+            "last_summary={summary}"
+        );
+        assert_eq!(counts.merge_n(), 1);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_green_advisory_fail_auto_merge_false_zero_merges() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), false);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(329, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Pass)],
+            &[("risk", CheckBucket::Fail)],
+            MergeStateStatus::Unstable,
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("skip merge");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert!(view.last_event.contains("merge skipped (auto_merge=false)"));
+        assert_eq!(counts.merge_n(), 0);
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(
+            st.ci.as_ref().and_then(|c| c.merge.as_deref()),
+            Some("skipped")
+        );
+        let summary = st
+            .ci
+            .as_ref()
+            .and_then(|c| c.last_summary.as_deref())
+            .unwrap_or("");
+        assert!(summary.contains("advisory fail"), "last_summary={summary}");
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_green_advisory_cancel_does_not_fail() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(12, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Pass)],
+            &[("bot", CheckBucket::Cancel)],
+            MergeStateStatus::Unstable,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("advisory cancel");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_ne!(view.failure_class, Some(FailureClass::CiFailed));
+        assert_eq!(counts.merge_n(), 1);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_fail_writes_ci_failed_even_with_advisory_fail() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(13, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Fail)],
+            &[("risk", CheckBucket::Fail)],
+            MergeStateStatus::Blocked,
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("required fail");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_cancel_writes_ci_failed() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(14, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Cancel)],
+            &[],
+            MergeStateStatus::Blocked,
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("required cancel");
+        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_pending_advisory_fail_stays_pending() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), false);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(15, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Pending)],
+            &[("risk", CheckBucket::Fail)],
+            MergeStateStatus::Blocked,
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(st.last_event.contains("waiting"));
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_skipping_and_pass_is_green() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(16, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Pass), ("opt", CheckBucket::Skipping)],
+            &[],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("skipping green");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_eq!(counts.merge_n(), 1);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_empty_unknown_does_not_merge() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(17, false, false))));
+        s.push_snapshot(Ok(required_snap(&[], &[], MergeStateStatus::Unknown)));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "should not run".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        assert_eq!(counts.merge_n(), 0);
+        drop(_hook);
+        let dir2 = tempdir().unwrap();
+        let r2 = rec(dir2.path(), false);
+        jump_ci_wait(&r2, WorkflowDriver::Adapter);
+        let s2 = ScriptedBackend::new();
+        s2.push_resolve(Ok(Some(pr(18, false, false))));
+        s2.push_snapshot(Ok(required_snap(&[], &[], MergeStateStatus::Unknown)));
+        let (_hook2, counts2) = hook(s2);
+        assert!(crate::workflow::tick(&r2).unwrap().is_none());
+        assert_eq!(counts2.merge_n(), 0);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
