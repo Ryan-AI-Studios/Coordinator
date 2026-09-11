@@ -14,6 +14,27 @@ use super::backend::{
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `gh pr view --json` fields. `mergedAt` is requested so `parse_pr_view` can
+/// see it; `state == MERGED` remains the primary shipped signal.
+const PR_VIEW_JSON_FIELDS: &str =
+    "number,url,isDraft,state,headRefName,mergeable,headRefOid,mergedAt";
+
+/// Pure argv for `gh pr list --head` (no spawn). `state` is `open` then `merged`.
+fn pr_list_head_args(branch: &str, state: &str) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "list".into(),
+        "--head".into(),
+        branch.into(),
+        "--state".into(),
+        state.into(),
+        "--json".into(),
+        "number,url".into(),
+        "--limit".into(),
+        "1".into(),
+    ]
+}
+
 pub struct GhCli;
 
 impl CiBackend for GhCli {
@@ -99,10 +120,7 @@ fn pr_view(cwd: &Path, number: Option<u64>) -> Result<Option<CiTarget>> {
     if let Some(ref n) = n {
         args.push(n.as_str());
     }
-    args.extend([
-        "--json",
-        "number,url,isDraft,state,headRefName,mergeable,headRefOid",
-    ]);
+    args.extend(["--json", PR_VIEW_JSON_FIELDS]);
     let out = gh_capture(cwd, &args)?;
     if out.exit == 4 {
         return Err(CoordinatorError::Message("gh auth required".into()));
@@ -145,36 +163,28 @@ fn parse_pr_view(stdout: &str) -> Result<Option<CiTarget>> {
 }
 
 fn pr_list_head(cwd: &Path, branch: &str) -> Result<Option<CiTarget>> {
-    let out = gh_capture(
-        cwd,
-        &[
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "open",
-            "--json",
-            "number,url",
-            "--limit",
-            "1",
-        ],
-    )?;
-    if out.exit == 4 {
-        return Err(CoordinatorError::Message("gh auth required".into()));
+    // Open first so an in-flight PR wins over an older merged PR on the same head.
+    for state in ["open", "merged"] {
+        let args = pr_list_head_args(branch, state);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = gh_capture(cwd, &refs)?;
+        if out.exit == 4 {
+            return Err(CoordinatorError::Message("gh auth required".into()));
+        }
+        if !out.ok {
+            continue;
+        }
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&out.stdout).unwrap_or_default();
+        let Some(first) = arr.first() else {
+            continue;
+        };
+        let Some(number) = first.get("number").and_then(|x| x.as_u64()) else {
+            continue;
+        };
+        // Need isDraft/merged from `pr view`. Do not invent a non-draft target.
+        return pr_view(cwd, Some(number));
     }
-    if !out.ok {
-        return Ok(None);
-    }
-    let arr: Vec<serde_json::Value> = serde_json::from_str(&out.stdout).unwrap_or_default();
-    let Some(first) = arr.first() else {
-        return Ok(None);
-    };
-    let Some(number) = first.get("number").and_then(|x| x.as_u64()) else {
-        return Ok(None);
-    };
-    // Need isDraft/merged from `pr view`. Do not invent a non-draft target.
-    pr_view(cwd, Some(number))
+    Ok(None)
 }
 
 fn pr_checks(cwd: &Path, number: u64) -> Result<CheckSnapshot> {
@@ -495,6 +505,27 @@ mod parse_tests {
     use super::*;
 
     #[test]
+    fn pr_list_head_args_open_then_merged_never_closed() {
+        let open = pr_list_head_args("feat/foo", "open");
+        let merged = pr_list_head_args("feat/foo", "merged");
+        let open: Vec<&str> = open.iter().map(String::as_str).collect();
+        let merged: Vec<&str> = merged.iter().map(String::as_str).collect();
+        assert!(open.windows(2).any(|w| w == ["--state", "open"]));
+        assert!(open.windows(2).any(|w| w == ["--head", "feat/foo"]));
+        assert!(merged.windows(2).any(|w| w == ["--state", "merged"]));
+        assert!(merged.windows(2).any(|w| w == ["--head", "feat/foo"]));
+        let joined = [open.as_slice(), merged.as_slice()].concat();
+        assert!(
+            !joined.iter().any(|t| *t == "closed" || *t == "all"),
+            "joined={joined:?}"
+        );
+        assert!(
+            PR_VIEW_JSON_FIELDS.split(',').any(|f| f == "mergedAt"),
+            "{PR_VIEW_JSON_FIELDS}"
+        );
+    }
+
+    #[test]
     fn parse_pr_view_draft() {
         let json = r#"{"number":7,"url":"https://example/pr/7","isDraft":true,"state":"OPEN","headRefOid":"abc"}"#;
         let t = parse_pr_view(json).unwrap().unwrap();
@@ -509,6 +540,29 @@ mod parse_tests {
                 assert!(is_draft);
                 assert!(!merged);
             }
+            _ => panic!("expected PR"),
+        }
+    }
+
+    #[test]
+    fn parse_pr_view_merged() {
+        let json = r#"{"number":66,"url":"https://example/pr/66","isDraft":false,"state":"MERGED","headRefOid":"abc"}"#;
+        let t = parse_pr_view(json).unwrap().unwrap();
+        match t {
+            CiTarget::PullRequest { number, merged, .. } => {
+                assert_eq!(number, 66);
+                assert!(merged);
+            }
+            _ => panic!("expected PR"),
+        }
+    }
+
+    #[test]
+    fn parse_pr_view_merged_at_without_merged_state() {
+        let json = r#"{"number":66,"url":"https://example/pr/66","isDraft":false,"state":"CLOSED","mergedAt":"2026-09-10T00:00:00Z","headRefOid":"abc"}"#;
+        let t = parse_pr_view(json).unwrap().unwrap();
+        match t {
+            CiTarget::PullRequest { merged, .. } => assert!(merged),
             _ => panic!("expected PR"),
         }
     }

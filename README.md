@@ -398,7 +398,7 @@ After a successful Review Gate, Coordinator watches CI **outside** any model Ses
 | Item | Behavior |
 |------|----------|
 | Tool | `gh` CLI from the **execution repo** cwd (`COORDINATOR_GH_BIN` or `gh` / `gh.exe`). Env: `GH_PROMPT_DISABLED=1`, `NO_COLOR=1`. No `octocrab`, no webhooks, no `gh pr checks --watch` |
-| Target | Persisted `RunState.ci` → implement `metadata.pr_number`/`pr_url` → `gh pr view` → `gh pr list --head` → default-branch `HEAD` sha (`gh run list`). Feature branch with no PR stays pending (`ci-wait: waiting for PR`) until the 3600s phase timeout |
+| Target | Persisted `RunState.ci` hint → `gh pr view` → `gh pr list --head` **open**, then **`--state merged --head`**, then 0046 `track(NNNN):` merged title probe. GitHub **MERGED** resolves immediately (`ci-wait: merged #{n}`, no squash). Hinted `pr view` miss is not sticky (falls through; does not treat the PR oid as default-branch `HeadSha`). Feature branch with neither open nor merged proof stays pending (`ci-wait: waiting for PR`) until the 3600s phase timeout. Default-branch `HEAD` sha still uses `gh run list` |
 | Checks | `gh pr checks {n} --json bucket,name,state` (all checks, **not** `--required`). Draft PR stays pending (`ci-wait: waiting (draft PR)`). Already `MERGED` is green. Any `fail`/`cancel` → `ci_failed`. Empty check list is green |
 | Default branch | `gh run list --commit {sha}`. Empty runs for &lt; 2 min stay pending; then treat as “no CI configured” (green, **no merge**) |
 | Interval | 15s (0–2 min) → 30s (2–10 min) → 60s (≥10 min), cap 120s. Reset to 15s when the check/run set changes. Tests: `COORDINATOR_CI_POLL_MS` is a **fixed** interval |
