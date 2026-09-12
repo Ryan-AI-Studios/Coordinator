@@ -179,6 +179,9 @@ pub struct CiWatchState {
     /// Interval to wait before the next spawn (ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_interval_ms: Option<u64>,
+    /// HEAD SHA of the last auto-publish spawn (0053). Not a Status JSON key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_attempted_sha: Option<String>,
 }
 
 impl RunState {

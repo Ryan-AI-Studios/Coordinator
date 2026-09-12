@@ -28,8 +28,8 @@ use crate::state::{
 use crate::workflow::{MergedTrackProbe, WorkflowDriver};
 
 pub use backend::{
-    CallCounts, CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend, CiTarget, MergeResult,
-    MergeStateStatus, PrHint, RecordingBackend, ScriptedBackend,
+    AutoPublishResult, CallCounts, CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend,
+    CiTarget, MergeResult, MergeStateStatus, PrHint, RecordingBackend, ScriptedBackend,
 };
 pub use gh::{GhCli, GhMergedTrackProbe};
 
@@ -106,6 +106,21 @@ pub fn drive_with(
     };
     // Probe after resolve (outside the apply lock). Err / missing → fail-open wait.
     let target = target.or_else(|| try_merged_track_target(state, &cwd));
+
+    let mut just_opened: Option<u64> = None;
+    let target = match target {
+        Some(t) => Some(t),
+        None => match try_auto_publish_target(record, state, backend, &cwd, now) {
+            Ok(AutoPublishDrive::Opened(t)) => {
+                if let CiTarget::PullRequest { number, .. } = &t {
+                    just_opened = Some(*number);
+                }
+                Some(t)
+            }
+            Ok(AutoPublishDrive::Wait) => return Ok(None),
+            Err(e) => return classify_backend_err(record, state, e),
+        },
+    };
 
     let Some(target) = target else {
         persist_watch(record, Some("ci-wait: waiting for PR"), |ci| {
@@ -195,6 +210,11 @@ pub fn drive_with(
 
     match decision {
         Decision::Pending { event, .. } => {
+            let event = if let Some(n) = just_opened {
+                format!("ci-wait: opened #{n}")
+            } else {
+                event
+            };
             persist_watch(record, Some(&event), |_| {})?;
             Ok(None)
         }
@@ -578,6 +598,115 @@ fn ci_merged_probe() -> Option<GhMergedTrackProbe> {
     Some(GhMergedTrackProbe::default())
 }
 
+enum AutoPublishDrive {
+    Opened(CiTarget),
+    Wait,
+}
+
+fn publish_already_attempted(state: &RunState, cwd: &Path) -> bool {
+    let Some(latched) = state
+        .ci
+        .as_ref()
+        .and_then(|c| c.publish_attempted_sha.as_deref())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    match gh::git_head_sha(cwd) {
+        Some(head) => latched == head,
+        None => true,
+    }
+}
+
+fn latch_sha_from_target(target: &CiTarget) -> Option<String> {
+    match target {
+        CiTarget::PullRequest {
+            head_oid, number, ..
+        } => head_oid.clone().or_else(|| Some(format!("pr:{number}"))),
+        CiTarget::HeadSha { sha } => Some(sha.clone()),
+    }
+}
+
+fn try_auto_publish_target(
+    record: &ProjectRecord,
+    state: &RunState,
+    backend: &dyn CiBackend,
+    cwd: &Path,
+    now: chrono::DateTime<Utc>,
+) -> Result<AutoPublishDrive> {
+    let Some(numeric) = state
+        .track_id
+        .as_deref()
+        .and_then(crate::notify::artifact::numeric_track_id)
+    else {
+        persist_watch(record, Some("ci-wait: waiting for PR"), |ci| {
+            stamp_poll(
+                ci,
+                now,
+                "waiting for PR",
+                "wait-pr",
+                next_interval_ms(elapsed(state, now), false),
+            );
+        })?;
+        return Ok(AutoPublishDrive::Wait);
+    };
+    if publish_already_attempted(state, cwd) {
+        persist_watch(
+            record,
+            Some("ci-wait: publish attempted — waiting for PR"),
+            |ci| {
+                stamp_poll(
+                    ci,
+                    now,
+                    "publish attempted",
+                    "wait-pr",
+                    next_interval_ms(elapsed(state, now), false),
+                );
+            },
+        )?;
+        return Ok(AutoPublishDrive::Wait);
+    }
+    match backend.try_auto_publish(cwd, numeric) {
+        Ok(AutoPublishResult::Opened(target)) => {
+            let n = match &target {
+                CiTarget::PullRequest { number, .. } => *number,
+                CiTarget::HeadSha { .. } => 0,
+            };
+            persist_watch(record, Some(&format!("ci-wait: opened #{n}")), |ci| {
+                apply_target(ci, &target);
+                ci.publish_attempted_sha = latch_sha_from_target(&target);
+                stamp_poll(
+                    ci,
+                    now,
+                    &format!("opened #{n}"),
+                    "wait-pr",
+                    next_interval_ms(elapsed(state, now), false),
+                );
+            })?;
+            Ok(AutoPublishDrive::Opened(target))
+        }
+        Ok(AutoPublishResult::Skipped {
+            event,
+            attempted_sha,
+        }) => {
+            persist_watch(record, Some(&event), |ci| {
+                if let Some(sha) = attempted_sha {
+                    ci.publish_attempted_sha = Some(sha);
+                }
+                stamp_poll(
+                    ci,
+                    now,
+                    "waiting for PR",
+                    "wait-pr",
+                    next_interval_ms(elapsed(state, now), false),
+                );
+            })?;
+            Ok(AutoPublishDrive::Wait)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Title-probe fallback when `resolve_pr` is still `None`. Fail-open on Err.
 fn try_merged_track_target(state: &RunState, cwd: &Path) -> Option<CiTarget> {
     let numeric = state
@@ -713,6 +842,13 @@ fn classify_backend_err(
     }
     if msg.contains("gh timed out") {
         persist_watch(record, Some("ci-wait: gh timed out"), |ci| {
+            ci.last_poll_at = Some(Utc::now());
+            ci.next_interval_ms = Some(next_interval_ms(elapsed(state, Utc::now()), false));
+        })?;
+        return Ok(None);
+    }
+    if msg.contains("git timed out") {
+        persist_watch(record, Some("ci-wait: git timed out"), |ci| {
             ci.last_poll_at = Some(Utc::now());
             ci.next_interval_ms = Some(next_interval_ms(elapsed(state, Utc::now()), false));
         })?;
@@ -1597,6 +1733,7 @@ mod tests {
             Some("done")
         );
         assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
@@ -1724,6 +1861,211 @@ mod tests {
             "last_event={}",
             st.last_event
         );
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn waiting_for_pr_auto_publish_opens_and_latches() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(7, false, false))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pending)])));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("ci-wait: opened #7"),
+            "last_event={}",
+            st.last_event
+        );
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(loaded.ci.as_ref().and_then(|c| c.pr_number), Some(7));
+        assert_eq!(
+            loaded
+                .ci
+                .as_ref()
+                .and_then(|c| c.publish_attempted_sha.as_deref()),
+            Some("abc")
+        );
+        assert_eq!(counts.publish_n(), 1);
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn waiting_for_pr_auto_publish_once_per_sha() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let mut st = load_run_state(&r).unwrap();
+        st.ci = Some(CiWatchState {
+            publish_attempted_sha: Some("abc".into()),
+            ..Default::default()
+        });
+        save_run_state(&r, &st).unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(8, false, false))));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("publish attempted"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_eq!(counts.publish_n(), 0);
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn waiting_for_pr_open_target_skips_publish() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(3, false, false))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pending)])));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(99, false, false))));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        assert_eq!(counts.publish_n(), 0);
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(loaded.ci.as_ref().and_then(|c| c.pr_number), Some(3));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn waiting_for_pr_auto_publish_skip_keeps_waiting() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped(
+            "ci-wait: dirty tree — waiting for PR",
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("dirty tree"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_ne!(st.failure_class, Some(FailureClass::Permission));
+        let loaded = load_run_state(&r).unwrap();
+        assert!(
+            loaded
+                .ci
+                .as_ref()
+                .and_then(|c| c.publish_attempted_sha.as_deref())
+                .is_none()
+        );
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn waiting_for_pr_auto_publish_safety_skips() {
+        let _g = poll_env();
+        for event in [
+            "ci-wait: detached HEAD — waiting for PR",
+            "ci-wait: on default branch — waiting for PR",
+            "ci-wait: no GitHub remote — waiting for PR",
+        ] {
+            let dir = tempdir().unwrap();
+            let r = rec(dir.path(), true);
+            jump_ci_wait(&r, WorkflowDriver::Adapter);
+            let s = ScriptedBackend::new();
+            s.push_resolve(Ok(None));
+            s.push_publish(Ok(AutoPublishResult::skipped(event)));
+            let (_hook, counts) = hook(s);
+            let view = crate::workflow::tick(&r).unwrap();
+            assert!(view.is_none(), "event={event}");
+            let st = run::status(&r).unwrap();
+            assert_eq!(st.status, RunStatus::Running);
+            assert!(
+                st.last_event
+                    .contains(event.split(" — ").next().unwrap_or(event)),
+                "last_event={} event={event}",
+                st.last_event
+            );
+            assert_ne!(st.failure_class, Some(FailureClass::Permission));
+            let loaded = load_run_state(&r).unwrap();
+            assert!(
+                loaded
+                    .ci
+                    .as_ref()
+                    .and_then(|c| c.publish_attempted_sha.as_deref())
+                    .is_none(),
+                "event={event}"
+            );
+            assert_eq!(counts.merge_n(), 0);
+        }
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn waiting_for_pr_git_timeout_stays_running() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Err(CoordinatorError::Message(
+            "ci-wait: git timed out".into(),
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("git timed out"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_ne!(st.failure_class, Some(FailureClass::Permission));
         assert_eq!(counts.merge_n(), 0);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);

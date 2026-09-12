@@ -141,6 +141,31 @@ pub struct PrHint {
     pub url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoPublishResult {
+    Opened(CiTarget),
+    Skipped {
+        event: String,
+        attempted_sha: Option<String>,
+    },
+}
+
+impl AutoPublishResult {
+    pub fn skipped(event: impl Into<String>) -> Self {
+        Self::Skipped {
+            event: event.into(),
+            attempted_sha: None,
+        }
+    }
+
+    pub fn skipped_latched(event: impl Into<String>, sha: impl Into<String>) -> Self {
+        Self::Skipped {
+            event: event.into(),
+            attempted_sha: Some(sha.into()),
+        }
+    }
+}
+
 pub trait CiBackend: Send + Sync {
     fn resolve_pr(&self, cwd: &Path, hint: Option<&PrHint>) -> Result<Option<CiTarget>>;
     fn checks(&self, cwd: &Path, target: &CiTarget) -> Result<CheckSnapshot>;
@@ -150,6 +175,7 @@ pub trait CiBackend: Send + Sync {
         pr_number: u64,
         head_oid: Option<&str>,
     ) -> Result<MergeResult>;
+    fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult>;
 }
 
 /// Programmed sequence of results. Exhausted sequences repeat the last value.
@@ -161,9 +187,11 @@ struct ScriptedInner {
     resolves: VecDeque<Result<Option<CiTarget>>>,
     snapshots: VecDeque<Result<CheckSnapshot>>,
     merges: VecDeque<Result<MergeResult>>,
+    publishes: VecDeque<Result<AutoPublishResult>>,
     last_resolve: Option<Result<Option<CiTarget>>>,
     last_snap: Option<Result<CheckSnapshot>>,
     last_merge: Option<Result<MergeResult>>,
+    last_publish: Option<Result<AutoPublishResult>>,
 }
 
 impl ScriptedBackend {
@@ -173,9 +201,11 @@ impl ScriptedBackend {
                 resolves: VecDeque::new(),
                 snapshots: VecDeque::new(),
                 merges: VecDeque::new(),
+                publishes: VecDeque::new(),
                 last_resolve: None,
                 last_snap: None,
                 last_merge: None,
+                last_publish: None,
             }),
         }
     }
@@ -201,6 +231,14 @@ impl ScriptedBackend {
             .lock()
             .expect("scripted lock")
             .merges
+            .push_back(v);
+    }
+
+    pub fn push_publish(&self, v: Result<AutoPublishResult>) {
+        self.inner
+            .lock()
+            .expect("scripted lock")
+            .publishes
             .push_back(v);
     }
 
@@ -263,6 +301,19 @@ impl CiBackend for ScriptedBackend {
             "scripted backend: no merge result programmed".into(),
         ))
     }
+
+    fn try_auto_publish(&self, _cwd: &Path, _track_id: &str) -> Result<AutoPublishResult> {
+        let mut g = self.inner.lock().expect("scripted lock");
+        let next = g
+            .publishes
+            .pop_front()
+            .or_else(|| g.last_publish.as_ref().map(clone_publish));
+        if let Some(v) = next {
+            g.last_publish = Some(clone_publish(&v));
+            return v;
+        }
+        Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"))
+    }
 }
 
 fn clone_resolve(v: &Result<Option<CiTarget>>) -> Result<Option<CiTarget>> {
@@ -286,11 +337,19 @@ fn clone_merge(v: &Result<MergeResult>) -> Result<MergeResult> {
     }
 }
 
+fn clone_publish(v: &Result<AutoPublishResult>) -> Result<AutoPublishResult> {
+    match v {
+        Ok(p) => Ok(p.clone()),
+        Err(e) => Err(CoordinatorError::Message(e.to_string())),
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct CallCounts {
     pub resolve: Arc<AtomicUsize>,
     pub checks: Arc<AtomicUsize>,
     pub merge: Arc<AtomicUsize>,
+    pub publish: Arc<AtomicUsize>,
 }
 
 impl CallCounts {
@@ -302,6 +361,9 @@ impl CallCounts {
     }
     pub fn merge_n(&self) -> usize {
         self.merge.load(Ordering::SeqCst)
+    }
+    pub fn publish_n(&self) -> usize {
+        self.publish.load(Ordering::SeqCst)
     }
 }
 
@@ -339,5 +401,10 @@ impl CiBackend for RecordingBackend {
     ) -> Result<MergeResult> {
         self.counts.merge.fetch_add(1, Ordering::SeqCst);
         self.inner.squash_merge(cwd, pr_number, head_oid)
+    }
+
+    fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
+        self.counts.publish.fetch_add(1, Ordering::SeqCst);
+        self.inner.try_auto_publish(cwd, track_id)
     }
 }
