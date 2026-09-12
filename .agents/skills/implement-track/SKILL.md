@@ -143,7 +143,10 @@ codex-review. Final gate must be a **new** clean pass.
 ```powershell
 cd C:\dev\coordinator\coordinator
 git fetch --all --prune
-git push -u origin HEAD
+# Push remote = git push order (branch.<name>.pushRemote → remote.pushDefault →
+# branch.<name>.remote if not `.` → GitHub identity match → sole remote → origin).
+# Do not hardcode `origin` (Ledgerful-class remotes are named `ledgerful`).
+git push -u <remote> <branch>
 gh pr create --title "track(####): <short objective>" --body "..."
 gh run list --branch track/<####-short-name>
 gh run watch <id> --exit-status    # wait until every CI job is green

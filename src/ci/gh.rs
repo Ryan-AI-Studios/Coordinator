@@ -9,11 +9,14 @@ use crate::config::ENV_COORDINATOR_GH_BIN;
 use crate::error::{CoordinatorError, Result};
 
 use super::backend::{
-    CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend, CiTarget, MergeResult,
-    MergeStateStatus, PrHint,
+    AutoPublishResult, CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend, CiTarget,
+    MergeResult, MergeStateStatus, PrHint,
 };
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_PR_BODY: &str =
+    "Opened by Coordinator ci-wait after a local track commit with no GitHub PR.";
 
 /// `gh pr view --json` fields. `mergedAt` is requested so `parse_pr_view` can
 /// see it; `state == MERGED` remains the primary shipped signal.
@@ -96,6 +99,161 @@ impl CiBackend for GhCli {
             return Ok(merge_from_output(&retry));
         }
         Ok(merge_from_output(&out))
+    }
+
+    fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
+        live_auto_publish(self, cwd, track_id)
+    }
+}
+
+fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
+    let numeric = crate::notify::artifact::numeric_track_id(track_id).unwrap_or(track_id);
+
+    let branch = match git_stdout(cwd, &["symbolic-ref", "--short", "HEAD"]) {
+        Ok(b) => {
+            let b = b.trim().to_string();
+            if b.is_empty() || b == "HEAD" {
+                return Ok(AutoPublishResult::skipped(
+                    "ci-wait: detached HEAD — waiting for PR",
+                ));
+            }
+            b
+        }
+        Err(_) => {
+            return Ok(AutoPublishResult::skipped(
+                "ci-wait: detached HEAD — waiting for PR",
+            ));
+        }
+    };
+
+    match git_stdout(cwd, &["status", "--porcelain"]) {
+        Ok(p) if !p.trim().is_empty() => {
+            return Ok(AutoPublishResult::skipped(
+                "ci-wait: dirty tree — waiting for PR",
+            ));
+        }
+        Ok(_) => {}
+        Err(_) => {
+            return Ok(AutoPublishResult::skipped(
+                "ci-wait: dirty tree — waiting for PR",
+            ));
+        }
+    }
+
+    let default_branch = match resolve_default_branch_name(cwd) {
+        Ok(d) => d,
+        Err(e) if e.to_string().contains("auth required") => return Err(e),
+        Err(_) => String::new(),
+    };
+    if !default_branch.is_empty() && branch == default_branch {
+        return Ok(AutoPublishResult::skipped(
+            "ci-wait: on default branch — waiting for PR",
+        ));
+    }
+
+    let subject = match git_stdout(cwd, &["log", "-1", "--format=%s"]) {
+        Ok(s) => s,
+        Err(_) => {
+            return Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"));
+        }
+    };
+    if !crate::workflow::shipped::pr_title_is_track(subject.trim(), numeric) {
+        return Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"));
+    }
+
+    let Some(remote) = resolve_live_push_remote(cwd)? else {
+        return Ok(AutoPublishResult::skipped(
+            "ci-wait: no GitHub remote — waiting for PR",
+        ));
+    };
+
+    let head = match git_stdout(cwd, &["rev-parse", "HEAD"]) {
+        Ok(h) => h.trim().to_string(),
+        Err(_) => {
+            return Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"));
+        }
+    };
+    if head.is_empty() {
+        return Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"));
+    }
+    if !default_branch.is_empty() {
+        let def_ref = format!("refs/remotes/{remote}/{default_branch}");
+        if let Ok(def_sha) = git_stdout(cwd, &["rev-parse", &def_ref])
+            && def_sha.trim() == head
+        {
+            return Ok(AutoPublishResult::skipped(
+                "ci-wait: on default branch — waiting for PR",
+            ));
+        }
+    }
+
+    let push_args = git_push_args(&remote, &branch);
+    let push_refs: Vec<&str> = push_args.iter().map(String::as_str).collect();
+    match run_process_timeout(Path::new("git"), &push_refs, cwd, GIT_PUSH_TIMEOUT) {
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("timed out") || msg.contains("auth required") {
+                return Err(e);
+            }
+            return Ok(AutoPublishResult::skipped_latched(
+                "ci-wait: push rejected — waiting for PR",
+                head,
+            ));
+        }
+        Ok(out) if !out.ok => {
+            return Ok(AutoPublishResult::skipped_latched(
+                "ci-wait: push rejected — waiting for PR",
+                head,
+            ));
+        }
+        Ok(_) => {}
+    }
+
+    let body = git_stdout(cwd, &["log", "-1", "--format=%b"])
+        .ok()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| DEFAULT_PR_BODY.to_string());
+    let repo = owner_repo_for_remote(cwd, &remote);
+    let base = if default_branch.is_empty() {
+        "main".to_string()
+    } else {
+        default_branch
+    };
+    let create_args = pr_create_args(subject.trim(), &body, &base, &branch, repo.as_deref());
+    let create_refs: Vec<&str> = create_args.iter().map(String::as_str).collect();
+    let out = gh_capture(cwd, &create_refs)?;
+    if out.exit == 4 {
+        return Err(CoordinatorError::Message("gh auth required".into()));
+    }
+    if out.ok
+        && let Some(number) = parse_pr_url_number(&out.stdout)
+    {
+        let url = out
+            .stdout
+            .lines()
+            .find(|l| l.contains("/pull/"))
+            .unwrap_or(out.stdout.trim());
+        return Ok(AutoPublishResult::Opened(CiTarget::PullRequest {
+            number,
+            url: url.trim().to_string(),
+            is_draft: false,
+            merged: false,
+            head_oid: Some(head),
+            merge_state: MergeStateStatus::Unspecified,
+        }));
+    }
+    match cli.resolve_pr(cwd, None) {
+        Ok(Some(t)) => Ok(AutoPublishResult::Opened(t)),
+        Ok(None) => Ok(AutoPublishResult::skipped_latched(
+            "ci-wait: waiting for PR",
+            head,
+        )),
+        Err(e) if e.to_string().contains("auth required") => Err(e),
+        Err(_) => Ok(AutoPublishResult::skipped_latched(
+            "ci-wait: waiting for PR",
+            head,
+        )),
     }
 }
 
@@ -364,15 +522,254 @@ fn parse_run_list(stdout: &str, raw_exit: i32) -> Result<CheckSnapshot> {
     })
 }
 
+fn normalize_github_identity(url: &str) -> Option<(String, String, String)> {
+    let u = url.trim();
+    if u.is_empty() {
+        return None;
+    }
+    if let Some(rest) = u.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        return split_owner_repo(host, path);
+    }
+    let rest = u
+        .strip_prefix("ssh://git@")
+        .or_else(|| u.strip_prefix("ssh://"))
+        .or_else(|| u.strip_prefix("https://"))
+        .or_else(|| u.strip_prefix("http://"))?;
+    let rest = rest.strip_prefix("git@").unwrap_or(rest);
+    let (host, path) = rest.split_once('/')?;
+    split_owner_repo(host, path)
+}
+
+fn split_owner_repo(host: &str, path: &str) -> Option<(String, String, String)> {
+    let path = path.trim_start_matches('/').trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() || host.trim().is_empty() {
+        return None;
+    }
+    Some((
+        host.trim().to_ascii_lowercase(),
+        owner.to_ascii_lowercase(),
+        repo.to_ascii_lowercase(),
+    ))
+}
+
+fn resolve_push_remote_from_inputs(
+    remotes: &[&str],
+    fetch_urls: &[(&str, &str)],
+    push_remote: Option<&str>,
+    push_default: Option<&str>,
+    branch_remote: Option<&str>,
+    gh_url: Option<&str>,
+) -> Option<String> {
+    let has = |name: &str| remotes.contains(&name);
+    for cand in [push_remote, push_default] {
+        if let Some(n) = cand.map(str::trim).filter(|s| !s.is_empty() && has(s)) {
+            return Some(n.to_string());
+        }
+    }
+    if let Some(n) = branch_remote
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "." && has(s))
+    {
+        return Some(n.to_string());
+    }
+    if let Some(gh) = gh_url.and_then(normalize_github_identity) {
+        for (name, url) in fetch_urls {
+            if normalize_github_identity(url).is_some_and(|id| id == gh) && has(name) {
+                return Some((*name).to_string());
+            }
+        }
+    }
+    if remotes.len() == 1 {
+        return Some(remotes[0].to_string());
+    }
+    if has("origin") {
+        return Some("origin".into());
+    }
+    None
+}
+
+fn git_push_args(remote: &str, branch: &str) -> Vec<String> {
+    vec!["push".into(), "-u".into(), remote.into(), branch.into()]
+}
+
+fn pr_create_args(
+    title: &str,
+    body: &str,
+    base: &str,
+    head: &str,
+    repo: Option<&str>,
+) -> Vec<String> {
+    let mut a = vec![
+        "pr".into(),
+        "create".into(),
+        "--title".into(),
+        title.into(),
+        "--body".into(),
+        body.into(),
+        "--base".into(),
+        base.into(),
+        "--head".into(),
+        head.into(),
+    ];
+    if let Some(r) = repo.filter(|s| !s.is_empty()) {
+        a.push("--repo".into());
+        a.push(r.into());
+    }
+    a
+}
+
+fn parse_pr_url_number(s: &str) -> Option<u64> {
+    let idx = s.find("/pull/")?;
+    let rest = &s[idx + 6..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn timeout_message(bin: &Path) -> &'static str {
+    if bin_is_git(bin) {
+        "ci-wait: git timed out"
+    } else {
+        "ci-wait: gh timed out"
+    }
+}
+
+fn not_found_message(bin: &Path) -> String {
+    if bin_is_git(bin) {
+        format!("git not found or not executable: {}", bin.display())
+    } else {
+        format!("gh not found or not executable: {}", bin.display())
+    }
+}
+
+fn bin_is_git(bin: &Path) -> bool {
+    bin.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("git"))
+}
+
+pub(crate) fn git_head_sha(cwd: &Path) -> Option<String> {
+    git_stdout(cwd, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn resolve_default_branch_name(cwd: &Path) -> Result<String> {
+    if let Ok(def) = gh_default_branch(cwd) {
+        return Ok(def);
+    }
+    if let Some(remote) = resolve_live_push_remote(cwd)? {
+        let sym = format!("refs/remotes/{remote}/HEAD");
+        if let Ok(s) = git_stdout(cwd, &["symbolic-ref", &sym]) {
+            let name = s.trim().rsplit('/').next().unwrap_or("").trim();
+            if !name.is_empty() {
+                return Ok(name.to_string());
+            }
+        }
+    }
+    Err(CoordinatorError::Message("no default branch".into()))
+}
+
+fn resolve_live_push_remote(cwd: &Path) -> Result<Option<String>> {
+    let listing = match git_stdout(cwd, &["remote"]) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let remotes: Vec<String> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if remotes.is_empty() {
+        return Ok(None);
+    }
+    let verbose = git_stdout(cwd, &["remote", "-v"]).unwrap_or_default();
+    let mut fetch_urls: Vec<(String, String)> = Vec::new();
+    for line in verbose.lines() {
+        if !line.contains("(fetch)") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else { continue };
+        let Some(url) = parts.next() else { continue };
+        fetch_urls.push((name.to_string(), url.to_string()));
+    }
+    let branch = git_stdout(cwd, &["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "HEAD");
+    let push_remote = branch.as_ref().and_then(|b| {
+        git_stdout(cwd, &["config", "--get", &format!("branch.{b}.pushRemote")])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let push_default = git_stdout(cwd, &["config", "--get", "remote.pushDefault"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let branch_remote = branch.as_ref().and_then(|b| {
+        git_stdout(cwd, &["config", "--get", &format!("branch.{b}.remote")])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let gh_url = gh_capture(cwd, &["repo", "view", "--json", "url"])
+        .ok()
+        .filter(|o| o.ok)
+        .and_then(|o| serde_json::from_str::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string));
+    let remote_refs: Vec<&str> = remotes.iter().map(String::as_str).collect();
+    let url_refs: Vec<(&str, &str)> = fetch_urls
+        .iter()
+        .map(|(n, u)| (n.as_str(), u.as_str()))
+        .collect();
+    Ok(resolve_push_remote_from_inputs(
+        &remote_refs,
+        &url_refs,
+        push_remote.as_deref(),
+        push_default.as_deref(),
+        branch_remote.as_deref(),
+        gh_url.as_deref(),
+    ))
+}
+
+fn owner_repo_for_remote(cwd: &Path, remote: &str) -> Option<String> {
+    let verbose = git_stdout(cwd, &["remote", "-v"]).ok()?;
+    for line in verbose.lines() {
+        if !line.contains("(fetch)") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else { continue };
+        if name != remote {
+            continue;
+        }
+        let Some(url) = parts.next() else { continue };
+        let (_, owner, repo) = normalize_github_identity(url)?;
+        return Some(format!("{owner}/{repo}"));
+    }
+    None
+}
+
 fn head_is_default_branch(cwd: &Path) -> Result<bool> {
     let head = git_stdout(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let head = head.trim();
     if let Ok(def) = gh_default_branch(cwd) {
         return Ok(head == def);
     }
-    if let Ok(sym) = git_stdout(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
-        let name = sym.trim().rsplit('/').next().unwrap_or("");
-        return Ok(!name.is_empty() && head == name);
+    if let Some(remote) = resolve_live_push_remote(cwd)? {
+        let sym = format!("refs/remotes/{remote}/HEAD");
+        if let Ok(s) = git_stdout(cwd, &["symbolic-ref", &sym]) {
+            let name = s.trim().rsplit('/').next().unwrap_or("");
+            return Ok(!name.is_empty() && head == name);
+        }
     }
     Ok(false)
 }
@@ -446,6 +843,10 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn run_process(bin: &Path, args: &[&str], cwd: &Path) -> Result<ProcOut> {
+    run_process_timeout(bin, args, cwd, PROCESS_TIMEOUT)
+}
+
+fn run_process_timeout(bin: &Path, args: &[&str], cwd: &Path, dur: Duration) -> Result<ProcOut> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
@@ -454,13 +855,13 @@ fn run_process(bin: &Path, args: &[&str], cwd: &Path) -> Result<ProcOut> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if bin_is_git(bin) {
+        cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(CoordinatorError::Message(format!(
-                "gh not found or not executable: {}",
-                bin.display()
-            )));
+            return Err(CoordinatorError::Message(not_found_message(bin)));
         }
         Err(e) => {
             return Err(CoordinatorError::Message(format!(
@@ -491,10 +892,10 @@ fn run_process(bin: &Path, args: &[&str], cwd: &Path) -> Result<ProcOut> {
                     stderr,
                 });
             }
-            Ok(None) if start.elapsed() >= PROCESS_TIMEOUT => {
+            Ok(None) if start.elapsed() >= dur => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(CoordinatorError::Message("ci-wait: gh timed out".into()));
+                return Err(CoordinatorError::Message(timeout_message(bin).into()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => {
@@ -557,10 +958,13 @@ impl GhMergedTrackProbe {
 
 /// Git `symbolic-ref` first, then `gh repo view` (once per omit-pick instance).
 fn resolve_omit_pick_default_branch(cwd: &Path) -> Result<String> {
-    if let Ok(sym) = git_stdout(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
-        let name = sym.trim().rsplit('/').next().unwrap_or("").trim();
-        if !name.is_empty() {
-            return Ok(name.to_string());
+    if let Ok(Some(remote)) = resolve_live_push_remote(cwd) {
+        let sym = format!("refs/remotes/{remote}/HEAD");
+        if let Ok(s) = git_stdout(cwd, &["symbolic-ref", &sym]) {
+            let name = s.trim().rsplit('/').next().unwrap_or("").trim();
+            if !name.is_empty() {
+                return Ok(name.to_string());
+            }
         }
     }
     gh_default_branch(cwd)
@@ -699,6 +1103,99 @@ mod parse_tests {
         assert_eq!(snap.raw_exit, 8);
         assert_eq!(snap.items[0].bucket, CheckBucket::Pass);
         assert_eq!(snap.items[1].bucket, CheckBucket::Pending);
+    }
+
+    #[test]
+    fn git_push_and_pr_create_args() {
+        let push = git_push_args("ledgerful", "track/0317-x");
+        assert_eq!(push, ["push", "-u", "ledgerful", "track/0317-x"]);
+        assert!(!push.iter().any(|a| a == "HEAD"));
+        let args = pr_create_args(
+            "track(0010): foo",
+            "body",
+            "main",
+            "track/0010-x",
+            Some("owner/repo"),
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--title", "track(0010): foo"])
+        );
+        assert!(args.windows(2).any(|w| w == ["--body", "body"]));
+        assert!(args.windows(2).any(|w| w == ["--base", "main"]));
+        assert!(args.windows(2).any(|w| w == ["--head", "track/0010-x"]));
+        assert!(args.windows(2).any(|w| w == ["--repo", "owner/repo"]));
+        assert!(!args.contains(&"--draft"));
+        assert!(!args.contains(&"--fill"));
+        let no_repo = pr_create_args("t", "b", "main", "head", None);
+        assert!(!no_repo.iter().any(|a| a == "--repo"));
+        assert_eq!(GIT_PUSH_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(timeout_message(Path::new("git")), "ci-wait: git timed out");
+        assert_eq!(
+            timeout_message(Path::new("gh.exe")),
+            "ci-wait: gh timed out"
+        );
+        assert!(crate::workflow::shipped::pr_title_is_track(
+            "track(0010): x",
+            "0010"
+        ));
+        assert_eq!(
+            parse_pr_url_number("https://github.com/o/r/pull/344\n"),
+            Some(344)
+        );
+    }
+
+    #[test]
+    fn resolve_push_remote_hierarchy() {
+        let sole = resolve_push_remote_from_inputs(
+            &["ledgerful"],
+            &[("ledgerful", "https://github.com/Ryan-AI-Studios/Ledgerful")],
+            None,
+            None,
+            None,
+            Some("https://github.com/Ryan-AI-Studios/Ledgerful"),
+        );
+        assert_eq!(sole.as_deref(), Some("ledgerful"));
+
+        let push_remote_wins = resolve_push_remote_from_inputs(
+            &["origin", "fork"],
+            &[
+                ("origin", "https://github.com/upstream/repo"),
+                ("fork", "https://github.com/me/repo"),
+            ],
+            Some("fork"),
+            None,
+            Some("origin"),
+            Some("https://github.com/upstream/repo"),
+        );
+        assert_eq!(push_remote_wins.as_deref(), Some("fork"));
+
+        let dot_ignored = resolve_push_remote_from_inputs(
+            &["origin"],
+            &[("origin", "https://github.com/o/r.git")],
+            None,
+            None,
+            Some("."),
+            None,
+        );
+        assert_eq!(dot_ignored.as_deref(), Some("origin"));
+
+        let none = resolve_push_remote_from_inputs(&[], &[], None, None, None, None);
+        assert_eq!(none, None);
+
+        let https = normalize_github_identity("https://github.com/Owner/Repo.git");
+        let ssh = normalize_github_identity("git@github.com:Owner/Repo.git");
+        assert_eq!(https, ssh);
+        assert_eq!(
+            https,
+            Some(("github.com".into(), "owner".into(), "repo".into()))
+        );
+        let ghes = normalize_github_identity("https://git.example.com/Acme/App");
+        assert_eq!(
+            ghes,
+            Some(("git.example.com".into(), "acme".into(), "app".into()))
+        );
     }
 
     #[test]
