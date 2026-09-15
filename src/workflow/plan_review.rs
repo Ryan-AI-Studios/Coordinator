@@ -1960,7 +1960,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         for slug in ["agy", "opencode"] {
             let state_file = crate::workflow::bundle::review_file(&r, slug).unwrap();
@@ -2023,10 +2023,10 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         assert_eq!(counts.n(), 2);
         let slugs = counts.slugs();
         assert_eq!(slugs.iter().filter(|s| *s == "agy").count(), 1);
@@ -2084,7 +2084,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         let reqs = counts.requests.lock().unwrap();
         let oc = remaining_of(&reqs, "opencode");
@@ -2154,7 +2154,7 @@ mod tests {
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
         write_review_markdown(&r, "agy", Some("agy done\n")).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         let mut saw_timeout = false;
         let mut spawned_at_timeout: Vec<String> = Vec::new();
         for _ in 0..80 {
@@ -2208,7 +2208,7 @@ mod tests {
             body,
         ))));
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let written = std::fs::read_to_string(track_file(dir.path(), "0001", "opencode")).unwrap();
         assert!(written.contains("crates.io"));
@@ -2327,7 +2327,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         let slugs = counts.slugs();
         assert!(slugs.iter().any(|s| s == "agy"));
@@ -2373,7 +2373,7 @@ mod tests {
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         state.pending_roles = vec!["agy".into(), "opencode".into()];
         save_run_state(&r, &state).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         assert_eq!(counts.n(), 0);
 
         run::stop(&r).unwrap();
@@ -2381,7 +2381,7 @@ mod tests {
         let mut state = load_run_state(&r).unwrap();
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         save_run_state(&r, &state).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         assert_eq!(counts.n(), 0);
         let s = load_run_state(&r).unwrap();
         assert!(!s.pending_roles.iter().any(|x| x == "agy"));
@@ -2416,7 +2416,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["agy"]);
         let agy_runs = counts.slugs().into_iter().filter(|s| s == "agy").count();
         assert_eq!(agy_runs, 2);
@@ -2460,7 +2460,7 @@ mod tests {
         });
         crate::persist::atomic_write_json(&roles.join("opencode.json"), &oc).unwrap();
 
-        let view = tick(&r).unwrap().expect("degrade join");
+        let view = tick_retry(&r).unwrap().expect("degrade join");
         assert_eq!(view.phase, graph::PHASE_FOLD);
         assert!(view.last_event.contains("degraded"));
         let agy_json = crate::outcome::outcome_roles_dir(&r)
@@ -2502,7 +2502,7 @@ mod tests {
         });
         crate::persist::atomic_write_json(&roles.join("agy.json"), &agy).unwrap();
 
-        let view = tick(&r).unwrap().expect("degrade join");
+        let view = tick_retry(&r).unwrap().expect("degrade join");
         assert_eq!(view.phase, graph::PHASE_FOLD);
         assert!(view.last_event.contains("degraded"));
     }
@@ -2520,7 +2520,7 @@ mod tests {
             inner: Arc::new(ScriptedBackend::ok_json("should not land")),
         });
         let _hook = install_test_backend(&r.id, backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         run::stop(&r).unwrap();
         {
             let (lock, cv) = &*gate;
@@ -2565,7 +2565,7 @@ mod tests {
                 inner: Arc::new(ScriptedBackend::ok_file("stale review from track A\n")),
             }),
         );
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         let first_epoch = load_run_state(&r).unwrap().run_epoch;
         run::stop(&r).unwrap();
         enter_plan_review(&r, "0002");
@@ -2622,7 +2622,7 @@ mod tests {
         let _hook = install_test_backend(&r.id, rec_backend);
 
         enter_plan_review(&r, "0001");
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         let after_spawn = load_run_state(&r).unwrap();
         assert!(
             after_spawn
@@ -2663,7 +2663,7 @@ mod tests {
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         state.pending_roles = vec!["agy".into(), "opencode".into()];
         save_run_state(&r, &state).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         assert_eq!(counts.n(), 4);
         let slugs = counts.slugs();
@@ -2771,7 +2771,7 @@ mod tests {
         let leftover_oc = track_file(dir.path(), "0001", "opencode");
         std::fs::write(&leftover_oc, "stale opencode from last run\n").unwrap();
         let _hook = install_test_backend(&r.id, Arc::new(ScriptedBackend::empty()));
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         for (slug, stale) in [
             ("agy", "stale review from last run"),
@@ -2813,7 +2813,7 @@ mod tests {
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
         let _hook = install_test_backend(&r.id, Arc::new(ScriptedBackend::empty()));
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let state_file = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
         if state_file.is_file() {
@@ -2839,7 +2839,7 @@ mod tests {
                 "# Track review: 0001-Example\n\n**Track:** `0001`\n\nndjson review body\n",
             )),
         );
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let state_file = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
         assert!(state_file.is_file());
@@ -2859,7 +2859,7 @@ mod tests {
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
         let _hook = install_test_backend(&r.id, Arc::new(ScriptedBackend::ndjson_error("login")));
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let state_file = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
         assert!(
@@ -2901,7 +2901,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(counts.n(), 0);
         let pending = load_run_state(&r).unwrap().pending_roles;
@@ -2925,7 +2925,7 @@ mod tests {
             ))),
         })));
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         run::pause(&r).unwrap();
         {
             let (lock, cv) = &*gate;
@@ -3039,7 +3039,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::stall())));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let oc_runs = counts
             .slugs()
@@ -3070,7 +3070,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let oc_runs = counts
             .slugs()
@@ -3105,7 +3105,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let oc_runs = counts
             .slugs()
@@ -3200,7 +3200,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let oc_runs = counts
             .slugs()
@@ -3261,7 +3261,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_join_retry_latched(&r);
         let latched = load_run_state(&r).unwrap();
         assert_eq!(latched.status, RunStatus::Running);
@@ -3329,7 +3329,7 @@ mod tests {
         };
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_join_retry_latched(&r);
         assert_eq!(load_run_state(&r).unwrap().plan_review_join_retries, 1);
         wait_stopped(&r);
@@ -3363,7 +3363,7 @@ mod tests {
         setup_track(dir.path(), "0001");
         let r = rec(dir.path());
         enter_plan_review(&r, "0001");
-        let view = tick(&r).unwrap().expect("fail-fast join");
+        let view = tick_retry(&r).unwrap().expect("fail-fast join");
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
         let s = load_run_state(&r).unwrap();
@@ -3444,7 +3444,7 @@ mod tests {
             state.pending_roles = vec!["agy".into()];
             save_run_state(&r, &state).unwrap();
         }
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_agy_consumed(&r);
         let state_file = crate::workflow::bundle::review_file(&r, "agy").unwrap();
         assert!(
@@ -3495,7 +3495,7 @@ mod tests {
         state.pending_roles = vec!["opencode".into()];
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let state_file = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
         assert!(
