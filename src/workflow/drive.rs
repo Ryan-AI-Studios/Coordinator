@@ -505,6 +505,9 @@ fn try_join(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
         .filter(|slug| review_produced(record, slug))
         .collect();
     if produced.is_empty() {
+        if super::plan_review::maybe_rearm_join_retry(record)? {
+            return Ok(None);
+        }
         return fail_phase(
             record,
             &state,

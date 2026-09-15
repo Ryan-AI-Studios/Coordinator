@@ -20,15 +20,18 @@ use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run
 use crate::workflow::drive::write_review_markdown;
 use crate::workflow::graph::{
     PHASE_PLAN_REVIEW, REVIEW_SLUG_AGY, REVIEW_SLUG_OPENCODE, ROLE_REVIEWER_AGY,
-    ROLE_REVIEWER_OPENCODE, resolve_track_dir, role_phase,
+    ROLE_REVIEWER_OPENCODE, resolve_track_dir, review_slugs, role_phase,
 };
 use crate::workflow::timeouts::{TIMEOUT_KEY_PLAN_REVIEW_SLOT, timeout_for_phase};
 
 const MIN_SPAWN_BUDGET: Duration = Duration::from_secs(60);
+/// Join-level empty/dud re-arm cap this phase (0054). Not a cross-epoch counter.
+pub(crate) const PLAN_REVIEW_JOIN_RETRY_CAP: u32 = 1;
 
 #[cfg(test)]
 thread_local! {
     static TEST_RETRY_REMAINING: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    static TEST_JOIN_REMAINING: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 /// One-shot plan-review CLI (scripted in default tests; live CLI otherwise).
@@ -532,6 +535,7 @@ fn apply_slot_result(
     backend: &dyn PlanReviewBackend,
     req: &PlanReviewRequest,
 ) {
+    mark_slot_ran(record, &req.slug);
     let t0 = Instant::now();
     let result = backend.run(req);
     if let Ok(ref out) = result {
@@ -786,6 +790,98 @@ fn journal_reviewer_stall(
         &crate::harness::journal::argv_head(&req.command, &req.argv),
         dur.as_millis() as u64,
     );
+    let _ = with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if !apply_allowed(&s, req) {
+            return Ok(());
+        }
+        let rv = s.review.get_or_insert_with(Default::default);
+        if !rv.stalled.iter().any(|x| x == &req.slug) {
+            rv.stalled.push(req.slug.clone());
+        }
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)
+    });
+}
+
+fn mark_slot_ran(record: &ProjectRecord, slug: &str) {
+    let _ = with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if s.phase != PHASE_PLAN_REVIEW {
+            return Ok(());
+        }
+        if !s.plan_review_slot_ran.iter().any(|x| x == slug) {
+            s.plan_review_slot_ran.push(slug.into());
+            s.updated_at = chrono::Utc::now();
+            save_run_state(record, &s)?;
+        }
+        Ok(())
+    });
+}
+
+/// Re-arm empty/dud slugs once after the shipped per-slot retry (0054).
+///
+/// Returns `true` when join should stay Running (spawn on the next tick).
+pub(crate) fn maybe_rearm_join_retry(record: &ProjectRecord) -> Result<bool> {
+    with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if s.status != RunStatus::Running || s.phase != PHASE_PLAN_REVIEW {
+            return Ok(false);
+        }
+        if !s.pending_roles.is_empty() {
+            return Ok(false);
+        }
+        if s.plan_review_join_retries >= PLAN_REVIEW_JOIN_RETRY_CAP {
+            return Ok(false);
+        }
+        let join_budget = {
+            #[cfg(test)]
+            {
+                TEST_JOIN_REMAINING
+                    .with(|c| c.get())
+                    .unwrap_or_else(|| remaining_budget(record, &s))
+            }
+            #[cfg(not(test))]
+            {
+                remaining_budget(record, &s)
+            }
+        };
+        if join_budget < MIN_SPAWN_BUDGET {
+            return Ok(false);
+        }
+        let stalled: Vec<String> = s
+            .review
+            .as_ref()
+            .map(|r| r.stalled.clone())
+            .unwrap_or_default();
+        let retryable: Vec<String> = review_slugs()
+            .iter()
+            .copied()
+            .filter(|slug| {
+                s.plan_review_slot_ran.iter().any(|x| x == slug)
+                    && !stalled.iter().any(|x| x == slug)
+            })
+            .map(str::to_string)
+            .collect();
+        if retryable.is_empty() {
+            return Ok(false);
+        }
+        s.plan_review_join_retries = s.plan_review_join_retries.saturating_add(1);
+        s.pending_roles.clone_from(&retryable);
+        s.plan_review_spawned
+            .retain(|x| !retryable.iter().any(|r| r == x));
+        let event = format!(
+            "plan-review: retrying join {} ({}/{})",
+            retryable.join(","),
+            s.plan_review_join_retries,
+            PLAN_REVIEW_JOIN_RETRY_CAP
+        );
+        s.last_event = event.clone();
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)?;
+        crate::progress_log::append(record, "plan-review", &event);
+        Ok(true)
+    })
 }
 
 fn unlink_track_review(req: &PlanReviewRequest) {
@@ -1395,6 +1491,27 @@ impl PlanReviewBackend for AgySequenceBackend {
 }
 
 #[cfg(test)]
+struct PerSlugSequenceBackend {
+    agy: Mutex<Vec<ScriptedBackend>>,
+    opencode: Mutex<Vec<ScriptedBackend>>,
+}
+
+#[cfg(test)]
+impl PlanReviewBackend for PerSlugSequenceBackend {
+    fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
+        let q = match req.slug.as_str() {
+            REVIEW_SLUG_OPENCODE => &self.opencode,
+            _ => &self.agy,
+        };
+        let mut q = q.lock().unwrap_or_else(|p| p.into_inner());
+        if !q.is_empty() {
+            return q.remove(0).run(req);
+        }
+        ScriptedBackend::empty().run(req)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
@@ -1542,6 +1659,39 @@ mod tests {
 
     fn wait_both_consumed(r: &ProjectRecord) {
         wait_slots_consumed(r, &["agy", "opencode"]);
+    }
+
+    fn wait_join_retry_latched(r: &ProjectRecord) {
+        use crate::state::RunStatus;
+        for _ in 0..80 {
+            let _ = tick(r);
+            let s = load_run_state(r).unwrap();
+            if s.plan_review_join_retries == 1 || s.status == RunStatus::Stopped {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let s = load_run_state(r).unwrap();
+        panic!(
+            "join retry not latched: retries={} status={:?} event={}",
+            s.plan_review_join_retries, s.status, s.last_event
+        );
+    }
+
+    fn wait_stopped(r: &ProjectRecord) {
+        use crate::state::RunStatus;
+        for _ in 0..80 {
+            let _ = tick(r);
+            if load_run_state(r).unwrap().status == RunStatus::Stopped {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let s = load_run_state(r).unwrap();
+        panic!(
+            "run did not stop: status={:?} event={} pending={:?}",
+            s.status, s.last_event, s.pending_roles
+        );
     }
 
     fn track_file(dir: &std::path::Path, track: &str, slug: &str) -> PathBuf {
@@ -2503,14 +2653,20 @@ mod tests {
         run::run_with_driver(&r, Some("0001".into()), WorkflowDriver::Adapter).unwrap();
         let state = load_run_state(&r).unwrap();
         assert!(state.plan_review_spawned.is_empty());
+        assert_eq!(state.plan_review_join_retries, 0);
+        assert!(state.plan_review_slot_ran.is_empty());
     }
 
     #[test]
     fn reset_phase_clock_clears_spawned() {
         let mut state = RunState::idle("p");
         state.plan_review_spawned = vec!["agy".into(), "opencode".into()];
+        state.plan_review_join_retries = 1;
+        state.plan_review_slot_ran = vec!["agy".into()];
         reset_phase_clock(&mut state);
         assert!(state.plan_review_spawned.is_empty());
+        assert_eq!(state.plan_review_join_retries, 0);
+        assert!(state.plan_review_slot_ran.is_empty());
     }
 
     #[test]
@@ -2908,6 +3064,7 @@ mod tests {
         state.pending_roles = vec!["opencode".into()];
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
+        write_review_markdown(&r, "agy", Some("agy already done\n")).unwrap();
         let seq = OpencodeSequenceBackend {
             opencode: Mutex::new(vec![
                 ScriptedBackend::ok_file(degenerate_review_body()),
@@ -3046,6 +3203,173 @@ mod tests {
         run::run_stub(&r, Some("0001".into())).unwrap();
         let state = load_run_state(&r).unwrap();
         assert!(state.plan_review_spawned.is_empty());
+        assert_eq!(state.plan_review_join_retries, 0);
+        assert!(state.plan_review_slot_ran.is_empty());
+    }
+
+    #[test]
+    fn join_zero_output_retries_then_pass() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let seq = PerSlugSequenceBackend {
+            agy: Mutex::new(vec![
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::ok_file(ok_review_body("0001")),
+            ]),
+            opencode: Mutex::new(vec![
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::ok_file(ok_review_body("0001")),
+            ]),
+        };
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_join_retry_latched(&r);
+        let latched = load_run_state(&r).unwrap();
+        assert_eq!(latched.status, RunStatus::Running);
+        assert_eq!(latched.plan_review_join_retries, 1);
+        assert!(
+            latched.last_event.starts_with("plan-review: retrying join"),
+            "got {}",
+            latched.last_event
+        );
+        assert!(latched.last_event.contains("(1/1)"));
+        assert!(latched.pending_roles.iter().any(|x| x == "agy"));
+        assert!(latched.pending_roles.iter().any(|x| x == "opencode"));
+        assert!(!latched.plan_review_spawned.iter().any(|x| x == "agy"));
+        assert!(!latched.plan_review_spawned.iter().any(|x| x == "opencode"));
+        assert!(latched.failure_class.is_none());
+        let first_wave_agy = counts.slugs().into_iter().filter(|s| s == "agy").count();
+        let first_wave_oc = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(first_wave_agy, 2, "slot retry consumes two empties");
+        assert_eq!(first_wave_oc, 2, "slot retry consumes two empties");
+        wait_both_consumed(&r);
+        let done = load_run_state(&r).unwrap();
+        assert_ne!(done.status, RunStatus::Stopped);
+        assert!(track_file(dir.path(), "0001", "agy").exists());
+        assert!(track_file(dir.path(), "0001", "opencode").exists());
+        let agy_runs = counts.slugs().into_iter().filter(|s| s == "agy").count();
+        let oc_runs = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(agy_runs, 3);
+        assert_eq!(oc_runs, 3);
+    }
+
+    #[test]
+    fn join_zero_output_retry_exhausted_stops_harness_crash() {
+        use crate::notify::NotifyEvent;
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let rec_h = crate::notify::hermes::install_recording(
+            "http://127.0.0.1:8644/webhooks/coordinator-failure",
+            "s",
+        );
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let seq = PerSlugSequenceBackend {
+            agy: Mutex::new(vec![
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+            ]),
+            opencode: Mutex::new(vec![
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+            ]),
+        };
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_join_retry_latched(&r);
+        assert_eq!(load_run_state(&r).unwrap().plan_review_join_retries, 1);
+        wait_stopped(&r);
+        let done = load_run_state(&r).unwrap();
+        assert_eq!(done.status, RunStatus::Stopped);
+        assert_eq!(done.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(
+            done.last_event.contains("zero reviewers produced output"),
+            "got {}",
+            done.last_event
+        );
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+        let captured = rec_h.take();
+        assert_eq!(captured.len(), 1);
+        let parsed: NotifyEvent = serde_json::from_slice(&captured[0].body).unwrap();
+        assert_eq!(parsed.failure_class, FailureClass::HarnessCrash);
+        assert!(
+            parsed
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("zero reviewers produced output")
+        );
+    }
+
+    #[test]
+    fn join_zero_output_never_ran_stops_without_retry() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let view = tick(&r).unwrap().expect("fail-fast join");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.plan_review_join_retries, 0);
+        assert!(s.plan_review_slot_ran.is_empty());
+        assert!(s.last_event.contains("zero reviewers produced output"));
+    }
+
+    #[test]
+    fn join_zero_output_under_min_spawn_budget_does_not_retry() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        TEST_JOIN_REMAINING.with(|c| c.set(Some(Duration::from_secs(10))));
+        struct JoinRemainingGuard;
+        impl Drop for JoinRemainingGuard {
+            fn drop(&mut self) {
+                TEST_JOIN_REMAINING.with(|c| c.set(None));
+            }
+        }
+        let _reset = JoinRemainingGuard;
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let seq = PerSlugSequenceBackend {
+            agy: Mutex::new(vec![ScriptedBackend::empty(), ScriptedBackend::empty()]),
+            opencode: Mutex::new(vec![ScriptedBackend::empty(), ScriptedBackend::empty()]),
+        };
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick(&r).unwrap();
+        wait_stopped(&r);
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Stopped);
+        assert_eq!(s.failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(s.plan_review_join_retries, 0);
+        assert!(s.last_event.contains("zero reviewers produced output"));
     }
 
     #[test]

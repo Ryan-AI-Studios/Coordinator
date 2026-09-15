@@ -124,6 +124,12 @@ pub struct RunState {
     /// Plan-review one-shot slots already launched this phase (0017). Additive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan_review_spawned: Vec<String>,
+    /// Join-level empty/dud re-arms this phase (0054). Cap 1. Not a Status JSON key.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub plan_review_join_retries: u32,
+    /// Slugs whose child actually ran `backend.run` this phase (0054). Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_review_slot_ran: Vec<String>,
     /// Address-findings entries this `run_epoch` (0031). Cap 2. Always serialized on disk.
     #[serde(default)]
     pub address_findings_attempts: u32,
@@ -212,6 +218,8 @@ impl RunState {
             stall_recycles: 0,
             aborted_session_id: None,
             plan_review_spawned: Vec::new(),
+            plan_review_join_retries: 0,
+            plan_review_slot_ran: Vec::new(),
             address_findings_attempts: 0,
         }
     }

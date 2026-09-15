@@ -70,6 +70,8 @@ pub(crate) fn run_with_origin(
                 state.stall_recycles = 0;
                 state.aborted_session_id = None;
                 state.plan_review_spawned.clear();
+                state.plan_review_join_retries = 0;
+                state.plan_review_slot_ran.clear();
                 state.address_findings_attempts = 0;
                 if picked {
                     let id = state.track_id.as_deref().unwrap_or("-");
@@ -135,6 +137,8 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.stall_recycles = 0;
                 state.aborted_session_id = None;
                 state.plan_review_spawned.clear();
+                state.plan_review_join_retries = 0;
+                state.plan_review_slot_ran.clear();
                 state.last_event = "run: started stub".into();
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);
