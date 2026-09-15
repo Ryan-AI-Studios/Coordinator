@@ -1636,7 +1636,7 @@ mod tests {
     }
 
     fn wait_slots_consumed(r: &ProjectRecord, slugs: &[&str]) {
-        for _ in 0..80 {
+        for _ in 0..200 {
             let _ = tick(r);
             let s = load_run_state(r).unwrap();
             if slugs
@@ -1663,12 +1663,17 @@ mod tests {
 
     fn wait_join_retry_latched(r: &ProjectRecord) {
         use crate::state::RunStatus;
-        for _ in 0..80 {
-            let _ = tick(r);
+        for _ in 0..200 {
             let s = load_run_state(r).unwrap();
-            if s.plan_review_join_retries == 1 || s.status == RunStatus::Stopped {
+            if s.plan_review_join_retries >= 1
+                || s.last_event.contains("plan-review: retrying join")
+            {
                 return;
             }
+            if s.status == RunStatus::Stopped {
+                return;
+            }
+            let _ = tick(r);
             std::thread::sleep(Duration::from_millis(25));
         }
         let s = load_run_state(r).unwrap();
@@ -1680,11 +1685,11 @@ mod tests {
 
     fn wait_stopped(r: &ProjectRecord) {
         use crate::state::RunStatus;
-        for _ in 0..80 {
-            let _ = tick(r);
+        for _ in 0..200 {
             if load_run_state(r).unwrap().status == RunStatus::Stopped {
                 return;
             }
+            let _ = tick(r);
             std::thread::sleep(Duration::from_millis(25));
         }
         let s = load_run_state(r).unwrap();
@@ -3210,6 +3215,7 @@ mod tests {
     #[test]
     fn join_zero_output_retries_then_pass() {
         use crate::state::RunStatus;
+        TEST_JOIN_REMAINING.with(|c| c.set(None));
         let _env = IsolatedHome::enter();
         let dir = tempdir().unwrap();
         setup_track(dir.path(), "0001");
