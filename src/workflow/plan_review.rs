@@ -541,7 +541,7 @@ fn apply_slot_result(
     backend: &dyn PlanReviewBackend,
     req: &PlanReviewRequest,
 ) {
-    mark_slot_ran(record, &req.slug);
+    mark_slot_ran(record, req);
     let t0 = Instant::now();
     let result = backend.run(req);
     if let Ok(ref out) = result {
@@ -810,14 +810,14 @@ fn journal_reviewer_stall(
     });
 }
 
-fn mark_slot_ran(record: &ProjectRecord, slug: &str) {
+fn mark_slot_ran(record: &ProjectRecord, req: &PlanReviewRequest) {
     let _ = with_run_state_lock(record, || {
         let mut s = load_run_state(record)?;
-        if s.phase != PHASE_PLAN_REVIEW {
+        if !apply_allowed(&s, req) {
             return Ok(());
         }
-        if !s.plan_review_slot_ran.iter().any(|x| x == slug) {
-            s.plan_review_slot_ran.push(slug.into());
+        if !s.plan_review_slot_ran.iter().any(|x| x == &req.slug) {
+            s.plan_review_slot_ran.push(req.slug.clone());
             s.updated_at = chrono::Utc::now();
             save_run_state(record, &s)?;
         }
@@ -832,10 +832,12 @@ pub(crate) fn maybe_rearm_join_retry(record: &ProjectRecord) -> Result<bool> {
     with_run_state_lock(record, || {
         let mut s = load_run_state(record)?;
         if s.status != RunStatus::Running || s.phase != PHASE_PLAN_REVIEW {
-            return Ok(false);
+            // Another tick already left plan-review; do not fail_phase.
+            return Ok(true);
         }
         if !s.pending_roles.is_empty() {
-            return Ok(false);
+            // Concurrent ticker already re-armed this join. Stay Running.
+            return Ok(true);
         }
         if s.plan_review_join_retries >= PLAN_REVIEW_JOIN_RETRY_CAP {
             return Ok(false);
@@ -1641,28 +1643,36 @@ mod tests {
         save_run_state(r, &state).unwrap();
     }
 
+    fn is_transient_lock_err(e: &crate::error::CoordinatorError) -> bool {
+        let msg = e.to_string();
+        msg.contains("Access is denied") || msg.contains("timed out waiting for run-state lock")
+    }
+
     fn tick_retry(r: &ProjectRecord) -> crate::error::Result<Option<crate::state::StatusView>> {
         for _ in 0..40 {
             match tick(r) {
                 Ok(v) => return Ok(v),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("Access is denied")
-                        || msg.contains("timed out waiting for run-state lock")
-                    {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    return Err(e);
+                Err(e) if is_transient_lock_err(&e) => {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
                 }
+                Err(e) => return Err(e),
             }
         }
         tick(r)
     }
 
+    fn tick_or_continue(r: &ProjectRecord) {
+        match tick_retry(r) {
+            Ok(_) => {}
+            Err(e) if is_transient_lock_err(&e) => {}
+            Err(e) => panic!("tick: {e}"),
+        }
+    }
+
     fn wait_slots_consumed(r: &ProjectRecord, slugs: &[&str]) {
         for _ in 0..200 {
-            let _ = tick(r);
+            tick_or_continue(r);
             let s = load_run_state(r).unwrap();
             if slugs
                 .iter()
@@ -1698,7 +1708,7 @@ mod tests {
             if s.status == RunStatus::Stopped {
                 return;
             }
-            let _ = tick(r);
+            tick_or_continue(r);
             std::thread::sleep(Duration::from_millis(25));
         }
         let s = load_run_state(r).unwrap();
@@ -1714,7 +1724,7 @@ mod tests {
             if load_run_state(r).unwrap().status == RunStatus::Stopped {
                 return;
             }
-            let _ = tick(r);
+            tick_or_continue(r);
             std::thread::sleep(Duration::from_millis(25));
         }
         let s = load_run_state(r).unwrap();
@@ -2348,9 +2358,25 @@ mod tests {
             }),
         );
         let start = Instant::now();
-        let _ = poll_once(&r).unwrap();
+        let mut last_err = None;
+        for _ in 0..40 {
+            match poll_once(&r) {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) if is_transient_lock_err(&e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        if let Some(e) = last_err {
+            panic!("{e}");
+        }
         assert!(
-            start.elapsed() < Duration::from_millis(800),
+            start.elapsed() < Duration::from_millis(1500),
             "poll_once blocked for {:?}",
             start.elapsed()
         );
@@ -2529,7 +2555,7 @@ mod tests {
             cv.notify_all();
         }
         std::thread::sleep(Duration::from_millis(80));
-        let _ = tick(&r);
+        let _ = tick_retry(&r);
         let roles = outcome_roles_dir(&r).unwrap();
         for slug in ["agy", "opencode"] {
             if roles.join(format!("{slug}.json")).exists() {
@@ -2596,6 +2622,43 @@ mod tests {
                 .pending_roles
                 .iter()
                 .any(|x| x == "agy")
+        );
+        assert!(
+            load_run_state(&r).unwrap().plan_review_slot_ran.is_empty(),
+            "stale child must not stamp slot_ran on the new epoch"
+        );
+    }
+
+    #[test]
+    fn stale_mark_slot_ran_does_not_stamp_new_epoch() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let first_epoch = load_run_state(&r).unwrap().run_epoch;
+        run::stop(&r).unwrap();
+        enter_plan_review(&r, "0002");
+        assert!(load_run_state(&r).unwrap().plan_review_slot_ran.is_empty());
+        let stale = PlanReviewRequest {
+            slug: "agy".into(),
+            command: "agy".into(),
+            model: None,
+            workspace_root: dir.path().to_path_buf(),
+            execution_repo: None,
+            track_dir: None,
+            prompt: String::new(),
+            remaining: Duration::from_secs(60),
+            argv: Vec::new(),
+            extra_env: Vec::new(),
+            spawn_epoch: first_epoch,
+            spawn_track_id: Some("0001".into()),
+        };
+        mark_slot_ran(&r, &stale);
+        assert!(
+            load_run_state(&r).unwrap().plan_review_slot_ran.is_empty(),
+            "epoch mismatch must not mark the live run as having run"
         );
     }
 
@@ -3401,6 +3464,74 @@ mod tests {
         assert_eq!(s.failure_class, Some(FailureClass::HarnessCrash));
         assert_eq!(s.plan_review_join_retries, 0);
         assert!(s.last_event.contains("zero reviewers produced output"));
+    }
+
+    #[test]
+    fn join_zero_output_pending_rearm_stays_running() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let _hook = install_test_backend(
+            &r.id,
+            Arc::new(HangBackend {
+                delay: Duration::from_secs(3),
+            }),
+        );
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["agy".into(), "opencode".into()];
+            s.plan_review_spawned = vec!["agy".into(), "opencode".into()];
+            s.plan_review_slot_ran = vec!["agy".into(), "opencode".into()];
+            s.plan_review_join_retries = 1;
+            s.last_event = "plan-review: retrying join agy,opencode (1/1)".into();
+            save_run_state(&r, &s).unwrap();
+        }
+        assert!(maybe_rearm_join_retry(&r).unwrap());
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        assert_eq!(s.plan_review_join_retries, 1);
+        assert_eq!(s.pending_roles.len(), 2);
+        assert!(s.failure_class.is_none());
+        let view = tick_retry(&r).unwrap();
+        assert!(
+            view.is_none(),
+            "join must not Stop while pending is refilled"
+        );
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        assert!(s.failure_class.is_none());
+    }
+
+    #[test]
+    fn join_zero_output_concurrent_rearm_stays_running() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles.clear();
+            s.plan_review_spawned = vec!["agy".into(), "opencode".into()];
+            s.plan_review_slot_ran = vec!["agy".into(), "opencode".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let rec_a = r.clone();
+        let rec_b = r.clone();
+        let h1 = std::thread::spawn(move || maybe_rearm_join_retry(&rec_a).unwrap());
+        let h2 = std::thread::spawn(move || maybe_rearm_join_retry(&rec_b).unwrap());
+        let a = h1.join().unwrap();
+        let b = h2.join().unwrap();
+        assert!(a && b, "neither ticker may treat a live re-arm as exhaust");
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        assert_eq!(s.plan_review_join_retries, 1);
+        assert!(!s.pending_roles.is_empty());
+        assert!(s.failure_class.is_none());
     }
 
     #[test]
