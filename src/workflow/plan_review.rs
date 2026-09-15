@@ -1641,6 +1641,25 @@ mod tests {
         save_run_state(r, &state).unwrap();
     }
 
+    fn tick_retry(r: &ProjectRecord) -> crate::error::Result<Option<crate::state::StatusView>> {
+        for _ in 0..40 {
+            match tick(r) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("Access is denied")
+                        || msg.contains("timed out waiting for run-state lock")
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        tick(r)
+    }
+
     fn wait_slots_consumed(r: &ProjectRecord, slugs: &[&str]) {
         for _ in 0..200 {
             let _ = tick(r);
@@ -2030,21 +2049,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        for _ in 0..40 {
-            match tick(&r) {
-                Ok(_) => break,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("Access is denied")
-                        || msg.contains("timed out waiting for run-state lock")
-                    {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    panic!("{e}");
-                }
-            }
-        }
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         let reqs = counts.requests.lock().unwrap();
         let oc = remaining_of(&reqs, "opencode");
@@ -2983,7 +2988,7 @@ mod tests {
         })));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         let oc_runs = counts
             .slugs()
@@ -3389,7 +3394,7 @@ mod tests {
         };
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_stopped(&r);
         let s = load_run_state(&r).unwrap();
         assert_eq!(s.status, RunStatus::Stopped);
