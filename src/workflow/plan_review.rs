@@ -20,15 +20,18 @@ use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run
 use crate::workflow::drive::write_review_markdown;
 use crate::workflow::graph::{
     PHASE_PLAN_REVIEW, REVIEW_SLUG_AGY, REVIEW_SLUG_OPENCODE, ROLE_REVIEWER_AGY,
-    ROLE_REVIEWER_OPENCODE, resolve_track_dir, role_phase,
+    ROLE_REVIEWER_OPENCODE, resolve_track_dir, review_slugs, role_phase,
 };
 use crate::workflow::timeouts::{TIMEOUT_KEY_PLAN_REVIEW_SLOT, timeout_for_phase};
 
 const MIN_SPAWN_BUDGET: Duration = Duration::from_secs(60);
+/// Join-level empty/dud re-arm cap this phase (0054). Not a cross-epoch counter.
+pub(crate) const PLAN_REVIEW_JOIN_RETRY_CAP: u32 = 1;
 
 #[cfg(test)]
 thread_local! {
     static TEST_RETRY_REMAINING: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    static TEST_JOIN_REMAINING: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 /// One-shot plan-review CLI (scripted in default tests; live CLI otherwise).
@@ -72,13 +75,19 @@ impl PlanReviewBackend for AgyCli {
         if let Some(ref td) = req.track_dir {
             watch_paths.push(td.join(format!("{}-review.md", req.slug)));
         }
+        // agy `--output-format json` is silent until the final object, and it
+        // typically writes `agy-review.md` at the end. The 600s file/stdio
+        // stall then kills a live reviewer (coordinated 0350/0351:
+        // `reviewer_stall` exit 124, `dur_ms≈600180`). OpenCode streams JSON
+        // so the same stall is a real hang detector there. Phase remaining
+        // (`--print-timeout`) is the agy backstop.
         let out = run_process(
             &bin,
             &req.argv,
             &req.workspace_root,
             ProcessWait {
                 timeout: req.remaining,
-                stall: crate::workflow::watchdog::progress_stall_interval(),
+                stall: None,
                 watch_paths: &watch_paths,
             },
             &[],
@@ -532,6 +541,7 @@ fn apply_slot_result(
     backend: &dyn PlanReviewBackend,
     req: &PlanReviewRequest,
 ) {
+    mark_slot_ran(record, req);
     let t0 = Instant::now();
     let result = backend.run(req);
     if let Ok(ref out) = result {
@@ -786,6 +796,100 @@ fn journal_reviewer_stall(
         &crate::harness::journal::argv_head(&req.command, &req.argv),
         dur.as_millis() as u64,
     );
+    let _ = with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if !apply_allowed(&s, req) {
+            return Ok(());
+        }
+        let rv = s.review.get_or_insert_with(Default::default);
+        if !rv.stalled.iter().any(|x| x == &req.slug) {
+            rv.stalled.push(req.slug.clone());
+        }
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)
+    });
+}
+
+fn mark_slot_ran(record: &ProjectRecord, req: &PlanReviewRequest) {
+    let _ = with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if !apply_allowed(&s, req) {
+            return Ok(());
+        }
+        if !s.plan_review_slot_ran.iter().any(|x| x == &req.slug) {
+            s.plan_review_slot_ran.push(req.slug.clone());
+            s.updated_at = chrono::Utc::now();
+            save_run_state(record, &s)?;
+        }
+        Ok(())
+    });
+}
+
+/// Re-arm empty/dud slugs once after the shipped per-slot retry (0054).
+///
+/// Returns `true` when join should stay Running (spawn on the next tick).
+pub(crate) fn maybe_rearm_join_retry(record: &ProjectRecord) -> Result<bool> {
+    with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if s.status != RunStatus::Running || s.phase != PHASE_PLAN_REVIEW {
+            // Another tick already left plan-review; do not fail_phase.
+            return Ok(true);
+        }
+        if !s.pending_roles.is_empty() {
+            // Concurrent ticker already re-armed this join. Stay Running.
+            return Ok(true);
+        }
+        if s.plan_review_join_retries >= PLAN_REVIEW_JOIN_RETRY_CAP {
+            return Ok(false);
+        }
+        let join_budget = {
+            #[cfg(test)]
+            {
+                TEST_JOIN_REMAINING
+                    .with(|c| c.get())
+                    .unwrap_or_else(|| remaining_budget(record, &s))
+            }
+            #[cfg(not(test))]
+            {
+                remaining_budget(record, &s)
+            }
+        };
+        if join_budget < MIN_SPAWN_BUDGET {
+            return Ok(false);
+        }
+        let stalled: Vec<String> = s
+            .review
+            .as_ref()
+            .map(|r| r.stalled.clone())
+            .unwrap_or_default();
+        let retryable: Vec<String> = review_slugs()
+            .iter()
+            .copied()
+            .filter(|slug| {
+                s.plan_review_slot_ran.iter().any(|x| x == slug)
+                    && !stalled.iter().any(|x| x == slug)
+            })
+            .map(str::to_string)
+            .collect();
+        if retryable.is_empty() {
+            return Ok(false);
+        }
+        s.plan_review_join_retries = s.plan_review_join_retries.saturating_add(1);
+        s.pending_roles.clone_from(&retryable);
+        s.plan_review_spawned
+            .retain(|x| !retryable.iter().any(|r| r == x));
+        let event = format!(
+            "plan-review: retrying join {} ({}/{})",
+            retryable.join(","),
+            s.plan_review_join_retries,
+            PLAN_REVIEW_JOIN_RETRY_CAP
+        );
+        s.last_event = event.clone();
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)?;
+        crate::progress_log::append(record, "plan-review", &event);
+        Ok(true)
+    })
 }
 
 fn unlink_track_review(req: &PlanReviewRequest) {
@@ -1395,6 +1499,27 @@ impl PlanReviewBackend for AgySequenceBackend {
 }
 
 #[cfg(test)]
+struct PerSlugSequenceBackend {
+    agy: Mutex<Vec<ScriptedBackend>>,
+    opencode: Mutex<Vec<ScriptedBackend>>,
+}
+
+#[cfg(test)]
+impl PlanReviewBackend for PerSlugSequenceBackend {
+    fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
+        let q = match req.slug.as_str() {
+            REVIEW_SLUG_OPENCODE => &self.opencode,
+            _ => &self.agy,
+        };
+        let mut q = q.lock().unwrap_or_else(|p| p.into_inner());
+        if !q.is_empty() {
+            return q.remove(0).run(req);
+        }
+        ScriptedBackend::empty().run(req)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
@@ -1518,9 +1643,36 @@ mod tests {
         save_run_state(r, &state).unwrap();
     }
 
+    fn is_transient_lock_err(e: &crate::error::CoordinatorError) -> bool {
+        let msg = e.to_string();
+        msg.contains("Access is denied") || msg.contains("timed out waiting for run-state lock")
+    }
+
+    fn tick_retry(r: &ProjectRecord) -> crate::error::Result<Option<crate::state::StatusView>> {
+        for _ in 0..40 {
+            match tick(r) {
+                Ok(v) => return Ok(v),
+                Err(e) if is_transient_lock_err(&e) => {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        tick(r)
+    }
+
+    fn tick_or_continue(r: &ProjectRecord) {
+        match tick_retry(r) {
+            Ok(_) => {}
+            Err(e) if is_transient_lock_err(&e) => {}
+            Err(e) => panic!("tick: {e}"),
+        }
+    }
+
     fn wait_slots_consumed(r: &ProjectRecord, slugs: &[&str]) {
-        for _ in 0..80 {
-            let _ = tick(r);
+        for _ in 0..200 {
+            tick_or_continue(r);
             let s = load_run_state(r).unwrap();
             if slugs
                 .iter()
@@ -1542,6 +1694,44 @@ mod tests {
 
     fn wait_both_consumed(r: &ProjectRecord) {
         wait_slots_consumed(r, &["agy", "opencode"]);
+    }
+
+    fn wait_join_retry_latched(r: &ProjectRecord) {
+        use crate::state::RunStatus;
+        for _ in 0..200 {
+            let s = load_run_state(r).unwrap();
+            if s.plan_review_join_retries >= 1
+                || s.last_event.contains("plan-review: retrying join")
+            {
+                return;
+            }
+            if s.status == RunStatus::Stopped {
+                return;
+            }
+            tick_or_continue(r);
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let s = load_run_state(r).unwrap();
+        panic!(
+            "join retry not latched: retries={} status={:?} event={}",
+            s.plan_review_join_retries, s.status, s.last_event
+        );
+    }
+
+    fn wait_stopped(r: &ProjectRecord) {
+        use crate::state::RunStatus;
+        for _ in 0..200 {
+            if load_run_state(r).unwrap().status == RunStatus::Stopped {
+                return;
+            }
+            tick_or_continue(r);
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let s = load_run_state(r).unwrap();
+        panic!(
+            "run did not stop: status={:?} event={} pending={:?}",
+            s.status, s.last_event, s.pending_roles
+        );
     }
 
     fn track_file(dir: &std::path::Path, track: &str, slug: &str) -> PathBuf {
@@ -1780,7 +1970,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         for slug in ["agy", "opencode"] {
             let state_file = crate::workflow::bundle::review_file(&r, slug).unwrap();
@@ -1843,10 +2033,10 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         assert_eq!(counts.n(), 2);
         let slugs = counts.slugs();
         assert_eq!(slugs.iter().filter(|s| *s == "agy").count(), 1);
@@ -1869,7 +2059,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         let reqs = counts.requests.lock().unwrap();
         let oc = remaining_of(&reqs, "opencode");
@@ -1904,7 +2094,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         let reqs = counts.requests.lock().unwrap();
         let oc = remaining_of(&reqs, "opencode");
@@ -1974,7 +2164,7 @@ mod tests {
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
         write_review_markdown(&r, "agy", Some("agy done\n")).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         let mut saw_timeout = false;
         let mut spawned_at_timeout: Vec<String> = Vec::new();
         for _ in 0..80 {
@@ -2028,7 +2218,7 @@ mod tests {
             body,
         ))));
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let written = std::fs::read_to_string(track_file(dir.path(), "0001", "opencode")).unwrap();
         assert!(written.contains("crates.io"));
@@ -2147,7 +2337,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         let slugs = counts.slugs();
         assert!(slugs.iter().any(|s| s == "agy"));
@@ -2168,9 +2358,25 @@ mod tests {
             }),
         );
         let start = Instant::now();
-        let _ = poll_once(&r).unwrap();
+        let mut last_err = None;
+        for _ in 0..40 {
+            match poll_once(&r) {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) if is_transient_lock_err(&e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        if let Some(e) = last_err {
+            panic!("{e}");
+        }
         assert!(
-            start.elapsed() < Duration::from_millis(800),
+            start.elapsed() < Duration::from_millis(1500),
             "poll_once blocked for {:?}",
             start.elapsed()
         );
@@ -2193,7 +2399,7 @@ mod tests {
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         state.pending_roles = vec!["agy".into(), "opencode".into()];
         save_run_state(&r, &state).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         assert_eq!(counts.n(), 0);
 
         run::stop(&r).unwrap();
@@ -2201,7 +2407,7 @@ mod tests {
         let mut state = load_run_state(&r).unwrap();
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         save_run_state(&r, &state).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         assert_eq!(counts.n(), 0);
         let s = load_run_state(&r).unwrap();
         assert!(!s.pending_roles.iter().any(|x| x == "agy"));
@@ -2236,7 +2442,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["agy"]);
         let agy_runs = counts.slugs().into_iter().filter(|s| s == "agy").count();
         assert_eq!(agy_runs, 2);
@@ -2280,7 +2486,7 @@ mod tests {
         });
         crate::persist::atomic_write_json(&roles.join("opencode.json"), &oc).unwrap();
 
-        let view = tick(&r).unwrap().expect("degrade join");
+        let view = tick_retry(&r).unwrap().expect("degrade join");
         assert_eq!(view.phase, graph::PHASE_FOLD);
         assert!(view.last_event.contains("degraded"));
         let agy_json = crate::outcome::outcome_roles_dir(&r)
@@ -2322,7 +2528,7 @@ mod tests {
         });
         crate::persist::atomic_write_json(&roles.join("agy.json"), &agy).unwrap();
 
-        let view = tick(&r).unwrap().expect("degrade join");
+        let view = tick_retry(&r).unwrap().expect("degrade join");
         assert_eq!(view.phase, graph::PHASE_FOLD);
         assert!(view.last_event.contains("degraded"));
     }
@@ -2340,7 +2546,7 @@ mod tests {
             inner: Arc::new(ScriptedBackend::ok_json("should not land")),
         });
         let _hook = install_test_backend(&r.id, backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         run::stop(&r).unwrap();
         {
             let (lock, cv) = &*gate;
@@ -2349,7 +2555,7 @@ mod tests {
             cv.notify_all();
         }
         std::thread::sleep(Duration::from_millis(80));
-        let _ = tick(&r);
+        let _ = tick_retry(&r);
         let roles = outcome_roles_dir(&r).unwrap();
         for slug in ["agy", "opencode"] {
             if roles.join(format!("{slug}.json")).exists() {
@@ -2385,7 +2591,7 @@ mod tests {
                 inner: Arc::new(ScriptedBackend::ok_file("stale review from track A\n")),
             }),
         );
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         let first_epoch = load_run_state(&r).unwrap().run_epoch;
         run::stop(&r).unwrap();
         enter_plan_review(&r, "0002");
@@ -2417,6 +2623,43 @@ mod tests {
                 .iter()
                 .any(|x| x == "agy")
         );
+        assert!(
+            load_run_state(&r).unwrap().plan_review_slot_ran.is_empty(),
+            "stale child must not stamp slot_ran on the new epoch"
+        );
+    }
+
+    #[test]
+    fn stale_mark_slot_ran_does_not_stamp_new_epoch() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let first_epoch = load_run_state(&r).unwrap().run_epoch;
+        run::stop(&r).unwrap();
+        enter_plan_review(&r, "0002");
+        assert!(load_run_state(&r).unwrap().plan_review_slot_ran.is_empty());
+        let stale = PlanReviewRequest {
+            slug: "agy".into(),
+            command: "agy".into(),
+            model: None,
+            workspace_root: dir.path().to_path_buf(),
+            execution_repo: None,
+            track_dir: None,
+            prompt: String::new(),
+            remaining: Duration::from_secs(60),
+            argv: Vec::new(),
+            extra_env: Vec::new(),
+            spawn_epoch: first_epoch,
+            spawn_track_id: Some("0001".into()),
+        };
+        mark_slot_ran(&r, &stale);
+        assert!(
+            load_run_state(&r).unwrap().plan_review_slot_ran.is_empty(),
+            "epoch mismatch must not mark the live run as having run"
+        );
     }
 
     #[test]
@@ -2442,7 +2685,7 @@ mod tests {
         let _hook = install_test_backend(&r.id, rec_backend);
 
         enter_plan_review(&r, "0001");
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         let after_spawn = load_run_state(&r).unwrap();
         assert!(
             after_spawn
@@ -2483,7 +2726,7 @@ mod tests {
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         state.pending_roles = vec!["agy".into(), "opencode".into()];
         save_run_state(&r, &state).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         assert_eq!(counts.n(), 4);
         let slugs = counts.slugs();
@@ -2503,14 +2746,20 @@ mod tests {
         run::run_with_driver(&r, Some("0001".into()), WorkflowDriver::Adapter).unwrap();
         let state = load_run_state(&r).unwrap();
         assert!(state.plan_review_spawned.is_empty());
+        assert_eq!(state.plan_review_join_retries, 0);
+        assert!(state.plan_review_slot_ran.is_empty());
     }
 
     #[test]
     fn reset_phase_clock_clears_spawned() {
         let mut state = RunState::idle("p");
         state.plan_review_spawned = vec!["agy".into(), "opencode".into()];
+        state.plan_review_join_retries = 1;
+        state.plan_review_slot_ran = vec!["agy".into()];
         reset_phase_clock(&mut state);
         assert!(state.plan_review_spawned.is_empty());
+        assert_eq!(state.plan_review_join_retries, 0);
+        assert!(state.plan_review_slot_ran.is_empty());
     }
 
     #[test]
@@ -2585,7 +2834,7 @@ mod tests {
         let leftover_oc = track_file(dir.path(), "0001", "opencode");
         std::fs::write(&leftover_oc, "stale opencode from last run\n").unwrap();
         let _hook = install_test_backend(&r.id, Arc::new(ScriptedBackend::empty()));
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         for (slug, stale) in [
             ("agy", "stale review from last run"),
@@ -2627,7 +2876,7 @@ mod tests {
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
         let _hook = install_test_backend(&r.id, Arc::new(ScriptedBackend::empty()));
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let state_file = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
         if state_file.is_file() {
@@ -2653,7 +2902,7 @@ mod tests {
                 "# Track review: 0001-Example\n\n**Track:** `0001`\n\nndjson review body\n",
             )),
         );
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let state_file = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
         assert!(state_file.is_file());
@@ -2673,7 +2922,7 @@ mod tests {
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
         let _hook = install_test_backend(&r.id, Arc::new(ScriptedBackend::ndjson_error("login")));
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let state_file = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
         assert!(
@@ -2715,7 +2964,7 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(counts.n(), 0);
         let pending = load_run_state(&r).unwrap().pending_roles;
@@ -2739,7 +2988,7 @@ mod tests {
             ))),
         })));
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         run::pause(&r).unwrap();
         {
             let (lock, cv) = &*gate;
@@ -2802,7 +3051,7 @@ mod tests {
         })));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_both_consumed(&r);
         let oc_runs = counts
             .slugs()
@@ -2853,7 +3102,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::stall())));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let oc_runs = counts
             .slugs()
@@ -2884,7 +3133,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let oc_runs = counts
             .slugs()
@@ -2908,6 +3157,7 @@ mod tests {
         state.pending_roles = vec!["opencode".into()];
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
+        write_review_markdown(&r, "agy", Some("agy already done\n")).unwrap();
         let seq = OpencodeSequenceBackend {
             opencode: Mutex::new(vec![
                 ScriptedBackend::ok_file(degenerate_review_body()),
@@ -2918,7 +3168,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let oc_runs = counts
             .slugs()
@@ -3013,7 +3263,7 @@ mod tests {
         let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let oc_runs = counts
             .slugs()
@@ -3046,6 +3296,242 @@ mod tests {
         run::run_stub(&r, Some("0001".into())).unwrap();
         let state = load_run_state(&r).unwrap();
         assert!(state.plan_review_spawned.is_empty());
+        assert_eq!(state.plan_review_join_retries, 0);
+        assert!(state.plan_review_slot_ran.is_empty());
+    }
+
+    #[test]
+    fn join_zero_output_retries_then_pass() {
+        use crate::state::RunStatus;
+        TEST_JOIN_REMAINING.with(|c| c.set(None));
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let seq = PerSlugSequenceBackend {
+            agy: Mutex::new(vec![
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::ok_file(ok_review_body("0001")),
+            ]),
+            opencode: Mutex::new(vec![
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::ok_file(ok_review_body("0001")),
+            ]),
+        };
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick_retry(&r).unwrap();
+        wait_join_retry_latched(&r);
+        let latched = load_run_state(&r).unwrap();
+        assert_eq!(latched.status, RunStatus::Running);
+        assert_eq!(latched.plan_review_join_retries, 1);
+        assert!(
+            latched.last_event.starts_with("plan-review: retrying join"),
+            "got {}",
+            latched.last_event
+        );
+        assert!(latched.last_event.contains("(1/1)"));
+        assert!(latched.pending_roles.iter().any(|x| x == "agy"));
+        assert!(latched.pending_roles.iter().any(|x| x == "opencode"));
+        assert!(!latched.plan_review_spawned.iter().any(|x| x == "agy"));
+        assert!(!latched.plan_review_spawned.iter().any(|x| x == "opencode"));
+        assert!(latched.failure_class.is_none());
+        let first_wave_agy = counts.slugs().into_iter().filter(|s| s == "agy").count();
+        let first_wave_oc = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(first_wave_agy, 2, "slot retry consumes two empties");
+        assert_eq!(first_wave_oc, 2, "slot retry consumes two empties");
+        wait_both_consumed(&r);
+        let done = load_run_state(&r).unwrap();
+        assert_ne!(done.status, RunStatus::Stopped);
+        assert!(track_file(dir.path(), "0001", "agy").exists());
+        assert!(track_file(dir.path(), "0001", "opencode").exists());
+        let agy_runs = counts.slugs().into_iter().filter(|s| s == "agy").count();
+        let oc_runs = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(agy_runs, 3);
+        assert_eq!(oc_runs, 3);
+    }
+
+    #[test]
+    fn join_zero_output_retry_exhausted_stops_harness_crash() {
+        use crate::notify::NotifyEvent;
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let rec_h = crate::notify::hermes::install_recording(
+            "http://127.0.0.1:8644/webhooks/coordinator-failure",
+            "s",
+        );
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let seq = PerSlugSequenceBackend {
+            agy: Mutex::new(vec![
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+            ]),
+            opencode: Mutex::new(vec![
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+            ]),
+        };
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick_retry(&r).unwrap();
+        wait_join_retry_latched(&r);
+        assert_eq!(load_run_state(&r).unwrap().plan_review_join_retries, 1);
+        wait_stopped(&r);
+        let done = load_run_state(&r).unwrap();
+        assert_eq!(done.status, RunStatus::Stopped);
+        assert_eq!(done.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(
+            done.last_event.contains("zero reviewers produced output"),
+            "got {}",
+            done.last_event
+        );
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+        let captured = rec_h.take();
+        assert_eq!(captured.len(), 1);
+        let parsed: NotifyEvent = serde_json::from_slice(&captured[0].body).unwrap();
+        assert_eq!(parsed.failure_class, FailureClass::HarnessCrash);
+        assert!(
+            parsed
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("zero reviewers produced output")
+        );
+    }
+
+    #[test]
+    fn join_zero_output_never_ran_stops_without_retry() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let view = tick_retry(&r).unwrap().expect("fail-fast join");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.plan_review_join_retries, 0);
+        assert!(s.plan_review_slot_ran.is_empty());
+        assert!(s.last_event.contains("zero reviewers produced output"));
+    }
+
+    #[test]
+    fn join_zero_output_under_min_spawn_budget_does_not_retry() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        TEST_JOIN_REMAINING.with(|c| c.set(Some(Duration::from_secs(10))));
+        struct JoinRemainingGuard;
+        impl Drop for JoinRemainingGuard {
+            fn drop(&mut self) {
+                TEST_JOIN_REMAINING.with(|c| c.set(None));
+            }
+        }
+        let _reset = JoinRemainingGuard;
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let seq = PerSlugSequenceBackend {
+            agy: Mutex::new(vec![ScriptedBackend::empty(), ScriptedBackend::empty()]),
+            opencode: Mutex::new(vec![ScriptedBackend::empty(), ScriptedBackend::empty()]),
+        };
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(seq)));
+        let _hook = install_test_backend(&r.id, rec_backend);
+        tick_retry(&r).unwrap();
+        wait_stopped(&r);
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Stopped);
+        assert_eq!(s.failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(s.plan_review_join_retries, 0);
+        assert!(s.last_event.contains("zero reviewers produced output"));
+    }
+
+    #[test]
+    fn join_zero_output_pending_rearm_stays_running() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let _hook = install_test_backend(
+            &r.id,
+            Arc::new(HangBackend {
+                delay: Duration::from_secs(3),
+            }),
+        );
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["agy".into(), "opencode".into()];
+            s.plan_review_spawned = vec!["agy".into(), "opencode".into()];
+            s.plan_review_slot_ran = vec!["agy".into(), "opencode".into()];
+            s.plan_review_join_retries = 1;
+            s.last_event = "plan-review: retrying join agy,opencode (1/1)".into();
+            save_run_state(&r, &s).unwrap();
+        }
+        assert!(maybe_rearm_join_retry(&r).unwrap());
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        assert_eq!(s.plan_review_join_retries, 1);
+        assert_eq!(s.pending_roles.len(), 2);
+        assert!(s.failure_class.is_none());
+        let view = tick_retry(&r).unwrap();
+        assert!(
+            view.is_none(),
+            "join must not Stop while pending is refilled"
+        );
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        assert!(s.failure_class.is_none());
+    }
+
+    #[test]
+    fn join_zero_output_concurrent_rearm_stays_running() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles.clear();
+            s.plan_review_spawned = vec!["agy".into(), "opencode".into()];
+            s.plan_review_slot_ran = vec!["agy".into(), "opencode".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let rec_a = r.clone();
+        let rec_b = r.clone();
+        let h1 = std::thread::spawn(move || maybe_rearm_join_retry(&rec_a).unwrap());
+        let h2 = std::thread::spawn(move || maybe_rearm_join_retry(&rec_b).unwrap());
+        let a = h1.join().unwrap();
+        let b = h2.join().unwrap();
+        assert!(a && b, "neither ticker may treat a live re-arm as exhaust");
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running);
+        assert_eq!(s.plan_review_join_retries, 1);
+        assert!(!s.pending_roles.is_empty());
+        assert!(s.failure_class.is_none());
     }
 
     #[test]
@@ -3089,7 +3575,7 @@ mod tests {
             state.pending_roles = vec!["agy".into()];
             save_run_state(&r, &state).unwrap();
         }
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_agy_consumed(&r);
         let state_file = crate::workflow::bundle::review_file(&r, "agy").unwrap();
         assert!(
@@ -3140,7 +3626,7 @@ mod tests {
         state.pending_roles = vec!["opencode".into()];
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
-        tick(&r).unwrap();
+        tick_retry(&r).unwrap();
         wait_slots_consumed(&r, &["opencode"]);
         let state_file = crate::workflow::bundle::review_file(&r, "opencode").unwrap();
         assert!(

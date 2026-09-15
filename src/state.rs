@@ -124,6 +124,12 @@ pub struct RunState {
     /// Plan-review one-shot slots already launched this phase (0017). Additive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan_review_spawned: Vec<String>,
+    /// Join-level empty/dud re-arms this phase (0054). Cap 1. Not a Status JSON key.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub plan_review_join_retries: u32,
+    /// Slugs whose child actually ran `backend.run` this phase (0054). Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_review_slot_ran: Vec<String>,
     /// Address-findings entries this `run_epoch` (0031). Cap 2. Always serialized on disk.
     #[serde(default)]
     pub address_findings_attempts: u32,
@@ -212,6 +218,8 @@ impl RunState {
             stall_recycles: 0,
             aborted_session_id: None,
             plan_review_spawned: Vec::new(),
+            plan_review_join_retries: 0,
+            plan_review_slot_ran: Vec::new(),
             address_findings_attempts: 0,
         }
     }
@@ -550,11 +558,12 @@ where
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::AlreadyExists
-                    || (e.kind() == std::io::ErrorKind::PermissionDenied && lock_path.exists()) =>
+                    || e.kind() == std::io::ErrorKind::PermissionDenied =>
             {
                 // Break stale lock if older than 60s.
-                // Windows can surface PermissionDenied instead of AlreadyExists
-                // while another thread is creating or removing the lock dir.
+                // Windows surfaces PermissionDenied instead of AlreadyExists
+                // while another thread is creating or removing the lock dir,
+                // including when exists() is already false (delete in flight).
                 if let Ok(meta) = std::fs::metadata(&lock_path)
                     && let Ok(modified) = meta.modified()
                     && let Ok(age) = std::time::SystemTime::now().duration_since(modified)
@@ -739,6 +748,33 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_STATE_DIR);
         }
+    }
+
+    #[test]
+    fn run_state_lock_contention_succeeds() {
+        let dir = tempdir().unwrap();
+        let mut rec = sample_record(dir.path());
+        rec.state_dir = Some(dir.path().join("explicit-state"));
+        save_run_state(&rec, &RunState::idle(&rec.id)).unwrap();
+        let rec = std::sync::Arc::new(rec);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let rec = rec.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..20 {
+                    with_run_state_lock(&rec, || {
+                        let mut s = load_run_state(&rec)?;
+                        s.last_event = "lock".into();
+                        save_run_state(&rec, &s)
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(run_state_path(&rec).unwrap().exists());
     }
 
     #[test]

@@ -505,9 +505,16 @@ fn try_join(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
         .filter(|slug| review_produced(record, slug))
         .collect();
     if produced.is_empty() {
+        if super::plan_review::maybe_rearm_join_retry(record)? {
+            return Ok(None);
+        }
+        let latest = load_run_state(record)?;
+        if !latest.pending_roles.is_empty() {
+            return Ok(None);
+        }
         return fail_phase(
             record,
-            &state,
+            &latest,
             FailureClass::HarnessCrash,
             "plan-review: zero reviewers produced output".into(),
             OutcomeSource::Test,
