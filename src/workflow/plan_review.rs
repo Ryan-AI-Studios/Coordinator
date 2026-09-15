@@ -75,13 +75,19 @@ impl PlanReviewBackend for AgyCli {
         if let Some(ref td) = req.track_dir {
             watch_paths.push(td.join(format!("{}-review.md", req.slug)));
         }
+        // agy `--output-format json` is silent until the final object, and it
+        // typically writes `agy-review.md` at the end. The 600s file/stdio
+        // stall then kills a live reviewer (coordinated 0350/0351:
+        // `reviewer_stall` exit 124, `dur_ms≈600180`). OpenCode streams JSON
+        // so the same stall is a real hang detector there. Phase remaining
+        // (`--print-timeout`) is the agy backstop.
         let out = run_process(
             &bin,
             &req.argv,
             &req.workspace_root,
             ProcessWait {
                 timeout: req.remaining,
-                stall: crate::workflow::watchdog::progress_stall_interval(),
+                stall: None,
                 watch_paths: &watch_paths,
             },
             &[],
@@ -2024,7 +2030,21 @@ mod tests {
         ))));
         let counts = rec_backend.counts.clone();
         let _hook = install_test_backend(&r.id, rec_backend);
-        tick(&r).unwrap();
+        for _ in 0..40 {
+            match tick(&r) {
+                Ok(_) => break,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("Access is denied")
+                        || msg.contains("timed out waiting for run-state lock")
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    panic!("{e}");
+                }
+            }
+        }
         wait_both_consumed(&r);
         let reqs = counts.requests.lock().unwrap();
         let oc = remaining_of(&reqs, "opencode");
