@@ -175,6 +175,11 @@ pub fn is_completed(status_raw: &str) -> bool {
     status_clean(status_raw) == "Completed"
 }
 
+/// Registry `**In progress**` (exact `status_clean`; 0055 sticky-exempt).
+pub fn is_in_progress(status_raw: &str) -> bool {
+    status_clean(status_raw) == "In progress"
+}
+
 /// Best-effort `{conductor_dir}/conductor.md` rows. Missing / unreadable → `None`.
 pub fn load_track_rows(record: &ProjectRecord) -> Option<Vec<TrackRow>> {
     let path = crate::layout::resolve(record)
@@ -640,6 +645,20 @@ pub fn pick_next_ready_excluding(
     skip: &[String],
     probe: Option<&dyn MergedTrackProbe>,
 ) -> Result<String> {
+    pick_next_ready_excluding_sticky(record, skip, probe, &[])
+}
+
+/// Like [`pick_next_ready_excluding`], plus a read-time Ready overlay (0055).
+///
+/// Sticky ids stay eligible when the live cell is no longer a Ready alias,
+/// unless HITL, `<!-- nostart -->`, Completed, or `In progress`. Merged-PR
+/// probe still wins. Does not write `conductor.md`.
+pub fn pick_next_ready_excluding_sticky(
+    record: &ProjectRecord,
+    skip: &[String],
+    probe: Option<&dyn MergedTrackProbe>,
+    sticky: &[String],
+) -> Result<String> {
     let path = crate::layout::resolve(record)
         .conductor_dir
         .join("conductor.md");
@@ -655,11 +674,7 @@ pub fn pick_next_ready_excluding(
     let aliases = ready_aliases_for(record);
     let mut eligible: Vec<&TrackRow> = rows
         .iter()
-        .filter(|r| {
-            is_eligible_ready_in(&r.status_raw, &aliases)
-                && !is_hitl_marked(&r.id, &r.slug, &r.status_raw, &r.summary)
-                && !r.nostart
-        })
+        .filter(|r| row_overlay_eligible(r, &aliases, sticky))
         .collect();
     if eligible.is_empty() {
         return Err(CoordinatorError::Message(empty_ready_pick_error(record)));
@@ -700,6 +715,65 @@ pub fn pick_next_ready_excluding(
         "Ready track(s) {} have no matching conductor directory; pass --track <id>",
         missing.join(", ")
     )))
+}
+
+fn row_overlay_eligible(row: &TrackRow, aliases: &[String], sticky: &[String]) -> bool {
+    if is_hitl_marked(&row.id, &row.slug, &row.status_raw, &row.summary) || row.nostart {
+        return false;
+    }
+    if is_eligible_ready_in(&row.status_raw, aliases) {
+        return true;
+    }
+    if is_completed(&row.status_raw) || is_in_progress(&row.status_raw) {
+        return false;
+    }
+    sticky.iter().any(|s| track_ids_match(&row.id, s))
+}
+
+fn sticky_keep_live(row: &TrackRow) -> bool {
+    !is_hitl_marked(&row.id, &row.slug, &row.status_raw, &row.summary)
+        && !row.nostart
+        && !is_completed(&row.status_raw)
+        && !is_in_progress(&row.status_raw)
+}
+
+/// Union-capture operator-Ready ids (0055). Missing/unparseable file → `prev`.
+pub fn capture_sticky_ready_ids(record: &ProjectRecord, prev: &[String]) -> Vec<String> {
+    let Some(rows) = load_track_rows(record) else {
+        return prev.to_vec();
+    };
+    let aliases = ready_aliases_for(record);
+    let mut out: Vec<String> = Vec::new();
+    let push = |out: &mut Vec<String>, id: &str| {
+        if !out.iter().any(|e| track_ids_match(e, id)) {
+            out.push(id.to_string());
+        }
+    };
+    for id in prev {
+        if let Some(row) = rows.iter().find(|r| track_ids_match(&r.id, id))
+            && sticky_keep_live(row)
+        {
+            push(&mut out, &row.id);
+        }
+    }
+    for row in &rows {
+        if is_eligible_ready_in(&row.status_raw, &aliases) && sticky_keep_live(row) {
+            push(&mut out, &row.id);
+        }
+    }
+    out
+}
+
+/// `Some(status_clean)` when `id` was picked but the live cell is not Ready.
+pub fn overlay_file_status(record: &ProjectRecord, id: &str) -> Option<String> {
+    let rows = load_track_rows(record)?;
+    let aliases = ready_aliases_for(record);
+    let row = rows.iter().find(|r| track_ids_match(&r.id, id))?;
+    if is_eligible_ready_in(&row.status_raw, &aliases) {
+        None
+    } else {
+        Some(status_clean(&row.status_raw))
+    }
 }
 
 /// Test helper: one exact Ready row + `{id}-Fixture/` dir under `ws/conductor/`.
@@ -787,6 +861,10 @@ mod tests {
         assert!(is_completed("Completed"));
         assert!(!is_completed("**Ready — not started**"));
         assert!(!is_completed("**Cancelled**"));
+        assert!(is_in_progress("**In progress**"));
+        assert!(is_in_progress("In progress"));
+        assert!(!is_in_progress("**Completed**"));
+        assert!(!is_in_progress("**Ready — not started**"));
     }
 
     #[test]
@@ -1551,5 +1629,205 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no Ready"), "{err}");
+    }
+
+    fn proposed_md(id: &str, slug: &str) -> String {
+        format!(
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | {id}-Done | `.` | **Completed** | done |\n\
+             | {id2}-{slug} | `.` | **Proposed — placeholder, needs full spec/plan pass** | later |\n",
+            id = "0001",
+            id2 = id,
+            slug = slug
+        )
+    }
+
+    #[test]
+    fn sticky_overlay_picks_proposed_successor() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(ws, &proposed_md("0002", "Next"));
+        mkdir_track(ws, "0001-Done");
+        mkdir_track(ws, "0002-Next");
+        let r = rec(ws);
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&r, &[], None, &["0002".into()]).unwrap(),
+            "0002"
+        );
+    }
+
+    #[test]
+    fn sticky_does_not_pick_never_ready_proposed() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(ws, &proposed_md("0002", "Next"));
+        mkdir_track(ws, "0001-Done");
+        mkdir_track(ws, "0002-Next");
+        let r = rec(ws);
+        let err = pick_next_ready_excluding_sticky(&r, &[], None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Ready"), "{err}");
+        assert!(err.contains("--track"), "{err}");
+    }
+
+    #[test]
+    fn sticky_skips_hitl_even_if_listed() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0011-OwnerHitl | `.` | **Proposed — placeholder, needs full spec/plan pass** | skip |\n\
+             | 0030-Ok | `.` | **Ready — not started** | go |\n",
+        );
+        mkdir_track(ws, "0011-OwnerHitl");
+        mkdir_track(ws, "0030-Ok");
+        let r = rec(ws);
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&r, &[], None, &["0011".into()]).unwrap(),
+            "0030"
+        );
+    }
+
+    #[test]
+    fn sticky_skips_nostart_even_if_listed() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0029-Lock](0029-Lock/spec.md) | `.` | **Proposed — placeholder, needs full spec/plan pass** <!-- nostart --> | skip |\n\
+             | [0030-Ok](0030-Ok/spec.md) | `.` | **Ready — not started** | go |\n",
+        );
+        mkdir_track(ws, "0029-Lock");
+        mkdir_track(ws, "0030-Ok");
+        let r = rec(ws);
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&r, &[], None, &["0029".into()]).unwrap(),
+            "0030"
+        );
+    }
+
+    #[test]
+    fn sticky_skips_completed_even_if_listed() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-Done | `.` | **Completed** | done |\n\
+             | 0002-Next | `.` | **Ready — not started** | go |\n",
+        );
+        mkdir_track(ws, "0001-Done");
+        mkdir_track(ws, "0002-Next");
+        let r = rec(ws);
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&r, &[], None, &["0001".into()]).unwrap(),
+            "0002"
+        );
+    }
+
+    #[test]
+    fn sticky_skips_in_progress_even_if_listed() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-Live | `.` | **In progress** | wip |\n\
+             | 0002-Next | `.` | **Ready — not started** | go |\n",
+        );
+        mkdir_track(ws, "0001-Live");
+        mkdir_track(ws, "0002-Next");
+        let r = rec(ws);
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&r, &[], None, &["0001".into()]).unwrap(),
+            "0002"
+        );
+    }
+
+    #[test]
+    fn sticky_ready_aliases_capture_and_pick() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0042-Queued | `.` | **Ready — full plan @ 072399b6** | go |\n",
+        );
+        mkdir_track(ws, "0042-Queued");
+        let mut r = rec(ws);
+        r.ready_aliases = vec!["Ready — full plan @ 072399b6".into()];
+        let sticky = capture_sticky_ready_ids(&r, &[]);
+        assert_eq!(sticky, vec!["0042".to_string()]);
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0042-Queued | `.` | **Proposed — placeholder, needs full spec/plan pass** | later |\n",
+        );
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&r, &[], None, &sticky).unwrap(),
+            "0042"
+        );
+    }
+
+    #[test]
+    fn sticky_merged_probe_still_skips() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-One | `.` | **Proposed — placeholder, needs full spec/plan pass** | a |\n\
+             | 0002-Two | `.` | **Ready — not started** | b |\n",
+        );
+        mkdir_track(ws, "0001-One");
+        mkdir_track(ws, "0002-Two");
+        let mut r = rec(ws);
+        r.execution_repo = Some(ws.to_path_buf());
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0001", 56);
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&r, &[], Some(&probe), &["0001".into()]).unwrap(),
+            "0002"
+        );
+    }
+
+    #[test]
+    fn sticky_capture_union_keeps_prev_proposed_adds_new_ready_drops_completed() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-Done | `.` | **Completed** | done |\n\
+             | 0002-Later | `.` | **Proposed — placeholder, needs full spec/plan pass** | later |\n\
+             | 0003-Go | `.` | **Ready — not started** | go |\n",
+        );
+        let r = rec(ws);
+        let out = capture_sticky_ready_ids(&r, &["0001".into(), "0002".into()]);
+        assert_eq!(out, vec!["0002".to_string(), "0003".to_string()]);
+    }
+
+    #[test]
+    fn sticky_capture_parse_error_keeps_prev() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(ws, "# not a registry\n");
+        let r = rec(ws);
+        let prev = vec!["0002".to_string()];
+        assert_eq!(capture_sticky_ready_ids(&r, &prev), prev);
+        let missing_dir = tempdir().unwrap();
+        let missing = rec(missing_dir.path());
+        assert_eq!(capture_sticky_ready_ids(&missing, &prev), prev);
     }
 }

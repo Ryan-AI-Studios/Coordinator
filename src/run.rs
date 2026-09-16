@@ -73,6 +73,10 @@ pub(crate) fn run_with_origin(
                 state.plan_review_join_retries = 0;
                 state.plan_review_slot_ran.clear();
                 state.address_findings_attempts = 0;
+                state.sticky_ready_ids = crate::workflow::conductor_md::capture_sticky_ready_ids(
+                    record,
+                    &state.sticky_ready_ids,
+                );
                 if picked {
                     let id = state.track_id.as_deref().unwrap_or("-");
                     state.last_event =

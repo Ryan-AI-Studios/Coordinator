@@ -133,6 +133,9 @@ pub struct RunState {
     /// Address-findings entries this `run_epoch` (0031). Cap 2. Always serialized on disk.
     #[serde(default)]
     pub address_findings_attempts: u32,
+    /// Operator-Ready ids captured at `run` (0055). Overlay pick; not a Status JSON key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sticky_ready_ids: Vec<String>,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -221,6 +224,7 @@ impl RunState {
             plan_review_join_retries: 0,
             plan_review_slot_ran: Vec::new(),
             address_findings_attempts: 0,
+            sticky_ready_ids: Vec::new(),
         }
     }
 

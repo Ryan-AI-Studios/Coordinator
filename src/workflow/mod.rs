@@ -18,8 +18,8 @@ use crate::registry::{AutoStartPolicy, ProjectRecord};
 use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock};
 
 pub use conductor_md::{
-    ReadyPickState, pick_next_ready, pick_next_ready_excluding, should_pick_next_ready,
-    track_row_nostart,
+    ReadyPickState, pick_next_ready, pick_next_ready_excluding, pick_next_ready_excluding_sticky,
+    should_pick_next_ready, track_row_nostart,
 };
 pub use drive::tick;
 pub use graph::{WORKFLOW_ID, is_canonical, is_stub_phase, resolve_track_dir, successor};
@@ -196,7 +196,20 @@ fn advance_successor(record: &ProjectRecord, state: &RunState) -> crate::error::
         .map(|s| s.to_string())
         .into_iter()
         .collect();
-    conductor_md::pick_next_ready_excluding(record, &excluded, None)
+    let id = conductor_md::pick_next_ready_excluding_sticky(
+        record,
+        &excluded,
+        None,
+        &state.sticky_ready_ids,
+    )?;
+    if let Some(file) = conductor_md::overlay_file_status(record, &id) {
+        crate::progress_log::append(
+            record,
+            "advance",
+            &format!("sticky Ready {id} (file={file})"),
+        );
+    }
+    Ok(id)
 }
 
 fn planner_recorded_id(state: &RunState) -> Option<String> {
@@ -1026,6 +1039,86 @@ mod tests {
             0
         );
         assert_eq!(load_run_state(&r).unwrap().address_findings_attempts, 0);
+    }
+
+    #[test]
+    fn advance_full_auto_starts_sticky_ready_after_proposed_rewrite() {
+        let dir = tempdir().unwrap();
+        write_both_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let captured = load_run_state(&r).unwrap().sticky_ready_ids.clone();
+        assert!(captured.iter().any(|id| id == "0002"), "{captured:?}");
+        let cond = dir.path().join("conductor").join("conductor.md");
+        let rewritten = "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0001-Example](0001-Example/spec.md) | `.` | **In progress** | one |\n\
+| [0002-Next](0002-Next/spec.md) | `.` | **Proposed — placeholder, needs full spec/plan pass** | next |\n";
+        std::fs::write(&cond, rewritten).unwrap();
+        let before = std::fs::read(&cond).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0002"));
+        assert!(
+            view.last_event.contains("auto-start 0002"),
+            "{}",
+            view.last_event
+        );
+        let after = std::fs::read(&cond).unwrap();
+        assert_eq!(before, after, "overlay must not write conductor.md");
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(
+            log.contains(
+                "sticky Ready 0002 (file=Proposed - placeholder, needs full spec/plan pass)"
+            ),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn advance_full_never_ready_tail_backlog_clears() {
+        let dir = tempdir().unwrap();
+        let cond = dir.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Ready — not started** | one |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Proposed — placeholder, needs full spec/plan pass** | next |\n",
+        )
+        .unwrap();
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let sticky = load_run_state(&r).unwrap().sticky_ready_ids.clone();
+        assert!(sticky.iter().any(|id| id == "0001"), "{sticky:?}");
+        assert!(!sticky.iter().any(|id| id == "0002"), "{sticky:?}");
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
+        let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+    }
+
+    #[test]
+    fn run_with_origin_captures_ready_ids() {
+        let dir = tempdir().unwrap();
+        write_both_ready(dir.path());
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let sticky = load_run_state(&r).unwrap().sticky_ready_ids;
+        assert!(sticky.iter().any(|id| id == "0001"), "{sticky:?}");
+        assert!(sticky.iter().any(|id| id == "0002"), "{sticky:?}");
     }
 
     #[test]

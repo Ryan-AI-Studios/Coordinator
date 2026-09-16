@@ -424,14 +424,16 @@ pub fn resolve_run_track_with_probe(
     if !crate::workflow::should_pick_next_ready(&pick) {
         return Ok((None, false));
     }
-    Ok((
-        Some(crate::workflow::pick_next_ready_excluding(
-            record,
-            &[],
-            probe,
-        )?),
-        true,
-    ))
+    let id = crate::workflow::pick_next_ready_excluding_sticky(
+        record,
+        &[],
+        probe,
+        &state.sticky_ready_ids,
+    )?;
+    if let Some(file) = crate::workflow::conductor_md::overlay_file_status(record, &id) {
+        crate::progress_log::append(record, "start", &format!("sticky Ready {id} (file={file})"));
+    }
+    Ok((Some(id), true))
 }
 
 fn resolve_run_track_for_driver(
@@ -1456,6 +1458,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("pass --track"), "{err}");
+        clear_home();
+    }
+
+    #[test]
+    fn omit_track_picks_sticky_after_idle() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        let cond = proj.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Done")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0001-Done | `.` | **Completed** | done |\n\
+             | 0002-Next | `.` | **Proposed — placeholder, needs full spec/plan pass** | later |\n",
+        )
+        .unwrap();
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.status = crate::state::RunStatus::Idle;
+        state.track_id = Some("0001".into());
+        state.next_track = None;
+        state.failure_class = None;
+        state.last_event = crate::workflow::LAST_EVENT_BACKLOG_CLEAR.into();
+        state.sticky_ready_ids = vec!["0002".into()];
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let (track, picked) = resolve_run_track(&rec, None).unwrap();
+        assert!(picked);
+        assert_eq!(track.as_deref(), Some("0002"));
         clear_home();
     }
 
