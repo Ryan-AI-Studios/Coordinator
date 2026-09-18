@@ -264,6 +264,14 @@ fn finish_green(
                 Err(e) => return classify_backend_err(record, state, e),
             };
             if !merge.ok {
+                if is_policy_block_merge(&merge.message) {
+                    persist_watch(
+                        record,
+                        Some("ci-wait: waiting (merge blocked by base branch policy)"),
+                        |_| {},
+                    )?;
+                    return Ok(None);
+                }
                 return apply_failure(
                     record,
                     state,
@@ -333,7 +341,7 @@ fn interpret_pr(snap: &CheckSnapshot, auto_merge: bool) -> Decision {
             MergeStateStatus::Blocked if !auto_merge && !snap.advisory.is_empty() => {
                 interpret_items(snap, &snap.advisory)
             }
-            MergeStateStatus::Unspecified => interpret_items(snap, &snap.items),
+            // Unspecified (0053 same-tick) and Unknown / Blocked / Behind / Dirty / Draft.
             _ => required_pending(snap),
         },
     }
@@ -355,6 +363,13 @@ fn apply_required_merge_gate(
             summary,
         },
     }
+}
+
+fn is_policy_block_merge(message: &str) -> bool {
+    let s = message.to_ascii_lowercase();
+    s.contains("policy prohibits the merge")
+        || s.contains("base branch policy")
+        || s.contains("required status check")
 }
 
 fn required_pending(snap: &CheckSnapshot) -> Decision {
@@ -922,13 +937,17 @@ mod tests {
     }
 
     fn pr(n: u64, draft: bool, merged: bool) -> CiTarget {
+        pr_state(n, draft, merged, MergeStateStatus::Unspecified)
+    }
+
+    fn pr_state(n: u64, draft: bool, merged: bool, merge_state: MergeStateStatus) -> CiTarget {
         CiTarget::PullRequest {
             number: n,
             url: format!("https://example/pr/{n}"),
             is_draft: draft,
             merged,
             head_oid: Some("abc".into()),
-            merge_state: MergeStateStatus::Unspecified,
+            merge_state,
         }
     }
 
@@ -1046,6 +1065,63 @@ mod tests {
         assert!(matches!(
             interpret_pr(&required_snap(&[], &[], MergeStateStatus::Blocked), true),
             Decision::Pending { .. }
+        ));
+        assert!(matches!(
+            interpret_pr(&required_snap(&[], &[], MergeStateStatus::Unstable), true),
+            Decision::Green { .. }
+        ));
+        assert!(matches!(
+            interpret_pr(&required_snap(&[], &[], MergeStateStatus::HasHooks), true),
+            Decision::Green { .. }
+        ));
+    }
+
+    #[test]
+    fn interpret_required_empty_unspecified_is_pending() {
+        let snap = required_snap(&[], &[], MergeStateStatus::Unspecified);
+        assert!(matches!(
+            interpret_pr(&snap, true),
+            Decision::Pending { .. }
+        ));
+        assert!(matches!(
+            interpret_pr(&snap, false),
+            Decision::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn interpret_required_empty_blocked_auto_merge_false_uses_advisory() {
+        assert!(matches!(
+            interpret_pr(
+                &required_snap(
+                    &[],
+                    &[("ci", CheckBucket::Pending)],
+                    MergeStateStatus::Blocked
+                ),
+                false
+            ),
+            Decision::Pending { .. }
+        ));
+        assert!(matches!(
+            interpret_pr(
+                &required_snap(&[], &[("ci", CheckBucket::Pass)], MergeStateStatus::Blocked),
+                false
+            ),
+            Decision::Green { .. }
+        ));
+    }
+
+    #[test]
+    fn is_policy_block_merge_matches_pinned_substrings() {
+        assert!(is_policy_block_merge(
+            "X Pull request #1 is not mergeable: the base branch policy prohibits the merge."
+        ));
+        assert!(is_policy_block_merge("Base branch policy"));
+        assert!(is_policy_block_merge(
+            "required status check \"fmt\" has not passed"
+        ));
+        assert!(!is_policy_block_merge(
+            "GraphQL: Pull Request is not mergeable"
         ));
     }
 
@@ -1561,6 +1637,152 @@ mod tests {
         assert!(view.last_event.contains("merge failed"));
         assert!(crate::notify::artifact::existing_path(&r).is_some());
         assert_eq!(counts.merge_n(), 1);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn policy_block_merge_stays_pending() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_state(1, false, false, MergeStateStatus::Clean))));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Pass)],
+            &[],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: false,
+            queued: false,
+            message:
+                "X Pull request #1 is not mergeable: the base branch policy prohibits the merge."
+                    .into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event
+                .contains("merge blocked by base branch policy"),
+            "last_event={}",
+            st.last_event
+        );
+        let loaded = load_run_state(&r).unwrap();
+        let ci = loaded.ci.as_ref().expect("ci");
+        assert!(ci.merge.is_none(), "ci.merge={:?}", ci.merge);
+        assert_eq!(ci.next_interval_ms, Some(1));
+        assert!(
+            ci.set_key
+                .as_deref()
+                .is_some_and(|k| k.contains("fmt:pass")),
+            "set_key={:?}",
+            ci.set_key
+        );
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert_eq!(counts.merge_n(), 1);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn auto_publish_empty_required_unspecified_does_not_merge() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr_state(
+            7,
+            false,
+            false,
+            MergeStateStatus::Unspecified,
+        ))));
+        s.push_snapshot(Ok(required_snap(&[], &[], MergeStateStatus::Unspecified)));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "should not run".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(loaded.ci.as_ref().and_then(|c| c.pr_number), Some(7));
+        assert!(
+            loaded
+                .ci
+                .as_ref()
+                .and_then(|c| c.merge.as_deref())
+                .is_none(),
+            "ci.merge={:?}",
+            loaded.ci.as_ref().and_then(|c| c.merge.as_deref())
+        );
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn empty_required_unspecified_then_required_green_merges_once() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_state(
+            7,
+            false,
+            false,
+            MergeStateStatus::Unspecified,
+        ))));
+        s.push_resolve(Ok(Some(pr_state(7, false, false, MergeStateStatus::Clean))));
+        s.push_snapshot(Ok(required_snap(&[], &[], MergeStateStatus::Unspecified)));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Pass)],
+            &[],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let first = crate::workflow::tick(&r).unwrap();
+        assert!(first.is_none());
+        assert_eq!(counts.merge_n(), 0);
+        let loaded = load_run_state(&r).unwrap();
+        assert!(
+            loaded
+                .ci
+                .as_ref()
+                .and_then(|c| c.merge.as_deref())
+                .is_none(),
+            "pending tick must not set ci.merge"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        let view = crate::workflow::tick(&r).unwrap().expect("recovered");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_eq!(counts.merge_n(), 1);
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(
+            loaded.ci.as_ref().and_then(|c| c.merge.as_deref()),
+            Some("done")
+        );
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
