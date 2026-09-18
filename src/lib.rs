@@ -23,6 +23,7 @@
 //! ci-wait resolves immediately when the awaited PR is already GitHub MERGED (`--head` merged list + title probe): track **0048**.
 //! ci-wait fail-set is required GitHub checks only (`--required` + `mergeStateStatus` backstop + all-checks fallback): track **0049**.
 //! ci-wait auto-publishes a clean local `track(NNNN):` commit when no PR exists (resolved remote + `gh pr create`): track **0053**.
+//! ci-wait defers squash until required checks register (`Required` + empty + `Unspecified` waits; policy-block merge retries): track **0056**.
 //! Slot-quality admission (plan-review + cross-model; schema-only JSON is dud): track **0043**.
 //! Per-project `AutoStartPolicy` (full|hitl|never) + `<!-- nostart -->`: track **0044**.
 //! Address-findings side loop after GateFail (cap 2 then difficulty Stop): track **0031**.
