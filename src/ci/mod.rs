@@ -124,6 +124,7 @@ pub fn drive_with(
 
     let Some(target) = target else {
         persist_watch(record, Some("ci-wait: waiting for PR"), |ci| {
+            ci.head_sha = None;
             stamp_poll(
                 ci,
                 now,
@@ -582,24 +583,48 @@ fn resolve_target(
     cwd: &Path,
     hint: Option<&PrHint>,
 ) -> Result<Option<CiTarget>> {
-    if let Some(ci) = state.ci.as_ref() {
-        if let Some(n) = ci.pr_number {
-            let hinted = PrHint {
-                number: Some(n),
-                url: ci.pr_url.clone(),
-            };
-            if let Some(t) = backend.resolve_pr(cwd, Some(&hinted))? {
-                return Ok(Some(t));
-            }
-            // Hinted view miss is not sticky. Unhinted walks open then merged --head.
-            // Do not invent is_draft=false. Do not map the persisted PR oid to HeadSha.
-            return backend.resolve_pr(cwd, None);
+    if let Some(ci) = state.ci.as_ref()
+        && let Some(n) = ci.pr_number
+    {
+        let hinted = PrHint {
+            number: Some(n),
+            url: ci.pr_url.clone(),
+        };
+        if let Some(t) = backend.resolve_pr(cwd, Some(&hinted))? {
+            return Ok(accept_resolved_target(state, cwd, Some(t)));
         }
-        if let Some(ref sha) = ci.head_sha {
-            return Ok(Some(CiTarget::HeadSha { sha: sha.clone() }));
-        }
+        // Hinted view miss is not sticky. Unhinted walks open then merged --head.
+        // Do not invent is_draft=false. Do not map the persisted PR oid to HeadSha.
+        let resolved = backend.resolve_pr(cwd, None)?;
+        return Ok(accept_resolved_target(state, cwd, resolved));
     }
-    backend.resolve_pr(cwd, hint)
+    let resolved = backend.resolve_pr(cwd, hint)?;
+    Ok(accept_resolved_target(state, cwd, resolved))
+}
+
+/// HeadSha is legal only when no local `track/NNNN-*` tip is ahead of that sha.
+fn accept_resolved_target(
+    state: &RunState,
+    cwd: &Path,
+    target: Option<CiTarget>,
+) -> Option<CiTarget> {
+    match target {
+        Some(CiTarget::HeadSha { sha }) => {
+            let Some(numeric) = state
+                .track_id
+                .as_deref()
+                .and_then(crate::notify::artifact::numeric_track_id)
+            else {
+                return Some(CiTarget::HeadSha { sha });
+            };
+            if gh::track_tip_blocks_head_sha(cwd, numeric, &sha) {
+                None
+            } else {
+                Some(CiTarget::HeadSha { sha })
+            }
+        }
+        other => other,
+    }
 }
 
 /// Adapter merged-PR probe. Tests never construct a live `GhMergedTrackProbe`.
@@ -655,6 +680,7 @@ fn try_auto_publish_target(
         .and_then(crate::notify::artifact::numeric_track_id)
     else {
         persist_watch(record, Some("ci-wait: waiting for PR"), |ci| {
+            ci.head_sha = None;
             stamp_poll(
                 ci,
                 now,
@@ -670,6 +696,7 @@ fn try_auto_publish_target(
             record,
             Some("ci-wait: publish attempted — waiting for PR"),
             |ci| {
+                ci.head_sha = None;
                 stamp_poll(
                     ci,
                     now,
@@ -705,6 +732,7 @@ fn try_auto_publish_target(
             attempted_sha,
         }) => {
             persist_watch(record, Some(&event), |ci| {
+                ci.head_sha = None;
                 if let Some(sha) = attempted_sha {
                     ci.publish_attempted_sha = Some(sha);
                 }
@@ -2299,5 +2327,233 @@ mod tests {
     fn is_grok_bound_false_for_ci_wait() {
         assert!(!graph::is_grok_bound(graph::PHASE_CI_WAIT));
         assert!(!graph::is_skip_phase(graph::PHASE_CI_WAIT));
+    }
+
+    fn git_ok(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "probe")
+            .env("GIT_AUTHOR_EMAIL", "probe@example.com")
+            .env("GIT_COMMITTER_NAME", "probe")
+            .env("GIT_COMMITTER_EMAIL", "probe@example.com")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    fn init_track_repo(dir: &std::path::Path) -> String {
+        git_ok(dir, &["init", "-b", "main"]);
+        git_ok(dir, &["config", "user.email", "probe@example.com"]);
+        git_ok(dir, &["config", "user.name", "probe"]);
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        git_ok(dir, &["add", "f.txt"]);
+        git_ok(dir, &["commit", "-m", "base"]);
+        let main_sha = String::from_utf8(git_ok(dir, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        git_ok(dir, &["switch", "-c", "track/0412-foo"]);
+        std::fs::write(dir.join("f.txt"), "ahead\n").unwrap();
+        git_ok(dir, &["commit", "-am", "ahead"]);
+        git_ok(dir, &["switch", "main"]);
+        main_sha
+    }
+
+    fn latch_track(r: &ProjectRecord, head_sha: Option<String>) {
+        let mut st = load_run_state(r).unwrap();
+        st.track_id = Some("0412-regex-whitespace-trigrams".into());
+        st.ci = Some(CiWatchState {
+            head_sha,
+            ..Default::default()
+        });
+        save_run_state(r, &st).unwrap();
+    }
+
+    fn force_due(r: &ProjectRecord) {
+        let mut st = load_run_state(r).unwrap();
+        if let Some(ci) = st.ci.as_mut() {
+            ci.last_poll_at = None;
+        }
+        save_run_state(r, &st).unwrap();
+    }
+
+    #[test]
+    fn push_rejected_latches_once() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped_latched(
+            "ci-wait: push rejected — waiting for PR",
+            "abc",
+        )));
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(99, false, false))));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        force_due(&r);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert!(
+            st.last_event.contains("publish attempted"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_eq!(counts.publish_n(), 1);
+        assert_eq!(counts.merge_n(), 0);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn sticky_sha_on_track_branch_does_not_complete() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        latch_track(&r, Some("mainsha".into()));
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped("ci-wait: waiting for PR")));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("waiting for PR"),
+            "{}",
+            st.last_event
+        );
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(loaded.ci.as_ref().and_then(|c| c.head_sha.clone()), None);
+        assert_eq!(loaded.ci.as_ref().and_then(|c| c.merge.clone()), None);
+        assert_eq!(counts.merge_n(), 0);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn sticky_head_sha_cleared_when_track_branch_not_ancestor() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let main_sha = init_track_repo(dir.path());
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        latch_track(&r, Some(main_sha.clone()));
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(CiTarget::HeadSha { sha: main_sha })));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("waiting for PR"),
+            "last_event={}",
+            st.last_event
+        );
+        assert!(
+            !st.last_event.contains("default branch, no PR"),
+            "last_event={}",
+            st.last_event
+        );
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(loaded.ci.as_ref().and_then(|c| c.head_sha.clone()), None);
+        assert_eq!(loaded.ci.as_ref().and_then(|c| c.merge.clone()), None);
+        assert_eq!(
+            loaded
+                .ci
+                .as_ref()
+                .and_then(|c| c.publish_attempted_sha.clone()),
+            None
+        );
+        assert_eq!(counts.merge_n(), 0);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn head_sha_green_when_track_tip_is_ancestor() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let _base = init_track_repo(dir.path());
+        git_ok(dir.path(), &["merge", "--ff-only", "track/0412-foo"]);
+        let merged = String::from_utf8(git_ok(dir.path(), &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        latch_track(&r, Some(merged.clone()));
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(CiTarget::HeadSha { sha: merged })));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pass)])));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r)
+            .unwrap()
+            .expect("ancestor headsha");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert!(view.last_event.contains("default branch, no PR"));
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn sticky_clear_then_pr_merge_reaches_compact_once() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let main_sha = init_track_repo(dir.path());
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        latch_track(&r, Some(main_sha.clone()));
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(CiTarget::HeadSha { sha: main_sha })));
+        s.push_resolve(Ok(Some(pr(7, false, false))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pass)])));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let mid = load_run_state(&r).unwrap();
+        assert_eq!(mid.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(mid.ci.as_ref().and_then(|c| c.head_sha.clone()), None);
+        force_due(&r);
+        let view = crate::workflow::tick(&r).unwrap().expect("recovered");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        let done = load_run_state(&r).unwrap();
+        assert_eq!(
+            done.ci.as_ref().and_then(|c| c.merge.clone()).as_deref(),
+            Some("done")
+        );
+        assert_eq!(counts.merge_n(), 1);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
     }
 }

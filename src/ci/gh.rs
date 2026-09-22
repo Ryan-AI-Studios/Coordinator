@@ -106,6 +106,86 @@ impl CiBackend for GhCli {
     }
 }
 
+/// `track/{numeric}` or `track/{numeric}-{slug}`. Numeric must be exactly four digits.
+pub(crate) fn branch_is_track(branch: &str, numeric: &str) -> bool {
+    let numeric = numeric.trim();
+    if numeric.len() != 4 || !numeric.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some(name) = branch.trim().strip_prefix("track/") else {
+        return false;
+    };
+    if name == numeric {
+        return true;
+    }
+    matches!(
+        name.strip_prefix(numeric),
+        Some(rest) if rest.starts_with('-') && rest.len() > 1
+    )
+}
+
+/// PR title for auto-publish. Keeps an existing `track(NNNN):` prefix; otherwise adds one.
+pub(crate) fn publish_pr_title(subject: &str, numeric: &str) -> String {
+    let subject = subject.trim();
+    if crate::workflow::shipped::pr_title_is_track(subject, numeric) {
+        return subject.to_string();
+    }
+    if subject.is_empty() {
+        format!("track({numeric}):")
+    } else {
+        format!("track({numeric}): {subject}")
+    }
+}
+
+/// Argv for `git merge-base --is-ancestor`. No spawn.
+pub(crate) fn merge_base_is_ancestor_argv(tip: &str, descendant: &str) -> Vec<String> {
+    vec![
+        "merge-base".into(),
+        "--is-ancestor".into(),
+        tip.into(),
+        descendant.into(),
+    ]
+}
+
+/// True when a local `track/{numeric}*` tip is not an ancestor of `descendant`.
+/// A missing git repo does not block. Other git failures fail closed.
+pub(crate) fn track_tip_blocks_head_sha(cwd: &Path, numeric: &str, descendant: &str) -> bool {
+    let list = match run_process(
+        Path::new("git"),
+        &[
+            "for-each-ref",
+            "--format=%(objectname)%00%(refname:short)",
+            "refs/heads",
+        ],
+        cwd,
+    ) {
+        Ok(out) => out,
+        Err(_) => return true,
+    };
+    if !list.ok {
+        return !list.stderr.contains("not a git repository");
+    }
+    for line in list.stdout.lines() {
+        let mut parts = line.split('\0');
+        let Some(tip) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(name) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !branch_is_track(name, numeric) {
+            continue;
+        }
+        let argv = merge_base_is_ancestor_argv(tip, descendant);
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match run_process(Path::new("git"), &refs, cwd) {
+            Ok(probe) if probe.exit == 0 => {}
+            Ok(_) | Err(_) => return true,
+        }
+    }
+    false
+}
+
 fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
     let numeric = crate::notify::artifact::numeric_track_id(track_id).unwrap_or(track_id);
 
@@ -151,15 +231,16 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
         ));
     }
 
+    if !branch_is_track(&branch, numeric) {
+        return Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"));
+    }
+
     let subject = match git_stdout(cwd, &["log", "-1", "--format=%s"]) {
         Ok(s) => s,
         Err(_) => {
             return Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"));
         }
     };
-    if !crate::workflow::shipped::pr_title_is_track(subject.trim(), numeric) {
-        return Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"));
-    }
 
     let Some(remote) = resolve_live_push_remote(cwd)? else {
         return Ok(AutoPublishResult::skipped(
@@ -220,7 +301,8 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
     } else {
         default_branch
     };
-    let create_args = pr_create_args(subject.trim(), &body, &base, &branch, repo.as_deref());
+    let title = publish_pr_title(subject.trim(), numeric);
+    let create_args = pr_create_args(&title, &body, &base, &branch, repo.as_deref());
     let create_refs: Vec<&str> = create_args.iter().map(String::as_str).collect();
     let out = gh_capture(cwd, &create_refs)?;
     if out.exit == 4 {
@@ -1209,6 +1291,130 @@ mod parse_tests {
         assert_eq!(snap.items[0].bucket, CheckBucket::Pass);
         assert_eq!(snap.items[1].bucket, CheckBucket::Fail);
         assert_eq!(snap.items[2].bucket, CheckBucket::Pending);
+    }
+
+    #[test]
+    fn branch_is_track_truth_table() {
+        assert!(branch_is_track("track/0412", "0412"));
+        assert!(branch_is_track(
+            "track/0412-regex-whitespace-trigrams",
+            "0412"
+        ));
+        assert!(branch_is_track("  track/0412-foo  ", "0412"));
+        for bad in [
+            "track/0413-foo",
+            "track/04120-x",
+            "track/0412-",
+            "track/0412/extra",
+            "chore/foo",
+            "dependabot/x",
+            "main",
+            "HEAD",
+            "origin/track/0412-foo",
+            "",
+            "Track/0412",
+        ] {
+            assert!(!branch_is_track(bad, "0412"), "{bad}");
+        }
+        assert!(!branch_is_track("track/0412-foo", "412"));
+        assert!(!branch_is_track("track/0412-foo", "04120"));
+    }
+
+    #[test]
+    fn publish_pr_title_table() {
+        assert_eq!(
+            publish_pr_title("Drop ASCII-space trigrams.", "0412"),
+            "track(0412): Drop ASCII-space trigrams."
+        );
+        assert_eq!(
+            publish_pr_title("track(0412): already", "0412"),
+            "track(0412): already"
+        );
+        assert_eq!(
+            publish_pr_title("Track(0412): kept", "0412"),
+            "Track(0412): kept"
+        );
+        assert_eq!(publish_pr_title("", "0412"), "track(0412):");
+        assert_eq!(publish_pr_title("   ", "0412"), "track(0412):");
+        assert_eq!(
+            publish_pr_title("track(0412): already", "0412"),
+            "track(0412): already"
+        );
+        assert!(
+            !publish_pr_title("Drop ASCII-space trigrams.", "0412")
+                .starts_with("track(0412): track(")
+        );
+    }
+
+    #[test]
+    fn merge_base_is_ancestor_argv_exact() {
+        assert_eq!(
+            merge_base_is_ancestor_argv("abc", "def"),
+            ["merge-base", "--is-ancestor", "abc", "def"]
+        );
+    }
+
+    fn git_ok(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "probe")
+            .env("GIT_AUTHOR_EMAIL", "probe@example.com")
+            .env("GIT_COMMITTER_NAME", "probe")
+            .env("GIT_COMMITTER_EMAIL", "probe@example.com")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    fn init_main(dir: &std::path::Path) {
+        git_ok(dir, &["init", "-b", "main"]);
+        git_ok(dir, &["config", "user.email", "probe@example.com"]);
+        git_ok(dir, &["config", "user.name", "probe"]);
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        git_ok(dir, &["add", "f.txt"]);
+        git_ok(dir, &["commit", "-m", "base"]);
+    }
+
+    fn head_sha(dir: &std::path::Path) -> String {
+        String::from_utf8(git_ok(dir, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn track_tip_blocks_head_sha_git_fixture() {
+        let bare = tempfile::tempdir().unwrap();
+        assert!(!track_tip_blocks_head_sha(bare.path(), "0412", "deadbeef"));
+
+        let repo = tempfile::tempdir().unwrap();
+        init_main(repo.path());
+        let main_only = head_sha(repo.path());
+        assert!(!track_tip_blocks_head_sha(repo.path(), "0412", &main_only));
+        assert!(!track_tip_blocks_head_sha(repo.path(), "0412", "deadbeef"));
+
+        git_ok(repo.path(), &["switch", "-c", "track/0413-other"]);
+        std::fs::write(repo.path().join("f.txt"), "other\n").unwrap();
+        git_ok(repo.path(), &["commit", "-am", "other"]);
+        git_ok(repo.path(), &["switch", "main"]);
+        assert!(!track_tip_blocks_head_sha(repo.path(), "0412", &main_only));
+
+        git_ok(repo.path(), &["switch", "-c", "track/0412-foo"]);
+        std::fs::write(repo.path().join("f.txt"), "ahead\n").unwrap();
+        git_ok(repo.path(), &["commit", "-am", "ahead"]);
+        git_ok(repo.path(), &["switch", "main"]);
+        assert!(track_tip_blocks_head_sha(repo.path(), "0412", &main_only));
+        assert!(track_tip_blocks_head_sha(repo.path(), "0412", "deadbeef"));
+
+        git_ok(repo.path(), &["merge", "--ff-only", "track/0412-foo"]);
+        let merged = head_sha(repo.path());
+        assert!(!track_tip_blocks_head_sha(repo.path(), "0412", &merged));
     }
 }
 
