@@ -383,12 +383,27 @@ fn required_pending(snap: &CheckSnapshot) -> Decision {
 
 fn interpret_items(snap: &CheckSnapshot, items: &[CheckItem]) -> Decision {
     let summary = decision_summary(snap);
-    if items
-        .iter()
-        .any(|i| matches!(i.bucket, CheckBucket::Fail | CheckBucket::Cancel))
-    {
+    if items.iter().any(|i| matches!(i.bucket, CheckBucket::Fail)) {
         return Decision::Fail {
             message: format!("ci-wait: checks failed ({summary})"),
+            summary,
+        };
+    }
+    if items
+        .iter()
+        .any(|i| matches!(i.bucket, CheckBucket::Cancel))
+    {
+        let mut names: Vec<&str> = items
+            .iter()
+            .filter(|i| i.bucket == CheckBucket::Cancel)
+            .map(|i| i.name.as_str())
+            .collect();
+        names.sort_unstable();
+        return Decision::Pending {
+            event: truncate_msg(&format!(
+                "ci-wait: waiting (cancelled: {}) ({summary})",
+                names.join(", ")
+            )),
             summary,
         };
     }
@@ -1026,7 +1041,28 @@ mod tests {
         ));
         assert!(matches!(
             interpret_pr(&items(&[("a", CheckBucket::Cancel)]), true),
-            Decision::Fail { .. }
+            Decision::Pending { event, .. } if event == "ci-wait: waiting (cancelled: a) (1 cancel)"
+        ));
+        assert!(matches!(
+            interpret_pr(
+                &items(&[("b", CheckBucket::Cancel), ("a", CheckBucket::Cancel)]),
+                true
+            ),
+            Decision::Pending { event, .. } if event == "ci-wait: waiting (cancelled: a, b) (2 cancel)"
+        ));
+        assert!(matches!(
+            interpret_pr(
+                &items(&[("a", CheckBucket::Cancel), ("b", CheckBucket::Fail)]),
+                true
+            ),
+            Decision::Fail { message, .. } if message.contains("checks failed")
+        ));
+        assert!(matches!(
+            interpret_pr(
+                &items(&[("a", CheckBucket::Cancel), ("b", CheckBucket::Pending)]),
+                true
+            ),
+            Decision::Pending { event, .. } if event == "ci-wait: waiting (cancelled: a) (1 pending, 1 cancel)"
         ));
         assert!(matches!(
             interpret_pr(
@@ -1046,6 +1082,14 @@ mod tests {
             interpret_pr(&CheckSnapshot::empty(), true),
             Decision::Green { .. }
         ));
+        assert_eq!(
+            summarize(&pair_items(&[("a", CheckBucket::Cancel)])),
+            "1 cancel"
+        );
+        assert_eq!(
+            advisory_tail(&pair_items(&[("bot", CheckBucket::Cancel)])),
+            "1 advisory cancel"
+        );
     }
 
     #[test]
@@ -1432,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn required_cancel_writes_ci_failed() {
+    fn required_cancel_stays_pending_and_does_not_fail() {
         let _g = poll_env();
         let dir = tempdir().unwrap();
         let r = rec(dir.path(), true);
@@ -1445,8 +1489,75 @@ mod tests {
             MergeStateStatus::Blocked,
         )));
         let (_hook, counts) = hook(s);
-        let view = crate::workflow::tick(&r).unwrap().expect("required cancel");
-        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(st.failure_class.is_none());
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert!(st.last_event.contains("cancelled: fmt"));
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_empty_clean_advisory_cancel_stays_pending() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_state(
+            16,
+            false,
+            false,
+            MergeStateStatus::Clean,
+        ))));
+        s.push_snapshot(Ok(required_snap(
+            &[],
+            &[("bot", CheckBucket::Cancel)],
+            MergeStateStatus::Clean,
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(st.failure_class.is_none());
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert!(st.last_event.contains("cancelled: bot"));
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn head_sha_cancel_stays_pending_zero_merges() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(CiTarget::HeadSha {
+            sha: "deadbeef".into(),
+        })));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Cancel)])));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(st.failure_class.is_none());
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert!(st.last_event.contains("cancelled: ci"));
         assert_eq!(counts.merge_n(), 0);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);

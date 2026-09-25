@@ -25,6 +25,7 @@
 //! ci-wait auto-publishes a clean local `track(NNNN):` commit when no PR exists (resolved remote + `gh pr create`): track **0053**.
 //! ci-wait defers squash until required checks register (`Required` + empty + `Unspecified` waits; policy-block merge retries): track **0056**.
 //! ci-wait publishes a clean local `track/NNNN` or `track/NNNN-*` branch even when the subject is prose (`gh pr create --title` stays `track(NNNN):`); sticky `head_sha` does not complete an unmerged track: track **0057**.
+//! ci-wait treats a cancelled check as Pending retry (not `ci_failed`); a cancelled required gate does not merge: track **0058**.
 //! Slot-quality admission (plan-review + cross-model; schema-only JSON is dud): track **0043**.
 //! Per-project `AutoStartPolicy` (full|hitl|never) + `<!-- nostart -->`: track **0044**.
 //! Address-findings side loop after GateFail (cap 2 then difficulty Stop): track **0031**.
