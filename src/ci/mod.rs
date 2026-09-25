@@ -1106,6 +1106,16 @@ mod tests {
             ])),
             "2 cancel"
         );
+        let long = "c".repeat(180);
+        match interpret_pr(&items(&[(&long, CheckBucket::Cancel)]), true) {
+            Decision::Pending { event, summary } => {
+                assert!(event.starts_with("ci-wait: waiting (cancelled: "));
+                assert_eq!(event.chars().count(), LAST_EVENT_MESSAGE_CAP + 1);
+                assert!(event.ends_with('…'));
+                assert_eq!(summary, "1 cancel");
+            }
+            other => panic!("expected pending, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1661,6 +1671,36 @@ mod tests {
         assert_ne!(view.failure_class, Some(FailureClass::CiFailed));
         assert!(crate::notify::artifact::existing_path(&r).is_none());
         assert_eq!(counts.merge_n(), 1);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn cancelled_long_name_caps_last_event_keeps_last_summary() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let long = "c".repeat(180);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(19, false, false))));
+        s.push_snapshot(Ok(items(&[(&long, CheckBucket::Cancel)])));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(st.last_event.chars().count(), LAST_EVENT_MESSAGE_CAP + 1);
+        assert!(st.last_event.ends_with('…'));
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(
+            loaded.ci.as_ref().and_then(|c| c.last_summary.as_deref()),
+            Some("1 cancel")
+        );
+        assert_eq!(counts.merge_n(), 0);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
@@ -2362,6 +2402,47 @@ mod tests {
             Some("abc")
         );
         assert_eq!(counts.publish_n(), 1);
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn auto_publish_opened_masks_cancelled_then_later_tick_names_it() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_resolve(Ok(Some(pr(20, false, false))));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(20, false, false))));
+        s.push_snapshot(Ok(items(&[("fmt", CheckBucket::Cancel)])));
+        s.push_snapshot(Ok(items(&[("fmt", CheckBucket::Cancel)])));
+        let (_hook, counts) = hook(s);
+        let first = crate::workflow::tick(&r).unwrap();
+        assert!(first.is_none());
+        let st = run::status(&r).unwrap();
+        assert!(
+            st.last_event.contains("ci-wait: opened #20"),
+            "last_event={}",
+            st.last_event
+        );
+        assert!(!st.last_event.contains("cancelled:"));
+        assert_eq!(counts.merge_n(), 0);
+        std::thread::sleep(Duration::from_millis(5));
+        let second = crate::workflow::tick(&r).unwrap();
+        assert!(second.is_none());
+        let st = run::status(&r).unwrap();
+        assert!(
+            st.last_event.contains("cancelled: fmt"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
         assert_eq!(counts.merge_n(), 0);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
