@@ -399,6 +399,7 @@ fn interpret_items(snap: &CheckSnapshot, items: &[CheckItem]) -> Decision {
             .map(|i| i.name.as_str())
             .collect();
         names.sort_unstable();
+        names.dedup();
         return Decision::Pending {
             event: truncate_msg(&format!(
                 "ci-wait: waiting (cancelled: {}) ({summary})",
@@ -1090,6 +1091,21 @@ mod tests {
             advisory_tail(&pair_items(&[("bot", CheckBucket::Cancel)])),
             "1 advisory cancel"
         );
+        assert!(matches!(
+            interpret_pr(
+                &items(&[("fmt", CheckBucket::Cancel), ("fmt", CheckBucket::Cancel)]),
+                true
+            ),
+            Decision::Pending { event, .. }
+                if event == "ci-wait: waiting (cancelled: fmt) (2 cancel)"
+        ));
+        assert_eq!(
+            summarize(&pair_items(&[
+                ("fmt", CheckBucket::Cancel),
+                ("fmt", CheckBucket::Cancel)
+            ])),
+            "2 cancel"
+        );
     }
 
     #[test]
@@ -1559,6 +1575,92 @@ mod tests {
         assert!(crate::notify::artifact::existing_path(&r).is_none());
         assert!(st.last_event.contains("cancelled: ci"));
         assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_empty_blocked_auto_merge_false_advisory_cancel_stays_pending() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), false);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_state(
+            17,
+            false,
+            false,
+            MergeStateStatus::Blocked,
+        ))));
+        s.push_snapshot(Ok(required_snap(
+            &[],
+            &[("bot", CheckBucket::Cancel)],
+            MergeStateStatus::Blocked,
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(st.failure_class.is_none());
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert!(st.last_event.contains("cancelled: bot"));
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn required_cancel_then_pass_merges() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_state(
+            18,
+            false,
+            false,
+            MergeStateStatus::Blocked,
+        ))));
+        s.push_resolve(Ok(Some(pr_state(
+            18,
+            false,
+            false,
+            MergeStateStatus::Clean,
+        ))));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Cancel)],
+            &[],
+            MergeStateStatus::Blocked,
+        )));
+        s.push_snapshot(Ok(required_snap(
+            &[("fmt", CheckBucket::Pass)],
+            &[],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let first = crate::workflow::tick(&r).unwrap();
+        assert!(first.is_none());
+        assert_eq!(counts.merge_n(), 0);
+        std::thread::sleep(Duration::from_millis(5));
+        let view = crate::workflow::tick(&r)
+            .unwrap()
+            .expect("cancel then pass");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_ne!(view.failure_class, Some(FailureClass::CiFailed));
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert_eq!(counts.merge_n(), 1);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
