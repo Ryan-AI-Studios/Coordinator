@@ -756,6 +756,10 @@ mod tests {
 
     #[test]
     fn run_state_lock_contention_succeeds() {
+        use crate::config::test_env_lock;
+
+        let _guard = test_env_lock();
+
         let dir = tempdir().unwrap();
         let mut rec = sample_record(dir.path());
         rec.state_dir = Some(dir.path().join("explicit-state"));
