@@ -12,6 +12,9 @@ use super::shipped::MergedTrackProbe;
 
 const READY_NORMALIZED: &str = "Ready - not started";
 
+/// Longest-first; shared by [`unwrap_emphasis`] and [`status_token_matches`].
+const EMPHASIS_MARKERS: [&str; 6] = ["**", "__", "~~", "`", "*", "_"];
+
 /// Default conveyor phrase (em dash). Empty `ProjectRecord.ready_aliases` uses this only.
 pub const DEFAULT_READY_PHRASE: &str = "Ready — not started";
 
@@ -143,8 +146,7 @@ pub fn status_clean(raw: &str) -> String {
 }
 
 fn unwrap_emphasis(s: &str) -> Option<&str> {
-    const MARKERS: [&str; 6] = ["**", "__", "~~", "`", "*", "_"];
-    for m in MARKERS {
+    for m in EMPHASIS_MARKERS {
         if s.len() >= m.len() * 2 && s.starts_with(m) && s.ends_with(m) {
             return Some(&s[m.len()..s.len() - m.len()]);
         }
@@ -170,14 +172,42 @@ pub fn is_eligible_ready_in<S: AsRef<str>>(status_raw: &str, aliases: &[S]) -> b
     aliases.iter().any(|a| status_clean(a.as_ref()) == cleaned)
 }
 
-/// Registry `**Completed**` (and the same after status_clean).
-pub fn is_completed(status_raw: &str) -> bool {
-    status_clean(status_raw) == "Completed"
+/// House-style status token on a `status_clean` string (0062).
+///
+/// Peels at most one leading emphasis marker, requires the full `phrase`
+/// (case-sensitive; `"In progress"` keeps its internal space), peels the
+/// matching closer, then accepts end-of-string or a separator
+/// (whitespace / `-` / `(` / `:` / `,`). Not a substring match.
+fn status_token_matches(cleaned: &str, phrase: &str) -> bool {
+    let mut s = cleaned;
+    let mut opener: Option<&str> = None;
+    for m in EMPHASIS_MARKERS {
+        if let Some(rest) = s.strip_prefix(m) {
+            opener = Some(m);
+            s = rest;
+            break;
+        }
+    }
+    let Some(after) = s.strip_prefix(phrase) else {
+        return false;
+    };
+    let after = match opener {
+        Some(m) => after.strip_prefix(m).unwrap_or(after),
+        None => after,
+    };
+    after.is_empty()
+        || after
+            .starts_with(|c: char| c.is_ascii_whitespace() || matches!(c, '-' | '(' | ':' | ','))
 }
 
-/// Registry `**In progress**` (exact `status_clean`; 0055 sticky-exempt).
+/// Registry `**Completed**` or house-style `**Completed** <detail>` (0062).
+pub fn is_completed(status_raw: &str) -> bool {
+    status_token_matches(&status_clean(status_raw), "Completed")
+}
+
+/// Registry `**In progress**` or `**In progress** <detail>` (0055 sticky-exempt).
 pub fn is_in_progress(status_raw: &str) -> bool {
-    status_clean(status_raw) == "In progress"
+    status_token_matches(&status_clean(status_raw), "In progress")
 }
 
 /// Best-effort `{conductor_dir}/conductor.md` rows. Missing / unreadable → `None`.
@@ -865,6 +895,114 @@ mod tests {
         assert!(is_in_progress("In progress"));
         assert!(!is_in_progress("**Completed**"));
         assert!(!is_in_progress("**Ready — not started**"));
+    }
+
+    const CELL_0053: &str = "**Completed** 2026-09-12 — PR **#54** squash `226f4ba`";
+    const CELL_0054: &str = "**Completed** 2026-09-15 — PR **#55** squash `cacb9cc`";
+    const CELL_0055: &str = "**Completed** 2026-09-16 — PR **#56** squash `8ab5bdb`";
+    const CELL_0056: &str = "**Completed** 2026-09-18 — PR **#57** squash `aa5f142`";
+    const CELL_0057: &str =
+        "**Completed** 2026-09-22 — PR **#58** squash `075f239b32f574301382dbcffee6588853807977`";
+    const CELL_0060_IN_PROGRESS: &str = "**In progress** PR #60";
+
+    #[test]
+    fn house_style_completed_cells_match_status_token() {
+        assert_eq!(
+            status_clean(CELL_0056),
+            "**Completed** 2026-09-18 - PR **#57** squash `aa5f142`"
+        );
+        assert_eq!(
+            status_clean(CELL_0057),
+            "**Completed** 2026-09-22 - PR **#58** squash `075f239b32f574301382dbcffee6588853807977`"
+        );
+        for cell in [CELL_0053, CELL_0054, CELL_0055, CELL_0056, CELL_0057] {
+            assert!(is_completed(cell), "{cell}");
+        }
+        assert!(is_completed("**Completed**"));
+        assert!(is_completed("Completed"));
+        assert!(is_completed("Completed - pending"));
+        assert!(is_in_progress(CELL_0060_IN_PROGRESS));
+        assert!(is_in_progress("**In progress**"));
+        assert!(!is_completed("Completedish"));
+        assert!(!is_completed("Not Completed"));
+        assert!(!is_completed("Complete"));
+        assert!(!is_in_progress("In Progressed"));
+        assert!(!is_completed("**Ready — not started**"));
+        assert!(!is_completed("**Cancelled**"));
+        assert!(!is_completed("**Absorbed — 0058 `204a258`**"));
+        assert!(!is_eligible_ready("**Ready — not started** (owner only)"));
+        assert!(is_eligible_ready("**Ready — not started**"));
+    }
+
+    #[test]
+    fn house_style_completed_sticky_row_dropped_picker_returns_ready() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0056-Done | `.` | **Completed** 2026-09-18 — PR **#57** squash `aa5f142` | shipped |\n\
+             | 0062-Go | `.` | **Ready — not started** | go |\n",
+        );
+        mkdir_track(ws, "0056-Done");
+        mkdir_track(ws, "0062-Go");
+        let r = rec(ws);
+        let rows = load_track_rows(&r).expect("rows");
+        assert!(track_row_completed(&rows, "0056"));
+        assert!(!track_row_completed(&rows, "0062"));
+        let out = capture_sticky_ready_ids(&r, &["0056".into()]);
+        assert_eq!(out, vec!["0062".to_string()]);
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&r, &[], None, &["0056".into()]).unwrap(),
+            "0062"
+        );
+    }
+
+    #[test]
+    fn detailed_in_progress_sticky_row_is_dropped() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0060-Dup | `.` | **In progress** PR #60 | mid |\n\
+             | 0062-Go | `.` | **Ready — not started** | go |\n",
+        );
+        mkdir_track(ws, "0060-Dup");
+        mkdir_track(ws, "0062-Go");
+        let r = rec(ws);
+        let out = capture_sticky_ready_ids(&r, &["0060".into()]);
+        assert_eq!(out, vec!["0062".to_string()]);
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&r, &[], None, &["0060".into()]).unwrap(),
+            "0062"
+        );
+    }
+
+    #[test]
+    fn house_style_completed_sticky_only_empty_walk() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0056-Done | `.` | **Completed** 2026-09-18 — PR **#57** squash `aa5f142` | shipped |\n",
+        );
+        mkdir_track(ws, "0056-Done");
+        let r = rec(ws);
+        let rows = load_track_rows(&r).expect("rows");
+        assert!(track_row_completed(&rows, "0056"));
+        let out = capture_sticky_ready_ids(&r, &["0056".into()]);
+        assert!(out.is_empty(), "{out:?}");
+        let err = pick_next_ready_excluding_sticky(&r, &[], None, &["0056".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no Ready"), "{err}");
+        assert!(err.contains("pass --track"), "{err}");
+        assert!(!err.contains("0056"), "{err}");
     }
 
     #[test]
