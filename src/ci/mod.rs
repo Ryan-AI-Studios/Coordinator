@@ -200,7 +200,8 @@ pub fn drive_with(
         CiTarget::HeadSha { .. } => interpret_runs(&snap, phase_elapsed),
     };
     let summary = decision.summary();
-    let key = set_key(&target, fail_set(&snap, record.auto_merge));
+    let (collapsed, _) = collapse_snapshot(&snap);
+    let key = set_key(&target, fail_set(&collapsed, record.auto_merge));
     let changed = state.ci.as_ref().and_then(|c| c.set_key.as_deref()) != Some(key.as_str());
     let interval = next_interval_ms(phase_elapsed, changed);
 
@@ -322,8 +323,87 @@ impl Decision {
     }
 }
 
+/// One effective bucket per check name (same SHA). Recency is not a tiebreaker.
+fn collapse_by_name(items: &[CheckItem]) -> (Vec<CheckItem>, Vec<String>) {
+    use std::collections::BTreeMap;
+    let mut by_name: BTreeMap<&str, Vec<CheckBucket>> = BTreeMap::new();
+    for i in items {
+        by_name.entry(i.name.as_str()).or_default().push(i.bucket);
+    }
+    let mut out = Vec::with_capacity(by_name.len());
+    let mut disagreed = Vec::new();
+    for (name, buckets) in by_name {
+        let has_pass = buckets.contains(&CheckBucket::Pass);
+        let has_fail = buckets.contains(&CheckBucket::Fail);
+        let has_pending = buckets.contains(&CheckBucket::Pending);
+        let has_cancel = buckets.contains(&CheckBucket::Cancel);
+        let bucket = if has_pass {
+            CheckBucket::Pass
+        } else if has_pending {
+            CheckBucket::Pending
+        } else if has_cancel {
+            CheckBucket::Cancel
+        } else if has_fail {
+            CheckBucket::Fail
+        } else {
+            CheckBucket::Skipping
+        };
+        if has_pass && has_fail {
+            disagreed.push(name.to_string());
+        }
+        out.push(CheckItem {
+            name: name.to_string(),
+            bucket,
+        });
+    }
+    (out, disagreed)
+}
+
+fn collapse_snapshot(snap: &CheckSnapshot) -> (CheckSnapshot, Vec<String>) {
+    let (items, mut disagreed) = collapse_by_name(&snap.items);
+    let (advisory, adv_disagreed) = collapse_by_name(&snap.advisory);
+    disagreed.extend(adv_disagreed);
+    disagreed.sort_unstable();
+    disagreed.dedup();
+    (
+        CheckSnapshot {
+            items,
+            raw_exit: snap.raw_exit,
+            merge_state: snap.merge_state,
+            view: snap.view,
+            advisory,
+        },
+        disagreed,
+    )
+}
+
+fn annotate_disagreed(d: Decision, disagreed: &[String]) -> Decision {
+    if disagreed.is_empty() {
+        return d;
+    }
+    let tag = format!(" (disagreed: {})", disagreed.join(", "));
+    match d {
+        Decision::Green { summary } => Decision::Green {
+            summary: format!("{summary}{tag}"),
+        },
+        Decision::Fail { message, summary } => Decision::Fail {
+            message: format!("{message}{tag}"),
+            summary: format!("{summary}{tag}"),
+        },
+        Decision::Pending { event, summary } => Decision::Pending {
+            event: truncate_msg(&format!("{event}{tag}")),
+            summary: format!("{summary}{tag}"),
+        },
+    }
+}
+
 /// PR buckets. Caller must already have rejected draft / already-merged.
 fn interpret_pr(snap: &CheckSnapshot, auto_merge: bool) -> Decision {
+    let (collapsed, disagreed) = collapse_snapshot(snap);
+    annotate_disagreed(interpret_pr_inner(&collapsed, auto_merge), &disagreed)
+}
+
+fn interpret_pr_inner(snap: &CheckSnapshot, auto_merge: bool) -> Decision {
     match snap.view {
         CheckView::Unspecified => interpret_items(snap, &snap.items),
         CheckView::Required if !snap.items.is_empty() => {
@@ -1097,7 +1177,7 @@ mod tests {
                 true
             ),
             Decision::Pending { event, .. }
-                if event == "ci-wait: waiting (cancelled: fmt) (2 cancel)"
+                if event == "ci-wait: waiting (cancelled: fmt) (1 cancel)"
         ));
         assert_eq!(
             summarize(&pair_items(&[
@@ -1115,6 +1195,111 @@ mod tests {
                 assert_eq!(summary, "1 cancel");
             }
             other => panic!("expected pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_duplicate_name_pass_fail_is_green() {
+        for pairs in [
+            &[("fmt", CheckBucket::Fail), ("fmt", CheckBucket::Pass)][..],
+            &[("fmt", CheckBucket::Pass), ("fmt", CheckBucket::Fail)][..],
+        ] {
+            match interpret_pr(&items(pairs), true) {
+                Decision::Green { summary } => {
+                    assert!(summary.contains("disagreed: fmt"), "summary={summary}");
+                    assert!(
+                        !summary.contains("fail"),
+                        "collapsed summary must not count the suppressed fail: {summary}"
+                    );
+                }
+                other => panic!("expected green, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            interpret_pr(&items(&[("fmt", CheckBucket::Fail)]), true),
+            Decision::Fail { .. }
+        ));
+        assert!(matches!(
+            interpret_pr(
+                &items(&[("fmt", CheckBucket::Fail), ("fmt", CheckBucket::Fail)]),
+                true
+            ),
+            Decision::Fail { .. }
+        ));
+        assert!(matches!(
+            interpret_pr(
+                &items(&[("fmt", CheckBucket::Fail), ("bot", CheckBucket::Pass)]),
+                true
+            ),
+            Decision::Fail { .. }
+        ));
+    }
+
+    #[test]
+    fn interpret_duplicate_name_fail_pending_stays_pending() {
+        match interpret_pr(
+            &items(&[("fmt", CheckBucket::Fail), ("fmt", CheckBucket::Pending)]),
+            true,
+        ) {
+            Decision::Pending { event, summary } => {
+                assert!(event.contains("waiting"), "event={event}");
+                assert!(!event.contains("checks failed"), "event={event}");
+                assert!(!summary.contains("disagreed"), "summary={summary}");
+            }
+            other => panic!("expected pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_duplicate_name_pass_cancel_is_green() {
+        match interpret_pr(
+            &items(&[("fmt", CheckBucket::Pass), ("fmt", CheckBucket::Cancel)]),
+            true,
+        ) {
+            Decision::Green { summary } => {
+                assert!(!summary.contains("cancel"), "summary={summary}");
+                assert!(!summary.contains("disagreed"), "summary={summary}");
+            }
+            other => panic!("expected green (pass dominates cancel), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_duplicate_name_fail_cancel_stays_pending() {
+        match interpret_pr(
+            &items(&[("fmt", CheckBucket::Fail), ("fmt", CheckBucket::Cancel)]),
+            true,
+        ) {
+            Decision::Pending { event, .. } => {
+                assert!(event.contains("cancelled: fmt"), "event={event}");
+                assert!(!event.contains("checks failed"), "event={event}");
+            }
+            other => panic!("expected pending cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_required_empty_clean_advisory_pass_fail_disagreed() {
+        match interpret_pr(
+            &required_snap(
+                &[],
+                &[
+                    ("fmt clippy test", CheckBucket::Fail),
+                    ("fmt clippy test", CheckBucket::Pass),
+                ],
+                MergeStateStatus::Clean,
+            ),
+            true,
+        ) {
+            Decision::Green { summary } => {
+                assert!(summary.contains("0 required"), "summary={summary}");
+                assert!(
+                    summary.contains("disagreed: fmt clippy test"),
+                    "summary={summary}"
+                );
+                assert!(!summary.contains("advisory fail"), "summary={summary}");
+            }
+            other => panic!("expected green, got {other:?}"),
         }
     }
 
@@ -1403,6 +1588,126 @@ mod tests {
         assert!(summary.contains("advisory fail"), "last_summary={summary}");
         assert!(
             !summary.starts_with("6 pass, 1 fail"),
+            "last_summary={summary}"
+        );
+        assert_eq!(counts.merge_n(), 1);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn duplicate_advisory_pass_fail_merges_and_keeps_disagreed_summary() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_state(
+            59,
+            false,
+            false,
+            MergeStateStatus::Clean,
+        ))));
+        s.push_snapshot(Ok(required_snap(
+            &[],
+            &[
+                ("fmt clippy test", CheckBucket::Fail),
+                ("fmt clippy test", CheckBucket::Pass),
+            ],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r)
+            .unwrap()
+            .expect("duplicate name must not ci_failed");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_ne!(view.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            view.last_event.contains("ci-wait: merged #59"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(
+            view.last_event.chars().count() <= LAST_EVENT_MESSAGE_CAP + 1,
+            "last_event len"
+        );
+        let st = load_run_state(&r).unwrap();
+        let summary = st
+            .ci
+            .as_ref()
+            .and_then(|c| c.last_summary.as_deref())
+            .unwrap_or("");
+        assert!(
+            summary.contains("disagreed: fmt clippy test"),
+            "last_summary={summary}"
+        );
+        assert!(!summary.contains("advisory fail"), "last_summary={summary}");
+        assert_eq!(
+            st.ci.as_ref().and_then(|c| c.merge.as_deref()),
+            Some("done")
+        );
+        assert_eq!(counts.merge_n(), 1);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn duplicate_long_disagreed_name_caps_last_event_keeps_last_summary() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let long = format!("fmt {}", "x".repeat(180));
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_state(
+            60,
+            false,
+            false,
+            MergeStateStatus::Clean,
+        ))));
+        s.push_snapshot(Ok(required_snap(
+            &[],
+            &[
+                (long.as_str(), CheckBucket::Fail),
+                (long.as_str(), CheckBucket::Pass),
+            ],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("merged");
+        assert!(
+            view.last_event.contains("ci-wait: merged #60"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(
+            view.last_event.chars().count() <= LAST_EVENT_MESSAGE_CAP + 1,
+            "last_event={}",
+            view.last_event
+        );
+        let st = load_run_state(&r).unwrap();
+        let summary = st
+            .ci
+            .as_ref()
+            .and_then(|c| c.last_summary.as_deref())
+            .unwrap_or("");
+        assert!(
+            summary.contains(&format!("disagreed: {long}")),
             "last_summary={summary}"
         );
         assert_eq!(counts.merge_n(), 1);
