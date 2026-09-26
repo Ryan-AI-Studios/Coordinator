@@ -982,6 +982,30 @@ mod tests {
     }
 
     #[test]
+    fn house_style_completed_sticky_only_empty_walk() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        write_md(
+            ws,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0056-Done | `.` | **Completed** 2026-09-18 — PR **#57** squash `aa5f142` | shipped |\n",
+        );
+        mkdir_track(ws, "0056-Done");
+        let r = rec(ws);
+        let rows = load_track_rows(&r).expect("rows");
+        assert!(track_row_completed(&rows, "0056"));
+        let out = capture_sticky_ready_ids(&r, &["0056".into()]);
+        assert!(out.is_empty(), "{out:?}");
+        let err = pick_next_ready_excluding_sticky(&r, &[], None, &["0056".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no Ready"), "{err}");
+        assert!(err.contains("pass --track"), "{err}");
+        assert!(!err.contains("0056"), "{err}");
+    }
+
+    #[test]
     fn should_pick_unset_true_stopped_and_failure_false() {
         assert!(should_pick_next_ready(&pick_state(
             None,
