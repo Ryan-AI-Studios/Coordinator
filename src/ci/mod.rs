@@ -1279,6 +1279,44 @@ mod tests {
     }
 
     #[test]
+    fn interpret_duplicate_name_fail_pass_fail_is_green() {
+        match interpret_pr(
+            &items(&[
+                ("fmt", CheckBucket::Fail),
+                ("fmt", CheckBucket::Pass),
+                ("fmt", CheckBucket::Fail),
+            ]),
+            true,
+        ) {
+            Decision::Green { summary } => {
+                assert!(summary.contains("disagreed: fmt"), "summary={summary}");
+                assert!(
+                    !summary.contains("fail"),
+                    "collapsed summary must not count suppressed fails: {summary}"
+                );
+            }
+            other => panic!("expected green (pass wins among three twins), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_runs_duplicate_name_pass_fail_is_green() {
+        match interpret_runs(
+            &items(&[("fmt", CheckBucket::Fail), ("fmt", CheckBucket::Pass)]),
+            Duration::from_secs(30),
+        ) {
+            Decision::Green { summary } => {
+                assert!(summary.contains("disagreed: fmt"), "summary={summary}");
+                assert!(
+                    !summary.contains("fail"),
+                    "HeadSha path must collapse via interpret_pr: {summary}"
+                );
+            }
+            other => panic!("expected green via interpret_runs, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn interpret_required_empty_clean_advisory_pass_fail_disagreed() {
         match interpret_pr(
             &required_snap(
