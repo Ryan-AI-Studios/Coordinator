@@ -333,10 +333,10 @@ fn collapse_by_name(items: &[CheckItem]) -> (Vec<CheckItem>, Vec<String>) {
     let mut out = Vec::with_capacity(by_name.len());
     let mut disagreed = Vec::new();
     for (name, buckets) in by_name {
-        let has_pass = buckets.iter().any(|b| *b == CheckBucket::Pass);
-        let has_fail = buckets.iter().any(|b| *b == CheckBucket::Fail);
-        let has_pending = buckets.iter().any(|b| *b == CheckBucket::Pending);
-        let has_cancel = buckets.iter().any(|b| *b == CheckBucket::Cancel);
+        let has_pass = buckets.contains(&CheckBucket::Pass);
+        let has_fail = buckets.contains(&CheckBucket::Fail);
+        let has_pending = buckets.contains(&CheckBucket::Pending);
+        let has_cancel = buckets.contains(&CheckBucket::Cancel);
         let bucket = if has_pass {
             CheckBucket::Pass
         } else if has_pending {
