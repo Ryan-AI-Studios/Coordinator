@@ -285,7 +285,7 @@ Hard failure (apply `status=failure`, including timeout synthesis and adapter fa
 
 | Item | Behavior |
 |------|----------|
-| Artifact | Atomic markdown: project/track/phase/class/epoch + fenced `last_event` / message + `recommended_action` (advisory — no auto-retry) |
+| Artifact | Atomic markdown: project/track/phase/class/epoch + fenced `last_event` / message + `recommended_action` (advisory; automatic recovery has stopped) |
 | Toast | `tauri-winrt-notification` 0.8.1, PowerShell AUMID (no installer). Title `Coordinator: {class}`. Disabled with `COORDINATOR_NOTIFY=off` |
 | Adapters | `NotifyAdapter` trait: Artifact + Toast + Log + **opt-in Hermes** (HMAC V2 POST of unchanged `NotifyEvent` JSON). Default **off**. Adapter errors never undo `FAILURE.md` or skip toast. |
 | Surfaces | `coordinator failure show` prints the raw markdown; `GET /v1/failure` returns `{path, body, superseded?}` or **404**. `coordinator failure resolve` (Idle/Stopped) deletes the file and drops `failure_class` (does not re-arm omit-`--track`). When the conductor row for the failed track is **Completed**, the stored record auto-settles (same clear + journal `failure: settled (conductor row Completed)` on run-entry and a narrow serve sweep). `failure show` is then empty; audit is `{workspace}/status.md`. Omit-`--track` still retains Stopped. `coordinator notify hermes-test` probes Hermes only (no artifact, no toast). `hermes-test --progress` probes a synthetic progress event. |

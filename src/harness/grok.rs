@@ -1,5 +1,7 @@
 //! Grok ACP stdio client (JSON-RPC 2.0, line-delimited).
 //!
+//! Stderr is kept (last 8 KiB, line-redacted). The Grok 1.0.3 pin below is historical.
+//!
 //! Pinned shapes (Grok 1.0.3 / docs.x.ai; re-verified 2026-08-12):
 //! - `initialize` `{ protocolVersion: 1, clientCapabilities: { fs, terminal } }`
 //! - `authenticate` `{ methodId, _meta: { headless: true } }`
@@ -23,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Notify;
 
 use crate::error::{CoordinatorError, Result};
 use crate::outcome::FailureClass;
@@ -42,6 +45,136 @@ pub const ENV_CURSOR_LIVE: &str = "COORDINATOR_CURSOR_LIVE";
 
 /// Holder-child env: which ACP harness (`grok` or `cursor`) this session is.
 pub const ENV_ACP_HARNESS: &str = "COORDINATOR_ACP_HARNESS";
+
+const STDERR_TAIL_CAP: usize = 8 * 1024;
+const STDERR_DRAIN_MS: u64 = 500;
+const CHILD_RECHECK_MS: u64 = 200;
+
+/// Already-collected child wait. Tests pass this in; they do not sleep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdoutChild {
+    ExitedCode(i32),
+    ExitedStatus(String),
+    Alive,
+    Unknown,
+}
+
+/// Shared stderr tail. The reader task sets `finished` then notifies.
+#[derive(Debug)]
+struct StderrShare {
+    tail: Arc<std::sync::Mutex<String>>,
+    done: Arc<Notify>,
+    finished: Arc<AtomicBool>,
+}
+
+impl StderrShare {
+    fn spawn(stderr: tokio::process::ChildStderr) -> Self {
+        let tail = Arc::new(std::sync::Mutex::new(String::new()));
+        let done = Arc::new(Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let tail_task = tail.clone();
+        let done_task = done.clone();
+        let finished_task = finished.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => push_stderr_line(&tail_task, &line),
+                }
+            }
+            finished_task.store(true, Ordering::SeqCst);
+            done_task.notify_waiters();
+        });
+        Self {
+            tail,
+            done,
+            finished,
+        }
+    }
+
+    fn snapshot(&self) -> String {
+        self.tail.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    async fn drain(&self) {
+        if self.finished.load(Ordering::SeqCst) {
+            return;
+        }
+        let notified = self.done.notified();
+        if self.finished.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(STDERR_DRAIN_MS), notified).await;
+    }
+}
+
+fn stderr_line_is_secret(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("api_key")
+        || lower.contains("bearer ")
+        || lower.contains("xai-")
+        || lower.contains("sk-")
+}
+
+fn push_stderr_line(tail: &std::sync::Mutex<String>, line: &str) {
+    let stored = if stderr_line_is_secret(line) {
+        "[redacted]\n".to_string()
+    } else {
+        let mut s = line.to_string();
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s
+    };
+    let Ok(mut buf) = tail.lock() else {
+        return;
+    };
+    buf.push_str(&stored);
+    if buf.len() > STDERR_TAIL_CAP {
+        let mut cut = buf.len() - STDERR_TAIL_CAP;
+        while cut < buf.len() && !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.drain(..cut);
+    }
+}
+
+/// Stable EOF diagnosis. `child=` appears once.
+pub fn format_stdout_close(
+    method: &str,
+    after_cancel: bool,
+    child: &StdoutChild,
+    stderr_tail: &str,
+) -> String {
+    let cancel = if after_cancel { " after cancel" } else { "" };
+    let token = match child {
+        StdoutChild::ExitedCode(n) => format!("child=exited:{n}"),
+        StdoutChild::ExitedStatus(display) => format!("child=exited:status={display}"),
+        StdoutChild::Alive => "child=alive".to_string(),
+        StdoutChild::Unknown => "child=unknown".to_string(),
+    };
+    format!("ACP stdout closed during {method}{cancel}; {token}; stderr={stderr_tail}")
+}
+
+fn child_from_status(status: std::process::ExitStatus) -> StdoutChild {
+    match status.code() {
+        Some(n) => StdoutChild::ExitedCode(n),
+        None => StdoutChild::ExitedStatus(status.to_string()),
+    }
+}
+
+/// Prefix is `HarnessCrash` directly. `map_failure_class` would see `auth` inside
+/// `authenticate` and `quota` / `timeout` inside the stderr tail.
+pub fn failure_class_for_message(msg: &str) -> FailureClass {
+    if msg.starts_with("ACP stdout closed during ") {
+        FailureClass::HarnessCrash
+    } else {
+        map_failure_class(msg)
+    }
+}
 
 /// Result of one `session/prompt` turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +205,8 @@ pub struct GrokSession {
     session_id_shared: Arc<std::sync::Mutex<String>>,
     cancel_requested: Arc<AtomicBool>,
     terminals: crate::harness::terminal::TerminalHub,
+    /// Bounded redacted stderr. Absent on the mock transport.
+    stderr: Option<StderrShare>,
 }
 
 /// Cloneable stdin writer so abort can send `session/cancel` without the pool lock.
@@ -119,7 +254,8 @@ impl std::fmt::Debug for AcpWriterInner {
 #[derive(Clone, Debug)]
 struct MockIo {
     written: Arc<std::sync::Mutex<Vec<String>>>,
-    incoming_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// `CancelHandle` clones the writer, so one `Sender` clone cannot close the channel.
+    incoming_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 enum AcpTransport {
@@ -173,8 +309,30 @@ impl GrokSession {
         model: Option<&str>,
         harness: &str,
     ) -> Result<Self> {
+        let args = acp_agent_argv(harness, model);
+        Self::spawn_piped(cwd, timeout, bin, &args, harness).await
+    }
+
+    /// Test peer: do not append `acp_agent_argv`.
+    #[cfg(test)]
+    pub async fn start_with_raw_command(
+        cwd: PathBuf,
+        timeout: Duration,
+        bin: PathBuf,
+        args: &[String],
+    ) -> Result<Self> {
+        Self::spawn_piped(cwd, timeout, bin, args, "grok").await
+    }
+
+    async fn spawn_piped(
+        cwd: PathBuf,
+        timeout: Duration,
+        bin: PathBuf,
+        args: &[String],
+        harness: &str,
+    ) -> Result<Self> {
         let mut cmd = acp_spawn_command(&bin);
-        for arg in acp_agent_argv(harness, model) {
+        for arg in args {
             cmd.arg(arg);
         }
         cmd.stdin(Stdio::piped())
@@ -201,19 +359,7 @@ impl GrokSession {
             .stdout
             .take()
             .ok_or_else(|| CoordinatorError::Message("grok child stdout not piped".into()))?;
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-            });
-        }
+        let stderr = child.stderr.take().map(StderrShare::spawn);
         let pid = child.id();
         let writer = AcpWriter {
             inner: AcpWriterInner::Process(Arc::new(TokioMutex::new(stdin))),
@@ -240,6 +386,7 @@ impl GrokSession {
             session_id_shared,
             cancel_requested,
             terminals: crate::harness::terminal::TerminalHub::new(),
+            stderr,
         };
         session.terminals.set_adapter(harness);
         session.handshake(timeout).await?;
@@ -267,16 +414,22 @@ impl GrokSession {
         harness: &str,
     ) -> Result<Self> {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        let incoming_slot = Arc::new(std::sync::Mutex::new(Some(incoming_tx)));
         for line in responses {
-            incoming_tx
-                .send(line)
+            let guard = incoming_slot
+                .lock()
+                .map_err(|_| CoordinatorError::Message("mock inbox lock poisoned".into()))?;
+            let tx = guard
+                .as_ref()
+                .ok_or_else(|| CoordinatorError::Message("mock inbox closed".into()))?;
+            tx.send(line)
                 .map_err(|_| CoordinatorError::Message("mock inbox closed".into()))?;
         }
         let written = Arc::new(std::sync::Mutex::new(Vec::new()));
         let writer = AcpWriter {
             inner: AcpWriterInner::Mock(MockIo {
                 written: written.clone(),
-                incoming_tx,
+                incoming_tx: incoming_slot,
             }),
         };
         let in_flight_id = Arc::new(AtomicU64::new(0));
@@ -301,6 +454,7 @@ impl GrokSession {
             session_id_shared,
             cancel_requested,
             terminals: crate::harness::terminal::TerminalHub::new(),
+            stderr: None,
         };
         session.terminals.set_adapter(harness);
         session.handshake(timeout).await?;
@@ -318,9 +472,24 @@ impl GrokSession {
     /// Queue extra mock response lines (after handshake). Wakes a pending `read_line`.
     pub fn mock_push_responses(&mut self, lines: impl IntoIterator<Item = String>) {
         if let AcpWriterInner::Mock(m) = &self.writer.inner {
+            let Ok(guard) = m.incoming_tx.lock() else {
+                return;
+            };
+            let Some(tx) = guard.as_ref() else {
+                return;
+            };
             for line in lines {
-                let _ = m.incoming_tx.send(line);
+                let _ = tx.send(line);
             }
+        }
+    }
+
+    /// Drop the last mock stdout sender so `read_line` returns EOF.
+    pub fn mock_close(&mut self) {
+        if let AcpWriterInner::Mock(m) = &self.writer.inner
+            && let Ok(mut guard) = m.incoming_tx.lock()
+        {
+            guard.take();
         }
     }
 
@@ -509,9 +678,8 @@ impl GrokSession {
             };
             let Some(line) = line else {
                 self.in_flight_id.store(0, Ordering::SeqCst);
-                return Err(CoordinatorError::Message(format!(
-                    "ACP stdout closed during {method}"
-                )));
+                let msg = self.stdout_closed_message(method).await;
+                return Err(CoordinatorError::Message(msg));
             };
             if line.trim().is_empty() {
                 continue;
@@ -707,6 +875,45 @@ impl GrokSession {
         self.writer.write_line(json_line).await
     }
 
+    async fn observe_child(&mut self) -> StdoutChild {
+        let AcpTransport::Process { child, .. } = &mut self.transport else {
+            return StdoutChild::Unknown;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => child_from_status(status),
+            Err(_) => StdoutChild::Unknown,
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_millis(CHILD_RECHECK_MS)).await;
+                match child.try_wait() {
+                    Ok(Some(status)) => child_from_status(status),
+                    Ok(None) => StdoutChild::Alive,
+                    Err(_) => StdoutChild::Unknown,
+                }
+            }
+        }
+    }
+
+    async fn stdout_closed_message(&mut self, method: &str) -> String {
+        let after_cancel = self.cancel_requested.load(Ordering::SeqCst);
+        let child = self.observe_child().await;
+        let tail = if self.stderr.is_none() {
+            String::new()
+        } else {
+            if matches!(
+                child,
+                StdoutChild::ExitedCode(_) | StdoutChild::ExitedStatus(_)
+            ) && let Some(share) = &self.stderr
+            {
+                share.drain().await;
+            }
+            self.stderr
+                .as_ref()
+                .map(|s| s.snapshot())
+                .unwrap_or_default()
+        };
+        format_stdout_close(method, after_cancel, &child, &tail)
+    }
+
     async fn read_line(&mut self) -> Result<Option<String>> {
         match &mut self.transport {
             AcpTransport::Process { stdout, .. } => {
@@ -776,10 +983,11 @@ impl CancelHandle {
         self.writer.write_line(&payload.to_string()).await?;
         if let AcpWriterInner::Mock(m) = &self.writer.inner {
             let id = self.in_flight_id.load(Ordering::SeqCst);
-            if id > 0 {
-                let _ = m
-                    .incoming_tx
-                    .send(rpc_result(id, json!({ "stopReason": "cancelled" })));
+            if id > 0
+                && let Ok(guard) = m.incoming_tx.lock()
+                && let Some(tx) = guard.as_ref()
+            {
+                let _ = tx.send(rpc_result(id, json!({ "stopReason": "cancelled" })));
             }
         }
         Ok(())
@@ -1439,6 +1647,61 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("advertised"), "{err}");
         assert!(err.contains("something_else"), "{err}");
+    }
+
+    #[test]
+    fn format_stdout_close_tokens_cancel_and_redaction() {
+        let exited = format_stdout_close(
+            "session/prompt",
+            false,
+            &StdoutChild::ExitedCode(42),
+            "diag-stderr",
+        );
+        assert_eq!(
+            exited,
+            "ACP stdout closed during session/prompt; child=exited:42; stderr=diag-stderr"
+        );
+        assert_eq!(exited.matches("child=").count(), 1);
+        let alive = format_stdout_close("session/prompt", false, &StdoutChild::Alive, "");
+        assert!(alive.contains("child=alive"), "{alive}");
+        assert_eq!(alive.matches("child=").count(), 1);
+        let unknown = format_stdout_close("session/prompt", true, &StdoutChild::Unknown, "");
+        assert!(unknown.contains(" after cancel"), "{unknown}");
+        assert!(unknown.contains("child=unknown"), "{unknown}");
+        let status = format_stdout_close(
+            "initialize",
+            false,
+            &StdoutChild::ExitedStatus("exit code: unavailable".into()),
+            "",
+        );
+        assert!(
+            status.contains("child=exited:status=exit code: unavailable"),
+            "{status}"
+        );
+        let tail = std::sync::Mutex::new(String::new());
+        push_stderr_line(&tail, "diag-stderr\n");
+        push_stderr_line(&tail, "sk-live-secret\n");
+        push_stderr_line(&tail, "Bearer token\n");
+        let stored = tail.lock().unwrap().clone();
+        assert!(stored.contains("diag-stderr\n"), "{stored}");
+        assert!(stored.contains("[redacted]\n"), "{stored}");
+        assert!(!stored.contains("sk-live-secret"), "{stored}");
+        assert!(!stored.to_ascii_lowercase().contains("bearer "), "{stored}");
+        let redacted =
+            format_stdout_close("authenticate", false, &StdoutChild::ExitedCode(7), &stored);
+        assert!(redacted.contains("[redacted]"), "{redacted}");
+        assert!(!redacted.contains("sk-live-secret"), "{redacted}");
+    }
+
+    #[test]
+    fn stdout_close_prefix_is_harness_crash_despite_auth_and_quota() {
+        let msg = "ACP stdout closed during authenticate; child=exited:7; stderr=auth quota";
+        assert_eq!(failure_class_for_message(msg), FailureClass::HarnessCrash);
+        assert_eq!(map_failure_class(msg), FailureClass::Permission);
+        assert_eq!(
+            map_failure_class("quota exceeded"),
+            FailureClass::ModelExhaustion
+        );
     }
 
     #[test]
@@ -2173,6 +2436,102 @@ mod tests {
             .expect("cursor/ask_question result written");
         assert_eq!(reply["result"]["outcome"]["outcome"], "skipped");
         assert!(reply.get("method").is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_peer_stdout_close_exit_stderr_and_auth_quota() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("peer.ps1");
+        std::fs::write(
+            &script,
+            r#"$mode = 'prompt'
+if ($args.Count -gt 0) { $mode = $args[0] }
+$reader = New-Object System.IO.StreamReader([Console]::OpenStandardInput())
+while ($null -ne ($line = $reader.ReadLine())) {
+  if ($line -match '"initialize"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"cached_token"}]}}')
+    [Console]::Out.Flush()
+    if ($mode -eq 'auth') {
+      [Console]::Error.WriteLine('auth quota')
+      [Console]::Error.Flush()
+      exit 7
+    }
+    continue
+  }
+  if ($line -match '"authenticate"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":2,"result":{}}')
+    [Console]::Out.Flush()
+    continue
+  }
+  if ($line -match '"session/new"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":3,"result":{"sessionId":"peer-1"}}')
+    [Console]::Out.Flush()
+    continue
+  }
+  if ($line -match '"session/prompt"') {
+    [Console]::Error.WriteLine('diag-stderr')
+    [Console]::Error.WriteLine('sk-live-secret')
+    [Console]::Error.Flush()
+    exit 42
+  }
+}
+"#,
+        )
+        .unwrap();
+        let bin = PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut prompt_args = vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-File".into(),
+            script.display().to_string(),
+            "prompt".into(),
+        ];
+        let mut session = GrokSession::start_with_raw_command(
+            dir.path().to_path_buf(),
+            Duration::from_secs(20),
+            bin.clone(),
+            &prompt_args,
+        )
+        .await
+        .unwrap();
+        let err = session
+            .inject_prompt("x", Duration::from_secs(20))
+            .await
+            .unwrap_err()
+            .to_string();
+        let _ = session.shutdown().await;
+        assert!(
+            err.contains("ACP stdout closed during session/prompt"),
+            "{err}"
+        );
+        assert!(err.contains("child=exited:42"), "{err}");
+        assert!(err.contains("diag-stderr"), "{err}");
+        assert!(err.contains("[redacted]"), "{err}");
+        assert!(!err.contains("sk-live-secret"), "{err}");
+        assert_eq!(err.matches("child=").count(), 1, "{err}");
+
+        prompt_args.pop();
+        prompt_args.push("auth".into());
+        let auth = GrokSession::start_with_raw_command(
+            dir.path().to_path_buf(),
+            Duration::from_secs(20),
+            bin,
+            &prompt_args,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            auth.contains("ACP stdout closed during authenticate"),
+            "{auth}"
+        );
+        assert!(auth.contains("auth"), "{auth}");
+        assert!(auth.contains("quota"), "{auth}");
+        assert_eq!(failure_class_for_message(&auth), FailureClass::HarnessCrash);
+        let _ = std::fs::remove_file(&script);
     }
 }
 

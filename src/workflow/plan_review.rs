@@ -2741,11 +2741,13 @@ mod tests {
         run::run_with_driver(&r, Some("0001".into()), WorkflowDriver::Adapter).unwrap();
         let mut state = load_run_state(&r).unwrap();
         state.plan_review_spawned = vec!["agy".into(), "opencode".into()];
+        state.acp_stdout_retries = 2;
         save_run_state(&r, &state).unwrap();
         run::stop(&r).unwrap();
         run::run_with_driver(&r, Some("0001".into()), WorkflowDriver::Adapter).unwrap();
         let state = load_run_state(&r).unwrap();
         assert!(state.plan_review_spawned.is_empty());
+        assert_eq!(state.acp_stdout_retries, 0);
         assert_eq!(state.plan_review_join_retries, 0);
         assert!(state.plan_review_slot_ran.is_empty());
     }
@@ -2756,10 +2758,12 @@ mod tests {
         state.plan_review_spawned = vec!["agy".into(), "opencode".into()];
         state.plan_review_join_retries = 1;
         state.plan_review_slot_ran = vec!["agy".into()];
+        state.acp_stdout_retries = 2;
         reset_phase_clock(&mut state);
         assert!(state.plan_review_spawned.is_empty());
         assert_eq!(state.plan_review_join_retries, 0);
         assert!(state.plan_review_slot_ran.is_empty());
+        assert_eq!(state.acp_stdout_retries, 0);
     }
 
     #[test]

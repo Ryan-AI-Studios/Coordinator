@@ -69,6 +69,7 @@ pub(crate) fn run_with_origin(
                 state.pause_spans.clear();
                 state.stall_recycles = 0;
                 state.aborted_session_id = None;
+                state.acp_stdout_retries = 0;
                 state.plan_review_spawned.clear();
                 state.plan_review_join_retries = 0;
                 state.plan_review_slot_ran.clear();
@@ -140,6 +141,7 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.pause_spans.clear();
                 state.stall_recycles = 0;
                 state.aborted_session_id = None;
+                state.acp_stdout_retries = 0;
                 state.plan_review_spawned.clear();
                 state.plan_review_join_retries = 0;
                 state.plan_review_slot_ran.clear();
@@ -434,8 +436,14 @@ mod tests {
         let mut state = crate::state::RunState::idle(&r.id);
         state.parked_next = Some("0002".into());
         crate::state::save_run_state(&r, &state).unwrap();
+        state.acp_stdout_retries = 2;
+        crate::state::save_run_state(&r, &state).unwrap();
         let view = run_stub(&r, Some("0002".into())).unwrap();
         assert!(view.parked_next.is_none());
         assert_eq!(view.track_id.as_deref(), Some("0002"));
+        assert_eq!(
+            crate::state::load_run_state(&r).unwrap().acp_stdout_retries,
+            0
+        );
     }
 }

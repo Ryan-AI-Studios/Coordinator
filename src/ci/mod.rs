@@ -12,7 +12,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::Utc;
 
@@ -39,6 +39,34 @@ const TEN_MIN: Duration = Duration::from_secs(600);
 #[cfg(test)]
 thread_local! {
     static TEST_BACKEND: RefCell<Option<Arc<dyn CiBackend>>> = const { RefCell::new(None) };
+}
+
+// None = unset (tests do not call gh). Some(None) forces no PR. Some(Some(n)) forces the sentence.
+#[cfg(test)]
+static TEST_OPEN_GREEN_PR: Mutex<Option<Option<u64>>> = Mutex::new(None);
+
+#[cfg(test)]
+static GREEN_PR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub struct GreenPrGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for GreenPrGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = TEST_OPEN_GREEN_PR.lock() {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn set_test_open_green_pr(value: Option<u64>) -> GreenPrGuard {
+    let lock = GREEN_PR_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    *TEST_OPEN_GREEN_PR.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+    GreenPrGuard { _lock: lock }
 }
 
 #[cfg(test)]
@@ -1004,6 +1032,82 @@ fn classify_backend_err(
     Ok(None)
 }
 
+/// Read-only green open PR. Empty checks plus Clean, Unstable, or HasHooks is green.
+/// Unspecified and Blocked do not qualify. Never merges and never publishes.
+pub(crate) fn open_pr_is_green(
+    state: &RunState,
+    backend: &dyn CiBackend,
+    cwd: &Path,
+) -> Result<Option<u64>> {
+    let Some(target) = resolve_target(state, backend, cwd, pr_hint(state).as_ref())? else {
+        return Ok(None);
+    };
+    let number = match &target {
+        CiTarget::PullRequest {
+            number,
+            is_draft,
+            merged,
+            merge_state,
+            ..
+        } => {
+            if *is_draft || *merged {
+                return Ok(None);
+            }
+            if !matches!(
+                merge_state,
+                MergeStateStatus::Clean | MergeStateStatus::Unstable | MergeStateStatus::HasHooks
+            ) {
+                return Ok(None);
+            }
+            *number
+        }
+        CiTarget::HeadSha { .. } => return Ok(None),
+    };
+    let snap = backend.checks(cwd, &target)?;
+    let (collapsed, _) = collapse_snapshot(&snap);
+    let items = if collapsed.view == CheckView::Required && collapsed.items.is_empty() {
+        collapsed.advisory.as_slice()
+    } else {
+        collapsed.items.as_slice()
+    };
+    match interpret_items(&collapsed, items) {
+        Decision::Green { .. } => Ok(Some(number)),
+        _ => Ok(None),
+    }
+}
+
+fn lookup_green_open_pr(record: &ProjectRecord) -> Result<Option<u64>> {
+    #[cfg(test)]
+    {
+        let _ = record;
+        let forced = *TEST_OPEN_GREEN_PR.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(value) = forced {
+            return Ok(value);
+        }
+        Ok(None)
+    }
+    #[cfg(not(test))]
+    {
+        let state = load_run_state(record)?;
+        let Some(cwd) = crate::layout::resolve(record).execution_repo else {
+            return Ok(None);
+        };
+        open_pr_is_green(&state, &GhCli, &cwd)
+    }
+}
+
+pub(crate) fn with_green_pr_prefix(record: &ProjectRecord, phase: &str, message: String) -> String {
+    if phase != crate::workflow::graph::PHASE_IMPLEMENT
+        && phase != crate::workflow::graph::PHASE_ADDRESS_FINDINGS
+    {
+        return message;
+    }
+    match lookup_green_open_pr(record) {
+        Ok(Some(n)) => format!("PR #{n} green; merge not performed \u{2014} {message}"),
+        _ => message,
+    }
+}
+
 fn truncate_msg(s: &str) -> String {
     let t = s.trim();
     if t.chars().count() <= LAST_EVENT_MESSAGE_CAP {
@@ -1112,6 +1216,108 @@ mod tests {
         let counts = rec.counts.clone();
         let g = install_test_backend(Arc::new(rec));
         (g, counts)
+    }
+
+    fn recorded(target: CiTarget, snap: CheckSnapshot) -> RecordingBackend {
+        RecordingBackend::wrap(Arc::new(ScriptedBackend::new().with_pr(target, snap)))
+    }
+
+    fn required_clean(pairs: &[(&str, CheckBucket)], merge: MergeStateStatus) -> CheckSnapshot {
+        CheckSnapshot {
+            items: pair_items(pairs),
+            raw_exit: 0,
+            merge_state: merge,
+            view: CheckView::Required,
+            advisory: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn open_pr_is_green_is_read_only() {
+        let dir = tempdir().unwrap();
+        let state = crate::state::RunState::idle("p");
+        let cwd = dir.path();
+        for merge in [
+            MergeStateStatus::Clean,
+            MergeStateStatus::Unstable,
+            MergeStateStatus::HasHooks,
+        ] {
+            let backend = recorded(
+                pr_state(505, false, false, merge),
+                required_clean(&[("ci", CheckBucket::Pass)], merge),
+            );
+            assert_eq!(
+                open_pr_is_green(&state, &backend, cwd).unwrap(),
+                Some(505),
+                "{merge:?}"
+            );
+            assert_eq!(backend.counts.merge_n(), 0);
+            assert_eq!(backend.counts.publish_n(), 0);
+        }
+        let empty = recorded(
+            pr_state(9, false, false, MergeStateStatus::Clean),
+            required_clean(&[], MergeStateStatus::Clean),
+        );
+        assert_eq!(open_pr_is_green(&state, &empty, cwd).unwrap(), Some(9));
+        assert_eq!(empty.counts.merge_n(), 0);
+        assert_eq!(empty.counts.publish_n(), 0);
+
+        let negatives = [
+            pr_state(1, true, false, MergeStateStatus::Clean),
+            pr_state(1, false, true, MergeStateStatus::Clean),
+            pr_state(1, false, false, MergeStateStatus::Unspecified),
+            pr_state(1, false, false, MergeStateStatus::Blocked),
+        ];
+        for target in negatives {
+            let backend = recorded(
+                target,
+                required_clean(&[("ci", CheckBucket::Pass)], MergeStateStatus::Clean),
+            );
+            assert_eq!(open_pr_is_green(&state, &backend, cwd).unwrap(), None);
+            assert_eq!(backend.counts.merge_n(), 0);
+            assert_eq!(backend.counts.publish_n(), 0);
+        }
+        for bucket in [CheckBucket::Pending, CheckBucket::Cancel, CheckBucket::Fail] {
+            let backend = recorded(
+                pr_state(1, false, false, MergeStateStatus::Clean),
+                required_clean(&[("ci", bucket)], MergeStateStatus::Clean),
+            );
+            assert_eq!(
+                open_pr_is_green(&state, &backend, cwd).unwrap(),
+                None,
+                "{bucket:?}"
+            );
+            assert_eq!(backend.counts.merge_n(), 0);
+            assert_eq!(backend.counts.publish_n(), 0);
+        }
+        let missing = RecordingBackend::wrap(Arc::new(ScriptedBackend::new()));
+        assert_eq!(open_pr_is_green(&state, &missing, cwd).unwrap(), None);
+        assert_eq!(missing.counts.merge_n(), 0);
+        assert_eq!(missing.counts.publish_n(), 0);
+        let broken = ScriptedBackend::new();
+        broken.push_resolve(Err(crate::error::CoordinatorError::Message(
+            "gh down".into(),
+        )));
+        let broken = RecordingBackend::wrap(Arc::new(broken));
+        assert!(open_pr_is_green(&state, &broken, cwd).is_err());
+        assert_eq!(broken.counts.merge_n(), 0);
+        assert_eq!(broken.counts.publish_n(), 0);
+    }
+
+    #[test]
+    fn green_pr_prefix_only_for_implement_and_address_findings() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let _guard = set_test_open_green_pr(Some(505));
+        let msg = "ACP stdout closed during session/prompt; child=unknown; stderr=".to_string();
+        let prefix = "PR #505 green; merge not performed \u{2014} ";
+        let implement = with_green_pr_prefix(&r, "implement", msg.clone());
+        assert!(implement.starts_with(prefix), "{implement}");
+        let address = with_green_pr_prefix(&r, "address-findings", msg.clone());
+        assert!(address.starts_with(prefix), "{address}");
+        let plan = with_green_pr_prefix(&r, "plan", msg);
+        assert!(!plan.contains("merge not performed"), "{plan}");
+        assert!(plan.starts_with("ACP stdout closed"), "{plan}");
     }
 
     #[test]

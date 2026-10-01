@@ -278,23 +278,45 @@ fn drive_adapter(
                 .await?;
                 crate::harness::prompt(Some(&selector), prompt, false).await
             });
-            match result {
-                Ok(view) => {
-                    if view.applied || view.skipped == Some(true) {
-                        return;
-                    }
-                    if let Some(err) = view.error {
-                        let class = view.failure_class.unwrap_or(FailureClass::HarnessCrash);
-                        apply_adapter_failure(&rec, class, err);
-                    }
-                }
-                Err(e) => apply_adapter_failure(&rec, FailureClass::HarnessCrash, e.to_string()),
-            }
+            finish_adapter_inject(&rec, result);
         })
         .map_err(|e| {
             CoordinatorError::Message(format!("failed to spawn adapter inject thread: {e}"))
         })?;
     Ok(None)
+}
+
+fn finish_adapter_inject(
+    record: &ProjectRecord,
+    result: Result<crate::harness::HarnessPromptView>,
+) {
+    match result {
+        Ok(view) => {
+            if view.applied || view.skipped == Some(true) {
+                return;
+            }
+            if let Some(err) = view.error {
+                let class = view.failure_class.unwrap_or(FailureClass::HarnessCrash);
+                apply_adapter_failure(record, class, err);
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.starts_with("ACP stdout closed during ") {
+                match crate::harness::abort::note_acp_stdout_close(record, &msg, None) {
+                    crate::harness::abort::StdoutCloseDisposition::Ignore
+                    | crate::harness::abort::StdoutCloseDisposition::Retry => {}
+                    crate::harness::abort::StdoutCloseDisposition::Fail { message } => {
+                        let phase = load_run_state(record).map(|s| s.phase).unwrap_or_default();
+                        let message = crate::ci::with_green_pr_prefix(record, &phase, message);
+                        apply_adapter_failure(record, FailureClass::HarnessCrash, message);
+                    }
+                }
+            } else {
+                apply_adapter_failure(record, FailureClass::HarnessCrash, msg);
+            }
+        }
+    }
 }
 
 fn apply_adapter_failure(record: &ProjectRecord, class: FailureClass, message: String) {
@@ -702,6 +724,57 @@ mod tests {
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn prefixed_start_error_retries_without_artifact() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0064".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut s = load_run_state(&r)?;
+            s.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            s.last_driven_phase = Some("implement".into());
+            crate::state::save_run_state(&r, &s)
+        })
+        .unwrap();
+        finish_adapter_inject(
+            &r,
+            Err(CoordinatorError::Message(
+                "ACP stdout closed during initialize; child=exited:42; stderr=".into(),
+            )),
+        );
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, crate::state::RunStatus::Running);
+        assert_eq!(s.phase, "implement");
+        assert_eq!(s.acp_stdout_retries, 1);
+        assert!(s.last_driven_phase.is_none());
+        assert!(
+            s.last_event.contains("recycle: acp-stdout 1/2"),
+            "{}",
+            s.last_event
+        );
+        assert!(s.last_event.contains("child=exited:42"), "{}", s.last_event);
+        assert!(s.last_event.contains('\u{2014}'), "{}", s.last_event);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+    }
+
+    #[test]
+    fn non_prefix_start_error_is_immediate_harness_crash() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0064".into()), WorkflowDriver::Adapter).unwrap();
+        finish_adapter_inject(
+            &r,
+            Err(CoordinatorError::Message(
+                "terminal host probe exit 1 (no usable shell for terminal/create)".into(),
+            )),
+        );
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, crate::state::RunStatus::Stopped);
+        assert_eq!(s.failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(s.acp_stdout_retries, 0);
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
     }
 
     fn dummy(dir: &std::path::Path, name: &str) -> PathBuf {

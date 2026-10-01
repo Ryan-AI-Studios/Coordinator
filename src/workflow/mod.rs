@@ -165,6 +165,7 @@ pub fn reset_phase_clock(state: &mut RunState) {
     state.stalled_at = None;
     state.stall_recycles = 0;
     state.aborted_session_id = None;
+    state.acp_stdout_retries = 0;
     state.plan_review_spawned.clear();
     state.plan_review_join_retries = 0;
     state.plan_review_slot_ran.clear();
