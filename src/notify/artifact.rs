@@ -197,7 +197,7 @@ fn render(event: &NotifyEvent) -> String {
     format!(
         "# Coordinator failure\n\
          \n\
-         Recommended action is **advisory** — Coordinator does **not** auto-retry in this track.\n\
+         Recommended action is **advisory**. This file means automatic recovery has stopped. An ACP stdout close restarts the session only before this file is written (bounded). Nothing else auto-retries.\n\
          \n\
          - project_id: {project}\n\
          - track_id: {track}\n\
@@ -294,7 +294,7 @@ mod tests {
         assert!(shown.body.contains("failure_class: timeout"));
         assert!(shown.body.contains("recommended_action"));
         assert!(shown.body.contains("Increase the phase budget"));
-        assert!(shown.body.contains("does **not** auto-retry"));
+        assert!(shown.body.contains("automatic recovery has stopped"));
         assert!(shown.body.contains("```\noutcome: failure"));
         assert!(shown.body.contains(r"C:\dev\work"));
         assert!(existing_path(&r).is_some());

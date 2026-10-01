@@ -11,8 +11,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{CoordinatorError, Result};
 use crate::harness::grok::{
-    ENV_ACP_HARNESS, ENV_CURSOR_BIN, ENV_GROK_BIN, GrokSession, PromptResult, map_failure_class,
-    resolve_cursor_binary,
+    ENV_ACP_HARNESS, ENV_CURSOR_BIN, ENV_GROK_BIN, GrokSession, PromptResult,
+    failure_class_for_message, resolve_cursor_binary,
 };
 use crate::harness::terminal::SpawnTally;
 use crate::harness::{grok_cwd, resolve_grok_binary};
@@ -424,29 +424,87 @@ async fn apply_turn(
             })
         }
         Err(e) => {
-            let class = map_failure_class(&e.to_string());
-            let mut status = None;
-            let mut applied = false;
+            let raw = e.to_string();
             let skip = state.status != RunStatus::Running
                 || harness_is_aborted(&state, &harness)
                 || drifted;
-            if !skip {
-                let outcome = PhaseOutcome::failure(
-                    injected_phase,
-                    class,
-                    OutcomeSource::Adapter,
-                    Some(e.to_string()),
-                    Some(state.run_epoch),
-                );
-                status = Some(write_and_apply(record, outcome)?);
-                applied = true;
+            if skip {
+                let class = failure_class_for_message(&raw);
+                return Ok(HarnessPromptView {
+                    text: None,
+                    stop_reason: None,
+                    applied: false,
+                    skipped: Some(true),
+                    error: Some(raw),
+                    failure_class: Some(class),
+                    status: None,
+                    harness: Some(harness),
+                });
             }
+            if raw.starts_with("ACP stdout closed during ") {
+                let sid = harness.session_id.as_deref();
+                match crate::harness::abort::note_acp_stdout_close(record, &raw, sid) {
+                    crate::harness::abort::StdoutCloseDisposition::Ignore
+                    | crate::harness::abort::StdoutCloseDisposition::Retry => {
+                        return Ok(HarnessPromptView {
+                            text: None,
+                            stop_reason: None,
+                            applied: false,
+                            skipped: Some(true),
+                            error: None,
+                            failure_class: None,
+                            status: None,
+                            harness: Some(harness),
+                        });
+                    }
+                    crate::harness::abort::StdoutCloseDisposition::Fail { message } => {
+                        let fallback = message.clone();
+                        let rec = record.clone();
+                        let phase = injected_phase.to_string();
+                        let message = match tokio::task::spawn_blocking(move || {
+                            crate::ci::with_green_pr_prefix(&rec, &phase, message)
+                        })
+                        .await
+                        {
+                            Ok(prefixed) => prefixed,
+                            Err(_) => fallback,
+                        };
+                        let outcome = PhaseOutcome::failure(
+                            injected_phase,
+                            FailureClass::HarnessCrash,
+                            OutcomeSource::Adapter,
+                            Some(message.clone()),
+                            Some(state.run_epoch),
+                        );
+                        let status = Some(write_and_apply(record, outcome)?);
+                        return Ok(HarnessPromptView {
+                            text: None,
+                            stop_reason: None,
+                            applied: true,
+                            skipped: None,
+                            error: Some(message),
+                            failure_class: Some(FailureClass::HarnessCrash),
+                            status,
+                            harness: Some(harness),
+                        });
+                    }
+                }
+            }
+            let class = failure_class_for_message(&raw);
+            let outcome = PhaseOutcome::failure(
+                injected_phase,
+                class,
+                OutcomeSource::Adapter,
+                Some(raw.clone()),
+                Some(state.run_epoch),
+            );
+            let status = Some(write_and_apply(record, outcome)?);
             Ok(HarnessPromptView {
                 text: None,
                 stop_reason: None,
-                applied,
-                skipped: if skip { Some(true) } else { None },
-                error: Some(e.to_string()),
+                applied: true,
+                skipped: None,
+                error: Some(raw),
                 failure_class: Some(class),
                 status,
                 harness: Some(harness),
@@ -1015,6 +1073,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     if normal {
                         set_prompt_in_flight(record, false);
                     }
+                    // Err leaves prompt_in_flight set so should_refuse_reuse starts a new session.
                     if let Err(e) = &turn {
                         let msg = e.to_string().to_ascii_lowercase();
                         if msg.contains("timed out") || msg.contains("timeout") {
@@ -1085,7 +1144,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             harness: Some(session_status(&session)),
                             applied: Some(false),
                             skipped: None,
-                            failure_class: Some(map_failure_class(&e.to_string())),
+                            failure_class: Some(failure_class_for_message(&e.to_string())),
                         },
                         false,
                     ),
@@ -1225,6 +1284,7 @@ pub async fn prompt(
     if normal {
         set_prompt_in_flight(&rec, false);
     } else if let Err(e) = &turn {
+        // Err leaves prompt_in_flight set so should_refuse_reuse starts a new session.
         let msg = e.to_string().to_ascii_lowercase();
         if msg.contains("timed out") || msg.contains("timeout") {
             crate::harness::abort::abort_stuck_prompt_sync(
@@ -1290,7 +1350,7 @@ pub async fn compact(project: Option<&str>, infer_cwd: bool) -> Result<HarnessPr
             applied: false,
             skipped: None,
             error: Some(e.to_string()),
-            failure_class: Some(map_failure_class(&e.to_string())),
+            failure_class: Some(failure_class_for_message(&e.to_string())),
             status: None,
             harness: Some(session_status(session)),
         }),
@@ -1792,6 +1852,213 @@ mod tests {
             view.status.as_ref().unwrap().failure_class,
             Some(FailureClass::HarnessCrash)
         );
+        let _ = shutdown(Some(&rec.id), false).await;
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    fn arm_stdout_phase(rec: &ProjectRecord, phase: &str, retries: u32) {
+        crate::state::with_run_state_lock(rec, || {
+            let mut s = load_run_state(rec)?;
+            s.driver = crate::workflow::WorkflowDriver::Adapter;
+            s.phase = phase.into();
+            s.status = RunStatus::Running;
+            s.acp_stdout_retries = retries;
+            s.last_driven_phase = Some(phase.into());
+            crate::state::save_run_state(rec, &s)
+        })
+        .unwrap();
+    }
+
+    async fn prompt_after_mock_close(rec: &ProjectRecord, sid: &str) -> HarnessPromptView {
+        let mut session = GrokSession::start_mock(
+            crate::harness::grok_cwd(rec),
+            mock_handshake_ok(sid),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        session.mock_close();
+        insert_test_session(rec.id.clone(), session).await;
+        prompt(Some(&rec.id), "x".into(), false).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn mock_close_retries_then_stops() {
+        let _guard = test_env_lock();
+        let _pr = crate::ci::set_test_open_green_pr(None);
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_stub(&rec, Some("0064".into())).unwrap();
+        arm_stdout_phase(&rec, "implement", 0);
+
+        let first = prompt_after_mock_close(&rec, "sess-stdout-1").await;
+        assert!(!first.applied);
+        assert_eq!(first.skipped, Some(true));
+        assert!(first.error.is_none());
+        let st = run::status(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, "implement");
+        let state = load_run_state(&rec).unwrap();
+        assert_eq!(state.acp_stdout_retries, 1);
+        assert!(state.last_driven_phase.is_none());
+        assert!(
+            state.last_event.contains("recycle: acp-stdout 1/2"),
+            "{}",
+            state.last_event
+        );
+        assert!(
+            state.last_event.contains("child=unknown"),
+            "{}",
+            state.last_event
+        );
+        assert!(
+            state.last_event.contains('\u{2014}'),
+            "{}",
+            state.last_event
+        );
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+
+        let second = prompt_after_mock_close(&rec, "sess-stdout-2").await;
+        assert!(!second.applied);
+        assert_eq!(load_run_state(&rec).unwrap().acp_stdout_retries, 2);
+
+        let third = prompt_after_mock_close(&rec, "sess-stdout-3").await;
+        assert!(third.applied);
+        assert_eq!(third.failure_class, Some(FailureClass::HarnessCrash));
+        let stopped = run::status(&rec).unwrap();
+        assert_eq!(stopped.status, RunStatus::Stopped);
+        assert_eq!(stopped.phase, "implement");
+        assert_eq!(stopped.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(crate::notify::artifact::existing_path(&rec).is_some());
+        let _ = shutdown(Some(&rec.id), false).await;
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stdout_close_after_cancel_does_not_retry() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_stub(&rec, Some("0064".into())).unwrap();
+        arm_stdout_phase(&rec, "implement", 0);
+
+        let mut session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            mock_handshake_ok("sess-cancel-eof"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        session.cancel_handle().cancel().await.unwrap();
+        session.mock_close();
+        insert_test_session(rec.id.clone(), session).await;
+        let view = prompt(Some(&rec.id), "x".into(), false).await.unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        assert!(view.error.is_none());
+        let state = load_run_state(&rec).unwrap();
+        assert_eq!(state.acp_stdout_retries, 0);
+        assert_eq!(state.status, RunStatus::Running);
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        let _ = shutdown(Some(&rec.id), false).await;
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stdout_closed_rpc_error_is_immediate_harness_crash() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_stub(&rec, Some("0064".into())).unwrap();
+        arm_stdout_phase(&rec, "implement", 0);
+
+        let mut lines = mock_handshake_ok("sess-rpc-stdout");
+        lines.push(crate::harness::grok::rpc_error(4, "stdout closed"));
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            lines,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+        let view = prompt(Some(&rec.id), "x".into(), false).await.unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(load_run_state(&rec).unwrap().acp_stdout_retries, 0);
+        let _ = shutdown(Some(&rec.id), false).await;
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn exhaust_names_green_pr_on_implement_and_address_findings_only() {
+        let _guard = test_env_lock();
+        let _pr = crate::ci::set_test_open_green_pr(Some(505));
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        let prefix = "PR #505 green; merge not performed \u{2014} ";
+
+        crate::run::run_stub(&rec, Some("0064".into())).unwrap();
+        arm_stdout_phase(&rec, "implement", 2);
+        let view = prompt_after_mock_close(&rec, "sess-pr-impl").await;
+        assert!(view.applied);
+        let err = view.error.unwrap_or_default();
+        assert!(err.starts_with(prefix), "{err}");
+        assert!(err.contains('\u{2014}'));
+        let st = run::status(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(st.phase, "implement");
+
+        crate::run::run_stub(&rec, Some("0064".into())).unwrap();
+        arm_stdout_phase(&rec, "address-findings", 2);
+        let view = prompt_after_mock_close(&rec, "sess-pr-addr").await;
+        let err = view.error.unwrap_or_default();
+        assert!(err.starts_with(prefix), "{err}");
+        assert_eq!(run::status(&rec).unwrap().phase, "address-findings");
+
+        crate::run::run_stub(&rec, Some("0064".into())).unwrap();
+        arm_stdout_phase(&rec, "plan", 2);
+        let view = prompt_after_mock_close(&rec, "sess-pr-plan").await;
+        let err = view.error.unwrap_or_default();
+        assert!(!err.contains("merge not performed"), "{err}");
+        assert!(err.starts_with("ACP stdout closed"), "{err}");
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
         let _ = shutdown(Some(&rec.id), false).await;
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
@@ -2428,6 +2695,12 @@ Loop\r\n",
         assert_eq!(st.status, crate::state::RunStatus::Running);
         assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN);
         assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        assert_eq!(
+            crate::state::load_run_state(&rec)
+                .unwrap()
+                .acp_stdout_retries,
+            0
+        );
         let _ = shutdown(Some(&rec.id), false).await;
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);

@@ -186,7 +186,7 @@ mod tests {
             assert!(shown.body.contains("run_epoch:"));
             assert!(shown.body.contains("written_at:"));
             assert!(shown.body.contains(recommended_action(class)));
-            assert!(shown.body.contains("does **not** auto-retry"));
+            assert!(shown.body.contains("automatic recovery has stopped"));
             assert!(shown.body.contains(&format!("msg-{class}")));
             assert!(view.failure_artifact.is_some());
         }

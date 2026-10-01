@@ -249,6 +249,98 @@ pub fn maybe_stamp_and_abort_stall(record: &ProjectRecord) -> Option<StatusView>
     stamped
 }
 
+/// Two stdout-close restarts, then stop (three attempts).
+pub const ACP_STDOUT_RETRY_CAP: u32 = 2;
+
+/// `note_acp_stdout_close` result. Not a `Result` — a lock error is `Fail`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdoutCloseDisposition {
+    Ignore,
+    Retry,
+    Fail { message: String },
+}
+
+fn stdout_message_after_cancel(msg: &str) -> bool {
+    let Some(rest) = msg.strip_prefix("ACP stdout closed during ") else {
+        return false;
+    };
+    let head = rest.split(';').next().unwrap_or(rest);
+    head.ends_with(" after cancel")
+}
+
+fn child_token_from_message(msg: &str) -> &str {
+    let Some(idx) = msg.find("child=") else {
+        return "child=unknown";
+    };
+    let rest = &msg[idx..];
+    let end = rest.find(';').unwrap_or(rest.len());
+    let token = rest[..end].trim();
+    if token.is_empty() {
+        "child=unknown"
+    } else {
+        token
+    }
+}
+
+fn flatten_progress_detail(detail: &str) -> String {
+    detail.replace(['\r', '\n'], " ")
+}
+
+fn session_matches_aborted(state: &crate::state::RunState, session_id: Option<&str>) -> bool {
+    match (state.aborted_session_id.as_deref(), session_id) {
+        (Some(aborted), Some(sid)) => aborted == sid,
+        _ => false,
+    }
+}
+
+/// Bounded ACP stdout-close policy. State update holds `with_run_state_lock`.
+/// A lock error fails closed with the original diagnosis.
+pub fn note_acp_stdout_close(
+    record: &ProjectRecord,
+    msg: &str,
+    session_id: Option<&str>,
+) -> StdoutCloseDisposition {
+    let fail = || StdoutCloseDisposition::Fail {
+        message: msg.to_string(),
+    };
+    if !msg.starts_with("ACP stdout closed during ") {
+        return fail();
+    }
+    let updated = with_run_state_lock(record, || {
+        let mut state = load_run_state(record)?;
+        if stdout_message_after_cancel(msg)
+            || session_matches_aborted(&state, session_id)
+            || state.status != RunStatus::Running
+        {
+            return Ok(StdoutCloseDisposition::Ignore);
+        }
+        if !crate::workflow::graph::is_grok_bound(&state.phase) {
+            return Ok(fail());
+        }
+        let adapter = state.driver == crate::workflow::WorkflowDriver::Adapter;
+        if state.acp_stdout_retries < ACP_STDOUT_RETRY_CAP && adapter {
+            state.acp_stdout_retries = state.acp_stdout_retries.saturating_add(1);
+            if let Some(sid) = session_id {
+                state.aborted_session_id = Some(sid.to_string());
+            }
+            state.last_driven_phase = None;
+            state.stalled_at = None;
+            let n = state.acp_stdout_retries;
+            let child = child_token_from_message(msg);
+            state.last_event = format!("recycle: acp-stdout {n}/{ACP_STDOUT_RETRY_CAP} — {child}");
+            state.updated_at = chrono::Utc::now();
+            save_run_state(record, &state)?;
+            crate::progress_log::append(record, "acp-stdout", &flatten_progress_detail(msg));
+            return Ok(StdoutCloseDisposition::Retry);
+        }
+        Ok(fail())
+    });
+    match updated {
+        Ok(disposition) => disposition,
+        Err(_) => fail(),
+    }
+}
+
 /// Stamp raced a live tool: drop CAP, surface stall, do not abort.
 fn revert_recycle_stamp(record: &ProjectRecord) -> Option<StatusView> {
     with_run_state_lock(record, || {
@@ -333,5 +425,74 @@ mod tests {
             should_abort_on_timeout_state(&review),
             "fold itself is Grok-bound; plan-review must be classified before apply"
         );
+    }
+
+    #[test]
+    fn stdout_retry_clears_stall_and_flattens_progress() {
+        use crate::registry::ProjectRecord;
+        use crate::state::{RunStatus, load_run_state, save_run_state};
+        use tempfile::tempdir;
+        use uuid::Uuid;
+
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            created_at: chrono::Utc::now(),
+        };
+        crate::run::run_with_driver(
+            &rec,
+            Some("0064".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        {
+            let mut state = load_run_state(&rec).unwrap();
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.stalled_at = Some(chrono::Utc::now());
+            state.stall_recycles = 1;
+            state.last_driven_phase = Some("implement".into());
+            save_run_state(&rec, &state).unwrap();
+        }
+        let msg =
+            "ACP stdout closed during session/prompt; child=exited:42; stderr=line1\nline2\rline3";
+        let disposition = note_acp_stdout_close(&rec, msg, Some("sess-stall"));
+        assert_eq!(disposition, StdoutCloseDisposition::Retry);
+        let state = load_run_state(&rec).unwrap();
+        assert_eq!(state.status, RunStatus::Running);
+        assert!(state.stalled_at.is_none());
+        assert_eq!(state.stall_recycles, 1);
+        assert!(state.last_driven_phase.is_none());
+        assert_eq!(state.aborted_session_id.as_deref(), Some("sess-stall"));
+        assert!(
+            state.last_event.starts_with("recycle: acp-stdout 1/2"),
+            "{}",
+            state.last_event
+        );
+        assert!(
+            state.last_event.contains('\u{2014}'),
+            "{}",
+            state.last_event
+        );
+        assert!(
+            state.last_event.contains("child=exited:42"),
+            "{}",
+            state.last_event
+        );
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
+        assert!(log.contains("line1 line2 line3"), "{log}");
+        assert!(!log.contains("line1\nline2"), "{log}");
+        assert_eq!(state.acp_stdout_retries, 1);
     }
 }

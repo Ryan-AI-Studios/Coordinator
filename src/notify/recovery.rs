@@ -1,4 +1,6 @@
-//! Recovery policy table (ADR-0009). Advisory text only — no auto-retry this track.
+//! Recovery policy table (ADR-0009). Advisory text. Automatic recovery has stopped
+//! once `FAILURE.md` exists. An ACP stdout close restarts the session only before
+//! that file is written (bounded). Nothing else auto-retries.
 
 use crate::outcome::FailureClass;
 
@@ -13,7 +15,7 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
             "Re-prompt Planner/Implementor with online research; adjust approach."
         }
         FailureClass::HarnessCrash => {
-            "Restart the Project session (limited retries later); inspect harness logs."
+            "For an ACP stdout close, bounded session restart already ran. Inspect exit status and stderr here. Other harness crashes are not auto-retried."
         }
         FailureClass::Timeout => "Increase the phase budget or split the work; then re-run.",
         FailureClass::CiFailed => "Do not merge. Inspect CI; re-run after fix (0010).",
@@ -40,7 +42,7 @@ mod tests {
         );
         assert_eq!(
             recommended_action(FailureClass::HarnessCrash),
-            "Restart the Project session (limited retries later); inspect harness logs."
+            "For an ACP stdout close, bounded session restart already ran. Inspect exit status and stderr here. Other harness crashes are not auto-retried."
         );
         assert_eq!(
             recommended_action(FailureClass::Timeout),

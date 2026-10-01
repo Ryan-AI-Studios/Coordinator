@@ -121,6 +121,9 @@ pub struct RunState {
     /// Session id being recycled; apply skips fallout from this id only (0027).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aborted_session_id: Option<String>,
+    /// ACP stdout-close restarts this phase (0064). Cap 2. Not a Status JSON key.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub acp_stdout_retries: u32,
     /// Plan-review one-shot slots already launched this phase (0017). Additive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan_review_spawned: Vec<String>,
@@ -220,6 +223,7 @@ impl RunState {
             pause_spans: Vec::new(),
             stall_recycles: 0,
             aborted_session_id: None,
+            acp_stdout_retries: 0,
             plan_review_spawned: Vec::new(),
             plan_review_join_retries: 0,
             plan_review_slot_ran: Vec::new(),
