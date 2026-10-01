@@ -1094,10 +1094,43 @@ pub fn map_failure_class(err: &str) -> FailureClass {
         || e.contains("rate limit")
         || e.contains("exhaust")
         || e.contains("resource_exhausted")
+        // Context/token ceiling, not a rate limit: the prompt or session grew past
+        // the model's window. Same remedy class (shrink/compact the input), so it
+        // belongs here rather than falling through to HarnessCrash.
+        || e.contains("token limit")
+        || e.contains("context limit")
+        || e.contains("context length")
+        || e.contains("maximum context")
     {
         return FailureClass::ModelExhaustion;
     }
     FailureClass::HarnessCrash
+}
+
+/// A harness failure that arrived inside an otherwise-successful turn.
+///
+/// ACP reports some failures as ordinary turn text: the child exits cleanly and the
+/// final message carries `Error: RetriableError: ...`. Trusting the transport status
+/// alone records that as `success`, and the chain advances on work that never
+/// happened — 0472's implement aborted on an input token limit, the outcome was
+/// written `success`, and advance reported the backlog clear.
+///
+/// Deliberately narrow: only an explicit `RetriableError`, or a *trailing* line that
+/// opens with `Error:`. A model narrating an error it already fixed mid-response must
+/// not trip this.
+pub fn harness_error_in_text(text: &str) -> Option<String> {
+    if text.contains("RetriableError") {
+        return text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.contains("RetriableError"))
+            .map(str::to_string);
+    }
+    let last = text.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    if last.starts_with("Error:") {
+        return Some(last.to_string());
+    }
+    None
 }
 
 /// Case-insensitive `grok` or `cursor` — harnesses that use this ACP client.
@@ -2625,5 +2658,45 @@ mod live_tests {
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
+    }
+
+    #[test]
+    fn token_limit_is_model_exhaustion_not_harness_crash() {
+        assert_eq!(
+            map_failure_class("RetriableError: [internal] Input token limit exceeded"),
+            FailureClass::ModelExhaustion
+        );
+    }
+
+    #[test]
+    fn harness_error_in_text_detects_the_0472_shape() {
+        let msg = "I'll load implement and onboarding, then execute 0472 from the track \
+                   spec path. Spec execution path is C:\\dev\\ledgerful. Starting Daily 5 \
+                   and Phase 0 baseline.\n\nError: RetriableError: [internal] Input token \
+                   limit exceeded";
+        let found = harness_error_in_text(msg).expect("must detect the trailing harness error");
+        assert!(found.contains("RetriableError"), "{found}");
+        assert_eq!(
+            failure_class_for_message(&found),
+            FailureClass::ModelExhaustion
+        );
+    }
+
+    #[test]
+    fn harness_error_in_text_ignores_normal_completion() {
+        assert!(harness_error_in_text("Done. Opened PR #123 and merged it.").is_none());
+    }
+
+    #[test]
+    fn harness_error_in_text_ignores_a_fixed_error_narrated_midway() {
+        let msg =
+            "Error: the test failed on first run.\nI fixed the assertion.\nAll tests pass now.";
+        assert!(harness_error_in_text(msg).is_none(), "{msg}");
+    }
+
+    #[test]
+    fn harness_error_in_text_detects_a_trailing_error_line() {
+        let msg = "Starting work.\nError: could not resolve the crate path";
+        assert!(harness_error_in_text(msg).is_some(), "{msg}");
     }
 }

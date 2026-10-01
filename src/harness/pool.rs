@@ -401,13 +401,29 @@ async fn apply_turn(
                     } else {
                         None
                     };
-                    let outcome = PhaseOutcome::success(
-                        injected_phase,
-                        OutcomeSource::Adapter,
-                        msg,
-                        next,
-                        Some(state.run_epoch),
-                    );
+                    let outcome = match crate::harness::grok::harness_error_in_text(&pr.text) {
+                        // The turn completed at the transport level but the payload is a
+                        // harness failure. Record it as one — never advance on it.
+                        Some(err) => {
+                            let class = failure_class_for_message(&err);
+                            error = Some(err.clone());
+                            failure_class = Some(class);
+                            PhaseOutcome::failure(
+                                injected_phase,
+                                class,
+                                OutcomeSource::Adapter,
+                                Some(err),
+                                Some(state.run_epoch),
+                            )
+                        }
+                        None => PhaseOutcome::success(
+                            injected_phase,
+                            OutcomeSource::Adapter,
+                            msg,
+                            next,
+                            Some(state.run_epoch),
+                        ),
+                    };
                     status = Some(write_and_apply(record, outcome)?);
                     applied = true;
                 }
