@@ -25,6 +25,21 @@ use tokio::sync::{Mutex as TokioMutex, Notify};
 
 use super::grok::rpc_error_value;
 
+/// Decrement a counter, saturating at zero.
+///
+/// Equivalent to `fetch_update(.., |n| Some(n.saturating_sub(1)))`, which newer toolchains
+/// deprecate in favour of `try_update`. Spelled as an explicit CAS loop so it compiles under
+/// both the local and the CI toolchain — the deprecated form trips CI's `-D warnings`.
+fn saturating_dec(counter: &AtomicU64) {
+    let mut cur = counter.load(Ordering::SeqCst);
+    while cur > 0 {
+        match counter.compare_exchange_weak(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 const HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const HOST_PROBE_LINE: &str = "echo coordinator-spawn-probe";
 
@@ -164,11 +179,7 @@ impl TerminalHub {
     }
 
     pub fn dec_wait(&self) {
-        let _ = self
-            .wait_count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                Some(n.saturating_sub(1))
-            });
+        saturating_dec(&self.wait_count);
         self.clear_tool_ids_if_idle();
         self.note_bound_progress();
     }
@@ -477,11 +488,7 @@ impl TerminalHub {
                     harness: &harness,
                 });
             }
-            let _ = hub
-                .running
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    Some(n.saturating_sub(1))
-                });
+            saturating_dec(&hub.running);
             hub.clear_tool_ids_if_idle();
             hub.note_bound_progress();
             *waiter.exit.lock().await = Some(ex);
