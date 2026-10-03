@@ -129,7 +129,52 @@ pub fn first_phase() -> &'static str {
     PHASE_PLAN
 }
 
-/// `{conductor_dir}/{track_id}` if that dir exists; else first `{track_id}-*` directory.
+/// Digits-only id, or a case-insensitive `track` prefix plus digits (`track72` → `72`).
+///
+/// A slug (`0065-Name`, `track72-foo`) has no bare form. Callers still try the raw id.
+fn bare_track_digits(track_id: &str) -> Option<&str> {
+    let id = track_id.trim();
+    let rest = if id.len() >= 5 && id[..5].eq_ignore_ascii_case("track") {
+        &id[5..]
+    } else {
+        id
+    };
+    if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn existing_child_dir(conductor: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let path = conductor.join(name);
+    path.is_dir().then_some(path)
+}
+
+/// First directory whose name starts with `prefix`, in sorted path order.
+fn first_prefixed_dir(conductor: &std::path::Path, prefix: &str) -> Option<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let rd = std::fs::read_dir(conductor).ok()?;
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with(prefix)
+        {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found.into_iter().next()
+}
+
+/// Resolve `track_id` to a conductor directory.
+///
+/// Order: exact name, bare digits, `track{digits}`, `{raw}-` prefix, `{digits}-`
+/// prefix, then a 4-digit zero-pad when the digits are shorter than 4. Prefix
+/// ties take the first sorted name. `None` means no directory.
 pub fn resolve_track_dir(
     record: &crate::registry::ProjectRecord,
     track_id: &str,
@@ -138,28 +183,46 @@ pub fn resolve_track_dir(
     if !conductor.is_dir() {
         return None;
     }
-    let exact = conductor.join(track_id);
-    if exact.is_dir() {
+    if let Some(exact) = existing_child_dir(&conductor, track_id) {
         return Some(exact);
     }
-    let prefix = format!("{track_id}-");
-    let mut found = Vec::new();
-    let Ok(rd) = std::fs::read_dir(&conductor) else {
-        return None;
-    };
-    for ent in rd.flatten() {
-        let p = ent.path();
-        if !p.is_dir() {
-            continue;
-        }
-        if let Some(name) = p.file_name().and_then(|n| n.to_str())
-            && name.starts_with(&prefix)
+    let norm = bare_track_digits(track_id);
+    if let Some(norm) = norm {
+        if norm != track_id
+            && let Some(bare) = existing_child_dir(&conductor, norm)
         {
-            found.push(p);
+            return Some(bare);
+        }
+        let track_name = format!("track{norm}");
+        if track_name != track_id
+            && let Some(prefixed) = existing_child_dir(&conductor, &track_name)
+        {
+            return Some(prefixed);
         }
     }
-    found.sort();
-    found.into_iter().next()
+    let raw_prefix = format!("{track_id}-");
+    if let Some(hit) = first_prefixed_dir(&conductor, &raw_prefix) {
+        return Some(hit);
+    }
+    let norm = norm?;
+    let norm_prefix = format!("{norm}-");
+    if norm_prefix != raw_prefix
+        && let Some(hit) = first_prefixed_dir(&conductor, &norm_prefix)
+    {
+        return Some(hit);
+    }
+    if norm.len() < 4 {
+        let padded = format!("{norm:0>4}");
+        if padded != norm {
+            if let Some(exact) = existing_child_dir(&conductor, &padded) {
+                return Some(exact);
+            }
+            if let Some(hit) = first_prefixed_dir(&conductor, &format!("{padded}-")) {
+                return Some(hit);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -216,5 +279,114 @@ mod tests {
         assert_eq!(ADDRESS_FINDINGS_CAP, 2);
         assert!(all_phase_ids().contains(&PHASE_ADDRESS_FINDINGS));
         assert_eq!(all_phase_ids().len(), canonical_phases().len() + 1);
+    }
+
+    fn record_at(path: &std::path::Path) -> crate::registry::ProjectRecord {
+        crate::registry::ProjectRecord {
+            id: "0065-test".into(),
+            path: path.to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn mkdir(root: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(root.join("conductor").join(name)).unwrap();
+    }
+
+    fn assert_resolved(root: &std::path::Path, id: &str, expect: Option<&str>) {
+        let got = resolve_track_dir(&record_at(root), id);
+        match expect {
+            None => assert!(got.is_none(), "id {id} resolved {}", got.unwrap().display()),
+            Some(name) => {
+                let got = got
+                    .unwrap_or_else(|| panic!("id {id} resolved None"))
+                    .canonicalize()
+                    .unwrap();
+                let expect = root.join("conductor").join(name).canonicalize().unwrap();
+                assert_eq!(got, expect, "id {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn bare_track_digits_table() {
+        assert_eq!(bare_track_digits("72"), Some("72"));
+        assert_eq!(bare_track_digits("track72"), Some("72"));
+        assert_eq!(bare_track_digits("Track72"), Some("72"));
+        assert_eq!(bare_track_digits("TRACK72"), Some("72"));
+        assert_eq!(bare_track_digits("0065"), Some("0065"));
+        assert_eq!(bare_track_digits("  track72  "), Some("72"));
+        assert_eq!(bare_track_digits("track72-foo"), None);
+        assert_eq!(bare_track_digits("0065-Slug"), None);
+        assert_eq!(bare_track_digits("track"), None);
+        assert_eq!(bare_track_digits(""), None);
+    }
+
+    #[test]
+    fn resolve_track_dir_notation_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "track72");
+        assert_resolved(root, "72", Some("track72"));
+        assert_resolved(root, "TRACK72", Some("track72"));
+        assert_resolved(root, "track72", Some("track72"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "72");
+        assert_resolved(root, "track72", Some("72"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "0065-PlanReviewAdoptionTrackId");
+        assert_resolved(root, "0065", Some("0065-PlanReviewAdoptionTrackId"));
+        assert_resolved(
+            root,
+            "0065-PlanReviewAdoptionTrackId",
+            Some("0065-PlanReviewAdoptionTrackId"),
+        );
+        assert_resolved(root, "65", Some("0065-PlanReviewAdoptionTrackId"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "track72");
+        mkdir(root, "72-Real");
+        assert_resolved(root, "72", Some("track72"));
+        assert_resolved(root, "track72", Some("track72"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "track72");
+        mkdir(root, "0072-Other");
+        assert_resolved(root, "72", Some("track72"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "65-Old");
+        mkdir(root, "0065-New");
+        assert_resolved(root, "65", Some("65-Old"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "track720");
+        mkdir(root, "720-Foo");
+        assert_resolved(root, "72", None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "track72-foo");
+        assert_resolved(root, "track72-foo", Some("track72-foo"));
+        assert_resolved(root, "72", None);
     }
 }

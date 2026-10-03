@@ -3595,6 +3595,151 @@ mod tests {
         );
     }
 
+    fn mkdir_track(dir: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(dir.join("conductor").join(name)).unwrap();
+    }
+
+    fn assert_both_reviews_adopted(
+        r: &ProjectRecord,
+        dir: &std::path::Path,
+        folder: &str,
+        track_id: &str,
+    ) {
+        for slug in ["agy", "opencode"] {
+            let state_file = crate::workflow::bundle::review_file(r, slug).unwrap();
+            assert!(state_file.is_file(), "{slug} state review missing");
+            let body = std::fs::read_to_string(&state_file).unwrap();
+            assert!(
+                body.to_ascii_lowercase().contains("# track review:"),
+                "{slug} body missing header: {body}"
+            );
+            assert!(body.contains(track_id), "{slug} body missing id: {body}");
+            let copy = dir
+                .join("conductor")
+                .join(folder)
+                .join(format!("{slug}-review.md"));
+            assert!(copy.is_file(), "expected {}", copy.display());
+        }
+        let done = load_run_state(r).unwrap();
+        assert_ne!(done.status, crate::state::RunStatus::Stopped);
+        assert!(
+            !done.last_event.contains("zero reviewers produced output"),
+            "{}",
+            done.last_event
+        );
+    }
+
+    fn adopt_on_disk_body(dir: &std::path::Path, folder: &str, track_id: &str) {
+        mkdir_track(dir, folder);
+        let r = rec(dir);
+        enter_plan_review(&r, track_id);
+        let backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            ok_review_body(track_id),
+        ))));
+        let _hook = install_test_backend(&r.id, backend);
+        tick_retry(&r).unwrap();
+        wait_both_consumed(&r);
+        assert_both_reviews_adopted(&r, dir, folder, track_id);
+    }
+
+    #[test]
+    fn track72_id_72_adopts_on_disk_body() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        adopt_on_disk_body(dir.path(), "track72", "72");
+    }
+
+    #[test]
+    fn track_prefixed_id_adopts_bare_dir() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        adopt_on_disk_body(dir.path(), "72", "track72");
+    }
+
+    #[test]
+    fn prefixed_dir_still_joins() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        adopt_on_disk_body(dir.path(), "0065-PlanReviewAdoptionTrackId", "0065");
+    }
+
+    #[test]
+    fn unresolvable_id_is_diagnosed() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        mkdir_track(dir.path(), "track720");
+        mkdir_track(dir.path(), "720-Foo");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "72");
+        let _hook = install_test_backend(&r.id, Arc::new(ScriptedBackend::empty()));
+        tick_retry(&r).unwrap();
+        wait_stopped(&r);
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Stopped);
+        assert_eq!(s.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(
+            s.last_event
+                .contains("cannot resolve track dir for id '72'"),
+            "{}",
+            s.last_event
+        );
+        assert!(!s.last_event.contains("zero reviewers produced output"));
+        assert_eq!(s.plan_review_join_retries, 0);
+    }
+
+    #[test]
+    fn unresolvable_success_role_journals_and_stops() {
+        use crate::state::RunStatus;
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        mkdir_track(dir.path(), "track720");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "72");
+        {
+            let mut state = load_run_state(&r).unwrap();
+            state.plan_review_spawned = vec!["agy".into(), "opencode".into()];
+            save_run_state(&r, &state).unwrap();
+        }
+        let roles = outcome_roles_dir(&r).unwrap();
+        std::fs::create_dir_all(&roles).unwrap();
+        for (slug, role) in [
+            ("agy", graph::ROLE_REVIEWER_AGY),
+            ("opencode", graph::ROLE_REVIEWER_OPENCODE),
+        ] {
+            let mut outcome = PhaseOutcome::success(
+                format!("plan-review:{slug}"),
+                OutcomeSource::File,
+                None,
+                None,
+                None,
+            );
+            outcome.metadata = Some(OutcomeMetadata {
+                next_track: None,
+                role: Some(role.into()),
+                ..Default::default()
+            });
+            crate::persist::atomic_write_json(&roles.join(format!("{slug}.json")), &outcome)
+                .unwrap();
+        }
+        tick_retry(&r).unwrap();
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Stopped);
+        assert_eq!(s.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(
+            s.last_event
+                .contains("cannot resolve track dir for id '72'"),
+            "{}",
+            s.last_event
+        );
+        assert_eq!(s.plan_review_join_retries, 0);
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(
+            log.contains("plan-review: cannot resolve track dir for id '72'"),
+            "{log}"
+        );
+    }
+
     #[test]
     #[ignore]
     fn opencode_live_run_optional() {

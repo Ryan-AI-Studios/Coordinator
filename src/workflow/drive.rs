@@ -469,6 +469,8 @@ fn adopt_track_review_if_missing(record: &ProjectRecord, slug: &str) -> Result<(
         return Ok(());
     };
     let Some(track_dir) = resolve_track_dir(record, track_id) else {
+        let event = format!("plan-review: cannot resolve track dir for id '{track_id}'");
+        crate::progress_log::append(record, "plan-review", &event);
         return Ok(());
     };
     let src = track_dir.join(format!("{slug}-review.md"));
@@ -527,6 +529,17 @@ fn try_join(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
         .filter(|slug| review_produced(record, slug))
         .collect();
     if produced.is_empty() {
+        if let Some(id) = state.track_id.as_deref()
+            && resolve_track_dir(record, id).is_none()
+        {
+            return fail_phase(
+                record,
+                &state,
+                FailureClass::HarnessCrash,
+                format!("plan-review: cannot resolve track dir for id '{id}'"),
+                OutcomeSource::Test,
+            );
+        }
         if super::plan_review::maybe_rearm_join_retry(record)? {
             return Ok(None);
         }
