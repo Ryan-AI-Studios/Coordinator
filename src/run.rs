@@ -43,6 +43,18 @@ pub(crate) fn run_with_origin(
         let mut state = load_run_state(record)?;
         match state.status {
             RunStatus::Idle | RunStatus::Stopped => {
+                if track_id.is_none()
+                    && let Some(id) = state
+                        .track_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    && crate::workflow::track_is_shipped_local(record, &state, id)
+                {
+                    return Err(CoordinatorError::Message(format!(
+                        "omit-pick: shipped track {id} is not resumable; pass --track <id>"
+                    )));
+                }
                 let leftover = state.failure_class.is_some()
                     || crate::notify::artifact::existing_path(record).is_some();
                 let already_settled = state.last_event == crate::notify::SETTLED_DETAIL;
