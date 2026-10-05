@@ -397,6 +397,43 @@ pub fn resolve_run_track(
     resolve_run_track_with_probe(record, explicit, None)
 }
 
+/// Shipped retain that must not come back as `Ok((None, false))`.
+///
+/// Local terminal state and `track_is_shipped_local` refuse without `gh`.
+/// A probe `Err` fail-opens (same as the picker). Explicit `--track` never
+/// reaches here.
+fn refused_retain_id(
+    record: &crate::registry::ProjectRecord,
+    state: &crate::state::RunState,
+    probe: Option<&dyn crate::workflow::MergedTrackProbe>,
+) -> Option<String> {
+    let id = state
+        .track_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let local = crate::workflow::track_is_shipped_local(record, state, id);
+    let terminal = crate::workflow::conductor_md::load_track_rows(record)
+        .is_some_and(|rows| crate::workflow::conductor_md::track_row_terminal(&rows, id));
+    if local || terminal {
+        return Some(id.to_string());
+    }
+    let merged = probe.is_some_and(|probe| {
+        let Some(cwd) = crate::layout::resolve(record).execution_repo else {
+            return false;
+        };
+        let Some(nid) = crate::notify::artifact::numeric_track_id(id) else {
+            return false;
+        };
+        probe
+            .merged_pr_for_track(&cwd, nid)
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    if merged { Some(id.to_string()) } else { None }
+}
+
 /// Adapter omit-pick: optional merged-PR probe. Explicit `--track` still wins.
 pub fn resolve_run_track_with_probe(
     record: &crate::registry::ProjectRecord,
@@ -421,12 +458,28 @@ pub fn resolve_run_track_with_probe(
             ));
         }
     }
+    let mut refuse_skip: Vec<String> = Vec::new();
     if !crate::workflow::should_pick_next_ready(&pick) {
-        return Ok((None, false));
+        match refused_retain_id(record, &state, probe) {
+            Some(id) => {
+                if record.auto_start == crate::registry::AutoStartPolicy::Never {
+                    return Err(CoordinatorError::Message(
+                        "auto_start=never; pass --track".into(),
+                    ));
+                }
+                crate::progress_log::append(
+                    record,
+                    "start",
+                    &format!("omit-pick: refuse shipped {id}"),
+                );
+                refuse_skip.push(id);
+            }
+            None => return Ok((None, false)),
+        }
     }
     let id = crate::workflow::pick_next_ready_excluding_sticky(
         record,
-        &[],
+        &refuse_skip,
         probe,
         &state.sticky_ready_ids,
     )?;
@@ -1435,6 +1488,251 @@ mod tests {
         clear_home();
     }
 
+    struct CountingProbe {
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::workflow::MergedTrackProbe for CountingProbe {
+        fn merged_pr_for_track(
+            &self,
+            _cwd: &std::path::Path,
+            numeric_id: &str,
+        ) -> Result<Option<u64>> {
+            if numeric_id == "0060" {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(None)
+        }
+    }
+
+    fn write_status_rows(ws: &std::path::Path, rows: &[(&str, &str)]) {
+        let cond = ws.join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        let mut md = String::from(
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n",
+        );
+        for (slug, status) in rows {
+            std::fs::create_dir_all(cond.join(slug)).unwrap();
+            md.push_str(&format!("| {slug} | `.` | {status} | row |\n"));
+        }
+        std::fs::write(cond.join("conductor.md"), md).unwrap();
+    }
+
+    fn retain_state(rec: &ProjectRecord, id: &str, stopped: bool) {
+        let mut state = crate::state::load_run_state(rec).unwrap();
+        state.status = if stopped {
+            RunStatus::Stopped
+        } else {
+            RunStatus::Idle
+        };
+        state.track_id = Some(id.into());
+        state.next_track = None;
+        state.failure_class = None;
+        state.last_event = if stopped {
+            "stop: hold".into()
+        } else {
+            "idle: retained".into()
+        };
+        state.sticky_ready_ids.clear();
+        crate::state::save_run_state(rec, &state).unwrap();
+    }
+
+    /// Epochs 30/31/32 (2026-09-26) resumed shipped 0060 while its cell read
+    /// `In progress` #60, `In progress` #62, then `**Completed**`.
+    fn assert_refused_shipped_picks_sibling(stopped: bool) {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        write_status_rows(
+            proj.path(),
+            &[
+                ("0060-Shipped", "**In progress** PR #60"),
+                ("0061-Next", "**Ready — not started**"),
+            ],
+        );
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        retain_state(&rec, "0060", stopped);
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0060", 60);
+        let (track, picked) = resolve_run_track_with_probe(&rec, None, Some(&probe)).unwrap();
+        assert!(picked);
+        assert_eq!(track.as_deref(), Some("0061"));
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap_or_default();
+        assert!(log.contains("omit-pick: refuse shipped 0060"), "{log}");
+        clear_home();
+    }
+
+    #[test]
+    fn omit_stopped_merged_in_progress_picks_other_ready() {
+        assert_refused_shipped_picks_sibling(true);
+    }
+
+    #[test]
+    fn omit_idle_without_backlog_merged_in_progress_picks_other_ready() {
+        assert_refused_shipped_picks_sibling(false);
+    }
+
+    #[test]
+    fn omit_stopped_merged_in_progress_empty_ready_leaves_state() {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        write_status_rows(proj.path(), &[("0060-Shipped", "**In progress** PR #60")]);
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        retain_state(&rec, "0060", true);
+        let state_path = crate::state::run_state_path(&rec).unwrap();
+        let before_state = std::fs::read(&state_path).unwrap();
+        let before_md = std::fs::read(proj.path().join("conductor").join("conductor.md")).unwrap();
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0060", 60);
+        let err = resolve_run_track_with_probe(&rec, None, Some(&probe))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no Ready"), "{err}");
+        assert_eq!(std::fs::read(&state_path).unwrap(), before_state);
+        assert_eq!(
+            std::fs::read(proj.path().join("conductor").join("conductor.md")).unwrap(),
+            before_md
+        );
+        let loaded = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(loaded.status, RunStatus::Stopped);
+        assert_eq!(loaded.track_id.as_deref(), Some("0060"));
+        clear_home();
+    }
+
+    #[test]
+    fn omit_stopped_completed_does_not_call_probe() {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        write_status_rows(
+            proj.path(),
+            &[
+                ("0060-Shipped", "**Completed**"),
+                ("0061-Next", "**Ready — not started**"),
+            ],
+        );
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        retain_state(&rec, "0060", true);
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = CountingProbe { hits: hits.clone() };
+        let (track, picked) = resolve_run_track_with_probe(&rec, None, Some(&probe)).unwrap();
+        assert!(picked);
+        assert_eq!(track.as_deref(), Some("0061"));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        clear_home();
+    }
+
+    #[test]
+    fn omit_stopped_in_progress_probe_none_retains() {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        write_status_rows(
+            proj.path(),
+            &[
+                ("0060-Open", "**In progress** PR #60"),
+                ("0061-Next", "**Ready — not started**"),
+            ],
+        );
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        retain_state(&rec, "0060", true);
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::default();
+        let (track, picked) = resolve_run_track_with_probe(&rec, None, Some(&probe)).unwrap();
+        assert!(!picked);
+        assert!(track.is_none());
+        clear_home();
+    }
+
+    #[test]
+    fn omit_stopped_in_progress_probe_err_retains() {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        write_status_rows(proj.path(), &[("0060-Open", "**In progress** PR #60")]);
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        retain_state(&rec, "0060", true);
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::err("0060", "gh down");
+        let (track, picked) = resolve_run_track_with_probe(&rec, None, Some(&probe)).unwrap();
+        assert!(!picked);
+        assert!(track.is_none());
+        clear_home();
+    }
+
+    #[test]
+    fn omit_stopped_merged_never_does_not_pick() {
+        let _guard = test_env_lock();
+        let (_home, proj, mut rec) = add_isolated_project();
+        write_status_rows(
+            proj.path(),
+            &[
+                ("0060-Shipped", "**In progress** PR #60"),
+                ("0061-Next", "**Ready — not started**"),
+            ],
+        );
+        rec.execution_repo = Some(proj.path().to_path_buf());
+        rec.auto_start = crate::registry::AutoStartPolicy::Never;
+        retain_state(&rec, "0060", true);
+        let state_path = crate::state::run_state_path(&rec).unwrap();
+        let before_state = std::fs::read(&state_path).unwrap();
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0060", 60);
+        let err = resolve_run_track_with_probe(&rec, None, Some(&probe))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("auto_start=never"), "{err}");
+        assert_eq!(std::fs::read(&state_path).unwrap(), before_state);
+        clear_home();
+    }
+
+    #[test]
+    fn omit_stopped_absorbed_sticky_does_not_return_self() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_status_rows(proj.path(), &[("0060-Gone", "**Absorbed**")]);
+        retain_state(&rec, "0060", true);
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.sticky_ready_ids = vec!["0060".into()];
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let err = resolve_run_track_with_probe(&rec, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no Ready"), "{err}");
+        let loaded = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(loaded.status, RunStatus::Stopped);
+        assert_eq!(loaded.track_id.as_deref(), Some("0060"));
+        clear_home();
+    }
+
+    #[test]
+    fn run_with_origin_refuses_completed_retain() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_status_rows(
+            proj.path(),
+            &[(
+                "0060-Shipped",
+                "**Completed** 2026-09-26 — PR **#60** squash `0d8244a`",
+            )],
+        );
+        retain_state(&rec, "0060", true);
+        let err = run::run_with_origin(&rec, None, crate::workflow::WorkflowDriver::Stub, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0060"), "{err}");
+        assert!(err.contains("not resumable"), "{err}");
+        let loaded = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(loaded.status, RunStatus::Stopped);
+        assert_eq!(loaded.track_id.as_deref(), Some("0060"));
+        clear_home();
+    }
+
+    #[test]
+    fn run_with_origin_keeps_open_stopped_retain() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_status_rows(proj.path(), &[("0060-Open", "**In progress** PR #60")]);
+        retain_state(&rec, "0060", true);
+        let view =
+            run::run_with_origin(&rec, None, crate::workflow::WorkflowDriver::Stub, false).unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0060"));
+        clear_home();
+    }
+
     #[test]
     fn cmd_run_stub_omit_ignores_installed_probe() {
         let _guard = test_env_lock();
@@ -1793,7 +2091,7 @@ mod tests {
     }
 
     #[test]
-    fn settle_completed_row_keeps_stopped_and_omit_retains() {
+    fn settle_completed_row_keeps_stopped_and_omit_picks_next() {
         let _guard = test_env_lock();
         let (_home, proj, rec) = add_isolated_project();
         write_conductor_rows(
@@ -1813,9 +2111,11 @@ mod tests {
         let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
         assert!(log.contains(crate::notify::SETTLED_DETAIL));
         assert!(cmd_failure_show(Some(&rec.id), false).unwrap().is_none());
+        // 0063: a Completed retain is not resumable. Settle stays Stopped;
+        // the next omit picks the Ready sibling instead of keeping 0045.
         let (track, picked) = resolve_run_track(&rec, None).unwrap();
-        assert!(track.is_none());
-        assert!(!picked);
+        assert!(picked);
+        assert_eq!(track.as_deref(), Some("0046"));
         assert!(!settle_if_conductor_completed(&rec).unwrap());
         let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
         assert_eq!(log.matches(crate::notify::SETTLED_DETAIL).count(), 1);

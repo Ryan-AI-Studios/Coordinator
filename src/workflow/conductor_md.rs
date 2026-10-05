@@ -210,6 +210,21 @@ pub fn is_in_progress(status_raw: &str) -> bool {
     status_token_matches(&status_clean(status_raw), "In progress")
 }
 
+/// Registry `**Absorbed**` or `**Absorbed** <detail>` (0063 retain refusal).
+pub fn is_absorbed(status_raw: &str) -> bool {
+    status_token_matches(&status_clean(status_raw), "Absorbed")
+}
+
+/// Registry `**Cancelled**` or `**Cancelled** <detail>` (0063 retain refusal).
+pub fn is_cancelled(status_raw: &str) -> bool {
+    status_token_matches(&status_clean(status_raw), "Cancelled")
+}
+
+/// Completed, Absorbed, or Cancelled. Does not change Ready aliases or the sticky overlay.
+pub fn is_terminal(status_raw: &str) -> bool {
+    is_completed(status_raw) || is_absorbed(status_raw) || is_cancelled(status_raw)
+}
+
 /// Best-effort `{conductor_dir}/conductor.md` rows. Missing / unreadable → `None`.
 pub fn load_track_rows(record: &ProjectRecord) -> Option<Vec<TrackRow>> {
     let path = crate::layout::resolve(record)
@@ -236,6 +251,12 @@ fn row_matches_track(row: &TrackRow, key: &str) -> bool {
 pub fn track_row_completed(rows: &[TrackRow], key: &str) -> bool {
     rows.iter()
         .any(|r| row_matches_track(r, key) && is_completed(&r.status_raw))
+}
+
+/// True when a row matching `key` is Completed, Absorbed, or Cancelled.
+pub fn track_row_terminal(rows: &[TrackRow], key: &str) -> bool {
+    rows.iter()
+        .any(|r| row_matches_track(r, key) && is_terminal(&r.status_raw))
 }
 
 /// Read-time SUPERSEDED reason (0040). Missing conductor.md skips the Completed signal.
@@ -930,6 +951,19 @@ mod tests {
         assert!(!is_completed("**Ready — not started**"));
         assert!(!is_completed("**Cancelled**"));
         assert!(!is_completed("**Absorbed — 0058 `204a258`**"));
+        assert!(is_absorbed("**Absorbed**"));
+        assert!(is_absorbed("**Absorbed — 0058 `204a258`**"));
+        assert!(is_cancelled("**Cancelled**"));
+        assert!(is_cancelled("**Cancelled** - note"));
+        assert!(!is_absorbed("Absorbedish"));
+        assert!(!is_cancelled("**In progress**"));
+        assert!(is_terminal(
+            "**Completed** 2026-09-26 — PR **#60** squash `0d8244a`"
+        ));
+        assert!(is_terminal("**Absorbed**"));
+        assert!(is_terminal("**Cancelled** - note"));
+        assert!(!is_terminal("**In progress** PR #60"));
+        assert!(!is_terminal("**Ready — not started**"));
         assert!(!is_eligible_ready("**Ready — not started** (owner only)"));
         assert!(is_eligible_ready("**Ready — not started**"));
     }
