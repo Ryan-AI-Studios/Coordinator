@@ -2291,6 +2291,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         });
         session.inject_prompt("read", timeout()).await.unwrap();
@@ -2333,6 +2334,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
 

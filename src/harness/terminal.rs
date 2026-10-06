@@ -1154,6 +1154,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         }
     }

@@ -316,6 +316,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         }
     }
@@ -1056,6 +1057,51 @@ mod tests {
             view.last_event
         );
         assert!(view.stall.is_some());
+        clear_clocks();
+    }
+
+    #[test]
+    fn self_check_report_does_not_block_stall() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        isolate_clocks(home.path(), "1", "3600");
+        let r = rec(dir.path());
+        start_driven_adapter(&r);
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = graph::PHASE_IMPLEMENT.into();
+            state.last_driven_phase = Some(graph::PHASE_IMPLEMENT.into());
+            state.phase_started_at = Some(Utc::now() - chrono::Duration::seconds(5));
+            state.last_event = "self-check: non-convergence repair-repeat".into();
+            state.self_check = Some(crate::state::SelfCheckState {
+                steps: 2,
+                report: Some(state.last_event.clone()),
+                ..crate::state::SelfCheckState::default()
+            });
+            save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _ = std::fs::remove_file(progress_path(&r).unwrap());
+        let view = check_stall(&r).unwrap().expect("stall with no sidecar");
+        assert!(
+            view.last_event.contains("watchdog: stall"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(view.stall.is_some());
+        assert!(view.failure_class.is_none());
+        assert!(artifact::existing_path(&r).is_none());
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            assert!(state.stalled_at.is_some());
+            state.last_event = "self-check: non-convergence plateau".into();
+            save_run_state(&r, &state)
+        })
+        .unwrap();
+        let again = check_stall(&r).unwrap().expect("re-stamp");
+        assert!(again.last_event.contains("watchdog: stall"));
+        assert!(again.stall.is_some());
         clear_clocks();
     }
 }

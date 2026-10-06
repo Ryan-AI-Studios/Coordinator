@@ -161,6 +161,58 @@ const ADAPTER_START_IN_PROCESS: bool = false;
 static TEST_SLOW_INJECT: std::sync::Mutex<Option<std::time::Duration>> =
     std::sync::Mutex::new(None);
 
+#[cfg(test)]
+static TEST_CAPTURE_PROMPTS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// Arm a one-shot capture of adapter prompts. No harness process is started.
+#[cfg(test)]
+pub(crate) struct CapturePromptGuard;
+
+#[cfg(test)]
+pub(crate) fn arm_capture_prompts() -> CapturePromptGuard {
+    *TEST_CAPTURE_PROMPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+    CapturePromptGuard
+}
+
+#[cfg(test)]
+pub(crate) fn captured_prompts() -> Vec<String> {
+    TEST_CAPTURE_PROMPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+impl Drop for CapturePromptGuard {
+    fn drop(&mut self) {
+        *TEST_CAPTURE_PROMPTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn capture_slot_armed() -> bool {
+    TEST_CAPTURE_PROMPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
+}
+
+#[cfg(test)]
+fn push_captured_prompt(prompt: &str) {
+    if let Some(buf) = TEST_CAPTURE_PROMPTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        buf.push(prompt.to_string());
+    }
+}
+
 /// Arm a one-shot mock inject that does not block `poll_once` (DoD-1).
 /// Disarm on drop so a panic cannot leak the hook into another test.
 #[cfg(test)]
@@ -206,11 +258,31 @@ fn drive_adapter(
     record: &ProjectRecord,
     state: &RunState,
 ) -> Result<Option<crate::state::StatusView>> {
-    if state.last_driven_phase.as_deref() == Some(state.phase.as_str()) {
+    let continuing = super::self_check::continuation_pending(state);
+    if state.last_driven_phase.as_deref() == Some(state.phase.as_str()) && !continuing {
         return Ok(None);
     }
 
-    if let Err(err) = refresh_plan_evidence_stamp(record, state) {
+    // Test seam: capture the continuation prompt without resolving a harness binary.
+    #[cfg(test)]
+    if continuing && capture_slot_armed() {
+        let Some(prompt) = super::self_check::claim_continuation(record)? else {
+            return Ok(None);
+        };
+        let inject_sid = crate::harness::status_bundle_sync(record)
+            .and_then(|b| b.grok)
+            .and_then(|g| g.session_id);
+        crate::workflow::watchdog::note_progress(
+            record,
+            crate::workflow::watchdog::ProgressKind::Inject,
+            inject_sid.as_deref(),
+            false,
+        );
+        push_captured_prompt(&prompt);
+        return Ok(None);
+    }
+
+    if !continuing && let Err(err) = refresh_plan_evidence_stamp(record, state) {
         return fail_phase(
             record,
             state,
@@ -278,8 +350,17 @@ fn drive_adapter(
         !adapter.eq_ignore_ascii_case(&binding.harness)
     });
 
-    mark_driven(record, &state.phase)?;
+    let prompt = if continuing {
+        match super::self_check::claim_continuation(record)? {
+            Some(prompt) => prompt,
+            None => return Ok(None),
+        }
+    } else {
+        mark_driven(record, &state.phase)?;
+        prompts::phase_prompt(record, &state.phase, state.track_id.as_deref())
+    };
     // Inject-start heartbeat so a slow ACP start is not an immediate stall.
+    // Continuation uses the same kind. Classify and the self-check log do not.
     let inject_sid = crate::harness::status_bundle_sync(record)
         .and_then(|b| b.grok)
         .and_then(|g| g.session_id);
@@ -292,6 +373,10 @@ fn drive_adapter(
 
     #[cfg(test)]
     {
+        if capture_slot_armed() {
+            push_captured_prompt(&prompt);
+            return Ok(None);
+        }
         let delay = TEST_SLOW_INJECT
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -303,7 +388,6 @@ fn drive_adapter(
         }
     }
 
-    let prompt = prompts::phase_prompt(record, &state.phase, state.track_id.as_deref());
     let selector = record.path.to_string_lossy().to_string();
     let rec = record.clone();
     let model = binding.model.clone();
@@ -787,6 +871,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         }
     }
@@ -1231,5 +1316,47 @@ mod tests {
             .as_deref(),
             Some(ROLE_PLANNER)
         );
+    }
+
+    #[test]
+    fn self_check_pending_inject_spawns_one_continuation() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path());
+        r.self_continuation = true;
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.last_driven_phase = Some(crate::workflow::graph::PHASE_IMPLEMENT.into());
+            state.driver = WorkflowDriver::Adapter;
+            state.self_check = Some(crate::state::SelfCheckState {
+                steps: 1,
+                pending_inject: true,
+                last_finding: Some("none".into()),
+                last_action: Some("progress".into()),
+                ..crate::state::SelfCheckState::default()
+            });
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        let prompts = super::captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].contains("self-check"), "{}", prompts[0]);
+        assert!(prompts[0].contains("step 2 of 8"), "{}", prompts[0]);
+        assert!(prompts[0].contains("About 10 minutes"), "{}", prompts[0]);
+        let state = load_run_state(&r).unwrap();
+        assert!(!state.self_check.unwrap().pending_inject);
+        assert_eq!(
+            state.last_driven_phase.as_deref(),
+            Some(crate::workflow::graph::PHASE_IMPLEMENT)
+        );
+        let sidecar = crate::workflow::watchdog::progress_path(&r).unwrap();
+        let body = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(body.contains("inject"), "{body}");
+        tick(&r).unwrap();
+        assert_eq!(super::captured_prompts().len(), 1);
     }
 }

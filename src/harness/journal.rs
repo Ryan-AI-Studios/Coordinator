@@ -219,7 +219,7 @@ pub(crate) fn sanitize_track(track: &str) -> String {
         .collect()
 }
 
-fn journal_file(record: &ProjectRecord, track: &str, epoch: u64) -> Option<PathBuf> {
+pub(crate) fn journal_file(record: &ProjectRecord, track: &str, epoch: u64) -> Option<PathBuf> {
     let dir = resolve_state_dir(record).ok()?;
     Some(dir.join("journal").join(format!("{track}-{epoch}.jsonl")))
 }
@@ -348,6 +348,7 @@ mod tests {
                 ready_aliases: Vec::new(),
                 auto_start: Default::default(),
                 state_policies: Vec::new(),
+                self_continuation: false,
                 created_at: Utc::now(),
             }
         }

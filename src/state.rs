@@ -13,6 +13,29 @@ use crate::outcome::FailureClass;
 use crate::persist::atomic_write_json;
 use crate::registry::ProjectRecord;
 
+/// In-phase self-check snap (track 0070). Absent on old run-state files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelfCheckState {
+    #[serde(default)]
+    pub steps: u32,
+    #[serde(default)]
+    pub pending_inject: bool,
+    #[serde(default)]
+    pub repairs_in_a_row: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_diff_fp: Option<String>,
+    #[serde(default)]
+    pub last_journal_lines: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_started_at: Option<DateTime<Utc>>,
+}
+
 /// Run lifecycle status (stub phases + outcome-driven completion in 0005).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
@@ -156,6 +179,9 @@ pub struct RunState {
     /// Latest state-policy alert (0069). Cleared on fresh `run` and on Allow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_gate: Option<crate::policy::StateGate>,
+    /// Bounded self-check snap (0070). Cleared on fresh `run`. Omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_check: Option<SelfCheckState>,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -251,6 +277,7 @@ impl RunState {
             restored_epoch: None,
             policy_approvals: Vec::new(),
             state_gate: None,
+            self_check: None,
         }
     }
 
@@ -335,6 +362,9 @@ pub struct StatusView {
     /// Contextual state-policy alert (0069). Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_gate: Option<crate::policy::StateGate>,
+    /// Bounded self-check snap (0070). Omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_check: Option<SelfCheckState>,
 }
 
 /// Status JSON `ticker` object (0023). `owner` is `serve` or `none` — never `cli`.
@@ -442,6 +472,7 @@ impl StatusView {
             stall: stall_status_view(record, state),
             ticker: None,
             state_gate: state.state_gate.clone(),
+            self_check: state.self_check.clone(),
         }
     }
 }
@@ -643,6 +674,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         }
     }

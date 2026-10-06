@@ -8,6 +8,7 @@ pub mod evidence_stamp;
 pub mod graph;
 pub mod plan_review;
 pub mod prompts;
+pub mod self_check;
 pub mod shipped;
 pub mod timeouts;
 pub mod watchdog;
@@ -570,6 +571,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         }
     }

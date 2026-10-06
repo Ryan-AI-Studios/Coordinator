@@ -46,6 +46,7 @@
 //! Opt-in Hermes fleet summary (`notify fleet-summary` and serve cadence): track **0068**.
 //! Recorded owner-decision channel (`decision record|show|list`, one active comment block, fold inject): track **0077**.
 //! Contextual state policies (diff + durable counters gate publish and squash-merge): track **0069**.
+//! Bounded self-check between adapter `implement` and `address-findings` turns (report-only, off by default): track **0070**.
 
 pub mod api;
 pub mod checkpoint;
