@@ -12,7 +12,7 @@ pub const PHASE_COMPACT: &str = "compact";
 pub const PHASE_ADVANCE: &str = "advance";
 /// Apply-path side loop after GateFail (0031). Not in [`canonical_phases`].
 pub const PHASE_ADDRESS_FINDINGS: &str = "address-findings";
-/// Same-epoch repair after a required-check failure (0071). Not in [`canonical_phases`].
+/// Same-epoch repair after the ci-wait gate fails (0071; slice unified in 0079). Not in [`canonical_phases`].
 pub const PHASE_ADDRESS_CI: &str = "address-ci";
 /// Max entries into `address-findings` this `run_epoch`. No operator env.
 pub const ADDRESS_FINDINGS_CAP: u32 = 2;

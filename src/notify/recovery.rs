@@ -1,7 +1,7 @@
 //! Recovery policy table (ADR-0009). Advisory text. Automatic recovery has stopped
 //! once `FAILURE.md` exists. An ACP stdout close restarts the session only before
-//! that file is written (bounded). Opt-in `address-ci` (0071) may route a required-check
-//! failure before that file exists. Nothing else auto-retries, and `FAILURE.md` ends auto-retry.
+//! that file is written (bounded). Opt-in `address-ci` (0071) may route the ci-wait gate's
+//! failing checks before that file exists. Nothing else auto-retries, and `FAILURE.md` ends auto-retry.
 
 use crate::outcome::FailureClass;
 

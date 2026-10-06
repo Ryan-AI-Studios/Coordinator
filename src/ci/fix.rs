@@ -1,4 +1,4 @@
-//! Opt-in route from a required-check failure into same-epoch `address-ci` (0071).
+//! Opt-in route from the gate's failing checks into same-epoch `address-ci` (0071, 0079).
 
 use std::path::Path;
 use std::process::Command;
@@ -13,8 +13,7 @@ use crate::state::{
 use crate::workflow::graph::{CI_FIX_CAP, PHASE_ADDRESS_CI};
 use crate::workflow::shipped::pr_title_is_track;
 
-use super::backend::{CheckBucket, CheckItem, CheckSnapshot, CheckView, CiTarget};
-use super::collapse_snapshot;
+use super::backend::{CheckBucket, CheckItem, CiTarget};
 use super::gh::branch_is_track;
 
 /// `COORDINATOR_CI_FIX=off` forces the route off. No other value turns it on.
@@ -51,12 +50,12 @@ pub(crate) fn try_route_ci_failure(
     record: &ProjectRecord,
     state: &RunState,
     target: &CiTarget,
-    snap: &CheckSnapshot,
+    judged: &[CheckItem],
 ) -> Result<RouteOutcome> {
     let Some(owned) = owned_pr(state, target) else {
         return Ok(RouteOutcome::Declined);
     };
-    let Some(checks) = failing_required(snap) else {
+    let Some(checks) = failing_checks(judged) else {
         return Ok(RouteOutcome::Declined);
     };
     if !enabled(record) {
@@ -128,14 +127,9 @@ fn owned_pr(state: &RunState, target: &CiTarget) -> Option<OwnedPr> {
     }
 }
 
-/// Collapsed required items that contain a Fail. Advisory fallback is not a route.
-fn failing_required(snap: &CheckSnapshot) -> Option<Vec<CiFixCheck>> {
-    let (collapsed, _) = collapse_snapshot(snap);
-    if collapsed.view != CheckView::Required || collapsed.items.is_empty() {
-        return None;
-    }
-    let failing: Vec<CiFixCheck> = collapsed
-        .items
+/// The slice is the one the gate judged. A Fail on that slice is the route.
+fn failing_checks(judged: &[CheckItem]) -> Option<Vec<CiFixCheck>> {
+    let failing: Vec<CiFixCheck> = judged
         .iter()
         .filter(|item| item.bucket == CheckBucket::Fail)
         .map(check_from_item)
@@ -459,5 +453,20 @@ mod tests {
         assert_eq!(view.last_event, "address-ci: diff unreadable");
         assert_eq!(load_run_state(&record).unwrap().ci_fix_attempts, 1);
         assert!(crate::notify::artifact::existing_path(&record).is_some());
+    }
+
+    #[test]
+    fn failing_checks_ignores_empty_pass_and_cancel() {
+        assert!(failing_checks(&[]).is_none());
+        assert!(failing_checks(&[CheckItem::new("lint", CheckBucket::Pass)]).is_none());
+        assert!(failing_checks(&[CheckItem::new("risk", CheckBucket::Cancel)]).is_none());
+        let got = failing_checks(&[
+            CheckItem::new("lint", CheckBucket::Pass),
+            CheckItem::new("risk", CheckBucket::Fail),
+        ])
+        .expect("fail");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "risk");
+        assert_eq!(got[0].bucket, "fail");
     }
 }

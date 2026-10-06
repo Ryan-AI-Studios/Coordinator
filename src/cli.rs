@@ -378,7 +378,7 @@ pub enum ProjectCommands {
         /// true | false (omit = leave unchanged). Bounded self-check on implement and address-findings.
         #[arg(long = "self-continuation", value_parser = parse_auto_merge)]
         self_continuation: Option<bool>,
-        /// true | false (omit = leave unchanged). Route a required-check failure into address-ci.
+        /// true | false (omit = leave unchanged). Route the ci-wait gate's failing checks into address-ci.
         #[arg(long = "ci-fix-routing", value_parser = parse_auto_merge)]
         ci_fix_routing: Option<bool>,
         /// Repeatable. Canonical phase id or `plan_review_slot` = seconds (>0).

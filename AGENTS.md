@@ -93,7 +93,7 @@ Adapter injects name the phase skill as `{workspace|execution}/.agents/skills/<p
 
 **`address-findings`:** after a cross-model GateFail, adapter injects this named phase (implementor Role Binding + implement/onboarding skill paths), then a fresh gate; cap 2 then `difficulty` Stop.
 
-**`address-ci`:** opt-in route when a required check fails on this run's owned PR (implementor, cap 2, 1800s). `project set --ci-fix-routing true|false` turns it on. `COORDINATOR_CI_FIX=off` forces it off.
+**`address-ci`:** opt-in route when the ci-wait gate fails this run's owned PR (implementor, cap 2, 1800s). `project set --ci-fix-routing true|false` turns it on. `COORDINATOR_CI_FIX=off` forces it off.
 
 **Scan footgun:** never `project scan --root C:\dev --add` — `C:\dev` has many conductor markers (Orca, coordinator, coordinated, …). Scan a single workspace (`--root C:\dev\Orca`) or add one project at a time.
 

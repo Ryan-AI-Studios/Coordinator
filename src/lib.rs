@@ -47,7 +47,7 @@
 //! Recorded owner-decision channel (`decision record|show|list`, one active comment block, fold inject): track **0077**.
 //! Contextual state policies (diff + durable counters gate publish and squash-merge): track **0069**.
 //! Bounded self-check between adapter `implement` and `address-findings` turns (report-only, off by default): track **0070**.
-//! Opt-in same-epoch `address-ci` when a required check fails on this run's owned PR (cap 2, off by default): track **0071**.
+//! Opt-in same-epoch `address-ci` when the ci-wait gate fails this run's owned PR (cap 2, off by default): track **0071** (slice unified in **0079**).
 
 pub mod api;
 pub mod checkpoint;
