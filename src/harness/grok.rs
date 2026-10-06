@@ -2290,6 +2290,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         });
         session.inject_prompt("read", timeout()).await.unwrap();
@@ -2331,6 +2332,7 @@ mod tests {
             worktree_isolation: on,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
 

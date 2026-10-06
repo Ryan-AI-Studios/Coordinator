@@ -325,6 +325,9 @@ pub struct MachineConfig {
     /// JSONL journal files to keep under `{state_dir}/journal/`. Missing → 20. `0` skips GC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_keep: Option<u64>,
+    /// Machine-wide contextual state policies (0069). Empty = no machine override.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_policies: Vec<crate::policy::PolicyRule>,
 }
 
 impl Default for MachineConfig {
@@ -337,6 +340,7 @@ impl Default for MachineConfig {
             hermes: HermesNotifyConfig::default(),
             progress_stall_secs: None,
             journal_keep: None,
+            state_policies: Vec::new(),
         }
     }
 }
@@ -522,6 +526,7 @@ mod tests {
             hermes: HermesNotifyConfig::default(),
             progress_stall_secs: None,
             journal_keep: None,
+            state_policies: Vec::new(),
         };
         atomic_write_json(&path, &cfg).unwrap();
         let loaded = load_machine_config_at(&path).unwrap();
@@ -718,6 +723,7 @@ mod tests {
             },
             progress_stall_secs: None,
             journal_keep: None,
+            state_policies: Vec::new(),
         };
         atomic_write_json(&path, &cfg).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

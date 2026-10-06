@@ -155,6 +155,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: DecisionCommands,
     },
+    /// Show, set, or approve a contextual state policy.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -186,6 +191,36 @@ pub enum NotifyCommands {
     },
     /// Post one fleet status summary (no artifact, no toast).
     FleetSummary,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PolicyCommands {
+    /// Print the four builtin rules and where each action came from.
+    Show {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Upsert one builtin on the project record.
+    Set {
+        #[arg(long)]
+        project: Option<String>,
+        /// dependency-manifest | ci-workflow-path | consecutive-failures | restore-before-publish
+        #[arg(long)]
+        name: String,
+        /// allow | report | require-approval | block
+        #[arg(long)]
+        action: String,
+        /// Rule threshold. Consecutive-failures defaults to 3 when omitted.
+        #[arg(long)]
+        threshold: Option<u32>,
+    },
+    /// Approve the current fingerprint for one builtin.
+    Approve {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -808,6 +843,25 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 print!("{text}");
             }
         },
+        Commands::Policy { action } => match action {
+            PolicyCommands::Show { project } => {
+                let text = api::cmd_policy_show(project.as_deref(), true)?;
+                print!("{text}");
+            }
+            PolicyCommands::Set {
+                project,
+                name,
+                action,
+                threshold,
+            } => {
+                api::cmd_policy_set(project.as_deref(), &name, &action, threshold, true)?;
+                println!("policy set {name}");
+            }
+            PolicyCommands::Approve { project, name } => {
+                let fingerprint = api::cmd_policy_approve(project.as_deref(), &name, true)?;
+                println!("policy approved {name} {fingerprint}");
+            }
+        },
     }
     Ok(())
 }
@@ -918,6 +972,62 @@ mod tests {
             help.contains("--serve-port"),
             "run --help should mention --serve-port: {help}"
         );
+    }
+
+    #[test]
+    fn policy_set_parses_builtin_name_and_action() {
+        let cmd = Cli::try_parse_from([
+            "coordinator",
+            "policy",
+            "set",
+            "--name",
+            "dependency-manifest",
+            "--action",
+            "require-approval",
+            "--threshold",
+            "3",
+            "--project",
+            "p",
+        ])
+        .unwrap();
+        match cmd.command {
+            Commands::Policy { action } => match action {
+                PolicyCommands::Set {
+                    project,
+                    name,
+                    action,
+                    threshold,
+                } => {
+                    assert_eq!(project.as_deref(), Some("p"));
+                    assert_eq!(name, "dependency-manifest");
+                    assert_eq!(action, "require-approval");
+                    assert_eq!(threshold, Some(3));
+                }
+                other => panic!("expected policy set, got {other:?}"),
+            },
+            other => panic!("expected policy, got {other:?}"),
+        }
+        let show = Cli::try_parse_from(["coordinator", "policy", "show"]).unwrap();
+        assert!(matches!(
+            show.command,
+            Commands::Policy {
+                action: PolicyCommands::Show { project: None }
+            }
+        ));
+        let approve = Cli::try_parse_from([
+            "coordinator",
+            "policy",
+            "approve",
+            "--name",
+            "restore-before-publish",
+        ])
+        .unwrap();
+        assert!(matches!(
+            approve.command,
+            Commands::Policy {
+                action: PolicyCommands::Approve { .. }
+            }
+        ));
     }
 
     #[test]

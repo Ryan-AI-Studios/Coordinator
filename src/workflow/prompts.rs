@@ -300,6 +300,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -369,6 +370,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -519,6 +521,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -666,6 +669,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         };
         run_with_driver(&rec, Some("0031".into()), WorkflowDriver::FileWait).unwrap();

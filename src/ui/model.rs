@@ -454,6 +454,23 @@ pub fn show_failure(project_id: &str) -> Result<Option<crate::notify::FailureSho
     api::cmd_failure_show(Some(project_id), false)
 }
 
+/// Auto-start row. This is not the contextual state-policy alert.
+pub const AUTO_START_ROW_LABEL: &str = "Policy";
+
+/// Contextual state-policy row on the project card (0069).
+pub const STATE_GATE_ROW_LABEL: &str = "State gate";
+
+/// Text for the State gate row. `None` when the run has no alert.
+pub fn state_gate_row(view: &StatusView) -> Option<String> {
+    let gate = view.state_gate.as_ref()?;
+    let detail = gate.detail.trim();
+    if detail.is_empty() {
+        Some(format!("{} {}", gate.action, gate.name))
+    } else {
+        Some(format!("{} {} — {detail}", gate.action, gate.name))
+    }
+}
+
 /// Display title for a card (display_name, else last path component, else id).
 pub fn card_title(view: &StatusView) -> String {
     if let Some(name) = view
@@ -552,6 +569,7 @@ mod tests {
             ticker: None,
             auto_start: Default::default(),
             parked_next: None,
+            state_gate: None,
         }
     }
 
@@ -811,6 +829,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -986,6 +1005,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         run::run_with_driver(&rec, Some("0014".into()), WorkflowDriver::FileWait).unwrap();
@@ -1000,6 +1020,25 @@ mod tests {
         );
         assert_eq!(stop_copy(), STOP_LAST_EVENT);
         assert_eq!(card_title(&stopped), "RunMe");
+    }
+
+    #[test]
+    fn state_gate_row_is_separate_from_auto_start_policy() {
+        assert_eq!(AUTO_START_ROW_LABEL, "Policy");
+        assert_eq!(STATE_GATE_ROW_LABEL, "State gate");
+        let quiet = view(RunStatus::Running, "ci-wait", None, None);
+        assert!(state_gate_row(&quiet).is_none());
+        let mut gated = quiet;
+        gated.state_gate = Some(crate::policy::StateGate {
+            name: "dependency-manifest".into(),
+            action: "report".into(),
+            detail: "policy: report dependency-manifest: Cargo.toml".into(),
+        });
+        let row = state_gate_row(&gated).unwrap();
+        assert!(row.contains("dependency-manifest"), "{row}");
+        assert!(row.contains("report"), "{row}");
+        assert!(row.contains("Cargo.toml"), "{row}");
+        assert_ne!(STATE_GATE_ROW_LABEL, AUTO_START_ROW_LABEL);
     }
 
     #[test]

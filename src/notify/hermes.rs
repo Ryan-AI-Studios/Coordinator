@@ -934,6 +934,7 @@ mod tests {
             },
             progress_stall_secs: None,
             journal_keep: None,
+            state_policies: Vec::new(),
         };
         save_machine_config(&cfg).unwrap();
     }

@@ -94,6 +94,7 @@ fn restore_locked(record: &ProjectRecord, discard: bool) -> Result<StatusView> {
     }
     let detail = format!("{name} discard={discard}");
     crate::progress_log::append(record, "restore", &detail);
+    state.restored_epoch = Some(state.run_epoch);
     state.last_event = format!("restore: {detail}");
     state.updated_at = chrono::Utc::now();
     save_run_state(record, &state)?;
@@ -328,6 +329,7 @@ mod tests {
             worktree_isolation: on,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -680,6 +682,7 @@ mod tests {
             "main"
         );
         assert!(porcelain(repo.path()).is_empty());
+        assert_eq!(load_run_state(&rec).unwrap().restored_epoch, Some(6));
     }
 
     #[test]
@@ -693,6 +696,7 @@ mod tests {
             "{err}"
         );
         assert_eq!(head(repo.path()), before);
+        assert!(load_run_state(&rec).unwrap().restored_epoch.is_none());
     }
 
     #[test]

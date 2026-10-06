@@ -385,6 +385,46 @@ fn fire_pending_notify(record: &ProjectRecord, commit: &ApplyCommit) {
 }
 
 /// Artifact is written after apply locks drop; refresh the path on the returned view.
+/// Count committed failures for the track that just finished.
+///
+/// A gate bounce and a `policy:` failure do not increment. Success stores `0`
+/// for that track (the key stays). Fresh `run` does not touch this map.
+fn note_consecutive_failures(
+    state: &mut RunState,
+    outcome: &PhaseOutcome,
+    track: &Option<String>,
+    bounced: bool,
+) {
+    let Some(id) = track.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    match outcome.status {
+        OutcomeStatus::Success => {
+            state.consecutive_failures.insert(id.to_string(), 0);
+        }
+        OutcomeStatus::Failure => {
+            if bounced {
+                return;
+            }
+            if outcome
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("policy:")
+            {
+                return;
+            }
+            let n = state
+                .consecutive_failures
+                .get(id)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            state.consecutive_failures.insert(id.to_string(), n);
+        }
+    }
+}
+
 fn refresh_failure_artifact(record: &ProjectRecord, mut view: StatusView) -> StatusView {
     view.failure_artifact = crate::notify::artifact::existing_path(record);
     view
@@ -512,6 +552,8 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
             }
         }
     }
+
+    note_consecutive_failures(&mut state, &outcome, &snap_track, bounced);
 
     state.updated_at = Utc::now();
     state.last_applied_outcome_hash = Some(hash.clone());
@@ -846,6 +888,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -1005,6 +1048,97 @@ mod tests {
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.phase, STUB_PHASE_FAILED);
         assert_eq!(view.failure_class, Some(FailureClass::Permission));
+    }
+
+    #[test]
+    fn consecutive_failures_skip_policy_and_bounce_and_reset_on_success() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_stub(&r, Some("0069".into())).unwrap();
+        let fail = |phase: &str, class: FailureClass, msg: &str| {
+            apply(
+                &r,
+                PhaseOutcome::failure(phase, class, OutcomeSource::Test, Some(msg.into()), None),
+            )
+            .unwrap();
+        };
+        fail(STUB_PHASE_ACTIVE, FailureClass::HarnessCrash, "boom");
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .consecutive_failures
+                .get("0069")
+                .copied(),
+            Some(1)
+        );
+        run_stub(&r, Some("0069".into())).unwrap();
+        fail(
+            STUB_PHASE_ACTIVE,
+            FailureClass::Permission,
+            "policy: block dependency-manifest: Cargo.toml",
+        );
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .consecutive_failures
+                .get("0069")
+                .copied(),
+            Some(1),
+            "a policy block must not increment"
+        );
+
+        run_stub(&r, Some("0069".into())).unwrap();
+        {
+            let mut state = load_run_state(&r).unwrap();
+            state.phase = crate::workflow::graph::PHASE_CROSS_MODEL.into();
+            save_run_state(&r, &state).unwrap();
+        }
+        let bounced = apply(
+            &r,
+            PhaseOutcome::failure(
+                crate::workflow::graph::PHASE_CROSS_MODEL,
+                FailureClass::Difficulty,
+                OutcomeSource::Test,
+                Some("gate".into()),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            bounced.phase,
+            crate::workflow::graph::PHASE_ADDRESS_FINDINGS
+        );
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .consecutive_failures
+                .get("0069")
+                .copied(),
+            Some(1),
+            "a gate bounce must not increment"
+        );
+
+        run::stop(&r).unwrap();
+        run_stub(&r, Some("0069".into())).unwrap();
+        apply(
+            &r,
+            PhaseOutcome::success(
+                STUB_PHASE_ACTIVE,
+                OutcomeSource::Test,
+                Some("ok".into()),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .consecutive_failures
+                .get("0069")
+                .copied(),
+            Some(0)
+        );
     }
 
     #[test]

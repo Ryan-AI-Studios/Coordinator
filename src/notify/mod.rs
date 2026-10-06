@@ -236,6 +236,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -1088,6 +1089,7 @@ mod tests {
             },
             progress_stall_secs: None,
             journal_keep: None,
+            state_policies: Vec::new(),
         };
         save_machine_config(&cfg).unwrap();
         assert!(!fleet_summary_enabled());

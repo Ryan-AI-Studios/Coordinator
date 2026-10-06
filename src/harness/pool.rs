@@ -2166,6 +2166,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         crate::state::ensure_state_dir(&rec).unwrap();
@@ -2207,6 +2208,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         let stale = PersistedGrokHandle {
@@ -2279,6 +2281,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(&rec, None, crate::workflow::WorkflowDriver::FileWait).unwrap();
@@ -2319,6 +2322,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         let t = prompt_timeout_for(&rec);
@@ -2350,6 +2354,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         let p = persist_path(&rec).unwrap();
@@ -2374,6 +2379,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         ensure_state_dir(&rec).unwrap();
@@ -2408,6 +2414,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         ensure_state_dir(&rec).unwrap();
@@ -2783,6 +2790,7 @@ Loop\r\n",
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         assert_eq!(grok_cwd(&rec), exec);
@@ -3143,6 +3151,7 @@ Loop\r\n",
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(
