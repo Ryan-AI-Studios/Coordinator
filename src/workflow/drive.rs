@@ -872,6 +872,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         }
     }
@@ -1358,5 +1359,117 @@ mod tests {
         assert!(body.contains("inject"), "{body}");
         tick(&r).unwrap();
         assert_eq!(super::captured_prompts().len(), 1);
+    }
+
+    #[test]
+    fn address_ci_injects_one_prompt_and_does_not_merge() {
+        let _home = IsolatedHome::enter();
+        let prev_poll = std::env::var_os(crate::config::ENV_COORDINATOR_CI_POLL_MS);
+        let prev_notify = std::env::var_os(crate::notify::ENV_COORDINATOR_NOTIFY);
+        let prev_fix = std::env::var_os(crate::ci::fix::ENV_CI_FIX);
+        let prev_policies = std::env::var_os(crate::policy::ENV_STATE_POLICIES);
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_CI_POLL_MS, "1");
+            std::env::set_var(crate::notify::ENV_COORDINATOR_NOTIFY, "off");
+            std::env::remove_var(crate::ci::fix::ENV_CI_FIX);
+            std::env::remove_var(crate::policy::ENV_STATE_POLICIES);
+        }
+        struct Restore {
+            poll: Option<std::ffi::OsString>,
+            notify: Option<std::ffi::OsString>,
+            fix: Option<std::ffi::OsString>,
+            policies: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                fn put(key: &str, prev: &Option<std::ffi::OsString>) {
+                    unsafe {
+                        match prev {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+                put(crate::config::ENV_COORDINATOR_CI_POLL_MS, &self.poll);
+                put(crate::notify::ENV_COORDINATOR_NOTIFY, &self.notify);
+                put(crate::ci::fix::ENV_CI_FIX, &self.fix);
+                put(crate::policy::ENV_STATE_POLICIES, &self.policies);
+            }
+        }
+        let _restore = Restore {
+            poll: prev_poll,
+            notify: prev_notify,
+            fix: prev_fix,
+            policies: prev_policies,
+        };
+        let implementor = dummy(_home._home.path(), "address-ci-implementor.exe");
+        _home.write_bindings(|b| {
+            b.get_mut(ROLE_IMPLEMENTOR).unwrap().command = implementor.to_string_lossy().into();
+        });
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(dir.path().to_path_buf());
+        r.ci_fix_routing = true;
+        run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_CI_WAIT.into();
+            state.last_driven_phase = None;
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let scripted = crate::ci::ScriptedBackend::new();
+        scripted.push_resolve(Ok(Some(crate::ci::CiTarget::PullRequest {
+            number: 71,
+            url: "https://example/pr/71".into(),
+            is_draft: false,
+            merged: false,
+            head_oid: Some("abc111".into()),
+            merge_state: crate::ci::MergeStateStatus::Clean,
+            head_ref: "track/0071-CiFailureRoutesToImplementer".into(),
+            title: "track(0071): route ci".into(),
+        })));
+        scripted.push_snapshot(Ok(crate::ci::CheckSnapshot {
+            items: vec![crate::ci::CheckItem {
+                name: "fmt".into(),
+                bucket: crate::ci::CheckBucket::Fail,
+                description: "rustfmt failed".into(),
+                link: "https://example/checks/fmt".into(),
+            }],
+            raw_exit: 0,
+            merge_state: crate::ci::MergeStateStatus::Clean,
+            view: crate::ci::CheckView::Required,
+            advisory: Vec::new(),
+        }));
+        let recorded = crate::ci::RecordingBackend::wrap(std::sync::Arc::new(scripted));
+        let counts = recorded.counts.clone();
+        let _backend = crate::ci::install_test_backend(std::sync::Arc::new(recorded));
+        let routed = tick(&r).unwrap().expect("routed");
+        assert_eq!(routed.phase, crate::workflow::graph::PHASE_ADDRESS_CI);
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        let prompts = super::captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        let prompt = &prompts[0];
+        assert!(prompt.contains("attempt 1 of 2"), "{prompt}");
+        assert!(prompt.contains("fmt"), "{prompt}");
+        assert!(prompt.contains("rustfmt failed"), "{prompt}");
+        assert!(prompt.contains("https://example/checks/fmt"), "{prompt}");
+        assert!(prompt.contains("bucket=fail"), "{prompt}");
+        assert!(prompt.contains("git push"), "{prompt}");
+        assert!(prompt.contains("gh pr create"), "{prompt}");
+        assert!(prompt.contains("gh pr merge"), "{prompt}");
+        assert!(!prompt.contains("self-check:"), "{prompt}");
+        tick(&r).unwrap();
+        assert_eq!(super::captured_prompts().len(), 1);
+        let saved = load_run_state(&r).unwrap();
+        assert_eq!(saved.address_findings_attempts, 0);
+        assert_eq!(saved.ci_fix_attempts, 1);
+        assert_eq!(
+            saved.last_driven_phase.as_deref(),
+            Some(crate::workflow::graph::PHASE_ADDRESS_CI)
+        );
     }
 }

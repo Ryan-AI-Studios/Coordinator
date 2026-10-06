@@ -506,6 +506,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         }
     }
@@ -595,6 +596,7 @@ mod tests {
                 auto_start: Default::default(),
                 state_policies: Vec::new(),
                 self_continuation: false,
+                ci_fix_routing: false,
                 created_at: chrono::Utc::now(),
             };
             let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::File, None, None, None);

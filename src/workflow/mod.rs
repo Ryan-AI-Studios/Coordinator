@@ -85,8 +85,18 @@ pub fn resolve_driver(explicit: Option<&str>) -> Result<WorkflowDriver> {
     }
 }
 
+/// `address-ci` success with no tracked diff stops inside this apply.
+pub enum AddressCiFollowUp {
+    Continue,
+    Stopped { message: String },
+}
+
 /// Apply-table hook: canonical success → successor (stay Running/Paused) or advance.
-pub fn on_success(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseOutcome) {
+pub fn on_success(
+    record: &ProjectRecord,
+    state: &mut RunState,
+    outcome: &PhaseOutcome,
+) -> AddressCiFollowUp {
     if let Some(ref meta) = outcome.metadata {
         if let Some(ref next) = meta.next_track {
             let t = next.trim();
@@ -110,9 +120,25 @@ pub fn on_success(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseO
     state.failure_class = None;
     state.last_driven_phase = None;
 
+    if state.phase == graph::PHASE_ADDRESS_CI {
+        match crate::ci::fix::classify_diff(record, state) {
+            crate::ci::fix::DiffClass::Changed => {}
+            crate::ci::fix::DiffClass::Empty { sha } => {
+                let message = format!("address-ci: no diff from {sha}");
+                stop_address_ci(state, &message);
+                return AddressCiFollowUp::Stopped { message };
+            }
+            crate::ci::fix::DiffClass::Unreadable => {
+                let message = "address-ci: diff unreadable".to_string();
+                stop_address_ci(state, &message);
+                return AddressCiFollowUp::Stopped { message };
+            }
+        }
+    }
+
     if state.phase == graph::PHASE_ADVANCE {
         apply_advance(record, state);
-        return;
+        return AddressCiFollowUp::Continue;
     }
 
     if let Some(next) = successor(&state.phase) {
@@ -124,7 +150,7 @@ pub fn on_success(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseO
             state.failure_class = None;
             state.last_event = e.to_string();
             crate::progress_log::append(record, "checkpoint-refused", &state.last_event);
-            return;
+            return AddressCiFollowUp::Continue;
         }
         let from = state.phase.clone();
         state.phase = next.to_string();
@@ -160,6 +186,15 @@ pub fn on_success(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseO
         state.pause_started_at = None;
         state.last_event = "workflow: graph complete".into();
     }
+    AddressCiFollowUp::Continue
+}
+
+fn stop_address_ci(state: &mut RunState, message: &str) {
+    state.status = RunStatus::Stopped;
+    state.failure_class = Some(FailureClass::CiFailed);
+    state.phase_started_at = None;
+    state.pause_started_at = None;
+    state.last_event = message.to_string();
 }
 
 fn advance_event(from: &str, next: &str, paused: bool) -> String {
@@ -496,6 +531,8 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.review = None;
     state.stalled_at = None;
     state.address_findings_attempts = 0;
+    state.ci_fix_attempts = 0;
+    state.ci_fix_request = None;
     reset_phase_clock(state);
     state.last_event = format!("workflow: auto-start {track_id}");
 }
@@ -572,6 +609,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         }
     }

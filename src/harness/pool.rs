@@ -2187,6 +2187,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         crate::state::ensure_state_dir(&rec).unwrap();
@@ -2230,6 +2231,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         let stale = PersistedGrokHandle {
@@ -2304,6 +2306,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(&rec, None, crate::workflow::WorkflowDriver::FileWait).unwrap();
@@ -2346,6 +2349,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         let t = prompt_timeout_for(&rec);
@@ -2379,6 +2383,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         let p = persist_path(&rec).unwrap();
@@ -2405,6 +2410,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         ensure_state_dir(&rec).unwrap();
@@ -2441,6 +2447,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         ensure_state_dir(&rec).unwrap();
@@ -2818,6 +2825,7 @@ Loop\r\n",
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         assert_eq!(grok_cwd(&rec), exec);
@@ -3180,6 +3188,7 @@ Loop\r\n",
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(

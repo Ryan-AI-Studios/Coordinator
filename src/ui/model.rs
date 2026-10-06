@@ -8,8 +8,8 @@ use crate::layout::LayoutProfile;
 use crate::registry::{ProjectAddOptions, ProjectRecord};
 use crate::state::{RunStatus, STOP_LAST_EVENT, StatusView, TickerView};
 use crate::workflow::graph::{
-    PHASE_ADDRESS_FINDINGS, PHASE_CI_WAIT, PHASE_IMPLEMENT, PHASE_PLAN_REVIEW, REVIEW_SLUG_AGY,
-    REVIEW_SLUG_OPENCODE, canonical_phases, is_canonical, is_stub_phase,
+    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_CI_WAIT, PHASE_IMPLEMENT, PHASE_PLAN_REVIEW,
+    REVIEW_SLUG_AGY, REVIEW_SLUG_OPENCODE, canonical_phases, is_canonical, is_stub_phase,
 };
 
 /// Mock `article[data-state]` values (0003 visual contract).
@@ -150,6 +150,26 @@ pub fn phase_chips(view: &StatusView) -> Vec<PhaseChip> {
                     ((*phase).to_string(), ChipKind::Done)
                 } else if i == idx {
                     (PHASE_ADDRESS_FINDINGS.to_string(), ChipKind::Current)
+                } else {
+                    ((*phase).to_string(), ChipKind::Next)
+                };
+                PhaseChip { label, kind }
+            })
+            .collect();
+    }
+    if current == PHASE_ADDRESS_CI {
+        let idx = canonical_phases()
+            .iter()
+            .position(|p| *p == PHASE_CI_WAIT)
+            .expect("ci-wait is a canonical phase");
+        return canonical_phases()
+            .iter()
+            .enumerate()
+            .map(|(i, phase)| {
+                let (label, kind) = if i < idx {
+                    ((*phase).to_string(), ChipKind::Done)
+                } else if i == idx {
+                    (PHASE_ADDRESS_CI.to_string(), ChipKind::Current)
                 } else {
                     ((*phase).to_string(), ChipKind::Next)
                 };
@@ -463,6 +483,9 @@ pub const STATE_GATE_ROW_LABEL: &str = "State gate";
 /// Bounded self-check row on the project card (0070).
 pub const SELF_CHECK_ROW_LABEL: &str = "Self-check";
 
+/// Required-check repair row on the project card (0071).
+pub const CI_FIX_ROW_LABEL: &str = "CI fix";
+
 /// Text for the State gate row. `None` when the run has no alert.
 pub fn state_gate_row(view: &StatusView) -> Option<String> {
     let gate = view.state_gate.as_ref()?;
@@ -472,6 +495,22 @@ pub fn state_gate_row(view: &StatusView) -> Option<String> {
     } else {
         Some(format!("{} {} — {detail}", gate.action, gate.name))
     }
+}
+
+/// Text for the CI-fix row. `None` until this epoch has entered `address-ci`.
+pub fn ci_fix_row(view: &StatusView) -> Option<String> {
+    let n = view
+        .workflow
+        .as_ref()
+        .map(|w| w.ci_fix_attempts)
+        .unwrap_or(0);
+    if n == 0 {
+        return None;
+    }
+    Some(format!(
+        "attempt {n}/{}",
+        crate::workflow::graph::CI_FIX_CAP
+    ))
 }
 
 /// Text for the Self-check row. `None` when the run has no snap.
@@ -734,6 +773,38 @@ mod tests {
     }
 
     #[test]
+    fn address_ci_occupies_ci_wait_chip() {
+        let chips = phase_chips(&view(RunStatus::Running, PHASE_ADDRESS_CI, None, None));
+        assert_eq!(chips.len(), canonical_phases().len());
+        let ci_idx = canonical_phases()
+            .iter()
+            .position(|p| *p == PHASE_CI_WAIT)
+            .unwrap();
+        assert_eq!(chips[ci_idx].label, PHASE_ADDRESS_CI);
+        assert_eq!(chips[ci_idx].kind, ChipKind::Current);
+        assert_eq!(chips[ci_idx - 1].kind, ChipKind::Done);
+        assert_eq!(chips[ci_idx + 1].kind, ChipKind::Next);
+    }
+
+    #[test]
+    fn ci_fix_row_shows_attempt_separate_from_policy() {
+        let mut view = view(RunStatus::Running, PHASE_ADDRESS_CI, None, None);
+        assert!(ci_fix_row(&view).is_none());
+        view.workflow = Some(WorkflowView {
+            id: Some("canonical_v1".into()),
+            driver: "adapter".into(),
+            pending_roles: Vec::new(),
+            address_findings_attempts: 0,
+            ci_fix_attempts: 1,
+        });
+        let row = ci_fix_row(&view).unwrap();
+        assert_eq!(row, "attempt 1/2");
+        assert_ne!(CI_FIX_ROW_LABEL, AUTO_START_ROW_LABEL);
+        assert_ne!(CI_FIX_ROW_LABEL, STATE_GATE_ROW_LABEL);
+        assert_ne!(CI_FIX_ROW_LABEL, SELF_CHECK_ROW_LABEL);
+    }
+
+    #[test]
     fn missing_grok_is_no_session_row() {
         let rows = session_rows(&view(RunStatus::Idle, STUB_PHASE_IDLE, None, None));
         assert_eq!(rows.len(), 1);
@@ -750,6 +821,7 @@ mod tests {
             driver: "file_wait".into(),
             pending_roles: vec![REVIEW_SLUG_AGY.into()],
             address_findings_attempts: 0,
+            ci_fix_attempts: 0,
         });
         v.harness = Some(HarnessStatusBundle {
             grok: Some(GrokHarnessStatus {
@@ -850,6 +922,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         }
     }
@@ -1027,6 +1100,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: chrono::Utc::now(),
         };
         run::run_with_driver(&rec, Some("0014".into()), WorkflowDriver::FileWait).unwrap();

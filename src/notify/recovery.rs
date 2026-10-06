@@ -1,6 +1,7 @@
 //! Recovery policy table (ADR-0009). Advisory text. Automatic recovery has stopped
 //! once `FAILURE.md` exists. An ACP stdout close restarts the session only before
-//! that file is written (bounded). Nothing else auto-retries.
+//! that file is written (bounded). Opt-in `address-ci` (0071) may route a required-check
+//! failure before that file exists. Nothing else auto-retries, and `FAILURE.md` ends auto-retry.
 
 use crate::outcome::FailureClass;
 
@@ -18,7 +19,9 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
             "For an ACP stdout close, bounded session restart already ran. Inspect exit status and stderr here. Other harness crashes are not auto-retried."
         }
         FailureClass::Timeout => "Increase the phase budget or split the work; then re-run.",
-        FailureClass::CiFailed => "Do not merge. Inspect CI; re-run after fix (0010).",
+        FailureClass::CiFailed => {
+            "Do not merge. Inspect CI; re-run after fix (0010). Opt-in address-ci is off or its cap is exhausted (0071)."
+        }
     }
 }
 
@@ -50,7 +53,7 @@ mod tests {
         );
         assert_eq!(
             recommended_action(FailureClass::CiFailed),
-            "Do not merge. Inspect CI; re-run after fix (0010)."
+            "Do not merge. Inspect CI; re-run after fix (0010). Opt-in address-ci is off or its cap is exhausted (0071)."
         );
     }
 }

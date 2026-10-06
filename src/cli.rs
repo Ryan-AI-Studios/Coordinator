@@ -378,6 +378,9 @@ pub enum ProjectCommands {
         /// true | false (omit = leave unchanged). Bounded self-check on implement and address-findings.
         #[arg(long = "self-continuation", value_parser = parse_auto_merge)]
         self_continuation: Option<bool>,
+        /// true | false (omit = leave unchanged). Route a required-check failure into address-ci.
+        #[arg(long = "ci-fix-routing", value_parser = parse_auto_merge)]
+        ci_fix_routing: Option<bool>,
         /// Repeatable. Canonical phase id or `plan_review_slot` = seconds (>0).
         #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
         phase_timeouts: Vec<(String, u64)>,
@@ -525,6 +528,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 notify_progress,
                 worktree_isolation,
                 self_continuation,
+                ci_fix_routing,
                 phase_timeouts,
                 clear_phase_timeout,
                 clear_phase_timeouts,
@@ -565,6 +569,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     notify_progress,
                     worktree_isolation,
                     self_continuation,
+                    ci_fix_routing,
                     phase_timeouts_secs,
                     clear_phase_timeouts,
                     clear_phase_timeout,
@@ -1212,11 +1217,20 @@ mod tests {
                 .any(|a| a.get_id() == "self_continuation"),
             "set --self-continuation"
         );
+        assert!(
+            set.get_arguments().any(|a| a.get_id() == "ci_fix_routing"),
+            "set --ci-fix-routing"
+        );
         let add = project.find_subcommand("add").expect("add");
         assert!(
             add.get_arguments()
                 .all(|a| a.get_id().as_str() != "self_continuation"),
             "add must not grow --self-continuation"
+        );
+        assert!(
+            add.get_arguments()
+                .all(|a| a.get_id().as_str() != "ci_fix_routing"),
+            "add must not grow --ci-fix-routing"
         );
     }
 

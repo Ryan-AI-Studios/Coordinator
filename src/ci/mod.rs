@@ -4,6 +4,7 @@
 //! `tick` must not sleep and must not spawn `gh` on every 500ms wake.
 
 pub mod backend;
+pub mod fix;
 pub mod gh;
 
 use std::path::Path;
@@ -261,7 +262,18 @@ pub fn drive_with(
             Ok(None)
         }
         Decision::Fail { message, .. } => {
-            apply_failure(record, state, FailureClass::CiFailed, message)
+            match fix::try_route_ci_failure(record, state, &target, &snap)? {
+                fix::RouteOutcome::Routed(view) => Ok(Some(*view)),
+                fix::RouteOutcome::Exhausted => apply_failure(
+                    record,
+                    state,
+                    FailureClass::CiFailed,
+                    format!("{message}; address-ci exhausted (2/2)"),
+                ),
+                fix::RouteOutcome::Declined => {
+                    apply_failure(record, state, FailureClass::CiFailed, message)
+                }
+            }
         }
         Decision::Green { .. } => finish_green(record, state, backend, &cwd, &target, &summary),
     }
@@ -373,17 +385,17 @@ impl Decision {
 /// One effective bucket per check name (same SHA). Recency is not a tiebreaker.
 fn collapse_by_name(items: &[CheckItem]) -> (Vec<CheckItem>, Vec<String>) {
     use std::collections::BTreeMap;
-    let mut by_name: BTreeMap<&str, Vec<CheckBucket>> = BTreeMap::new();
+    let mut by_name: BTreeMap<&str, Vec<&CheckItem>> = BTreeMap::new();
     for i in items {
-        by_name.entry(i.name.as_str()).or_default().push(i.bucket);
+        by_name.entry(i.name.as_str()).or_default().push(i);
     }
     let mut out = Vec::with_capacity(by_name.len());
     let mut disagreed = Vec::new();
-    for (name, buckets) in by_name {
-        let has_pass = buckets.contains(&CheckBucket::Pass);
-        let has_fail = buckets.contains(&CheckBucket::Fail);
-        let has_pending = buckets.contains(&CheckBucket::Pending);
-        let has_cancel = buckets.contains(&CheckBucket::Cancel);
+    for (name, group) in by_name {
+        let has_pass = group.iter().any(|i| i.bucket == CheckBucket::Pass);
+        let has_fail = group.iter().any(|i| i.bucket == CheckBucket::Fail);
+        let has_pending = group.iter().any(|i| i.bucket == CheckBucket::Pending);
+        let has_cancel = group.iter().any(|i| i.bucket == CheckBucket::Cancel);
         let bucket = if has_pass {
             CheckBucket::Pass
         } else if has_pending {
@@ -398,15 +410,22 @@ fn collapse_by_name(items: &[CheckItem]) -> (Vec<CheckItem>, Vec<String>) {
         if has_pass && has_fail {
             disagreed.push(name.to_string());
         }
+        let source = group
+            .iter()
+            .copied()
+            .find(|i| i.bucket == bucket)
+            .unwrap_or(group[0]);
         out.push(CheckItem {
             name: name.to_string(),
             bucket,
+            description: source.description.clone(),
+            link: source.link.clone(),
         });
     }
     (out, disagreed)
 }
 
-fn collapse_snapshot(snap: &CheckSnapshot) -> (CheckSnapshot, Vec<String>) {
+pub(crate) fn collapse_snapshot(snap: &CheckSnapshot) -> (CheckSnapshot, Vec<String>) {
     let (items, mut disagreed) = collapse_by_name(&snap.items);
     let (advisory, adv_disagreed) = collapse_by_name(&snap.advisory);
     disagreed.extend(adv_disagreed);
@@ -952,6 +971,8 @@ fn try_merged_track_target(state: &RunState, cwd: &Path) -> Option<CiTarget> {
         merged: true,
         head_oid: None,
         merge_state: MergeStateStatus::Unspecified,
+        head_ref: String::new(),
+        title: String::new(),
     })
 }
 
@@ -1213,6 +1234,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         }
     }
@@ -1243,17 +1265,13 @@ mod tests {
             merged,
             head_oid: Some("abc".into()),
             merge_state,
+            head_ref: String::new(),
+            title: String::new(),
         }
     }
 
     fn pair_items(pairs: &[(&str, CheckBucket)]) -> Vec<CheckItem> {
-        pairs
-            .iter()
-            .map(|(n, b)| CheckItem {
-                name: (*n).into(),
-                bucket: *b,
-            })
-            .collect()
+        pairs.iter().map(|(n, b)| CheckItem::new(*n, *b)).collect()
     }
 
     fn items(pairs: &[(&str, CheckBucket)]) -> CheckSnapshot {
@@ -1382,9 +1400,11 @@ mod tests {
         assert!(implement.starts_with(prefix), "{implement}");
         let address = with_green_pr_prefix(&r, "address-findings", msg.clone());
         assert!(address.starts_with(prefix), "{address}");
-        let plan = with_green_pr_prefix(&r, "plan", msg);
+        let plan = with_green_pr_prefix(&r, "plan", msg.clone());
         assert!(!plan.contains("merge not performed"), "{plan}");
         assert!(plan.starts_with("ACP stdout closed"), "{plan}");
+        let address_ci = with_green_pr_prefix(&r, "address-ci", msg);
+        assert!(!address_ci.contains("merge not performed"), "{address_ci}");
     }
 
     #[test]
@@ -3738,5 +3758,417 @@ mod tests {
         assert_eq!(counts.merge_n(), 0);
         assert_eq!(counts.publish_n(), 0);
         assert_eq!(counts.resolve_n(), 0);
+    }
+
+    const OWNED_REF: &str = "track/0071-CiFailureRoutesToImplementer";
+    const OWNED_TITLE: &str = "track(0071): route ci";
+
+    struct RouteEnv {
+        _poll: std::sync::MutexGuard<'static, ()>,
+        prev_fix: Option<std::ffi::OsString>,
+    }
+
+    impl RouteEnv {
+        fn enter() -> Self {
+            let poll = poll_env();
+            let prev_fix = std::env::var_os(super::fix::ENV_CI_FIX);
+            unsafe {
+                std::env::remove_var(super::fix::ENV_CI_FIX);
+            }
+            Self {
+                _poll: poll,
+                prev_fix,
+            }
+        }
+    }
+
+    impl Drop for RouteEnv {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+                std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+                match &self.prev_fix {
+                    Some(v) => std::env::set_var(super::fix::ENV_CI_FIX, v),
+                    None => std::env::remove_var(super::fix::ENV_CI_FIX),
+                }
+            }
+        }
+    }
+
+    fn item(name: &str, bucket: CheckBucket, description: &str, link: &str) -> CheckItem {
+        CheckItem {
+            name: name.into(),
+            bucket,
+            description: description.into(),
+            link: link.into(),
+        }
+    }
+
+    fn owned_pr(head_ref: &str, title: &str) -> CiTarget {
+        CiTarget::PullRequest {
+            number: 71,
+            url: "https://example/pr/71".into(),
+            is_draft: false,
+            merged: false,
+            head_oid: Some("abc111".into()),
+            merge_state: MergeStateStatus::Clean,
+            head_ref: head_ref.into(),
+            title: title.into(),
+        }
+    }
+
+    fn required_items(items: Vec<CheckItem>, advisory: Vec<CheckItem>) -> CheckSnapshot {
+        CheckSnapshot {
+            items,
+            raw_exit: 0,
+            merge_state: MergeStateStatus::Clean,
+            view: CheckView::Required,
+            advisory,
+        }
+    }
+
+    fn start_owned(routing: bool) -> (tempfile::TempDir, ProjectRecord) {
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.ci_fix_routing = routing;
+        run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
+        let mut s = load_run_state(&r).unwrap();
+        s.phase = graph::PHASE_CI_WAIT.into();
+        s.last_driven_phase = None;
+        s.ci = Some(crate::state::CiWatchState {
+            publish_attempted_sha: Some("keep-publish".into()),
+            merge: Some("skipped".into()),
+            ..crate::state::CiWatchState::default()
+        });
+        save_run_state(&r, &s).unwrap();
+        (dir, r)
+    }
+
+    fn script(
+        r: &ProjectRecord,
+        target: CiTarget,
+        snap: CheckSnapshot,
+    ) -> (TestBackendGuard, CallCounts) {
+        let backend = ScriptedBackend::new();
+        backend.push_resolve(Ok(Some(target)));
+        backend.push_snapshot(Ok(snap));
+        let hooked = hook(backend);
+        let _ = r;
+        hooked
+    }
+
+    fn assert_declined(r: &ProjectRecord) {
+        let st = load_run_state(r).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(st.failure_class, Some(FailureClass::CiFailed));
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(st.ci_fix_attempts, 0);
+        assert!(st.ci_fix_request.is_none());
+        assert_eq!(st.address_findings_attempts, 0);
+        assert!(
+            !st.last_event.contains("address-ci"),
+            "last_event={}",
+            st.last_event
+        );
+        assert!(crate::notify::artifact::existing_path(r).is_some());
+    }
+
+    #[test]
+    fn required_fail_on_owned_pr_routes_once_when_flag_on() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let long = "x".repeat(1100);
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_items(
+                vec![
+                    item(
+                        "fmt",
+                        CheckBucket::Fail,
+                        "rustfmt failed",
+                        "https://example/checks/fmt",
+                    ),
+                    item("lint", CheckBucket::Fail, "", ""),
+                    item(
+                        "notes",
+                        CheckBucket::Fail,
+                        &long,
+                        "https://example/checks/notes",
+                    ),
+                    item("ci", CheckBucket::Pass, "ok", "https://example/checks/ci"),
+                ],
+                Vec::new(),
+            ),
+        );
+        let view = crate::workflow::tick(&r).unwrap().expect("routed");
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_CI);
+        assert!(view.failure_class.is_none());
+        assert_eq!(view.run_epoch, 1);
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("\"ci_fix_attempts\":1"), "{json}");
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.ci_fix_attempts, 1);
+        assert_eq!(st.address_findings_attempts, 0);
+        assert_eq!(st.run_epoch, 1);
+        assert_eq!(st.last_event, "ci-wait: address-ci 1/2");
+        assert!(st.last_driven_phase.is_none());
+        let req = st.ci_fix_request.expect("request");
+        assert_eq!(req.pr_number, 71);
+        assert_eq!(req.from_sha, "abc111");
+        assert_eq!(req.checks.len(), 3);
+        assert_eq!(req.checks[0].name, "fmt");
+        assert_eq!(req.checks[0].bucket, "fail");
+        assert_eq!(req.checks[0].description, "rustfmt failed");
+        assert_eq!(req.checks[0].link, "https://example/checks/fmt");
+        assert_eq!(req.checks[1].name, "lint");
+        assert!(req.checks[1].description.is_empty());
+        assert_eq!(req.checks[2].description.chars().count(), 1024);
+        assert!(req.checks.iter().all(|c| c.name != "ci"));
+        let ci = st.ci.expect("watch");
+        assert_eq!(ci.pr_number, Some(71));
+        assert!(ci.pr_url.is_some());
+        assert!(ci.head_sha.is_none());
+        assert!(ci.set_key.is_none());
+        assert!(ci.last_summary.is_none());
+        assert!(ci.next_interval_ms.is_none());
+        assert!(ci.last_poll_at.is_some());
+        assert_eq!(ci.merge.as_deref(), Some("skipped"));
+        assert_eq!(ci.publish_attempted_sha.as_deref(), Some("keep-publish"));
+    }
+
+    #[test]
+    fn second_required_fail_increments_address_ci_to_two() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_items(
+                vec![item(
+                    "fmt",
+                    CheckBucket::Fail,
+                    "rustfmt failed",
+                    "https://example/fmt",
+                )],
+                Vec::new(),
+            ),
+        );
+        crate::workflow::tick(&r).unwrap().expect("first route");
+        crate::state::with_run_state_lock(&r, || {
+            let mut s = load_run_state(&r)?;
+            s.phase = graph::PHASE_CI_WAIT.into();
+            s.last_driven_phase = None;
+            if let Some(ci) = s.ci.as_mut() {
+                ci.last_poll_at = None;
+            }
+            save_run_state(&r, &s)
+        })
+        .unwrap();
+        let view = crate::workflow::tick(&r).unwrap().expect("second route");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_CI);
+        assert_eq!(view.status, RunStatus::Running);
+        assert!(view.failure_class.is_none());
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.ci_fix_attempts, 2);
+        assert_eq!(st.address_findings_attempts, 0);
+        assert_eq!(st.last_event, "ci-wait: address-ci 2/2");
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+    }
+
+    #[test]
+    fn address_ci_cap_stops_ci_failed() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.ci_fix_attempts = 2;
+            save_run_state(&r, &s).unwrap();
+        }
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_items(
+                vec![item(
+                    "fmt",
+                    CheckBucket::Fail,
+                    "rustfmt failed",
+                    "https://example/fmt",
+                )],
+                Vec::new(),
+            ),
+        );
+        let view = crate::workflow::tick(&r).unwrap().expect("exhausted");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            view.last_event.contains("address-ci exhausted (2/2)"),
+            "last_event={}",
+            view.last_event
+        );
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.ci_fix_attempts, 2);
+        assert_eq!(st.address_findings_attempts, 0);
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+    }
+
+    #[test]
+    fn flag_off_required_fail_stays_ci_failed() {
+        let _env = RouteEnv::enter();
+        unsafe {
+            std::env::set_var(super::fix::ENV_CI_FIX, "1");
+        }
+        let (_dir, r) = start_owned(false);
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_items(
+                vec![item(
+                    "fmt",
+                    CheckBucket::Fail,
+                    "rustfmt failed",
+                    "https://example/fmt",
+                )],
+                Vec::new(),
+            ),
+        );
+        crate::workflow::tick(&r).unwrap().expect("declined");
+        assert_declined(&r);
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+    }
+
+    #[test]
+    fn env_off_required_fail_stays_ci_failed() {
+        let _env = RouteEnv::enter();
+        unsafe {
+            std::env::set_var(super::fix::ENV_CI_FIX, "off");
+        }
+        let (_dir, r) = start_owned(true);
+        let (_hook, _counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_items(
+                vec![item(
+                    "fmt",
+                    CheckBucket::Fail,
+                    "rustfmt failed",
+                    "https://example/fmt",
+                )],
+                Vec::new(),
+            ),
+        );
+        crate::workflow::tick(&r).unwrap().expect("declined");
+        assert_declined(&r);
+    }
+
+    #[test]
+    fn required_cancel_stays_pending_and_does_not_route() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_items(
+                vec![item(
+                    "fmt",
+                    CheckBucket::Cancel,
+                    "cancelled",
+                    "https://example/fmt",
+                )],
+                Vec::new(),
+            ),
+        );
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(st.ci_fix_attempts, 0);
+        assert!(st.ci_fix_request.is_none());
+        assert!(st.last_event.contains("cancelled"), "{}", st.last_event);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+    }
+
+    #[test]
+    fn advisory_only_fail_does_not_route() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_snap(&[], &[("risk", CheckBucket::Fail)], MergeStateStatus::Clean),
+        );
+        crate::workflow::tick(&r).unwrap().expect("advisory stop");
+        assert_declined(&r);
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+    }
+
+    #[test]
+    fn head_sha_fail_does_not_route() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, _counts) = script(
+            &r,
+            CiTarget::HeadSha {
+                sha: "abc111".into(),
+            },
+            items(&[("ci", CheckBucket::Fail)]),
+        );
+        crate::workflow::tick(&r).unwrap().expect("head sha stop");
+        assert_declined(&r);
+    }
+
+    #[test]
+    fn foreign_title_does_not_route() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, _counts) = script(
+            &r,
+            owned_pr(OWNED_REF, "fix the build"),
+            required_items(
+                vec![item(
+                    "fmt",
+                    CheckBucket::Fail,
+                    "rustfmt failed",
+                    "https://example/fmt",
+                )],
+                Vec::new(),
+            ),
+        );
+        crate::workflow::tick(&r).unwrap().expect("foreign title");
+        assert_declined(&r);
+    }
+
+    #[test]
+    fn foreign_head_ref_does_not_route() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, _counts) = script(
+            &r,
+            owned_pr("feature/x", OWNED_TITLE),
+            required_items(
+                vec![item(
+                    "fmt",
+                    CheckBucket::Fail,
+                    "rustfmt failed",
+                    "https://example/fmt",
+                )],
+                Vec::new(),
+            ),
+        );
+        crate::workflow::tick(&r).unwrap().expect("foreign ref");
+        assert_declined(&r);
     }
 }

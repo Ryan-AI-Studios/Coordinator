@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::registry::ProjectRecord;
 use crate::workflow::graph::{
-    PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT, PHASE_PLAN,
+    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT,
+    PHASE_PLAN,
 };
 
 use super::graph::resolve_track_dir;
@@ -24,7 +25,11 @@ Do not run `coordinator outcome write` during this inject.";
 pub(crate) fn layout_block(record: &ProjectRecord, track_id: Option<&str>, phase: &str) -> String {
     let paths = crate::layout::resolve(record);
     let epoch = crate::worktree::active_epoch_dir(record);
-    let use_epoch = epoch.is_some() && matches!(phase, PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS);
+    let use_epoch = epoch.is_some()
+        && matches!(
+            phase,
+            PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS | PHASE_ADDRESS_CI
+        );
     let execution = if use_epoch {
         epoch.as_ref().map(|p| p.display().to_string())
     } else {
@@ -235,6 +240,7 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                  {END_TURN}\n"
             )
         }
+        PHASE_ADDRESS_CI => address_ci_body(record),
         PHASE_ADVANCE => {
             let path = workspace_skill(record, "plan");
             format!(
@@ -249,6 +255,58 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
         _ => "Unknown phase; end the turn.\n".into(),
     };
     format!("Coordinator phase `{phase}` for track `{track}`.\n{layout}{body}")
+}
+
+const ADDRESS_CI_CONTEXT_CAP: usize = 4096;
+
+fn truncate_scalars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max).collect()
+    }
+}
+
+/// `address-ci` inject. Does not load the implement-track publish loop or the self-check clause.
+fn address_ci_body(record: &ProjectRecord) -> String {
+    let state = crate::state::load_run_state(record).ok();
+    let attempts = state.as_ref().map(|s| s.ci_fix_attempts).unwrap_or(0);
+    let request = state.as_ref().and_then(|s| s.ci_fix_request.clone());
+    let pr = request
+        .as_ref()
+        .map(|req| req.pr_number.to_string())
+        .unwrap_or_else(|| "(none)".into());
+    let sha = request
+        .as_ref()
+        .map(|req| req.from_sha.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(none)".into());
+    let mut checks = String::new();
+    if let Some(req) = request {
+        for check in req.checks {
+            checks.push_str(&format!(
+                "- {} bucket={} description={} link={}\n",
+                check.name, check.bucket, check.description, check.link
+            ));
+        }
+    }
+    if checks.is_empty() {
+        checks.push_str("- (no failing required checks stored)\n");
+    }
+    let head = format!(
+        "This phase is `address-ci`, attempt {attempts} of {}.\n\
+         PR #{pr}\n\
+         from_sha: {sha}\n\
+         Commit a real diff against `from_sha` and end the turn.\n\
+         Do not run `git push`, `gh pr create`, or `gh pr merge`.\n\
+         Do not load the implement-track publish loop.\n\
+         Failing required checks:\n",
+        crate::workflow::graph::CI_FIX_CAP
+    );
+    let room = ADDRESS_CI_CONTEXT_CAP.saturating_sub(head.chars().count());
+    let checks = truncate_scalars(&checks, room);
+    let body = format!("{head}{checks}");
+    truncate_scalars(&body, ADDRESS_CI_CONTEXT_CAP)
 }
 
 /// Last matching `next_track:` line.
@@ -305,6 +363,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         }
     }
@@ -376,6 +435,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         }
     }
@@ -528,6 +588,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         }
     }
@@ -677,6 +738,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         };
         run_with_driver(&rec, Some("0031".into()), WorkflowDriver::FileWait).unwrap();

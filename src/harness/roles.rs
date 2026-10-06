@@ -9,8 +9,8 @@ pub use crate::config::{RoleBinding, default_role_bindings, load_machine_config}
 use crate::error::{CoordinatorError, Result};
 use crate::harness::grok::{ENV_CURSOR_BIN, ENV_GROK_BIN, reject_or_replace_ps1, resolve_command};
 use crate::workflow::graph::{
-    PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT, PHASE_PLAN,
-    ROLE_IMPLEMENTOR, ROLE_PLANNER,
+    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT,
+    PHASE_PLAN, ROLE_IMPLEMENTOR, ROLE_PLANNER,
 };
 
 /// Optional Role Binding key for `fold`. Not inserted by defaults / merge.
@@ -49,7 +49,7 @@ pub fn resolve_grok_command() -> Result<String> {
 pub fn phase_role_key(phase: &str) -> Option<&'static str> {
     match phase {
         PHASE_PLAN | PHASE_FOLD | PHASE_ADVANCE => Some(ROLE_PLANNER),
-        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS => Some(ROLE_IMPLEMENTOR),
+        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS | PHASE_ADDRESS_CI => Some(ROLE_IMPLEMENTOR),
         _ => None,
     }
 }
@@ -68,7 +68,9 @@ pub fn resolve_phase_role_key(
 ) -> Option<String> {
     match phase {
         PHASE_PLAN => Some(ROLE_PLANNER.to_string()),
-        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS => Some(ROLE_IMPLEMENTOR.to_string()),
+        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS | PHASE_ADDRESS_CI => {
+            Some(ROLE_IMPLEMENTOR.to_string())
+        }
         PHASE_FOLD => {
             if command_nonempty(bindings, ROLE_FOLD) {
                 Some(ROLE_FOLD.to_string())
@@ -272,6 +274,7 @@ mod tests {
         assert!(is_grok_bound(PHASE_IMPLEMENT));
         assert!(is_grok_bound(PHASE_ADVANCE));
         assert!(is_grok_bound(PHASE_ADDRESS_FINDINGS));
+        assert!(is_grok_bound(PHASE_ADDRESS_CI));
         assert!(!is_grok_bound(PHASE_PLAN_REVIEW));
         assert!(!is_grok_bound(PHASE_CI_WAIT));
         assert!(!is_grok_bound(PHASE_CROSS_MODEL));
@@ -283,6 +286,7 @@ mod tests {
             phase_role_key(PHASE_ADDRESS_FINDINGS),
             Some(ROLE_IMPLEMENTOR)
         );
+        assert_eq!(phase_role_key(PHASE_ADDRESS_CI), Some(ROLE_IMPLEMENTOR));
         assert!(phase_role_key(PHASE_PLAN_REVIEW).is_none());
     }
 

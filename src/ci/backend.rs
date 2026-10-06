@@ -57,6 +57,10 @@ pub enum CiTarget {
         merged: bool,
         head_oid: Option<String>,
         merge_state: MergeStateStatus,
+        /// `headRefName` from `gh pr view`. Empty when the caller did not supply it.
+        head_ref: String,
+        /// Pull request title. Empty when the caller did not supply it.
+        title: String,
     },
     HeadSha {
         sha: String,
@@ -99,6 +103,29 @@ impl CheckBucket {
 pub struct CheckItem {
     pub name: String,
     pub bucket: CheckBucket,
+    /// Check description. Empty when `gh` omitted it. Capped at 1024 scalars.
+    pub description: String,
+    /// Check link. Empty when `gh` omitted it.
+    pub link: String,
+}
+
+impl CheckItem {
+    pub fn new(name: impl Into<String>, bucket: CheckBucket) -> Self {
+        Self {
+            name: name.into(),
+            bucket,
+            description: String::new(),
+            link: String::new(),
+        }
+    }
+
+    /// Keep at most 1024 Unicode scalars. Missing text stays empty.
+    pub fn cap_description(&mut self) {
+        const CAP: usize = 1024;
+        if self.description.chars().count() > CAP {
+            self.description = self.description.chars().take(CAP).collect();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
