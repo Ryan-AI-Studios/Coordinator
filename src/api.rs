@@ -1917,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn omit_track_picks_sticky_after_idle() {
+    fn omit_track_rejects_sticky_proposed_after_idle() {
         let _guard = test_env_lock();
         let (_home, proj, rec) = add_isolated_project();
         let cond = proj.path().join("conductor");
@@ -1939,9 +1939,9 @@ mod tests {
         state.last_event = crate::workflow::LAST_EVENT_BACKLOG_CLEAR.into();
         state.sticky_ready_ids = vec!["0002".into()];
         crate::state::save_run_state(&rec, &state).unwrap();
-        let (track, picked) = resolve_run_track(&rec, None).unwrap();
-        assert!(picked);
-        assert_eq!(track.as_deref(), Some("0002"));
+        let err = resolve_run_track(&rec, None).unwrap_err().to_string();
+        assert!(err.contains("no Ready"), "{err}");
+        assert!(err.contains("--track"), "{err}");
         clear_home();
     }
 
