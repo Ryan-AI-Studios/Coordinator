@@ -55,6 +55,8 @@ pub(crate) fn run_with_origin(
                         "omit-pick: shipped track {id} is not resumable; pass --track <id>"
                     )));
                 }
+                let next_epoch = state.run_epoch.saturating_add(1);
+                crate::worktree::prepare_epoch(record, next_epoch)?;
                 let leftover = state.failure_class.is_some()
                     || crate::notify::artifact::existing_path(record).is_some();
                 let already_settled = state.last_event == crate::notify::SETTLED_DETAIL;
@@ -320,6 +322,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: Utc::now(),

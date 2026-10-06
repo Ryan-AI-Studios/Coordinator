@@ -282,6 +282,9 @@ pub enum ProjectCommands {
         /// true | false (omit = leave unchanged). Opt-in Hermes progress POSTs.
         #[arg(long = "notify-progress", value_parser = parse_auto_merge)]
         notify_progress: Option<bool>,
+        /// true | false (omit = leave unchanged). Per-run_epoch detached worktree.
+        #[arg(long = "worktree-isolation", value_parser = parse_auto_merge)]
+        worktree_isolation: Option<bool>,
         /// Repeatable. Canonical phase id or `plan_review_slot` = seconds (>0).
         #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
         phase_timeouts: Vec<(String, u64)>,
@@ -427,6 +430,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 execution_repo_name,
                 auto_merge,
                 notify_progress,
+                worktree_isolation,
                 phase_timeouts,
                 clear_phase_timeout,
                 clear_phase_timeouts,
@@ -465,6 +469,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     execution_repo_name,
                     auto_merge,
                     notify_progress,
+                    worktree_isolation,
                     phase_timeouts_secs,
                     clear_phase_timeouts,
                     clear_phase_timeout,
@@ -919,6 +924,11 @@ mod tests {
         assert!(
             set.get_arguments().any(|a| a.get_id() == "notify_progress"),
             "set --notify-progress"
+        );
+        assert!(
+            set.get_arguments()
+                .any(|a| a.get_id() == "worktree_isolation"),
+            "set --worktree-isolation"
         );
     }
 

@@ -634,7 +634,12 @@ async fn start_inner(
         if let Some(s) = pool.status_of(&rec.id)
             && s.alive
         {
-            if refuse || !s.adapter.eq_ignore_ascii_case(harness) {
+            let want = grok_cwd(&rec);
+            let cwd_mismatch = s
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| !crate::worktree::paths_same(cwd, &want));
+            if refuse || !s.adapter.eq_ignore_ascii_case(harness) || cwd_mismatch {
                 if let Some(mut session) = pool.remove(&rec.id) {
                     let _ = session.shutdown().await;
                 }
@@ -672,6 +677,15 @@ async fn reuse_or_reap_existing(
     if !existing.alive {
         return Ok(None);
     }
+    let want = grok_cwd(record);
+    if existing
+        .cwd
+        .as_ref()
+        .is_some_and(|cwd| !crate::worktree::paths_same(cwd, &want))
+    {
+        reap_stale_holder(record, &existing);
+        return Ok(None);
+    }
     if crate::harness::abort::should_refuse_reuse(record) {
         reap_stale_holder(record, &existing);
         return Ok(None);
@@ -701,6 +715,59 @@ fn clear_stale_holder_persist(record: &ProjectRecord) -> Result<()> {
         let _ = std::fs::remove_file(&path);
     }
     Ok(())
+}
+
+/// Persist fields the worktree live-check and sync shutdown need.
+#[derive(Debug, Clone)]
+pub(crate) struct PersistLive {
+    pub cwd: Option<PathBuf>,
+    pub pid: Option<u32>,
+    pub holder_pid: Option<u32>,
+    pub alive: bool,
+    pub prompt_in_flight: bool,
+}
+
+pub(crate) fn persist_live(record: &ProjectRecord) -> Option<PersistLive> {
+    let handle = load_persist(record).ok().flatten()?;
+    Some(PersistLive {
+        cwd: handle.cwd,
+        pid: handle.pid,
+        holder_pid: handle.holder_pid,
+        alive: handle.alive,
+        prompt_in_flight: handle.prompt_in_flight,
+    })
+}
+
+pub(crate) fn clear_persist_file(record: &ProjectRecord) {
+    let _ = clear_stale_holder_persist(record);
+}
+
+pub(crate) fn kill_live_pids(live: &PersistLive) {
+    if let Some(pid) = live.pid {
+        crate::harness::grok::tree_kill_pid(pid);
+    }
+    if let Some(holder) = live.holder_pid
+        && live.pid != Some(holder)
+    {
+        crate::harness::grok::tree_kill_pid(holder);
+    }
+}
+
+/// Drop an in-memory session whose cwd matches `pred`. Lock contention leaves it.
+pub(crate) fn detach_pooled_if_cwd(project_id: &str, pred: impl Fn(&std::path::Path) -> bool) {
+    let Some(pool) = POOL.get() else {
+        return;
+    };
+    let Ok(mut guard) = pool.try_lock() else {
+        return;
+    };
+    let matches = guard
+        .status_of(project_id)
+        .and_then(|status| status.cwd)
+        .is_some_and(|cwd| pred(&cwd));
+    if matches {
+        let _ = guard.remove(project_id);
+    }
 }
 
 /// After persist was cleared, interpret a newly written handle.
@@ -2081,6 +2148,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reuse_reaps_when_persisted_cwd_differs() {
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: "cwd-mismatch".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: Default::default(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            created_at: chrono::Utc::now(),
+        };
+        crate::state::ensure_state_dir(&rec).unwrap();
+        let handle = PersistedGrokHandle {
+            version: 1,
+            project_id: rec.id.clone(),
+            session_id: Some("sess".into()),
+            cwd: Some(PathBuf::from(r"C:\other\epoch")),
+            pid: None,
+            holder_pid: None,
+            control_addr: Some("127.0.0.1:1".into()),
+            adapter: "grok".into(),
+            supports_compact: true,
+            alive: true,
+            prompt_in_flight: false,
+            error: None,
+        };
+        save_persist(&rec, &handle).unwrap();
+        let got = reuse_or_reap_existing(&rec, "grok").await.unwrap();
+        assert!(got.is_none());
+        assert!(load_persist(&rec).unwrap().is_none());
+    }
+
     #[test]
     fn retry_after_failed_start_clears_stale_error() {
         let dir = tempdir().unwrap();
@@ -2096,6 +2204,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -2167,6 +2276,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -2206,6 +2316,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -2236,6 +2347,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -2259,6 +2371,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -2292,6 +2405,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -2666,6 +2780,7 @@ Loop\r\n",
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -3025,6 +3140,7 @@ Loop\r\n",
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),

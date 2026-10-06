@@ -70,7 +70,7 @@ Empty `COORDINATOR_HOME` or `COORDINATOR_STATE_DIR` is rejected.
 
 ### Layout Profiles (path bindings)
 
-Each registered project has a **layout profile** that tells the Control Plane how to resolve Workspace Root, conductor dir, execution repo(s), and state dir. Session pool key for later harness tracks is **`project_id` + workspace `path`** (path is immutable via `project set`).
+Each registered project has a **layout profile** that tells the Control Plane how to resolve Workspace Root, conductor dir, execution repo(s), and state dir. Session pool key is **`project_id`** (workspace `path` is immutable via `project set`).
 
 | Profile | Workspace | Conductor (default) | Execution | Typical use |
 |---------|-----------|---------------------|-----------|-------------|

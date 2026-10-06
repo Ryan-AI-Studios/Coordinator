@@ -238,7 +238,7 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
         .join("review-track")
         .join("SKILL.md");
     let file = format!("{slug}-review.md");
-    let layout = crate::workflow::prompts::layout_block(record, track_id);
+    let layout = crate::workflow::prompts::layout_block(record, track_id, "plan-review");
     let research = if slug == REVIEW_SLUG_OPENCODE {
         "Knowledge is stale. Verify APIs, hooks, and plan-vs-live-src against docs.rs, \
          official harness docs, and the execution repo — not crate-version pins.\n\
@@ -1625,6 +1625,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),

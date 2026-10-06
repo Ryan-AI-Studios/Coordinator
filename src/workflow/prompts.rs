@@ -17,14 +17,28 @@ const END_TURN: &str = "After artifacts exist, end this turn. Coordinator applie
 Do not run `coordinator outcome write` during this inject.";
 
 /// 0012 / 0016 layout lines plus the pinned planning-outside-product sentence.
-pub(crate) fn layout_block(record: &ProjectRecord, track_id: Option<&str>) -> String {
+///
+/// `implement` and `address-findings` name the epoch worktree as the execution
+/// repo when that directory exists. Other phases keep the shared execution repo
+/// and add an `Epoch worktree:` line.
+pub(crate) fn layout_block(record: &ProjectRecord, track_id: Option<&str>, phase: &str) -> String {
     let paths = crate::layout::resolve(record);
-    let workspace = paths.workspace_root.display();
-    let execution = paths
-        .execution_repo
+    let epoch = crate::worktree::active_epoch_dir(record);
+    let use_epoch = epoch.is_some() && matches!(phase, PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS);
+    let execution = if use_epoch {
+        epoch.as_ref().map(|p| p.display().to_string())
+    } else {
+        paths
+            .execution_repo
+            .as_ref()
+            .map(|p| p.display().to_string())
+    }
+    .unwrap_or_else(|| "(unset)".into());
+    let epoch_line = epoch
         .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "(unset)".into());
+        .map(|p| format!("Epoch worktree: {}\n", p.display()))
+        .unwrap_or_default();
+    let workspace = paths.workspace_root.display();
     let conductor = paths.conductor_dir.display();
     let state = paths.state_dir.display();
     let track_hint = track_id
@@ -46,6 +60,7 @@ pub(crate) fn layout_block(record: &ProjectRecord, track_id: Option<&str>) -> St
          {repos_block}\
          Conductor directory: {conductor}\n\
          State directory: {state}\n\
+         {epoch_line}\
          {track_hint}\
          Planning, conductor tracks, ADRs, and deferred.md stay outside the product git. \
          Never commit them into the execution repo.\n\
@@ -69,11 +84,9 @@ fn workspace_skill(record: &ProjectRecord, name: &str) -> String {
 
 fn execution_skill(record: &ProjectRecord, name: &str) -> String {
     let paths = crate::layout::resolve(record);
-    let root = paths
-        .execution_repo
-        .as_ref()
-        .unwrap_or(&paths.workspace_root);
-    skill_md(root, name).display().to_string()
+    let fallback = paths.execution_repo.clone().unwrap_or(paths.workspace_root);
+    let root = crate::worktree::active_epoch_dir(record).unwrap_or(fallback);
+    skill_md(&root, name).display().to_string()
 }
 
 fn honor_skill(name: &str, path: &str) -> String {
@@ -138,7 +151,7 @@ fn list_gate_archives(
 /// Injected into Grok-bound phases (plan / fold / implement / advance).
 pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>) -> String {
     let track = track_id.unwrap_or("(none)");
-    let layout = layout_block(record, track_id);
+    let layout = layout_block(record, track_id, phase);
     let body = match phase {
         PHASE_PLAN => {
             let path = workspace_skill(record, "plan");
@@ -275,6 +288,7 @@ mod tests {
             auto_merge: false,
             phase_timeouts_secs: BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: Utc::now(),
@@ -343,6 +357,7 @@ mod tests {
             auto_merge: false,
             phase_timeouts_secs: BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: Utc::now(),
@@ -560,6 +575,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: Utc::now(),

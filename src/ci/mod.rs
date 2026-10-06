@@ -113,7 +113,7 @@ pub fn drive_with(
     state: &RunState,
     backend: &dyn CiBackend,
 ) -> Result<Option<StatusView>> {
-    let Some(cwd) = crate::layout::resolve(record).execution_repo else {
+    let Some(cwd) = crate::worktree::product_git_cwd(record) else {
         return apply_failure(
             record,
             state,
@@ -1089,7 +1089,7 @@ fn lookup_green_open_pr(record: &ProjectRecord) -> Result<Option<u64>> {
     #[cfg(not(test))]
     {
         let state = load_run_state(record)?;
-        let Some(cwd) = crate::layout::resolve(record).execution_repo else {
+        let Some(cwd) = crate::worktree::product_git_cwd(record) else {
             return Ok(None);
         };
         open_pr_is_green(&state, &GhCli, &cwd)
@@ -1144,6 +1144,7 @@ mod tests {
             auto_merge,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: Utc::now(),

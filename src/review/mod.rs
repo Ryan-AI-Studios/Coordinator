@@ -91,7 +91,7 @@ pub fn drive_with(
     backend: &dyn ReviewBackend,
 ) -> Result<Option<StatusView>> {
     let paths = crate::layout::resolve(record);
-    let Some(exec_repo) = paths.execution_repo else {
+    let Some(exec_repo) = crate::worktree::product_git_cwd(record) else {
         return apply_failure(
             record,
             state,
@@ -571,6 +571,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: Default::default(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: Utc::now(),

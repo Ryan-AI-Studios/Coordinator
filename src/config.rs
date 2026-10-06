@@ -438,7 +438,8 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_NOTIFY_PROGRESS`, `.env` via `load_dotenv_path`,
 /// `COORDINATOR_PROGRESS_STALL_SECS`, `COORDINATOR_JOURNAL`,
 /// `COORDINATOR_CANCEL_WAIT_SECS`, `COORDINATOR_AGY_BIN`,
-/// `COORDINATOR_OPENCODE_BIN`, or `COORDINATOR_GROK_BIN` must
+/// `COORDINATOR_OPENCODE_BIN`, `COORDINATOR_GROK_BIN`,
+/// `COORDINATOR_WORKTREE`, or `COORDINATOR_WORKTREE_REAP_SECS` must
 /// hold this (survives poison so one failure does not cascade).
 /// Last-used persist tests (`last-used.json`) also isolate `COORDINATOR_HOME`.
 #[cfg(test)]
