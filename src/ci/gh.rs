@@ -21,7 +21,10 @@ const DEFAULT_PR_BODY: &str =
 /// `gh pr view --json` fields. `mergedAt` is requested so `parse_pr_view` can
 /// see it; `state == MERGED` remains the primary shipped signal.
 const PR_VIEW_JSON_FIELDS: &str =
-    "number,url,isDraft,state,headRefName,mergeable,headRefOid,mergedAt,mergeStateStatus";
+    "number,url,isDraft,state,headRefName,title,mergeable,headRefOid,mergedAt,mergeStateStatus";
+
+/// `gh pr checks --json` fields. The manual has no log field (fetched 2026-10-06).
+const PR_CHECKS_JSON_FIELDS: &str = "bucket,name,state,description,link";
 
 /// Pure argv for `gh pr list --head` (no spawn). `state` is `open` then `merged`.
 fn pr_list_head_args(branch: &str, state: &str) -> Vec<String> {
@@ -323,6 +326,8 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
             merged: false,
             head_oid: Some(head),
             merge_state: MergeStateStatus::Unspecified,
+            head_ref: branch.clone(),
+            title: title.clone(),
         }));
     }
     match cli.resolve_pr(cwd, None) {
@@ -403,6 +408,16 @@ fn parse_pr_view(stdout: &str) -> Result<Option<CiTarget>> {
         .and_then(|x| x.as_str())
         .map(MergeStateStatus::parse_live)
         .unwrap_or(MergeStateStatus::Unknown);
+    let head_ref = v
+        .get("headRefName")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let title = v
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     Ok(Some(CiTarget::PullRequest {
         number,
         url,
@@ -410,6 +425,8 @@ fn parse_pr_view(stdout: &str) -> Result<Option<CiTarget>> {
         merged,
         head_oid,
         merge_state,
+        head_ref,
+        title,
     }))
 }
 
@@ -445,7 +462,7 @@ fn pr_checks_args(number: u64, required: bool) -> Vec<String> {
         "checks".into(),
         number.to_string(),
         "--json".into(),
-        "bucket,name,state".into(),
+        PR_CHECKS_JSON_FIELDS.into(),
     ];
     if required {
         args.insert(3, "--required".into());
@@ -527,7 +544,22 @@ fn parse_pr_checks(stdout: &str, raw_exit: i32) -> Result<CheckSnapshot> {
                 .and_then(|x| x.as_str())
                 .map(CheckBucket::parse)
                 .unwrap_or(CheckBucket::Pending);
-            CheckItem { name, bucket }
+            let mut item = CheckItem {
+                name,
+                bucket,
+                description: row
+                    .get("description")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                link: row
+                    .get("link")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            };
+            item.cap_description();
+            item
         })
         .collect();
     Ok(CheckSnapshot {
@@ -594,7 +626,7 @@ fn parse_run_list(stdout: &str, raw_exit: i32) -> Result<CheckSnapshot> {
                     other => CheckBucket::parse(other),
                 }
             };
-            CheckItem { name, bucket }
+            CheckItem::new(name, bucket)
         })
         .collect();
     Ok(CheckSnapshot {
@@ -1103,9 +1135,12 @@ mod parse_tests {
         assert!(
             required
                 .windows(2)
-                .any(|w| w == ["--json", "bucket,name,state"])
+                .any(|w| { w == ["--json", "bucket,name,state,description,link"] })
         );
-        assert!(all.windows(2).any(|w| w == ["--json", "bucket,name,state"]));
+        assert!(
+            all.windows(2)
+                .any(|w| w == ["--json", "bucket,name,state,description,link"])
+        );
         assert!(
             !all.contains(&"--required"),
             "all-checks argv must not contain --required: {all:?}"
@@ -1185,6 +1220,34 @@ mod parse_tests {
         assert_eq!(snap.raw_exit, 8);
         assert_eq!(snap.items[0].bucket, CheckBucket::Pass);
         assert_eq!(snap.items[1].bucket, CheckBucket::Pending);
+        assert!(snap.items[0].description.is_empty());
+        assert!(snap.items[0].link.is_empty());
+    }
+
+    #[test]
+    fn parse_pr_checks_keeps_description_and_link() {
+        let long = "x".repeat(1100);
+        let json = format!(
+            r#"[{{"name":"fmt","bucket":"fail","state":"FAILURE","description":"{long}","link":"https://example/fmt"}}]"#
+        );
+        let snap = parse_pr_checks(&json, 1).unwrap();
+        assert_eq!(snap.items[0].description.chars().count(), 1024);
+        assert_eq!(snap.items[0].link, "https://example/fmt");
+    }
+
+    #[test]
+    fn parse_pr_view_keeps_head_ref_and_title() {
+        let json = r#"{"number":71,"url":"https://example/pr/71","isDraft":false,"state":"OPEN","headRefName":"track/0071-CiFailureRoutesToImplementer","title":"track(0071): route ci","headRefOid":"abc"}"#;
+        let t = parse_pr_view(json).unwrap().unwrap();
+        match t {
+            CiTarget::PullRequest {
+                head_ref, title, ..
+            } => {
+                assert_eq!(head_ref, "track/0071-CiFailureRoutesToImplementer");
+                assert_eq!(title, "track(0071): route ci");
+            }
+            _ => panic!("expected PR"),
+        }
     }
 
     #[test]

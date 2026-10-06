@@ -182,6 +182,12 @@ pub struct RunState {
     /// Bounded self-check snap (0070). Cleared on fresh `run`. Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_check: Option<SelfCheckState>,
+    /// Required-check repair entries this `run_epoch` (0071). Cap 2. Always serialized on disk.
+    #[serde(default)]
+    pub ci_fix_attempts: u32,
+    /// Payload for the current `address-ci` inject (0071). Omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_fix_request: Option<CiFixRequest>,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -239,6 +245,23 @@ pub struct CiWatchState {
     pub publish_attempted_sha: Option<String>,
 }
 
+/// One failing required check handed to `address-ci` (0071).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiFixCheck {
+    pub name: String,
+    pub bucket: String,
+    pub description: String,
+    pub link: String,
+}
+
+/// Durable `address-ci` payload (0071). `from_sha` is the PR head at route time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiFixRequest {
+    pub pr_number: u64,
+    pub from_sha: String,
+    pub checks: Vec<CiFixCheck>,
+}
+
 impl RunState {
     pub fn idle(project_id: impl Into<String>) -> Self {
         Self {
@@ -278,6 +301,8 @@ impl RunState {
             policy_approvals: Vec::new(),
             state_gate: None,
             self_check: None,
+            ci_fix_attempts: 0,
+            ci_fix_request: None,
         }
     }
 
@@ -431,6 +456,9 @@ pub struct WorkflowView {
     /// Omitted on happy-path JSON when 0.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub address_findings_attempts: u32,
+    /// Omitted on happy-path JSON when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub ci_fix_attempts: u32,
 }
 
 impl StatusView {
@@ -459,6 +487,7 @@ impl StatusView {
                 driver: state.driver.as_str().to_string(),
                 pending_roles: state.pending_roles.clone(),
                 address_findings_attempts: state.address_findings_attempts,
+                ci_fix_attempts: state.ci_fix_attempts,
             }),
             failure_artifact: crate::notify::artifact::existing_path(record),
             failure_superseded: failure_superseded_for(record, state),
@@ -675,6 +704,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         }
     }

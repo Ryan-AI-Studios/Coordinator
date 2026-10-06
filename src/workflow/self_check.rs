@@ -434,6 +434,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: on,
+            ci_fix_routing: false,
             created_at: ChronoUtc::now(),
         }
     }
@@ -705,6 +706,23 @@ mod tests {
         assert!(!fold.contains("self-check: continue"));
         let plan = crate::workflow::prompts::phase_prompt(&rec, "plan", Some("0070"));
         assert!(!plan.contains("self-check: continue"));
+        let address_ci = crate::workflow::prompts::phase_prompt(&rec, "address-ci", Some("0071"));
+        assert!(address_ci.contains("git push"), "{address_ci}");
+        assert!(address_ci.contains("gh pr create"), "{address_ci}");
+        assert!(address_ci.contains("gh pr merge"), "{address_ci}");
+        assert!(!address_ci.contains("self-check:"), "{address_ci}");
+    }
+
+    #[test]
+    fn address_ci_does_not_continue_self_check() {
+        let mut state = running("address-ci");
+        state.last_driven_phase = Some("address-ci".into());
+        state.self_check = Some(crate::state::SelfCheckState {
+            pending_inject: true,
+            steps: 1,
+            ..crate::state::SelfCheckState::default()
+        });
+        assert!(!continuation_pending(&state));
     }
 
     #[test]

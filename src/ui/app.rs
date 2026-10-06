@@ -8,10 +8,10 @@ use dioxus::prelude::*;
 
 use crate::error::CoordinatorError;
 use crate::ui::model::{
-    AUTO_START_ROW_LABEL, CardPrimaryAction, CardState, ChipKind, FleetSnapshot, ProjectCard,
-    SELF_CHECK_ROW_LABEL, STATE_GATE_ROW_LABEL, add_project, card_primary_action, load_fleet,
-    pause_all, resume_selected, run_selected, selected_is_paused, self_check_row, state_gate_row,
-    stop_selected, ticker_label,
+    AUTO_START_ROW_LABEL, CI_FIX_ROW_LABEL, CardPrimaryAction, CardState, ChipKind, FleetSnapshot,
+    ProjectCard, SELF_CHECK_ROW_LABEL, STATE_GATE_ROW_LABEL, add_project, card_primary_action,
+    ci_fix_row, load_fleet, pause_all, resume_selected, run_selected, selected_is_paused,
+    self_check_row, state_gate_row, stop_selected, ticker_label,
 };
 use crate::ui::{WEBVIEW2_MISSING_HINT, model::card_title};
 use crate::watch::ServeAttach;
@@ -726,6 +726,7 @@ fn project_card(
     let policy = card.view.auto_start.as_str().to_string();
     let state_gate = state_gate_row(&card.view);
     let self_check = self_check_row(&card.view);
+    let ci_fix = ci_fix_row(&card.view);
     let parked = card.view.parked_next.clone();
     let layout = card.view.layout_profile.as_str().to_string();
     let (pill_class, pill_label) = status_pill(card.card_state);
@@ -873,6 +874,13 @@ fn project_card(
                         span { class: "label", "{SELF_CHECK_ROW_LABEL}" }
                         span { class: "value", "{check}" }
                         span { class: "pill idle", "self-check" }
+                    }
+                }
+                if let Some(fix) = ci_fix {
+                    div { class: "row",
+                        span { class: "label", "{CI_FIX_ROW_LABEL}" }
+                        span { class: "value", "{fix}" }
+                        span { class: "pill idle", "ci-fix" }
                     }
                 }
                 if let Some(parked) = parked {
@@ -1025,6 +1033,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);
@@ -1073,6 +1082,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);

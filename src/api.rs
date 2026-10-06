@@ -70,6 +70,8 @@ pub struct ProjectSetRequest {
     #[serde(default)]
     pub self_continuation: Option<bool>,
     #[serde(default)]
+    pub ci_fix_routing: Option<bool>,
+    #[serde(default)]
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     pub clear_phase_timeouts: Option<bool>,
@@ -310,6 +312,7 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         notify_progress: req.notify_progress,
         worktree_isolation: req.worktree_isolation,
         self_continuation: req.self_continuation,
+        ci_fix_routing: req.ci_fix_routing,
         phase_timeouts_secs: req.phase_timeouts_secs,
         clear_phase_timeouts: req.clear_phase_timeouts.unwrap_or(false),
         clear_phase_timeout: req.clear_phase_timeout.unwrap_or_default(),

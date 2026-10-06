@@ -56,6 +56,8 @@ pub struct ProjectSetOptions {
     pub worktree_isolation: Option<bool>,
     /// Omit = leave unchanged. Bounded self-check between adapter turns (track 0070).
     pub self_continuation: Option<bool>,
+    /// Omit = leave unchanged. Route a required-check failure into address-ci (track 0071).
+    pub ci_fix_routing: Option<bool>,
     /// Overlay keys (None = no overlay). Merge; does not replace the map.
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
     /// Wipe the project timeout map before overlay.
@@ -116,6 +118,10 @@ pub struct ProjectRecord {
     /// Missing field on old records = off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub self_continuation: bool,
+    /// Opt-in route from a required-check failure into same-epoch `address-ci` (track 0071).
+    /// Missing field on old records = off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ci_fix_routing: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -277,6 +283,7 @@ impl Registry {
             auto_start: opts.auto_start.unwrap_or_default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
@@ -343,6 +350,9 @@ impl Registry {
         }
         if let Some(v) = opts.self_continuation {
             rec.self_continuation = v;
+        }
+        if let Some(v) = opts.ci_fix_routing {
+            rec.ci_fix_routing = v;
         }
         // Clears first, then overlay so clear-all + plan=3600 leaves only plan.
         if opts.clear_phase_timeouts {
@@ -870,6 +880,46 @@ mod tests {
         assert!(
             !text.contains("self_continuation"),
             "false self_continuation must omit the key: {text}"
+        );
+    }
+
+    #[test]
+    fn set_ci_fix_routing_round_trip_omits_false() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        assert!(!rec.ci_fix_routing);
+        let on = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    ci_fix_routing: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(on.ci_fix_routing);
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert!(loaded.projects[0].ci_fix_routing);
+        let mut r = Registry::load(&reg_path).unwrap();
+        let off = r
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    ci_fix_routing: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!off.ci_fix_routing);
+        r.save(&reg_path).unwrap();
+        let text = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(
+            !text.contains("ci_fix_routing"),
+            "false ci_fix_routing must omit the key: {text}"
         );
     }
 

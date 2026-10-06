@@ -51,6 +51,7 @@ pub fn default_timeout_secs(phase: &str) -> u64 {
         graph::PHASE_COMPACT => 600,
         graph::PHASE_ADVANCE => 900,
         graph::PHASE_ADDRESS_FINDINGS => 3600,
+        graph::PHASE_ADDRESS_CI => 1800,
         _ => 300,
     }
 }
@@ -119,7 +120,7 @@ pub fn is_timeout_key(key: &str) -> bool {
 
 fn unknown_timeout_key_msg(key: &str) -> String {
     format!(
-        "unknown phase '{key}'; expected a canonical phase id (plan, plan-review, fold, implement, cross-model-review, ci-wait, compact, advance, address-findings) or plan_review_slot"
+        "unknown phase '{key}'; expected a canonical phase id (plan, plan-review, fold, implement, cross-model-review, ci-wait, compact, advance, address-findings, address-ci) or plan_review_slot"
     )
 }
 
@@ -185,6 +186,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         }
     }
@@ -213,6 +215,7 @@ mod tests {
         assert_eq!(default_timeout_secs(graph::PHASE_COMPACT), 600);
         assert_eq!(default_timeout_secs(graph::PHASE_ADDRESS_FINDINGS), 3600);
         assert_ne!(default_timeout_secs(graph::PHASE_ADDRESS_FINDINGS), 300);
+        assert_eq!(default_timeout_secs(graph::PHASE_ADDRESS_CI), 1800);
     }
 
     #[test]

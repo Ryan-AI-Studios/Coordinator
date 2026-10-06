@@ -491,10 +491,15 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
     let mut state = base.clone();
     let canonical = crate::workflow::is_canonical(&outcome.phase);
     let mut bounced = false;
+    let mut address_ci_stop: Option<String> = None;
     match outcome.status {
         OutcomeStatus::Success => {
             if canonical {
-                crate::workflow::on_success(record, &mut state, &outcome);
+                if let crate::workflow::AddressCiFollowUp::Stopped { message } =
+                    crate::workflow::on_success(record, &mut state, &outcome)
+                {
+                    address_ci_stop = Some(message);
+                }
             } else {
                 state.phase = STUB_PHASE_COMPLETED.into();
                 state.failure_class = None;
@@ -616,7 +621,25 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
         kind = "end";
         notify = None;
     }
-    let progress = if crate::notify::progress_enabled(record)
+    if let Some(message) = address_ci_stop.clone() {
+        kind = "fail";
+        let artifact_path = crate::notify::artifact::path(record)
+            .unwrap_or_else(|_| record.path.join(".coordinator").join("FAILURE.md"));
+        notify = Some(crate::notify::NotifyEvent {
+            project_id: record.id.clone(),
+            track_id: state.track_id.clone(),
+            phase: state.phase.clone(),
+            failure_class: FailureClass::CiFailed,
+            message: Some(message),
+            last_event: state.last_event.clone(),
+            artifact_path,
+            written_at: outcome.written_at,
+            run_epoch: state.run_epoch,
+        });
+    }
+    let progress = if address_ci_stop.is_some() {
+        None
+    } else if crate::notify::progress_enabled(record)
         && ((matches!(outcome.status, OutcomeStatus::Success) && canonical) || bounced)
     {
         let to_phase = if state.status == RunStatus::Idle {
@@ -890,6 +913,7 @@ mod tests {
             auto_start: Default::default(),
             state_policies: Vec::new(),
             self_continuation: false,
+            ci_fix_routing: false,
             created_at: Utc::now(),
         }
     }
