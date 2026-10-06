@@ -830,6 +830,48 @@ pub async fn cmd_harness_grok_hold(project: Option<&str>) -> Result<()> {
     crate::harness::hold(project).await
 }
 
+/// `decision record`. CLI passes `infer_cwd = true`.
+pub fn cmd_decision_record(
+    project: Option<&str>,
+    track: &str,
+    by: &str,
+    sentence: &str,
+    supersede: bool,
+    infer_cwd: bool,
+) -> Result<crate::workflow::decision::RecordEffect> {
+    let record = resolve_selected(project, infer_cwd)?;
+    crate::workflow::decision::record_for(
+        &record,
+        track,
+        by,
+        sentence,
+        supersede,
+        chrono::Utc::now(),
+    )
+}
+
+/// `decision show`. CLI passes `infer_cwd = true`.
+pub fn cmd_decision_show(
+    project: Option<&str>,
+    track: &str,
+    json: bool,
+    infer_cwd: bool,
+) -> Result<String> {
+    let record = resolve_selected(project, infer_cwd)?;
+    crate::workflow::decision::show_for(&record, track, json)
+}
+
+/// `decision list`. CLI passes `infer_cwd = true`.
+pub fn cmd_decision_list(
+    project: Option<&str>,
+    track: &str,
+    json: bool,
+    infer_cwd: bool,
+) -> Result<String> {
+    let record = resolve_selected(project, infer_cwd)?;
+    crate::workflow::decision::list_for(&record, track, json)
+}
+
 /// Persist a scan root into machine config (optional convenience).
 pub fn save_scan_root(root: &Path) -> Result<config::MachineConfig> {
     let mut cfg = config::load_machine_config()?;

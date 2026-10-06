@@ -44,6 +44,7 @@
 //! Opt-in per-`run_epoch` detached worktree under the project state dir: track **0066**.
 //! Epoch checkpoint ref before `implement`, plus operator restore: track **0067**.
 //! Opt-in Hermes fleet summary (`notify fleet-summary` and serve cadence): track **0068**.
+//! Recorded owner-decision channel (`decision record|show|list`, one active comment block, fold inject): track **0077**.
 
 pub mod api;
 pub mod checkpoint;

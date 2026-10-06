@@ -71,7 +71,7 @@ fn is_version_line(line: &str) -> bool {
     !token.is_empty() && !token.chars().any(char::is_whitespace)
 }
 
-fn is_utc_line(line: &str) -> bool {
+pub(crate) fn is_utc_line(line: &str) -> bool {
     let bytes = line.as_bytes();
     if bytes.len() != 20 {
         return false;
