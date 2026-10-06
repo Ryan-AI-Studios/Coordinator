@@ -251,6 +251,18 @@ pub fn session_rows(view: &StatusView) -> Vec<SessionRow> {
             } else {
                 "compact: no".into()
             });
+            if let Some(usage) = &g.context_usage {
+                bits.push(format!("context: {}/{}", usage.used, usage.size));
+                if let Some(cost) = &usage.cost {
+                    bits.push(format!("cost: {cost}"));
+                }
+            }
+            if let Some(signal) = &g.last_signal {
+                bits.push(signal.clone());
+            }
+            if let Some(title) = &g.last_tool_title {
+                bits.push(format!("tool: {title}"));
+            }
             rows.push(SessionRow {
                 role: acp_role_cell(&view.phase),
                 harness: acp_harness_cell(&g.adapter),
@@ -831,6 +843,9 @@ mod tests {
                 supports_compact: true,
                 pid: Some(42),
                 adapter: "grok".into(),
+                context_usage: None,
+                last_signal: None,
+                last_tool_title: None,
             }),
         });
         let rows = session_rows(&v);
@@ -865,6 +880,9 @@ mod tests {
                 supports_compact: true,
                 pid: Some(42),
                 adapter: "cursor".into(),
+                context_usage: None,
+                last_signal: None,
+                last_tool_title: None,
             }),
         });
         let rows = session_rows(&v);
@@ -872,6 +890,55 @@ mod tests {
         assert_eq!(rows[0].harness, "cursor via grok holder");
         assert!(rows[0].detail.contains("pid 42"));
         assert!(rows[0].detail.contains("compact: yes"));
+        assert!(!rows[0].detail.contains("context:"));
+    }
+
+    #[test]
+    fn session_rows_include_context_only_when_usage_is_present() {
+        let mut bare = view(RunStatus::Running, PHASE_IMPLEMENT, None, None);
+        bare.harness = Some(HarnessStatusBundle {
+            grok: Some(GrokHarnessStatus {
+                alive: true,
+                session_id: Some("s".into()),
+                cwd: Some(PathBuf::from(r"C:\dev\demo")),
+                supports_compact: true,
+                pid: Some(7),
+                adapter: "grok".into(),
+                context_usage: None,
+                last_signal: None,
+                last_tool_title: None,
+            }),
+        });
+        let plain = session_rows(&bare);
+        assert!(!plain[0].detail.contains("context:"));
+        assert!(!plain[0].detail.contains("cost:"));
+        assert!(!plain[0].detail.contains("tool:"));
+
+        let mut v = bare;
+        v.harness = Some(HarnessStatusBundle {
+            grok: Some(GrokHarnessStatus {
+                alive: true,
+                session_id: Some("s".into()),
+                cwd: Some(PathBuf::from(r"C:\dev\demo")),
+                supports_compact: false,
+                pid: Some(7),
+                adapter: "grok".into(),
+                context_usage: Some(crate::harness::capabilities::ContextUsage {
+                    used: 10,
+                    size: 100,
+                    cost: Some("0.01 USD".into()),
+                }),
+                last_signal: Some(crate::harness::capabilities::APPROVALS_AUTO_ALLOWED.to_string()),
+                last_tool_title: Some("read file".into()),
+            }),
+        });
+        let detail = &session_rows(&v)[0].detail;
+        let compact_at = detail.find("compact: no").unwrap();
+        let context_at = detail.find("context: 10/100").unwrap();
+        assert!(compact_at < context_at);
+        assert!(detail.contains("cost: 0.01 USD"));
+        assert!(detail.contains(crate::harness::capabilities::APPROVALS_AUTO_ALLOWED));
+        assert!(detail.contains("tool: read file"));
     }
 
     #[test]

@@ -1162,6 +1162,9 @@ mod tests {
                 supports_compact: true,
                 pid: Some(1),
                 adapter: "grok".into(),
+                context_usage: None,
+                last_signal: None,
+                last_tool_title: None,
             }),
         });
         view.ci = Some(crate::state::CiStatusView {
