@@ -32,8 +32,12 @@ use crate::error::Result;
 use crate::layout;
 use crate::registry::ProjectRecord;
 
-/// Cwd for Grok: `execution_repo` if set, else `workspace_root`.
+/// Cwd for Grok: the active epoch worktree when isolation is on and that
+/// directory exists, otherwise `execution_repo` if set, else `workspace_root`.
 pub fn grok_cwd(record: &ProjectRecord) -> PathBuf {
+    if let Some(epoch) = crate::worktree::active_epoch_dir(record) {
+        return epoch;
+    }
     let paths = layout::resolve(record);
     paths.execution_repo.unwrap_or(paths.workspace_root)
 }

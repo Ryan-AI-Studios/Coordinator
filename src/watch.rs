@@ -402,6 +402,9 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
                         let _ = crate::api::settle_if_conductor_completed(&rec);
                     }
                 }
+                for rec in reg.list() {
+                    let _ = crate::worktree::reap_aged(rec);
+                }
             }
             Err(_) => {
                 // Registry missing/unreadable: skip tick.
@@ -472,6 +475,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -558,6 +562,7 @@ mod tests {
                 auto_merge: true,
                 phase_timeouts_secs: std::collections::BTreeMap::new(),
                 notify_progress: false,
+                worktree_isolation: false,
                 ready_aliases: Vec::new(),
                 auto_start: Default::default(),
                 created_at: chrono::Utc::now(),

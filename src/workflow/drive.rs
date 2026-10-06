@@ -45,10 +45,27 @@ pub fn tick(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
     }
 
     match state.driver {
-        WorkflowDriver::Stub => synth_success(record, &state, None, OutcomeSource::Test),
+        WorkflowDriver::Stub => {
+            stub_epoch_write(record, &state)?;
+            synth_success(record, &state, None, OutcomeSource::Test)
+        }
         WorkflowDriver::FileWait => Ok(None),
         WorkflowDriver::Adapter => drive_adapter(record, &state),
     }
+}
+
+/// Stub phases write one product file into the active epoch worktree.
+/// Flag off and a missing epoch directory leave the shared checkout untouched.
+fn stub_epoch_write(record: &ProjectRecord, state: &RunState) -> Result<()> {
+    if !crate::worktree::isolation_enabled(record).unwrap_or(false) {
+        return Ok(());
+    }
+    let Some(dir) = crate::worktree::active_epoch_dir(record) else {
+        return Ok(());
+    };
+    let body = format!("epoch={} phase={}\n", state.run_epoch, state.phase);
+    std::fs::write(dir.join("epoch-write.txt"), body)
+        .map_err(|e| CoordinatorError::Message(format!("stub epoch write: {e}")))
 }
 
 fn synth_success(
@@ -733,6 +750,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),

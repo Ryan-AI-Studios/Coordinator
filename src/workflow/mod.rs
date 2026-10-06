@@ -277,6 +277,15 @@ fn start_or_park(record: &ProjectRecord, state: &mut RunState, id: &str) {
     if let Some(policy) = park_policy(record, id) {
         park_next(record, state, id, policy);
     } else {
+        let next_epoch = state.run_epoch.saturating_add(1);
+        if let Err(e) = crate::worktree::prepare_epoch(record, next_epoch) {
+            state.status = RunStatus::Stopped;
+            state.failure_class = Some(FailureClass::HarnessCrash);
+            state.last_event = e.to_string();
+            state.phase_started_at = None;
+            state.pause_started_at = None;
+            return;
+        }
         auto_start(state, id);
         crate::outcome::clear_active_outcome_file(record);
         crate::workflow::drive::clear_plan_review_artifacts(record);
@@ -519,6 +528,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),

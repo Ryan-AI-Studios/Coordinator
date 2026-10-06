@@ -52,6 +52,8 @@ pub struct ProjectSetOptions {
     pub auto_merge: Option<bool>,
     /// Omit = leave unchanged. Opt-in Hermes progress POSTs (track 0033).
     pub notify_progress: Option<bool>,
+    /// Omit = leave unchanged. Per-`run_epoch` detached worktree (track 0066).
+    pub worktree_isolation: Option<bool>,
     /// Overlay keys (None = no overlay). Merge; does not replace the map.
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
     /// Wipe the project timeout map before overlay.
@@ -93,6 +95,9 @@ pub struct ProjectRecord {
     /// Opt-in Hermes progress POSTs (track 0033). Missing field on old records = off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notify_progress: bool,
+    /// Opt-in per-`run_epoch` detached worktree (track 0066). Missing field = off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worktree_isolation: bool,
     /// Extra omit-`--track` Ready phrases (0042). Empty = default `Ready — not started`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ready_aliases: Vec<String>,
@@ -258,6 +263,7 @@ impl Registry {
             auto_merge: opts.auto_merge.unwrap_or(true),
             phase_timeouts_secs: opts.phase_timeouts_secs,
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: opts.auto_start.unwrap_or_default(),
             created_at: Utc::now(),
@@ -320,6 +326,9 @@ impl Registry {
         }
         if let Some(v) = opts.notify_progress {
             rec.notify_progress = v;
+        }
+        if let Some(v) = opts.worktree_isolation {
+            rec.worktree_isolation = v;
         }
         // Clears first, then overlay so clear-all + plan=3600 leaves only plan.
         if opts.clear_phase_timeouts {
@@ -767,6 +776,46 @@ mod tests {
         assert!(
             !text.contains("notify_progress"),
             "false notify_progress must omit the key: {text}"
+        );
+    }
+
+    #[test]
+    fn set_worktree_isolation_round_trip_omits_false() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        assert!(!rec.worktree_isolation);
+        let on = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    worktree_isolation: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(on.worktree_isolation);
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert!(loaded.projects[0].worktree_isolation);
+        let mut r = Registry::load(&reg_path).unwrap();
+        let off = r
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    worktree_isolation: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!off.worktree_isolation);
+        r.save(&reg_path).unwrap();
+        let text = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(
+            !text.contains("worktree_isolation"),
+            "false worktree_isolation must omit the key: {text}"
         );
     }
 

@@ -783,10 +783,11 @@ impl GrokSession {
         };
         self.note_session_progress();
         let roots = self.fs_allowed_roots();
+        let deny = |path: &Path| self.blocks_shared_checkout(path);
         let reply = if read {
-            fs_read_reply(req_id, v.get("params"), &roots)
+            fs_read_reply(req_id, v.get("params"), &roots, &deny)
         } else {
-            fs_write_reply(req_id, v.get("params"), &roots)
+            fs_write_reply(req_id, v.get("params"), &roots, &deny)
         };
         self.write_line(&reply).await?;
         Ok(true)
@@ -810,7 +811,9 @@ impl GrokSession {
                 .and_then(|x| x.as_str())
         {
             let p = Path::new(raw);
-            if p.is_absolute() && !fs_path_allowed(p, &self.fs_allowed_roots()) {
+            if p.is_absolute()
+                && (self.blocks_shared_checkout(p) || !fs_path_allowed(p, &self.fs_allowed_roots()))
+            {
                 self.write_line(&rpc_error_value(
                     &req_id,
                     "terminal/create cwd is outside the project",
@@ -859,16 +862,50 @@ impl GrokSession {
     }
 
     /// Session cwd plus layout workspace / execution (planning tree is outside grok_cwd).
+    ///
+    /// When worktree isolation is on and the session cwd is a different path, the
+    /// shared execution repo is omitted. [`Self::blocks_shared_checkout`] also
+    /// rejects paths under that repo when an ancestor root (nested `workspace_root`)
+    /// would otherwise authorize them. The session cwd stays allowed, including a
+    /// worktree that lives under the execution-repo prefix.
     fn fs_allowed_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.cwd.clone()];
         if let Some(rec) = &self.progress_record {
             let paths = crate::layout::resolve(rec);
             roots.push(paths.workspace_root);
             if let Some(exec) = paths.execution_repo {
-                roots.push(exec);
+                let isolation = crate::worktree::isolation_enabled(rec).unwrap_or(false);
+                let distinct = !crate::worktree::paths_same(&exec, &self.cwd);
+                if !(isolation && distinct) {
+                    roots.push(exec);
+                }
             }
         }
         roots
+    }
+
+    /// Isolation on, session cwd is not the shared checkout, and `path` is that
+    /// checkout (or inside it) without also being inside the session cwd.
+    fn blocks_shared_checkout(&self, path: &Path) -> bool {
+        let Some(rec) = &self.progress_record else {
+            return false;
+        };
+        if !crate::worktree::isolation_enabled(rec).unwrap_or(false) {
+            return false;
+        }
+        let Some(exec) = crate::layout::resolve(rec).execution_repo else {
+            return false;
+        };
+        if crate::worktree::paths_same(&exec, &self.cwd) {
+            return false;
+        }
+        let under_exec = crate::worktree::paths_same(&exec, path) || path_is_under(&exec, path);
+        if !under_exec {
+            return false;
+        }
+        let under_cwd =
+            crate::worktree::paths_same(&self.cwd, path) || path_is_under(&self.cwd, path);
+        !under_cwd
     }
 
     async fn write_line(&self, json_line: &str) -> Result<()> {
@@ -1391,7 +1428,12 @@ fn fs_path_allowed(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path_is_under(root, path))
 }
 
-fn fs_read_reply(id: Value, params: Option<&Value>, roots: &[PathBuf]) -> String {
+fn fs_read_reply(
+    id: Value,
+    params: Option<&Value>,
+    roots: &[PathBuf],
+    deny: &dyn Fn(&Path) -> bool,
+) -> String {
     let Some(path) = params.and_then(|p| p.get("path")).and_then(|v| v.as_str()) else {
         return rpc_error_id(id, -32602, "fs/read_text_file missing path");
     };
@@ -1399,7 +1441,7 @@ fn fs_read_reply(id: Value, params: Option<&Value>, roots: &[PathBuf]) -> String
     if !p.is_absolute() {
         return rpc_error_id(id, -32602, "fs/read_text_file path must be absolute");
     }
-    if !fs_path_allowed(p, roots) {
+    if deny(p) || !fs_path_allowed(p, roots) {
         return rpc_error_id(id, -32602, "fs/read_text_file path is outside the project");
     }
     let line = params.and_then(|p| p.get("line")).and_then(|v| v.as_u64());
@@ -1413,7 +1455,12 @@ fn fs_read_reply(id: Value, params: Option<&Value>, roots: &[PathBuf]) -> String
     }
 }
 
-fn fs_write_reply(id: Value, params: Option<&Value>, roots: &[PathBuf]) -> String {
+fn fs_write_reply(
+    id: Value,
+    params: Option<&Value>,
+    roots: &[PathBuf],
+    deny: &dyn Fn(&Path) -> bool,
+) -> String {
     let Some(path) = params.and_then(|p| p.get("path")).and_then(|v| v.as_str()) else {
         return rpc_error_id(id, -32602, "fs/write_text_file missing path");
     };
@@ -1421,7 +1468,7 @@ fn fs_write_reply(id: Value, params: Option<&Value>, roots: &[PathBuf]) -> Strin
     if !p.is_absolute() {
         return rpc_error_id(id, -32602, "fs/write_text_file path must be absolute");
     }
-    if !fs_path_allowed(p, roots) {
+    if deny(p) || !fs_path_allowed(p, roots) {
         return rpc_error_id(id, -32602, "fs/write_text_file path is outside the project");
     }
     let Some(content) = params
@@ -2240,6 +2287,7 @@ mod tests {
             auto_merge: false,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -2252,6 +2300,94 @@ mod tests {
             .find(|v| v.get("id") == Some(&json!(41)))
             .expect("workspace parent read");
         assert_eq!(reply["result"]["content"], "probe spec\n");
+    }
+
+    #[tokio::test]
+    async fn isolation_blocks_nested_shared_checkout_and_keeps_planning_reads() {
+        let ws = tempdir().unwrap();
+        let exec = ws.path().join("product");
+        std::fs::create_dir_all(exec.join("src")).unwrap();
+        let shared = exec.join("src").join("lib.rs");
+        std::fs::write(&shared, "shared\n").unwrap();
+        let spec = ws.path().join("conductor").join("0066").join("spec.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(&spec, "plan\n").unwrap();
+        let tree = tempdir().unwrap();
+        let note = tree.path().join("note.txt");
+        std::fs::write(&note, "tree\n").unwrap();
+
+        let bound = |on: bool| ProjectRecord {
+            id: "iso".into(),
+            path: ws.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: Some(exec.clone()),
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: false,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: on,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            created_at: chrono::Utc::now(),
+        };
+
+        async fn one_read(
+            cwd: &Path,
+            rec: ProjectRecord,
+            path: &Path,
+            session: &str,
+            id: u64,
+        ) -> Value {
+            let mut lines = mock_handshake_ok(session);
+            lines.push(fs_read_text_file(id, session, path.to_str().unwrap()));
+            lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+            let mut session = GrokSession::start_mock(cwd.to_path_buf(), lines, timeout())
+                .await
+                .unwrap();
+            session.set_progress_record(rec);
+            session.inject_prompt("read", timeout()).await.unwrap();
+            let written = session.mock_written().unwrap();
+            written
+                .iter()
+                .map(|s| serde_json::from_str::<Value>(s).unwrap())
+                .find(|v| v.get("id") == Some(&json!(id)))
+                .expect("fs reply")
+        }
+
+        let cwd = tree.path();
+        let spec_reply = one_read(cwd, bound(true), &spec, "sess-plan", 41).await;
+        assert_eq!(spec_reply["result"]["content"], "plan\n");
+        let note_reply = one_read(cwd, bound(true), &note, "sess-note", 42).await;
+        assert_eq!(note_reply["result"]["content"], "tree\n");
+        let shared_reply = one_read(cwd, bound(true), &shared, "sess-shared", 43).await;
+        assert!(
+            shared_reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("outside"),
+            "{shared_reply}"
+        );
+
+        let mut lines = mock_handshake_ok("sess-write");
+        lines.push(fs_write_text_file(
+            44,
+            "sess-write",
+            shared.to_str().unwrap(),
+            "dirty\n",
+        ));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(cwd.to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.set_progress_record(bound(true));
+        session.inject_prompt("write", timeout()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), "shared\n");
+
+        let off = one_read(cwd, bound(false), &shared, "sess-off", 45).await;
+        assert_eq!(off["result"]["content"], "shared\n");
     }
 
     #[tokio::test]

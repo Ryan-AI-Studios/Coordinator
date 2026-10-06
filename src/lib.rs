@@ -41,6 +41,7 @@
 //! Role-bound plan/fold/implement/advance drive: track **0019**.
 //! Adaptive ACP spawn (cursor `--yolo --trust acp`, `cursor_login`, `/summarize`, `roles use`): track **0038**.
 //! Plan-review join wall 2400s + OpenCode `plan_review_slot` clock and pin-OOS prompt: track **0039**.
+//! Opt-in per-`run_epoch` detached worktree under the project state dir: track **0066**.
 
 pub mod api;
 pub mod ci;
@@ -63,5 +64,6 @@ pub mod state;
 pub mod ui;
 pub mod watch;
 pub mod workflow;
+pub mod worktree;
 
 pub use error::{CoordinatorError, Result};

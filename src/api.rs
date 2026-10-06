@@ -66,6 +66,8 @@ pub struct ProjectSetRequest {
     #[serde(default)]
     pub notify_progress: Option<bool>,
     #[serde(default)]
+    pub worktree_isolation: Option<bool>,
+    #[serde(default)]
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     pub clear_phase_timeouts: Option<bool>,
@@ -295,6 +297,7 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         execution_repo_name: req.execution_repo_name,
         auto_merge: req.auto_merge,
         notify_progress: req.notify_progress,
+        worktree_isolation: req.worktree_isolation,
         phase_timeouts_secs: req.phase_timeouts_secs,
         clear_phase_timeouts: req.clear_phase_timeouts.unwrap_or(false),
         clear_phase_timeout: req.clear_phase_timeout.unwrap_or_default(),

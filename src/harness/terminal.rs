@@ -140,6 +140,11 @@ impl TerminalHub {
         }
     }
 
+    fn cargo_target_env(&self, cwd: &Path) -> Option<std::path::PathBuf> {
+        let rec = self.record.lock().ok()?.clone()?;
+        crate::worktree::cargo_target_dir_for(&rec, cwd)
+    }
+
     fn adapter_slug(&self) -> String {
         self.adapter
             .lock()
@@ -410,6 +415,9 @@ impl TerminalHub {
             .current_dir(&cwd);
         for (k, v) in env_pairs {
             cmd.env(k, v);
+        }
+        if let Some(target) = self.cargo_target_env(&cwd) {
+            cmd.env("CARGO_TARGET_DIR", target);
         }
         #[cfg(windows)]
         {
@@ -1142,6 +1150,7 @@ mod tests {
             auto_merge: true,
             phase_timeouts_secs: std::collections::BTreeMap::new(),
             notify_progress: false,
+            worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
@@ -1541,5 +1550,92 @@ mod tests {
             "args={:?}",
             wrapped.args
         );
+    }
+
+    #[tokio::test]
+    async fn create_sets_absolute_cargo_target_only_inside_worktree() {
+        let state = tempfile::tempdir().unwrap();
+        let epoch = state.path().join("worktrees").join("4");
+        std::fs::create_dir_all(&epoch).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut on = journal_test_rec(state.path());
+        on.worktree_isolation = true;
+        on.state_dir = Some(state.path().to_path_buf());
+        seed_journal_run(&on);
+        let expected = state.path().join("cargo-target");
+
+        let seen = child_cargo_target(&on, &epoch, "relative-target").await;
+        assert_eq!(seen, expected.display().to_string());
+
+        let mut off = on.clone();
+        off.worktree_isolation = false;
+        let untouched = child_cargo_target(&off, &epoch, "relative-target").await;
+        assert_eq!(untouched, "relative-target");
+
+        let elsewhere = child_cargo_target(&on, outside.path(), "relative-target").await;
+        assert_eq!(elsewhere, "relative-target");
+    }
+
+    async fn child_cargo_target(
+        rec: &crate::registry::ProjectRecord,
+        cwd: &Path,
+        agent: &str,
+    ) -> String {
+        let hub = TerminalHub::new();
+        hub.bind_record(rec.clone());
+        let (command, args) = dump_cargo_target();
+        let params = json!({
+            "command": command,
+            "args": args,
+            "cwd": cwd,
+            "env": [{"name": "CARGO_TARGET_DIR", "value": agent}],
+        });
+        let created = serde_json::from_str::<Value>(
+            &hub.handle_sync(TerminalMethod::Create, json!(1), Some(&params), cwd)
+                .await,
+        )
+        .unwrap();
+        assert!(created.get("error").is_none(), "{created}");
+        let tid = created["result"]["terminalId"].as_str().unwrap();
+        let waited = serde_json::from_str::<Value>(
+            &hub.wait_for_exit_reply(json!(2), Some(&json!({"terminalId": tid})))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(waited["result"]["exitCode"], 0, "{waited}");
+        let out = serde_json::from_str::<Value>(
+            &hub.handle_sync(
+                TerminalMethod::Output,
+                json!(3),
+                Some(&json!({"terminalId": tid})),
+                cwd,
+            )
+            .await,
+        )
+        .unwrap();
+        let text = out["result"]["output"].as_str().unwrap_or("");
+        text.lines()
+            .find_map(|line| {
+                let rest = line.trim().strip_prefix("CARGO_TARGET_DIR=")?;
+                Some(rest.to_string())
+            })
+            .unwrap_or_else(|| text.trim().to_string())
+    }
+
+    fn dump_cargo_target() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            (
+                "cmd.exe".into(),
+                vec!["/C".into(), "set CARGO_TARGET_DIR".into()],
+            )
+        } else {
+            (
+                "sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf 'CARGO_TARGET_DIR=%s\\n' \"$CARGO_TARGET_DIR\"".into(),
+                ],
+            )
+        }
     }
 }
