@@ -402,6 +402,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         crate::run::run_stub(&rec, None).unwrap();
@@ -451,6 +452,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(

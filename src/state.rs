@@ -1,5 +1,6 @@
 //! Per-project run-state persistence under `.coordinator/`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -143,6 +144,18 @@ pub struct RunState {
     /// `None` when that `HEAD` was detached. Not rewritten when the ref already exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_branch: Option<String>,
+    /// Per-track committed failure count (0069). Fresh `run` does not clear it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub consecutive_failures: BTreeMap<String, u32>,
+    /// `run_epoch` captured by a successful operator restore (0069). Cleared on publish/merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_epoch: Option<u64>,
+    /// Fingerprints accepted by `policy approve` (0069). Fresh `run` does not clear them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_approvals: Vec<crate::policy::PolicyApproval>,
+    /// Latest state-policy alert (0069). Cleared on fresh `run` and on Allow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_gate: Option<crate::policy::StateGate>,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -234,6 +247,10 @@ impl RunState {
             address_findings_attempts: 0,
             sticky_ready_ids: Vec::new(),
             checkpoint_branch: None,
+            consecutive_failures: BTreeMap::new(),
+            restored_epoch: None,
+            policy_approvals: Vec::new(),
+            state_gate: None,
         }
     }
 
@@ -315,6 +332,9 @@ pub struct StatusView {
     /// Who ticks the machine. Filled only at `api::status` / `status_all` / `cmd_run_cli`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticker: Option<TickerView>,
+    /// Contextual state-policy alert (0069). Omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_gate: Option<crate::policy::StateGate>,
 }
 
 /// Status JSON `ticker` object (0023). `owner` is `serve` or `none` — never `cli`.
@@ -421,6 +441,7 @@ impl StatusView {
             },
             stall: stall_status_view(record, state),
             ticker: None,
+            state_gate: state.state_gate.clone(),
         }
     }
 }
@@ -621,6 +642,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         }
     }

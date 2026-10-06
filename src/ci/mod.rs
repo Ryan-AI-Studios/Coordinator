@@ -127,6 +127,13 @@ pub fn drive_with(
         return Ok(None);
     }
 
+    let head_gate = crate::policy::decide(record, state, &cwd, "HEAD");
+    if let crate::policy::GateDecision::Block(gate) = &head_gate {
+        crate::policy::remember_gate(record, Some(gate))?;
+        return apply_failure(record, state, FailureClass::Permission, gate.detail.clone());
+    }
+    crate::policy::remember_gate(record, head_gate.alert())?;
+
     let hint = pr_hint(state);
     let target = match resolve_target(state, backend, &cwd, hint.as_ref()) {
         Ok(t) => t,
@@ -138,16 +145,21 @@ pub fn drive_with(
     let mut just_opened: Option<u64> = None;
     let target = match target {
         Some(t) => Some(t),
-        None => match try_auto_publish_target(record, state, backend, &cwd, now) {
-            Ok(AutoPublishDrive::Opened(t)) => {
-                if let CiTarget::PullRequest { number, .. } = &t {
-                    just_opened = Some(*number);
-                }
-                Some(t)
+        None => {
+            if let MutationGate::Stop(view) = release_for_mutation(record, state, &head_gate)? {
+                return Ok(view.map(|view| *view));
             }
-            Ok(AutoPublishDrive::Wait) => return Ok(None),
-            Err(e) => return classify_backend_err(record, state, e),
-        },
+            match try_auto_publish_target(record, state, backend, &cwd, now) {
+                Ok(AutoPublishDrive::Opened(t)) => {
+                    if let CiTarget::PullRequest { number, .. } = &t {
+                        just_opened = Some(*number);
+                    }
+                    Some(t)
+                }
+                Ok(AutoPublishDrive::Wait) => return Ok(None),
+                Err(e) => return classify_backend_err(record, state, e),
+            }
+        }
     };
 
     let Some(target) = target else {
@@ -288,6 +300,13 @@ fn finish_green(
                     "ci-wait: green; merge skipped (auto_merge=false)".into(),
                     OutcomeSource::Adapter,
                 );
+            }
+            let merge_gate = match head_oid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(oid) => crate::policy::decide(record, state, cwd, oid),
+                None => crate::policy::unresolved_tip_block(record),
+            };
+            if let MutationGate::Stop(view) = release_for_mutation(record, state, &merge_gate)? {
+                return Ok(view.map(|view| *view));
             }
             let merge = match backend.squash_merge(cwd, *number, head_oid.as_deref()) {
                 Ok(m) => m,
@@ -791,6 +810,51 @@ fn latch_sha_from_target(target: &CiTarget) -> Option<String> {
     }
 }
 
+enum MutationGate {
+    Go,
+    /// `None` is a hold (stay Running). `Some` is a permission failure view.
+    Stop(Option<Box<StatusView>>),
+}
+
+/// Allow and Report clear the restore flag and fall through. Hold stays in `ci-wait`.
+fn release_for_mutation(
+    record: &ProjectRecord,
+    state: &RunState,
+    decision: &crate::policy::GateDecision,
+) -> Result<MutationGate> {
+    match decision {
+        crate::policy::GateDecision::Block(gate) => {
+            crate::policy::remember_gate(record, Some(gate))?;
+            let view = apply_failure(record, state, FailureClass::Permission, gate.detail.clone())?;
+            Ok(MutationGate::Stop(view.map(Box::new)))
+        }
+        crate::policy::GateDecision::Hold(gate) => {
+            persist_policy_hold(record, gate)?;
+            Ok(MutationGate::Stop(None))
+        }
+        crate::policy::GateDecision::Report(gate) => {
+            crate::policy::remember_gate(record, Some(gate))?;
+            crate::policy::consume_restore(record);
+            Ok(MutationGate::Go)
+        }
+        crate::policy::GateDecision::Allow => {
+            crate::policy::remember_gate(record, None)?;
+            crate::policy::consume_restore(record);
+            Ok(MutationGate::Go)
+        }
+    }
+}
+
+fn persist_policy_hold(record: &ProjectRecord, gate: &crate::policy::StateGate) -> Result<()> {
+    with_run_state_lock(record, || {
+        let mut stored = load_run_state(record)?;
+        stored.state_gate = Some(gate.clone());
+        stored.last_event = gate.detail.clone();
+        stored.updated_at = Utc::now();
+        save_run_state(record, &stored)
+    })
+}
+
 fn try_auto_publish_target(
     record: &ProjectRecord,
     state: &RunState,
@@ -1147,6 +1211,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -1691,6 +1756,7 @@ mod tests {
         unsafe {
             std::env::set_var(ENV_COORDINATOR_CI_POLL_MS, "1");
             std::env::set_var(ENV_COORDINATOR_NOTIFY, "off");
+            std::env::remove_var(crate::policy::ENV_STATE_POLICIES);
         }
         g
     }
@@ -3399,5 +3465,277 @@ mod tests {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
         }
+    }
+
+    struct PolicyHome(#[allow(dead_code)] tempfile::TempDir);
+
+    impl Drop for PolicyHome {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            }
+        }
+    }
+
+    fn policy_home() -> PolicyHome {
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::remove_var(crate::policy::ENV_STATE_POLICIES);
+        }
+        PolicyHome(home)
+    }
+
+    fn rule(name: &str, action: crate::policy::PolicyAction) -> crate::policy::PolicyRule {
+        crate::policy::PolicyRule {
+            name: name.into(),
+            action,
+            threshold: None,
+        }
+    }
+
+    fn reader(
+        paths: std::result::Result<Vec<String>, String>,
+        failures: u32,
+        restored: Option<u64>,
+    ) -> crate::policy::TestReaderGuard {
+        crate::policy::install_test_reader(Arc::new(crate::policy::FixedRead {
+            paths: std::sync::Mutex::new(paths),
+            failures: std::sync::Mutex::new(Ok(failures)),
+            restored: std::sync::Mutex::new(Ok(restored)),
+        }))
+    }
+
+    fn publish_pending() -> ScriptedBackend {
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(3, false, false))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pending)])));
+        s
+    }
+
+    #[test]
+    fn state_policy_block_stops_each_trigger_before_publish_or_merge() {
+        let _g = poll_env();
+        let _home = policy_home();
+        let cases = [
+            crate::policy::NAME_DEPENDENCY,
+            crate::policy::NAME_CI_WORKFLOW,
+            crate::policy::NAME_FAILURES,
+            crate::policy::NAME_RESTORE,
+        ];
+        for name in cases {
+            let _guard = match name {
+                crate::policy::NAME_DEPENDENCY => reader(Ok(vec!["Cargo.toml".into()]), 0, None),
+                crate::policy::NAME_CI_WORKFLOW => {
+                    reader(Ok(vec![".github/workflows/ci.yml".into()]), 0, None)
+                }
+                crate::policy::NAME_FAILURES => reader(Ok(vec![]), 3, None),
+                _ => reader(Ok(vec![]), 0, Some(2)),
+            };
+            let dir = tempdir().unwrap();
+            let mut r = rec(dir.path(), true);
+            r.state_policies
+                .push(rule(name, crate::policy::PolicyAction::Block));
+            jump_ci_wait(&r, WorkflowDriver::Adapter);
+            let s = ScriptedBackend::new();
+            s.push_resolve(Ok(Some(pr(1, false, false))));
+            s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pass)])));
+            s.push_merge(Ok(MergeResult {
+                ok: true,
+                queued: false,
+                message: "should not merge".into(),
+            }));
+            s.push_publish(Ok(AutoPublishResult::Opened(pr(1, false, false))));
+            let (_hook, counts) = hook(s);
+            let view = crate::workflow::tick(&r).unwrap().expect("policy block");
+            assert_eq!(view.status, RunStatus::Stopped, "{name}");
+            assert_eq!(view.failure_class, Some(FailureClass::Permission), "{name}");
+            assert!(
+                view.last_event.contains("policy: block"),
+                "{}",
+                view.last_event
+            );
+            assert!(view.last_event.contains(name), "{}", view.last_event);
+            assert!(
+                crate::notify::artifact::existing_path(&r).is_some(),
+                "{name}"
+            );
+            assert_eq!(counts.publish_n(), 0, "{name}");
+            assert_eq!(counts.merge_n(), 0, "{name}");
+            assert_eq!(counts.resolve_n(), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn state_policy_report_still_publishes_and_sets_state_gate() {
+        let _g = poll_env();
+        let _home = policy_home();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let _reader = reader(Ok(vec!["Cargo.toml".into()]), 0, None);
+        let (_hook, counts) = hook(publish_pending());
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none(), "pending checks stay in ci-wait");
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        let gate = st.state_gate.expect("report sets state_gate");
+        assert_eq!(gate.name, crate::policy::NAME_DEPENDENCY);
+        assert_eq!(gate.action, "report");
+        assert!(gate.detail.starts_with("policy: report"), "{}", gate.detail);
+        assert_eq!(counts.publish_n(), 1);
+        assert_eq!(counts.merge_n(), 0);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+    }
+
+    #[test]
+    fn state_policy_unreadable_diff_blocks_with_zero_calls() {
+        let _g = poll_env();
+        let _home = policy_home();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let _reader = reader(Err("missing checkpoint".into()), 0, None);
+        let (_hook, counts) = hook(publish_pending());
+        let view = crate::workflow::tick(&r).unwrap().expect("unreadable");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert!(
+            view.last_event.contains("policy: block"),
+            "{}",
+            view.last_event
+        );
+        assert!(
+            view.last_event.contains("unreadable"),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(counts.publish_n(), 0);
+        assert_eq!(counts.merge_n(), 0);
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+    }
+
+    #[test]
+    fn state_policy_empty_diff_does_not_block() {
+        let _g = poll_env();
+        let _home = policy_home();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let _reader = reader(Ok(vec!["src/lib.rs".into()]), 0, None);
+        let (_hook, counts) = hook(publish_pending());
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert!(st.state_gate.is_none());
+        assert!(st.failure_class.is_none());
+        assert_eq!(counts.publish_n(), 1);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+    }
+
+    #[test]
+    fn state_policy_hold_then_approve_publishes_once() {
+        let _g = poll_env();
+        let _home = policy_home();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.state_policies.push(rule(
+            crate::policy::NAME_DEPENDENCY,
+            crate::policy::PolicyAction::RequireApproval,
+        ));
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let _reader = reader(Ok(vec!["Cargo.toml".into()]), 0, None);
+        let (_hook, counts) = hook(publish_pending());
+        let held = crate::workflow::tick(&r).unwrap();
+        assert!(held.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(st.failure_class.is_none());
+        assert!(
+            st.last_event.contains("policy: require-approval"),
+            "{}",
+            st.last_event
+        );
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert_eq!(counts.publish_n(), 0);
+        let cwd = crate::worktree::product_git_cwd(&r).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            crate::policy::approve(&r, &mut state, &cwd, crate::policy::NAME_DEPENDENCY)?;
+            save_run_state(&r, &state)
+        })
+        .unwrap();
+        let opened = crate::workflow::tick(&r).unwrap();
+        assert!(opened.is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(st.failure_class.is_none());
+        assert_eq!(counts.publish_n(), 1);
+    }
+
+    #[test]
+    fn state_policy_off_skips_the_read_and_still_publishes() {
+        let _g = poll_env();
+        let _home = policy_home();
+        unsafe {
+            std::env::set_var(crate::policy::ENV_STATE_POLICIES, "OFF");
+        }
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.state_policies.push(rule(
+            crate::policy::NAME_DEPENDENCY,
+            crate::policy::PolicyAction::Block,
+        ));
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let _reader = reader(Err("would block".into()), 0, None);
+        let (_hook, counts) = hook(publish_pending());
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none());
+        assert_eq!(counts.publish_n(), 1);
+        assert_eq!(counts.merge_n(), 0);
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert!(st.failure_class.is_none());
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        unsafe {
+            std::env::remove_var(crate::policy::ENV_STATE_POLICIES);
+        }
+    }
+
+    #[test]
+    fn state_policy_block_refuses_squash_of_a_green_pr() {
+        let _g = poll_env();
+        let _home = policy_home();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.state_policies.push(rule(
+            crate::policy::NAME_CI_WORKFLOW,
+            crate::policy::PolicyAction::Block,
+        ));
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let _reader = reader(Ok(vec![".github/workflows/ci.yml".into()]), 0, None);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_state(9, false, false, MergeStateStatus::Clean))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "should not merge".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("blocked");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+        assert_eq!(counts.resolve_n(), 0);
     }
 }

@@ -45,6 +45,7 @@
 //! Epoch checkpoint ref before `implement`, plus operator restore: track **0067**.
 //! Opt-in Hermes fleet summary (`notify fleet-summary` and serve cadence): track **0068**.
 //! Recorded owner-decision channel (`decision record|show|list`, one active comment block, fold inject): track **0077**.
+//! Contextual state policies (diff + durable counters gate publish and squash-merge): track **0069**.
 
 pub mod api;
 pub mod checkpoint;
@@ -57,6 +58,7 @@ pub mod layout;
 pub mod notify;
 pub mod outcome;
 pub mod persist;
+pub mod policy;
 pub mod progress_log;
 pub mod registry;
 pub mod review;

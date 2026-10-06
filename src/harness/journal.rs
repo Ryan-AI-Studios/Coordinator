@@ -347,6 +347,7 @@ mod tests {
                 worktree_isolation: false,
                 ready_aliases: Vec::new(),
                 auto_start: Default::default(),
+                state_policies: Vec::new(),
                 created_at: Utc::now(),
             }
         }
@@ -714,6 +715,7 @@ mod tests {
             hermes: crate::config::HermesNotifyConfig::default(),
             progress_stall_secs: None,
             journal_keep: Some(2),
+            state_policies: Vec::new(),
         };
         save_machine_config(&cfg).unwrap();
         let rec = iso.rec();

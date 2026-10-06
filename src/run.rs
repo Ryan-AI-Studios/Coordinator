@@ -75,6 +75,7 @@ pub(crate) fn run_with_origin(
                 state.total_paused_ms = 0;
                 state.pause_started_at = None;
                 state.failure_class = None;
+                state.state_gate = None;
                 state.next_track = None;
                 state.parked_next = None;
                 state.last_applied_outcome_hash = None;
@@ -150,6 +151,7 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.total_paused_ms = 0;
                 state.pause_started_at = None;
                 state.failure_class = None;
+                state.state_gate = None;
                 state.parked_next = None;
                 state.last_applied_outcome_hash = None;
                 state.stalled_at = None;
@@ -326,6 +328,7 @@ mod tests {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -354,6 +357,37 @@ mod tests {
         let log = std::fs::read_to_string(dir.path().join("status.md")).unwrap();
         assert!(log.contains("start  track=0004"));
         assert!(log.contains("stop  track=0004"));
+    }
+
+    #[test]
+    fn fresh_run_clears_state_gate_and_keeps_durable_policy_state() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run(&r, Some("0069".into())).unwrap();
+        stop(&r).unwrap();
+        {
+            let mut state = load_run_state(&r).unwrap();
+            state.consecutive_failures.insert("0069".into(), 2);
+            state.restored_epoch = Some(1);
+            state.policy_approvals.push(crate::policy::PolicyApproval {
+                name: crate::policy::NAME_DEPENDENCY.into(),
+                fingerprint: "abc".into(),
+                at: Utc::now(),
+            });
+            state.state_gate = Some(crate::policy::StateGate {
+                name: crate::policy::NAME_DEPENDENCY.into(),
+                action: "report".into(),
+                detail: "policy: report dependency-manifest: Cargo.toml".into(),
+            });
+            save_run_state(&r, &state).unwrap();
+        }
+        let view = run(&r, Some("0069".into())).unwrap();
+        assert!(view.state_gate.is_none());
+        let state = load_run_state(&r).unwrap();
+        assert_eq!(state.consecutive_failures.get("0069"), Some(&2));
+        assert_eq!(state.restored_epoch, Some(1));
+        assert_eq!(state.policy_approvals.len(), 1);
+        assert!(state.state_gate.is_none());
     }
 
     #[test]

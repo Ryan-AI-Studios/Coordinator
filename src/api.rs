@@ -861,6 +861,59 @@ pub fn cmd_decision_show(
     crate::workflow::decision::show_for(&record, track, json)
 }
 
+/// `policy show`. CLI passes `infer_cwd = true`.
+pub fn cmd_policy_show(project: Option<&str>, infer_cwd: bool) -> Result<String> {
+    let record = resolve_selected(project, infer_cwd)?;
+    Ok(crate::policy::format_show(&crate::policy::resolved(
+        &record,
+    )))
+}
+
+/// `policy set`. Writes the project record only. Unknown names are an error.
+pub fn cmd_policy_set(
+    project: Option<&str>,
+    name: &str,
+    action: &str,
+    threshold: Option<u32>,
+    infer_cwd: bool,
+) -> Result<ProjectRecord> {
+    let name = crate::policy::require_name(name)?;
+    let action = crate::policy::PolicyAction::parse(action)?;
+    let selected = resolve_selected(project, infer_cwd)?;
+    let mut reg = load_registry()?;
+    let row = reg
+        .projects
+        .iter_mut()
+        .find(|p| p.id == selected.id)
+        .ok_or_else(|| CoordinatorError::ProjectNotFound(selected.id.clone()))?;
+    if let Some(rule) = row.state_policies.iter_mut().find(|r| r.name == name) {
+        rule.action = action;
+        rule.threshold = threshold;
+    } else {
+        row.state_policies.push(crate::policy::PolicyRule {
+            name: name.to_string(),
+            action,
+            threshold,
+        });
+    }
+    let saved = row.clone();
+    save_registry(&reg)?;
+    Ok(saved)
+}
+
+/// `policy approve`. Stores nothing when the fingerprint cannot be read.
+pub fn cmd_policy_approve(project: Option<&str>, name: &str, infer_cwd: bool) -> Result<String> {
+    let record = resolve_selected(project, infer_cwd)?;
+    let cwd = crate::worktree::product_git_cwd(&record)
+        .ok_or_else(|| CoordinatorError::Message("policy approve: no execution repo".into()))?;
+    crate::state::with_run_state_lock(&record, || {
+        let mut state = crate::state::load_run_state(&record)?;
+        let fingerprint = crate::policy::approve(&record, &mut state, &cwd, name)?;
+        crate::state::save_run_state(&record, &state)?;
+        Ok(fingerprint)
+    })
+}
+
 /// `decision list`. CLI passes `infer_cwd = true`.
 pub fn cmd_decision_list(
     project: Option<&str>,

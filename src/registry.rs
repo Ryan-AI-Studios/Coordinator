@@ -107,6 +107,9 @@ pub struct ProjectRecord {
         skip_serializing_if = "AutoStartPolicy::is_hitl"
     )]
     pub auto_start: AutoStartPolicy,
+    /// Contextual state policies (0069). Empty = builtin defaults, not "no policies".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_policies: Vec<crate::policy::PolicyRule>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -266,6 +269,7 @@ impl Registry {
             worktree_isolation: false,
             ready_aliases: Vec::new(),
             auto_start: opts.auto_start.unwrap_or_default(),
+            state_policies: Vec::new(),
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
