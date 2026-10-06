@@ -182,7 +182,7 @@ pub struct RunState {
     /// Bounded self-check snap (0070). Cleared on fresh `run`. Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_check: Option<SelfCheckState>,
-    /// Required-check repair entries this `run_epoch` (0071). Cap 2. Always serialized on disk.
+    /// CI-gate repair entries this `run_epoch` (0071). Cap 2. Always serialized on disk.
     #[serde(default)]
     pub ci_fix_attempts: u32,
     /// Payload for the current `address-ci` inject (0071). Omitted when none.
@@ -245,7 +245,7 @@ pub struct CiWatchState {
     pub publish_attempted_sha: Option<String>,
 }
 
-/// One failing required check handed to `address-ci` (0071).
+/// One failing check from the judged slice handed to `address-ci` (0071).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CiFixCheck {
     pub name: String,

@@ -56,7 +56,7 @@ pub struct ProjectSetOptions {
     pub worktree_isolation: Option<bool>,
     /// Omit = leave unchanged. Bounded self-check between adapter turns (track 0070).
     pub self_continuation: Option<bool>,
-    /// Omit = leave unchanged. Route a required-check failure into address-ci (track 0071).
+    /// Omit = leave unchanged. Route the ci-wait gate's failing checks into address-ci (track 0071; slice unified in 0079).
     pub ci_fix_routing: Option<bool>,
     /// Overlay keys (None = no overlay). Merge; does not replace the map.
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
@@ -118,7 +118,7 @@ pub struct ProjectRecord {
     /// Missing field on old records = off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub self_continuation: bool,
-    /// Opt-in route from a required-check failure into same-epoch `address-ci` (track 0071).
+    /// Opt-in route from the ci-wait gate's failing checks into same-epoch `address-ci` (track 0071; slice unified in 0079).
     /// Missing field on old records = off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ci_fix_routing: bool,

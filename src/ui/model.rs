@@ -495,7 +495,7 @@ pub const STATE_GATE_ROW_LABEL: &str = "State gate";
 /// Bounded self-check row on the project card (0070).
 pub const SELF_CHECK_ROW_LABEL: &str = "Self-check";
 
-/// Required-check repair row on the project card (0071).
+/// CI-gate repair row on the project card (0071). Logic stays attempt-based.
 pub const CI_FIX_ROW_LABEL: &str = "CI fix";
 
 /// Text for the State gate row. `None` when the run has no alert.

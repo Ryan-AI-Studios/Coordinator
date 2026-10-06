@@ -236,12 +236,18 @@ pub fn drive_with(
     };
 
     let phase_elapsed = elapsed(state, now);
+    // One collapse for the whole tick. The pull-request decision, both
+    // `set_key` targets, and the route borrow this binding. `interpret_runs`
+    // still collapses on its own for a HeadSha decision.
+    let (collapsed, disagreed) = collapse_snapshot(&snap);
     let decision = match &target {
-        CiTarget::PullRequest { .. } => interpret_pr(&snap, record.auto_merge),
+        CiTarget::PullRequest { .. } => annotate_disagreed(
+            interpret_pr_inner(&collapsed, record.auto_merge),
+            &disagreed,
+        ),
         CiTarget::HeadSha { .. } => interpret_runs(&snap, phase_elapsed),
     };
     let summary = decision.summary();
-    let (collapsed, _) = collapse_snapshot(&snap);
     let key = set_key(&target, fail_set(&collapsed, record.auto_merge));
     let changed = state.ci.as_ref().and_then(|c| c.set_key.as_deref()) != Some(key.as_str());
     let interval = next_interval_ms(phase_elapsed, changed);
@@ -262,7 +268,12 @@ pub fn drive_with(
             Ok(None)
         }
         Decision::Fail { message, .. } => {
-            match fix::try_route_ci_failure(record, state, &target, &snap)? {
+            match fix::try_route_ci_failure(
+                record,
+                state,
+                &target,
+                fail_set(&collapsed, record.auto_merge),
+            )? {
                 fix::RouteOutcome::Routed(view) => Ok(Some(*view)),
                 fix::RouteOutcome::Exhausted => apply_failure(
                     record,
@@ -470,27 +481,21 @@ fn interpret_pr(snap: &CheckSnapshot, auto_merge: bool) -> Decision {
 }
 
 fn interpret_pr_inner(snap: &CheckSnapshot, auto_merge: bool) -> Decision {
-    match snap.view {
-        CheckView::Unspecified => interpret_items(snap, &snap.items),
-        CheckView::Required if !snap.items.is_empty() => {
-            let d = interpret_items(snap, &snap.items);
-            match d {
-                Decision::Green { summary } => {
-                    apply_required_merge_gate(snap.merge_state, auto_merge, summary)
+    match gate_slice(snap, auto_merge) {
+        GateSlice::Pending => required_pending(snap),
+        GateSlice::Judge(items) => {
+            let d = interpret_items(snap, items);
+            if snap.view == CheckView::Required && !snap.items.is_empty() {
+                match d {
+                    Decision::Green { summary } => {
+                        apply_required_merge_gate(snap.merge_state, auto_merge, summary)
+                    }
+                    other => other,
                 }
-                other => other,
+            } else {
+                d
             }
         }
-        CheckView::Required => match snap.merge_state {
-            MergeStateStatus::Clean | MergeStateStatus::Unstable | MergeStateStatus::HasHooks => {
-                interpret_items(snap, &snap.advisory)
-            }
-            MergeStateStatus::Blocked if !auto_merge && !snap.advisory.is_empty() => {
-                interpret_items(snap, &snap.advisory)
-            }
-            // Unspecified (0053 same-tick) and Unknown / Blocked / Behind / Dirty / Draft.
-            _ => required_pending(snap),
-        },
     }
 }
 
@@ -566,6 +571,22 @@ fn interpret_items(snap: &CheckSnapshot, items: &[CheckItem]) -> Decision {
     Decision::Green { summary }
 }
 
+pub(crate) enum GateSlice<'a> {
+    Judge(&'a [CheckItem]),
+    Pending,
+}
+
+pub(crate) fn gate_slice<'a>(snap: &'a CheckSnapshot, auto_merge: bool) -> GateSlice<'a> {
+    match snap.view {
+        CheckView::Unspecified => GateSlice::Judge(&snap.items),
+        CheckView::Required if !snap.items.is_empty() => GateSlice::Judge(&snap.items),
+        CheckView::Required if uses_advisory_fallback(snap, auto_merge) => {
+            GateSlice::Judge(&snap.advisory)
+        }
+        _ => GateSlice::Pending,
+    }
+}
+
 fn uses_advisory_fallback(snap: &CheckSnapshot, auto_merge: bool) -> bool {
     if snap.view != CheckView::Required || !snap.items.is_empty() {
         return false;
@@ -578,10 +599,9 @@ fn uses_advisory_fallback(snap: &CheckSnapshot, auto_merge: bool) -> bool {
 }
 
 fn fail_set(snap: &CheckSnapshot, auto_merge: bool) -> &[CheckItem] {
-    if uses_advisory_fallback(snap, auto_merge) {
-        &snap.advisory
-    } else {
-        &snap.items
+    match gate_slice(snap, auto_merge) {
+        GateSlice::Judge(items) => items,
+        GateSlice::Pending => &snap.items,
     }
 }
 
@@ -1150,10 +1170,10 @@ pub(crate) fn open_pr_is_green(
     };
     let snap = backend.checks(cwd, &target)?;
     let (collapsed, _) = collapse_snapshot(&snap);
-    let items = if collapsed.view == CheckView::Required && collapsed.items.is_empty() {
-        collapsed.advisory.as_slice()
-    } else {
-        collapsed.items.as_slice()
+    // Clean, Unstable, and HasHooks ignore `auto_merge`, so `true` matches the fallback.
+    let items = match gate_slice(&collapsed, true) {
+        GateSlice::Judge(items) => items,
+        GateSlice::Pending => collapsed.items.as_slice(),
     };
     match interpret_items(&collapsed, items) {
         Decision::Green { .. } => Ok(Some(number)),
@@ -3828,8 +3848,12 @@ mod tests {
     }
 
     fn start_owned(routing: bool) -> (tempfile::TempDir, ProjectRecord) {
+        start_owned_merge(routing, true)
+    }
+
+    fn start_owned_merge(routing: bool, auto_merge: bool) -> (tempfile::TempDir, ProjectRecord) {
         let dir = tempdir().unwrap();
-        let mut r = rec(dir.path(), true);
+        let mut r = rec(dir.path(), auto_merge);
         r.ci_fix_routing = routing;
         run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
         let mut s = load_run_state(&r).unwrap();
@@ -4100,19 +4124,239 @@ mod tests {
         assert_eq!(counts.publish_n(), 0);
     }
 
-    #[test]
-    fn advisory_only_fail_does_not_route() {
+    fn assert_advisory_routed(r: &ProjectRecord, counts: &CallCounts, name: &str) {
+        let st = load_run_state(r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_ADDRESS_CI);
+        assert!(st.failure_class.is_none());
+        assert_eq!(st.ci_fix_attempts, 1);
+        assert_eq!(st.last_event, "ci-wait: address-ci 1/2");
+        let req = st.ci_fix_request.expect("request");
+        assert_eq!(req.checks.len(), 1);
+        assert_eq!(req.checks[0].name, name);
+        assert_eq!(req.checks[0].bucket, "fail");
+        assert!(crate::notify::artifact::existing_path(r).is_none());
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+        let ci = st.ci.expect("watch");
+        assert!(ci.set_key.is_none(), "set_key={:?}", ci.set_key);
+    }
+
+    fn route_advisory_merge(merge: MergeStateStatus) {
         let _env = RouteEnv::enter();
         let (_dir, r) = start_owned(true);
         let (_hook, counts) = script(
             &r,
             owned_pr(OWNED_REF, OWNED_TITLE),
+            required_snap(&[], &[("risk", CheckBucket::Fail)], merge),
+        );
+        let view = crate::workflow::tick(&r).unwrap().expect("routed");
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_CI);
+        assert!(view.failure_class.is_none());
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("\"ci_fix_attempts\":1"), "{json}");
+        assert_advisory_routed(&r, &counts, "risk");
+    }
+
+    #[test]
+    fn advisory_fallback_fail_routes_when_flag_on() {
+        route_advisory_merge(MergeStateStatus::Clean);
+    }
+
+    #[test]
+    fn advisory_fallback_fail_unstable_routes_when_flag_on() {
+        route_advisory_merge(MergeStateStatus::Unstable);
+    }
+
+    #[test]
+    fn advisory_fallback_fail_has_hooks_routes_when_flag_on() {
+        route_advisory_merge(MergeStateStatus::HasHooks);
+    }
+
+    #[test]
+    fn flag_off_advisory_fallback_stays_ci_failed() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(false);
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
             required_snap(&[], &[("risk", CheckBucket::Fail)], MergeStateStatus::Clean),
         );
-        crate::workflow::tick(&r).unwrap().expect("advisory stop");
+        crate::workflow::tick(&r).unwrap().expect("declined");
         assert_declined(&r);
         assert_eq!(counts.merge_n(), 0);
         assert_eq!(counts.publish_n(), 0);
+    }
+
+    #[test]
+    fn blocked_auto_merge_true_advisory_fail_stays_pending() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, _counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_snap(
+                &[],
+                &[("risk", CheckBucket::Fail)],
+                MergeStateStatus::Blocked,
+            ),
+        );
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(st.ci_fix_attempts, 0);
+        assert!(st.last_event.contains("waiting"), "{}", st.last_event);
+    }
+
+    #[test]
+    fn blocked_auto_merge_false_advisory_fail_routes() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned_merge(true, false);
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_snap(
+                &[],
+                &[("risk", CheckBucket::Fail)],
+                MergeStateStatus::Blocked,
+            ),
+        );
+        crate::workflow::tick(&r).unwrap().expect("routed");
+        assert_advisory_routed(&r, &counts, "risk");
+    }
+
+    #[test]
+    fn unspecified_merge_advisory_fail_stays_pending() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, _counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_snap(
+                &[],
+                &[("risk", CheckBucket::Fail)],
+                MergeStateStatus::Unspecified,
+            ),
+        );
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.ci_fix_attempts, 0);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+    }
+
+    #[test]
+    fn advisory_cancel_on_fallback_stays_pending() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, _counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_snap(
+                &[],
+                &[("risk", CheckBucket::Cancel), ("lint", CheckBucket::Pass)],
+                MergeStateStatus::Clean,
+            ),
+        );
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.ci_fix_attempts, 0);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(st.last_event.contains("cancelled"), "{}", st.last_event);
+        let key = st.ci.expect("watch").set_key.expect("set_key");
+        assert!(key.contains("risk:cancel"), "{key}");
+        assert!(key.contains("lint:pass"), "{key}");
+    }
+
+    #[test]
+    fn advisory_fallback_cap_stops() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.ci_fix_attempts = 2;
+            save_run_state(&r, &s).unwrap();
+        }
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_snap(&[], &[("risk", CheckBucket::Fail)], MergeStateStatus::Clean),
+        );
+        let view = crate::workflow::tick(&r).unwrap().expect("exhausted");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            view.last_event.contains("address-ci exhausted (2/2)"),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.publish_n(), 0);
+    }
+
+    #[test]
+    fn required_fail_ignores_advisory_sibling() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            required_items(
+                vec![item(
+                    "fmt",
+                    CheckBucket::Fail,
+                    "rustfmt failed",
+                    "https://example/fmt",
+                )],
+                vec![item("risk", CheckBucket::Fail, "", "")],
+            ),
+        );
+        crate::workflow::tick(&r).unwrap().expect("routed");
+        assert_advisory_routed(&r, &counts, "fmt");
+        let req = load_run_state(&r).unwrap().ci_fix_request.expect("request");
+        assert!(req.checks.iter().all(|c| c.name != "risk"));
+    }
+
+    #[test]
+    fn advisory_pass_fail_disagreement_does_not_route() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let backend = ScriptedBackend::new();
+        backend.push_resolve(Ok(Some(owned_pr(OWNED_REF, OWNED_TITLE))));
+        backend.push_snapshot(Ok(required_snap(
+            &[],
+            &[
+                ("fmt clippy test", CheckBucket::Fail),
+                ("fmt clippy test", CheckBucket::Pass),
+            ],
+            MergeStateStatus::Clean,
+        )));
+        backend.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(backend);
+        let view = crate::workflow::tick(&r).unwrap().expect("green merge");
+        assert_ne!(view.phase, graph::PHASE_ADDRESS_CI);
+        assert_eq!(counts.merge_n(), 1);
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.ci_fix_attempts, 0);
+        assert!(st.ci_fix_request.is_none());
+    }
+
+    #[test]
+    fn unspecified_view_pr_fail_routes_when_flag_on() {
+        let _env = RouteEnv::enter();
+        let (_dir, r) = start_owned(true);
+        let (_hook, counts) = script(
+            &r,
+            owned_pr(OWNED_REF, OWNED_TITLE),
+            items(&[("ci", CheckBucket::Fail)]),
+        );
+        crate::workflow::tick(&r).unwrap().expect("routed");
+        assert_advisory_routed(&r, &counts, "ci");
     }
 
     #[test]
