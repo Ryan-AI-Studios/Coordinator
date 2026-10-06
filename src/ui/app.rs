@@ -9,8 +9,9 @@ use dioxus::prelude::*;
 use crate::error::CoordinatorError;
 use crate::ui::model::{
     AUTO_START_ROW_LABEL, CardPrimaryAction, CardState, ChipKind, FleetSnapshot, ProjectCard,
-    STATE_GATE_ROW_LABEL, add_project, card_primary_action, load_fleet, pause_all, resume_selected,
-    run_selected, selected_is_paused, state_gate_row, stop_selected, ticker_label,
+    SELF_CHECK_ROW_LABEL, STATE_GATE_ROW_LABEL, add_project, card_primary_action, load_fleet,
+    pause_all, resume_selected, run_selected, selected_is_paused, self_check_row, state_gate_row,
+    stop_selected, ticker_label,
 };
 use crate::ui::{WEBVIEW2_MISSING_HINT, model::card_title};
 use crate::watch::ServeAttach;
@@ -724,6 +725,7 @@ fn project_card(
     let next = card.view.next_track.clone().unwrap_or_else(|| "—".into());
     let policy = card.view.auto_start.as_str().to_string();
     let state_gate = state_gate_row(&card.view);
+    let self_check = self_check_row(&card.view);
     let parked = card.view.parked_next.clone();
     let layout = card.view.layout_profile.as_str().to_string();
     let (pill_class, pill_label) = status_pill(card.card_state);
@@ -864,6 +866,13 @@ fn project_card(
                         span { class: "label", "{STATE_GATE_ROW_LABEL}" }
                         span { class: "value", "{gate}" }
                         span { class: "pill idle", "state-gate" }
+                    }
+                }
+                if let Some(check) = self_check {
+                    div { class: "row",
+                        span { class: "label", "{SELF_CHECK_ROW_LABEL}" }
+                        span { class: "value", "{check}" }
+                        span { class: "pill idle", "self-check" }
                     }
                 }
                 if let Some(parked) = parked {
@@ -1015,6 +1024,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);
@@ -1062,6 +1072,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         };
         let mut state = RunState::idle(&rec.id);

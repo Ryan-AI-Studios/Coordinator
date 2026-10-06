@@ -76,6 +76,7 @@ pub(crate) fn run_with_origin(
                 state.pause_started_at = None;
                 state.failure_class = None;
                 state.state_gate = None;
+                state.self_check = None;
                 state.next_track = None;
                 state.parked_next = None;
                 state.last_applied_outcome_hash = None;
@@ -152,6 +153,7 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.pause_started_at = None;
                 state.failure_class = None;
                 state.state_gate = None;
+                state.self_check = None;
                 state.parked_next = None;
                 state.last_applied_outcome_hash = None;
                 state.stalled_at = None;
@@ -329,6 +331,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         }
     }
@@ -379,15 +382,23 @@ mod tests {
                 action: "report".into(),
                 detail: "policy: report dependency-manifest: Cargo.toml".into(),
             });
+            state.self_check = Some(crate::state::SelfCheckState {
+                steps: 3,
+                pending_inject: true,
+                ..crate::state::SelfCheckState::default()
+            });
             save_run_state(&r, &state).unwrap();
         }
         let view = run(&r, Some("0069".into())).unwrap();
         assert!(view.state_gate.is_none());
+        assert!(view.self_check.is_none());
         let state = load_run_state(&r).unwrap();
         assert_eq!(state.consecutive_failures.get("0069"), Some(&2));
         assert_eq!(state.restored_epoch, Some(1));
         assert_eq!(state.policy_approvals.len(), 1);
         assert!(state.state_gate.is_none());
+        assert!(state.self_check.is_none());
+        assert!(!r.self_continuation);
     }
 
     #[test]

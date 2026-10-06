@@ -54,6 +54,8 @@ pub struct ProjectSetOptions {
     pub notify_progress: Option<bool>,
     /// Omit = leave unchanged. Per-`run_epoch` detached worktree (track 0066).
     pub worktree_isolation: Option<bool>,
+    /// Omit = leave unchanged. Bounded self-check between adapter turns (track 0070).
+    pub self_continuation: Option<bool>,
     /// Overlay keys (None = no overlay). Merge; does not replace the map.
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
     /// Wipe the project timeout map before overlay.
@@ -110,6 +112,10 @@ pub struct ProjectRecord {
     /// Contextual state policies (0069). Empty = builtin defaults, not "no policies".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub state_policies: Vec<crate::policy::PolicyRule>,
+    /// Opt-in bounded self-check on adapter implement and address-findings (track 0070).
+    /// Missing field on old records = off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_continuation: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -270,6 +276,7 @@ impl Registry {
             ready_aliases: Vec::new(),
             auto_start: opts.auto_start.unwrap_or_default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
@@ -333,6 +340,9 @@ impl Registry {
         }
         if let Some(v) = opts.worktree_isolation {
             rec.worktree_isolation = v;
+        }
+        if let Some(v) = opts.self_continuation {
+            rec.self_continuation = v;
         }
         // Clears first, then overlay so clear-all + plan=3600 leaves only plan.
         if opts.clear_phase_timeouts {
@@ -820,6 +830,46 @@ mod tests {
         assert!(
             !text.contains("worktree_isolation"),
             "false worktree_isolation must omit the key: {text}"
+        );
+    }
+
+    #[test]
+    fn set_self_continuation_round_trip_omits_false() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        assert!(!rec.self_continuation);
+        let on = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    self_continuation: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(on.self_continuation);
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert!(loaded.projects[0].self_continuation);
+        let mut r = Registry::load(&reg_path).unwrap();
+        let off = r
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    self_continuation: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!off.self_continuation);
+        r.save(&reg_path).unwrap();
+        let text = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(
+            !text.contains("self_continuation"),
+            "false self_continuation must omit the key: {text}"
         );
     }
 

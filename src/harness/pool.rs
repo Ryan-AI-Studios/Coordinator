@@ -416,13 +416,32 @@ async fn apply_turn(
                                 Some(state.run_epoch),
                             )
                         }
-                        None => PhaseOutcome::success(
-                            injected_phase,
-                            OutcomeSource::Adapter,
-                            msg,
-                            next,
-                            Some(state.run_epoch),
-                        ),
+                        None => {
+                            if crate::workflow::self_check::hold_continue(
+                                record,
+                                injected_phase,
+                                pr.stop_reason.as_deref(),
+                                &pr.text,
+                            )? {
+                                return Ok(HarnessPromptView {
+                                    text: Some(pr.text),
+                                    stop_reason: pr.stop_reason,
+                                    applied: false,
+                                    skipped: None,
+                                    error: None,
+                                    failure_class: None,
+                                    status: None,
+                                    harness: Some(harness),
+                                });
+                            }
+                            PhaseOutcome::success(
+                                injected_phase,
+                                OutcomeSource::Adapter,
+                                msg,
+                                next,
+                                Some(state.run_epoch),
+                            )
+                        }
                     };
                     status = Some(write_and_apply(record, outcome)?);
                     applied = true;
@@ -2167,6 +2186,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         crate::state::ensure_state_dir(&rec).unwrap();
@@ -2209,6 +2229,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         let stale = PersistedGrokHandle {
@@ -2282,6 +2303,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(&rec, None, crate::workflow::WorkflowDriver::FileWait).unwrap();
@@ -2323,6 +2345,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         let t = prompt_timeout_for(&rec);
@@ -2355,6 +2378,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         let p = persist_path(&rec).unwrap();
@@ -2380,6 +2404,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         ensure_state_dir(&rec).unwrap();
@@ -2415,6 +2440,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         ensure_state_dir(&rec).unwrap();
@@ -2791,6 +2817,7 @@ Loop\r\n",
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         assert_eq!(grok_cwd(&rec), exec);
@@ -3152,6 +3179,7 @@ Loop\r\n",
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         crate::run::run_with_driver(
@@ -3239,6 +3267,298 @@ Loop\r\n",
         let st = run::status(&rec).unwrap();
         assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN_REVIEW);
         assert_eq!(st.status, crate::state::RunStatus::Running);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    fn prepare_implement(on: bool) -> (tempfile::TempDir, tempfile::TempDir, ProjectRecord) {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let mut rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0070".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        rec.self_continuation = on;
+        crate::state::with_run_state_lock(&rec, || {
+            let mut state = crate::state::load_run_state(&rec)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            crate::state::save_run_state(&rec, &state)
+        })
+        .unwrap();
+        (home, proj, rec)
+    }
+
+    fn continue_line() -> PromptResult {
+        PromptResult {
+            text: "step body\nself-check: continue finding=none action=progress\n".into(),
+            stop_reason: Some("end_turn".into()),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn self_check_continue_skips_outcome_and_sets_pending() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = prepare_implement(true);
+        let before = crate::state::load_run_state(&rec).unwrap();
+        let view = apply_turn(
+            &rec,
+            Ok(continue_line()),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert!(view.skipped.is_none());
+        assert!(view.error.is_none());
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(state.phase, crate::workflow::graph::PHASE_IMPLEMENT);
+        assert_eq!(state.status, crate::state::RunStatus::Running);
+        assert!(state.failure_class.is_none());
+        assert_eq!(state.phase_started_at, before.phase_started_at);
+        let snap = state.self_check.expect("snap");
+        assert!(snap.pending_inject);
+        assert_eq!(snap.steps, 1);
+        assert!(state.last_event.starts_with("self-check: step 1 "));
+        assert!(state.last_event.contains("wall_ms="));
+        assert!(state.last_event.contains("tools_ms="));
+        assert!(state.last_event.contains("lines="));
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn self_check_done_and_missing_line_still_succeed() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = prepare_implement(true);
+        let done = PromptResult {
+            text: "self-check: done".into(),
+            stop_reason: Some("end_turn".into()),
+        };
+        let view = apply_turn(
+            &rec,
+            Ok(done),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        assert!(view.error.is_none());
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(state.phase, crate::workflow::graph::PHASE_CROSS_MODEL);
+        assert!(state.self_check.is_none());
+
+        let (_home2, _proj2, rec2) = prepare_implement(true);
+        let missing = PromptResult {
+            text: "finished the phase".into(),
+            stop_reason: Some("end_turn".into()),
+        };
+        let view = apply_turn(
+            &rec2,
+            Ok(missing),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        assert_eq!(
+            crate::state::load_run_state(&rec2).unwrap().phase,
+            crate::workflow::graph::PHASE_CROSS_MODEL
+        );
+
+        let (_home3, _proj3, rec3) = prepare_implement(true);
+        let no_stop = PromptResult {
+            text: "self-check: continue finding=none action=progress".into(),
+            stop_reason: None,
+        };
+        let view = apply_turn(
+            &rec3,
+            Ok(no_stop),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            view.applied,
+            "missing stopReason stays on today's success path"
+        );
+        assert!(
+            crate::state::load_run_state(&rec3)
+                .unwrap()
+                .self_check
+                .is_none()
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn self_check_step_cap_completes() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = prepare_implement(true);
+        crate::state::with_run_state_lock(&rec, || {
+            let mut state = crate::state::load_run_state(&rec)?;
+            state.self_check = Some(crate::state::SelfCheckState {
+                steps: crate::workflow::self_check::SELF_CHECK_MAX_STEPS,
+                ..crate::state::SelfCheckState::default()
+            });
+            crate::state::save_run_state(&rec, &state)
+        })
+        .unwrap();
+        let view = apply_turn(
+            &rec,
+            Ok(continue_line()),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(state.phase, crate::workflow::graph::PHASE_CROSS_MODEL);
+        assert!(state.failure_class.is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn self_check_does_not_extend_phase_timeout() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = prepare_implement(true);
+        let before = crate::state::load_run_state(&rec).unwrap();
+        let budget =
+            crate::workflow::timeout_for_phase(&rec, crate::workflow::graph::PHASE_IMPLEMENT);
+        let view = apply_turn(
+            &rec,
+            Ok(continue_line()),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        let after = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(after.phase_started_at, before.phase_started_at);
+        assert_eq!(
+            crate::workflow::timeout_for_phase(&rec, crate::workflow::graph::PHASE_IMPLEMENT),
+            budget
+        );
+        assert_eq!(budget, std::time::Duration::from_secs(7200));
+
+        let (_off_home, _off_proj, off) = prepare_implement(false);
+        let view = apply_turn(
+            &off,
+            Ok(continue_line()),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert!(view.applied, "flag off keeps the success path");
+        assert_eq!(
+            crate::state::load_run_state(&off).unwrap().phase,
+            crate::workflow::graph::PHASE_CROSS_MODEL
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn self_check_paused_or_stopped_does_not_set_pending() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = prepare_implement(true);
+        run::pause(&rec).unwrap();
+        let view = apply_turn(
+            &rec,
+            Ok(continue_line()),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        assert!(
+            crate::state::load_run_state(&rec)
+                .unwrap()
+                .self_check
+                .is_none()
+        );
+
+        let (_home2, _proj2, rec2) = prepare_implement(true);
+        crate::state::with_run_state_lock(&rec2, || {
+            let mut state = crate::state::load_run_state(&rec2)?;
+            state.status = crate::state::RunStatus::Stopped;
+            crate::state::save_run_state(&rec2, &state)
+        })
+        .unwrap();
+        let view = apply_turn(
+            &rec2,
+            Ok(continue_line()),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.skipped, Some(true));
+        assert!(
+            crate::state::load_run_state(&rec2)
+                .unwrap()
+                .self_check
+                .is_none()
+        );
+
+        let (_home3, _proj3, rec3) = prepare_implement(true);
+        let cancelled = PromptResult {
+            text: "self-check: continue finding=none action=repair".into(),
+            stop_reason: Some("cancelled".into()),
+        };
+        let view = apply_turn(
+            &rec3,
+            Ok(cancelled),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        let state = crate::state::load_run_state(&rec3).unwrap();
+        assert_eq!(state.phase, crate::workflow::graph::PHASE_IMPLEMENT);
+        assert!(state.self_check.is_none());
+        assert!(state.failure_class.is_none());
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }

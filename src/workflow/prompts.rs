@@ -152,6 +152,7 @@ fn list_gate_archives(
 pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>) -> String {
     let track = track_id.unwrap_or("(none)");
     let layout = layout_block(record, track_id, phase);
+    let clause = super::self_check::phase_clause(record);
     let body = match phase {
         PHASE_PLAN => {
             let path = workspace_skill(record, "plan");
@@ -198,6 +199,7 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                  do not reduce it to a stamp. Do not edit the execution repo and do not run \
                  cargo, ledgerful, or ai-brains there.\n\
                  {RESEARCH}\n\
+                 {clause}\
                  {END_TURN}\n"
             )
         }
@@ -229,6 +231,7 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                  Address every finding above low; lows may go to `deferred.md`. \
                  Do not plan, fold, or advance. Do not emit `next_track:`.\n\
                  {archive_lines}\
+                 {clause}\
                  {END_TURN}\n"
             )
         }
@@ -301,6 +304,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         }
     }
@@ -371,6 +375,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         }
     }
@@ -522,6 +527,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         }
     }
@@ -670,6 +676,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: Utc::now(),
         };
         run_with_driver(&rec, Some("0031".into()), WorkflowDriver::FileWait).unwrap();

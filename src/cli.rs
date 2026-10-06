@@ -375,6 +375,9 @@ pub enum ProjectCommands {
         /// true | false (omit = leave unchanged). Per-run_epoch detached worktree.
         #[arg(long = "worktree-isolation", value_parser = parse_auto_merge)]
         worktree_isolation: Option<bool>,
+        /// true | false (omit = leave unchanged). Bounded self-check on implement and address-findings.
+        #[arg(long = "self-continuation", value_parser = parse_auto_merge)]
+        self_continuation: Option<bool>,
         /// Repeatable. Canonical phase id or `plan_review_slot` = seconds (>0).
         #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
         phase_timeouts: Vec<(String, u64)>,
@@ -521,6 +524,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 auto_merge,
                 notify_progress,
                 worktree_isolation,
+                self_continuation,
                 phase_timeouts,
                 clear_phase_timeout,
                 clear_phase_timeouts,
@@ -560,6 +564,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     auto_merge,
                     notify_progress,
                     worktree_isolation,
+                    self_continuation,
                     phase_timeouts_secs,
                     clear_phase_timeouts,
                     clear_phase_timeout,
@@ -1201,6 +1206,17 @@ mod tests {
             set.get_arguments()
                 .any(|a| a.get_id() == "worktree_isolation"),
             "set --worktree-isolation"
+        );
+        assert!(
+            set.get_arguments()
+                .any(|a| a.get_id() == "self_continuation"),
+            "set --self-continuation"
+        );
+        let add = project.find_subcommand("add").expect("add");
+        assert!(
+            add.get_arguments()
+                .all(|a| a.get_id().as_str() != "self_continuation"),
+            "add must not grow --self-continuation"
         );
     }
 

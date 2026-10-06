@@ -460,6 +460,9 @@ pub const AUTO_START_ROW_LABEL: &str = "Policy";
 /// Contextual state-policy row on the project card (0069).
 pub const STATE_GATE_ROW_LABEL: &str = "State gate";
 
+/// Bounded self-check row on the project card (0070).
+pub const SELF_CHECK_ROW_LABEL: &str = "Self-check";
+
 /// Text for the State gate row. `None` when the run has no alert.
 pub fn state_gate_row(view: &StatusView) -> Option<String> {
     let gate = view.state_gate.as_ref()?;
@@ -469,6 +472,21 @@ pub fn state_gate_row(view: &StatusView) -> Option<String> {
     } else {
         Some(format!("{} {} — {detail}", gate.action, gate.name))
     }
+}
+
+/// Text for the Self-check row. `None` when the run has no snap.
+pub fn self_check_row(view: &StatusView) -> Option<String> {
+    let sc = view.self_check.as_ref()?;
+    if let Some(report) = sc.report.as_ref().filter(|text| !text.trim().is_empty()) {
+        return Some(report.clone());
+    }
+    let action = sc.last_action.as_deref().unwrap_or("—");
+    let finding = sc.last_finding.as_deref().unwrap_or("—");
+    Some(format!(
+        "step {}/{} {action} finding={finding}",
+        sc.steps,
+        crate::workflow::self_check::SELF_CHECK_MAX_STEPS
+    ))
 }
 
 /// Display title for a card (display_name, else last path component, else id).
@@ -570,6 +588,7 @@ mod tests {
             auto_start: Default::default(),
             parked_next: None,
             state_gate: None,
+            self_check: None,
         }
     }
 
@@ -830,6 +849,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         }
     }
@@ -1006,6 +1026,7 @@ mod tests {
             ready_aliases: Vec::new(),
             auto_start: Default::default(),
             state_policies: Vec::new(),
+            self_continuation: false,
             created_at: chrono::Utc::now(),
         };
         run::run_with_driver(&rec, Some("0014".into()), WorkflowDriver::FileWait).unwrap();
@@ -1039,6 +1060,21 @@ mod tests {
         assert!(row.contains("report"), "{row}");
         assert!(row.contains("Cargo.toml"), "{row}");
         assert_ne!(STATE_GATE_ROW_LABEL, AUTO_START_ROW_LABEL);
+        assert_eq!(SELF_CHECK_ROW_LABEL, "Self-check");
+        assert_ne!(SELF_CHECK_ROW_LABEL, AUTO_START_ROW_LABEL);
+        assert_ne!(SELF_CHECK_ROW_LABEL, STATE_GATE_ROW_LABEL);
+        assert!(self_check_row(&gated).is_none());
+        let mut checking = gated;
+        checking.self_check = Some(crate::state::SelfCheckState {
+            steps: 2,
+            last_action: Some("repair".into()),
+            last_finding: Some("F10".into()),
+            report: Some("self-check: non-convergence repair-repeat".into()),
+            ..crate::state::SelfCheckState::default()
+        });
+        let row = self_check_row(&checking).unwrap();
+        assert!(row.contains("repair-repeat"), "{row}");
+        assert!(!row.contains("Policy"));
     }
 
     #[test]
