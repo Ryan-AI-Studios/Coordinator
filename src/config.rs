@@ -300,6 +300,9 @@ pub struct HermesNotifyConfig {
     /// Opt-in phase-advance progress POSTs (track 0033). Missing key → false.
     #[serde(default)]
     pub progress: bool,
+    /// Opt-in periodic fleet summaries while `serve` runs (track 0068). Missing key → false.
+    #[serde(default)]
+    pub fleet_summary: bool,
 }
 
 /// Machine-level prefs (`{COORDINATOR_HOME}/config.json`).
@@ -435,7 +438,7 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_WORKFLOW_DRIVER`, `COORDINATOR_OUTCOME_POLL_MS`,
 /// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
 /// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`,
-/// `COORDINATOR_NOTIFY_PROGRESS`, `.env` via `load_dotenv_path`,
+/// `COORDINATOR_NOTIFY_PROGRESS`, `COORDINATOR_NOTIFY_FLEET`, `.env` via `load_dotenv_path`,
 /// `COORDINATOR_PROGRESS_STALL_SECS`, `COORDINATOR_JOURNAL`,
 /// `COORDINATOR_CANCEL_WAIT_SECS`, `COORDINATOR_AGY_BIN`,
 /// `COORDINATOR_OPENCODE_BIN`, `COORDINATOR_GROK_BIN`,
@@ -692,6 +695,10 @@ mod tests {
             !loaded.hermes.progress,
             "missing hermes.progress on old config.json defaults false"
         );
+        assert!(
+            !loaded.hermes.fleet_summary,
+            "missing hermes.fleet_summary on old config.json defaults false"
+        );
     }
 
     #[test]
@@ -707,6 +714,7 @@ mod tests {
                 enabled: true,
                 webhook_url: Some("http://127.0.0.1:8644/webhooks/coordinator-failure".into()),
                 progress: false,
+                fleet_summary: false,
             },
             progress_stall_secs: None,
             journal_keep: None,

@@ -1,6 +1,9 @@
 //! Failure notify: artifact + toast + adapter trait (track 0009) + Hermes (0015).
 //! Opt-in progress POSTs on phase advance (track 0033) use [`ProgressEvent`],
 //! never toast / `FAILURE.md`, and never fail apply.
+//! Opt-in fleet summaries (track 0068) use [`FleetSummaryEvent`] on that same
+//! Hermes path. `notify fleet-summary` posts once. `serve` posts at most once
+//! per hour, and only when the fleet flag is on.
 //!
 //! Hook failure notify only after a successful Phase Outcome **failure** commit.
 //! Operator `stop` is not a Failure Class and must not notify.
@@ -33,6 +36,15 @@ pub const ENV_COORDINATOR_NOTIFY_PROGRESS: &str = "COORDINATOR_NOTIFY_PROGRESS";
 
 /// JSON `event_type` for [`ProgressEvent`]. Failure [`NotifyEvent`] has no such field.
 pub const EVENT_TYPE_PROGRESS: &str = "progress";
+
+/// Opt-in periodic fleet summaries (`1` / `true` / `on`). `off` force-disables.
+pub const ENV_COORDINATOR_NOTIFY_FLEET: &str = "COORDINATOR_NOTIFY_FLEET";
+
+/// JSON `event_type` and `X-Coordinator-Event` value for [`FleetSummaryEvent`].
+pub const EVENT_TYPE_FLEET_SUMMARY: &str = "fleet_summary";
+
+/// Minimum gap between serve-loop fleet posts.
+pub const FLEET_SUMMARY_INTERVAL: chrono::Duration = chrono::Duration::seconds(3600);
 
 /// Payload fanned out to every [`NotifyAdapter`].
 ///
@@ -69,6 +81,17 @@ pub struct ProgressEvent {
     pub run_epoch: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_track: Option<String>,
+}
+
+/// Fleet snapshot posted on the Hermes path (track 0068).
+///
+/// `projects` is [`crate::state::StatusView`] from `api::status_all`. Not a
+/// [`NotifyEvent`] and not a [`ProgressEvent`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetSummaryEvent {
+    pub event_type: String,
+    pub written_at: DateTime<Utc>,
+    pub projects: Vec<crate::state::StatusView>,
 }
 
 /// Single notify entry. Never fails the caller (toast/adapter errors isolated).
@@ -112,6 +135,65 @@ pub fn progress_enabled(record: &ProjectRecord) -> bool {
         .map(|c| c.hermes.progress)
         .unwrap_or(false);
     machine || record.notify_progress
+}
+
+/// Env `off` wins; else env on **or** machine `hermes.fleet_summary`.
+/// No per-project flag. The CLI probe does not consult this.
+pub fn fleet_summary_enabled() -> bool {
+    if env_flag_off(ENV_COORDINATOR_NOTIFY_FLEET) {
+        return false;
+    }
+    if env_flag_on(ENV_COORDINATOR_NOTIFY_FLEET) {
+        return true;
+    }
+    crate::config::load_machine_config()
+        .map(|c| c.hermes.fleet_summary)
+        .unwrap_or(false)
+}
+
+/// `enabled` false is never due. A missing `last_sent` is due. Otherwise due
+/// once `now` is at least [`FLEET_SUMMARY_INTERVAL`] after `last_sent`.
+pub fn fleet_summary_due(
+    last_sent: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    enabled: bool,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    match last_sent {
+        None => true,
+        Some(last) => now.signed_duration_since(last) >= FLEET_SUMMARY_INTERVAL,
+    }
+}
+
+/// One fleet snapshot. `written_at` is the caller's clock, not a second read.
+pub fn build_fleet_summary_event(now: DateTime<Utc>) -> crate::error::Result<FleetSummaryEvent> {
+    Ok(FleetSummaryEvent {
+        event_type: EVENT_TYPE_FLEET_SUMMARY.to_string(),
+        written_at: now,
+        projects: crate::api::status_all()?,
+    })
+}
+
+/// One serve-loop chance to post. Sets `last_sent` when the post is due, including
+/// when build or POST fails, so a failure cannot retry on every poll tick.
+/// Never fails the caller.
+pub fn fleet_tick(last_sent: &mut Option<DateTime<Utc>>, now: DateTime<Utc>) {
+    if !fleet_summary_due(*last_sent, now, fleet_summary_enabled()) {
+        return;
+    }
+    *last_sent = Some(now);
+    let event = match build_fleet_summary_event(now) {
+        Ok(event) => event,
+        Err(e) => {
+            eprintln!("coordinator: fleet summary failed (non-fatal): {e}");
+            return;
+        }
+    };
+    if let Err(e) = hermes::HermesAdapter::for_default_stack().notify_fleet(&event) {
+        eprintln!("coordinator: fleet summary failed (non-fatal): {e}");
+    }
 }
 
 /// Hermes (+ one stderr line). Never artifact, never toast, never fails the caller.
@@ -872,5 +954,239 @@ mod tests {
             std::env::remove_var(ENV_COORDINATOR_NOTIFY_PROGRESS);
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
+    }
+
+    fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    fn forbid_secret_keys(value: &serde_json::Value) {
+        const BANNED: &[&str] = &[
+            "secret",
+            "token",
+            "password",
+            "authorization",
+            "api_key",
+            "webhook_url",
+        ];
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let lower = key.to_ascii_lowercase();
+                    assert!(
+                        !BANNED.contains(&lower.as_str()),
+                        "credential-shaped key {key}"
+                    );
+                    forbid_secret_keys(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    forbid_secret_keys(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn notify_and_progress_field_names_unchanged() {
+        let failure = NotifyEvent {
+            project_id: "p".into(),
+            track_id: Some("t".into()),
+            phase: "implement".into(),
+            failure_class: FailureClass::Timeout,
+            message: Some("m".into()),
+            last_event: "x".into(),
+            artifact_path: std::path::PathBuf::from("FAILURE.md"),
+            written_at: Utc::now(),
+            run_epoch: 1,
+        };
+        let progress = ProgressEvent {
+            event_type: EVENT_TYPE_PROGRESS.into(),
+            project_id: "p".into(),
+            track_id: Some("t".into()),
+            from_phase: "plan".into(),
+            to_phase: "implement".into(),
+            elapsed_secs: Some(1),
+            last_event: "x".into(),
+            message: Some("m".into()),
+            written_at: Utc::now(),
+            run_epoch: 1,
+            next_track: Some("n".into()),
+        };
+        assert_eq!(
+            sorted_keys(&serde_json::to_value(&failure).unwrap()),
+            [
+                "artifact_path",
+                "failure_class",
+                "last_event",
+                "message",
+                "phase",
+                "project_id",
+                "run_epoch",
+                "track_id",
+                "written_at",
+            ]
+        );
+        assert_eq!(
+            sorted_keys(&serde_json::to_value(&progress).unwrap()),
+            [
+                "elapsed_secs",
+                "event_type",
+                "from_phase",
+                "last_event",
+                "message",
+                "next_track",
+                "project_id",
+                "run_epoch",
+                "to_phase",
+                "track_id",
+                "written_at",
+            ]
+        );
+    }
+
+    #[test]
+    fn fleet_summary_due_table() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        assert!(!fleet_summary_due(None, now, false));
+        assert!(fleet_summary_due(None, now, true));
+        let ready = now - FLEET_SUMMARY_INTERVAL;
+        assert!(fleet_summary_due(Some(ready), now, true));
+        let early = now - (FLEET_SUMMARY_INTERVAL - chrono::Duration::seconds(1));
+        assert!(!fleet_summary_due(Some(early), now, true));
+        assert!(!fleet_summary_due(Some(now), now, true));
+        let backward = now + chrono::Duration::seconds(5);
+        assert!(!fleet_summary_due(Some(backward), now, true));
+    }
+
+    #[test]
+    fn fleet_off_beats_machine_flag_and_tick_posts_nothing() {
+        use crate::config::{
+            ENV_COORDINATOR_HOME, HermesNotifyConfig, MACHINE_CONFIG_VERSION, MachineConfig,
+            default_role_bindings, save_machine_config, test_env_lock,
+        };
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_COORDINATOR_NOTIFY_FLEET, "off");
+        }
+        let cfg = MachineConfig {
+            version: MACHINE_CONFIG_VERSION,
+            scan_roots: Vec::new(),
+            role_bindings: default_role_bindings(),
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            hermes: HermesNotifyConfig {
+                enabled: true,
+                webhook_url: Some("http://127.0.0.1:9/hook".into()),
+                progress: false,
+                fleet_summary: true,
+            },
+            progress_stall_secs: None,
+            journal_keep: None,
+        };
+        save_machine_config(&cfg).unwrap();
+        assert!(!fleet_summary_enabled());
+        let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
+        let mut last = None;
+        fleet_tick(&mut last, Utc::now());
+        assert!(last.is_none());
+        assert!(sink.take().is_empty());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY_FLEET);
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[test]
+    fn fleet_tick_due_posts_one_header_then_waits() {
+        use crate::config::{ENV_COORDINATOR_HOME, test_env_lock};
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_COORDINATOR_NOTIFY_FLEET, "1");
+            std::env::remove_var("COORDINATOR_HERMES");
+        }
+        assert!(fleet_summary_enabled());
+        let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
+        let now = Utc::now();
+        let mut last = None;
+        fleet_tick(&mut last, now);
+        assert_eq!(last, Some(now));
+        let posts = sink.take();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            hdr(&posts[0], "X-Coordinator-Event"),
+            EVENT_TYPE_FLEET_SUMMARY
+        );
+        let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
+        assert_eq!(body["event_type"], "fleet_summary");
+        assert!(body["projects"].as_array().unwrap().is_empty());
+        let text = String::from_utf8(posts[0].body.clone()).unwrap();
+        assert!(!text.contains("s3cret-fleet"));
+        fleet_tick(&mut last, now);
+        assert!(sink.take().is_empty());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY_FLEET);
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[test]
+    fn fleet_summary_json_has_no_credential_keys() {
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        let mut state = crate::state::RunState::idle(&record.id);
+        state.run_epoch = 4;
+        state.phase = "implement".into();
+        state.failure_class = Some(FailureClass::Timeout);
+        let mut view = crate::state::StatusView::from_record(&record, &state);
+        view.stall = Some(crate::state::StallView {
+            since: Utc::now(),
+            idle_secs: 9,
+        });
+        view.harness = Some(crate::harness::HarnessStatusBundle {
+            grok: Some(crate::harness::GrokHarnessStatus {
+                alive: true,
+                session_id: Some("sess-1".into()),
+                cwd: Some(dir.path().to_path_buf()),
+                supports_compact: true,
+                pid: Some(1),
+                adapter: "grok".into(),
+            }),
+        });
+        view.ci = Some(crate::state::CiStatusView {
+            pr: Some(1),
+            pr_url: Some("https://example.test/pr/1".into()),
+            head_sha: Some("abc".into()),
+            last_summary: None,
+            interval_ms: 1000,
+            auto_merge: false,
+            merge: None,
+        });
+        let event = FleetSummaryEvent {
+            event_type: EVENT_TYPE_FLEET_SUMMARY.into(),
+            written_at: Utc::now(),
+            projects: vec![view],
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        forbid_secret_keys(&value);
+        assert_eq!(value["projects"][0]["run_epoch"], 4);
+        assert_eq!(value["projects"][0]["phase"], "implement");
+        assert_eq!(value["projects"][0]["failure_class"], "timeout");
+        assert_eq!(
+            value["projects"][0]["harness"]["grok"]["session_id"],
+            "sess-1"
+        );
+        assert!(value["projects"][0]["stall"]["idle_secs"].is_number());
+        assert_eq!(
+            value["projects"][0]["ci"]["pr_url"],
+            "https://example.test/pr/1"
+        );
     }
 }

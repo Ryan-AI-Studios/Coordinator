@@ -13,7 +13,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::{HermesNotifyConfig, load_machine_config};
 use crate::error::{CoordinatorError, Result};
-use crate::notify::{EVENT_TYPE_PROGRESS, NotifyAdapter, NotifyEvent, ProgressEvent};
+use crate::notify::{
+    EVENT_TYPE_FLEET_SUMMARY, EVENT_TYPE_PROGRESS, FleetSummaryEvent, NotifyAdapter, NotifyEvent,
+    ProgressEvent,
+};
 
 /// Force-disable even if machine config is enabled.
 pub const ENV_COORDINATOR_HERMES: &str = "COORDINATOR_HERMES";
@@ -184,6 +187,41 @@ impl HermesAdapter {
         }
     }
 
+    /// Blocking fleet POST (CLI `notify fleet-summary`).
+    pub fn notify_fleet_blocking(&self, event: &FleetSummaryEvent) -> Result<u16> {
+        match &self.kind {
+            HermesKind::NoOp => Ok(0),
+            HermesKind::Http { url, secret } => post_fleet_http(url, secret, event),
+            #[cfg(test)]
+            HermesKind::Test(inst) => deliver_fleet_test(inst, event).map(|()| 200),
+        }
+    }
+
+    /// Detached fleet POST. Errors never fail the caller.
+    pub fn notify_fleet(&self, event: &FleetSummaryEvent) -> Result<()> {
+        match &self.kind {
+            HermesKind::NoOp => Ok(()),
+            HermesKind::Http { url, secret } => {
+                let url = url.clone();
+                let secret = secret.clone();
+                let event = event.clone();
+                let _ = std::thread::Builder::new()
+                    .name("coordinator-hermes-fleet".into())
+                    .spawn(move || match post_fleet_http(&url, &secret, &event) {
+                        Ok(status) => {
+                            eprintln!("coordinator: hermes fleet summary delivered HTTP {status}");
+                        }
+                        Err(e) => {
+                            eprintln!("coordinator: hermes fleet summary failed (non-fatal): {e}");
+                        }
+                    });
+                Ok(())
+            }
+            #[cfg(test)]
+            HermesKind::Test(inst) => deliver_fleet_test(inst, event),
+        }
+    }
+
     /// Detached progress POST. Errors never fail the caller.
     pub fn notify_progress(&self, event: &ProgressEvent) -> Result<()> {
         match &self.kind {
@@ -291,6 +329,12 @@ pub fn progress_request_id(event: &ProgressEvent) -> String {
     )
 }
 
+/// Fleet idempotency key. Millis suffix lets a second CLI post inside the
+/// Hermes one-hour cache still deliver.
+pub fn fleet_request_id(event: &FleetSummaryEvent) -> String {
+    format!("fleet_summary:{}", event.written_at.timestamp_millis())
+}
+
 /// Resolve config + env. Does not POST.
 pub fn resolve_from_machine() -> HermesResolve {
     if env_is_off(ENV_COORDINATOR_HERMES) {
@@ -344,6 +388,18 @@ pub fn probe_progress(event: &ProgressEvent) -> ProbeOutcome {
     match resolve_from_machine() {
         HermesResolve::Skip(reason) => ProbeOutcome::Skipped(reason),
         HermesResolve::Ready { url, secret } => match post_progress_http(&url, &secret, event) {
+            Ok(status) => ProbeOutcome::Delivered { status },
+            Err(e) => ProbeOutcome::Failed(e),
+        },
+    }
+}
+
+/// Synthetic fleet probe: no artifact, no toast. Blocking POST when Hermes resolves.
+/// Does not consult the periodic fleet flag.
+pub fn probe_fleet(event: &FleetSummaryEvent) -> ProbeOutcome {
+    match resolve_from_machine() {
+        HermesResolve::Skip(reason) => ProbeOutcome::Skipped(reason),
+        HermesResolve::Ready { url, secret } => match post_fleet_http(&url, &secret, event) {
             Ok(status) => ProbeOutcome::Delivered { status },
             Err(e) => ProbeOutcome::Failed(e),
         },
@@ -520,6 +576,16 @@ impl PreparedPost {
         )
     }
 
+    fn fleet(url: &str, secret: &str, event: &FleetSummaryEvent) -> Result<Self> {
+        Self::signed(
+            url,
+            secret,
+            EVENT_TYPE_FLEET_SUMMARY,
+            fleet_request_id(event),
+            serde_json::to_vec(event)?,
+        )
+    }
+
     #[cfg(test)]
     fn captured(&self) -> CapturedRequest {
         CapturedRequest {
@@ -544,6 +610,10 @@ fn post_http(url: &str, secret: &str, event: &NotifyEvent) -> Result<u16> {
 
 fn post_progress_http(url: &str, secret: &str, event: &ProgressEvent) -> Result<u16> {
     post_prepared(PreparedPost::progress(url, secret, event)?)
+}
+
+fn post_fleet_http(url: &str, secret: &str, event: &FleetSummaryEvent) -> Result<u16> {
+    post_prepared(PreparedPost::fleet(url, secret, event)?)
 }
 
 fn post_prepared(prepared: PreparedPost) -> Result<u16> {
@@ -586,6 +656,11 @@ fn deliver_progress_test(inst: &TestInstall, event: &ProgressEvent) -> Result<()
         inst,
         PreparedPost::progress(&inst.url, &inst.secret, event)?,
     )
+}
+
+#[cfg(test)]
+fn deliver_fleet_test(inst: &TestInstall, event: &FleetSummaryEvent) -> Result<()> {
+    deliver_prepared(inst, PreparedPost::fleet(&inst.url, &inst.secret, event)?)
 }
 
 #[cfg(test)]
@@ -855,6 +930,7 @@ mod tests {
                 enabled: true,
                 webhook_url: Some(url.into()),
                 progress: false,
+                fleet_summary: false,
             },
             progress_stall_secs: None,
             journal_keep: None,
@@ -1197,5 +1273,53 @@ mod tests {
             ProbeOutcome::Skipped(r) => panic!("live skip: {r}"),
             ProbeOutcome::Failed(e) => panic!("live fail: {e}"),
         }
+    }
+
+    fn fleet_event() -> FleetSummaryEvent {
+        FleetSummaryEvent {
+            event_type: EVENT_TYPE_FLEET_SUMMARY.into(),
+            written_at: chrono::DateTime::from_timestamp_millis(1_778_000_000_123).unwrap(),
+            projects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fleet_request_id_uses_millis_suffix() {
+        assert_eq!(
+            fleet_request_id(&fleet_event()),
+            "fleet_summary:1778000000123"
+        );
+    }
+
+    #[test]
+    fn recording_fleet_header_and_body_omit_secret() {
+        let ev = fleet_event();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let adapter = HermesAdapter {
+            kind: HermesKind::Test(TestInstall {
+                url: "http://127.0.0.1:8644/webhooks/coordinator-fleet".into(),
+                secret: "s3cret-fleet".into(),
+                mode: TestMode::Recording,
+                sink: sink.clone(),
+            }),
+        };
+        adapter.notify_fleet(&ev).unwrap();
+        let captured = sink.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        let req = &captured[0];
+        let parsed: FleetSummaryEvent = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(parsed, ev);
+        let text = String::from_utf8(req.body.clone()).unwrap();
+        assert!(!text.contains("s3cret-fleet"));
+        assert_eq!(header(req, HEADER_EVENT).unwrap(), EVENT_TYPE_FLEET_SUMMARY);
+        assert_eq!(
+            header(req, HEADER_REQUEST_ID).unwrap(),
+            fleet_request_id(&ev)
+        );
+        let ts: u64 = header(req, HEADER_TIMESTAMP).unwrap().parse().unwrap();
+        assert_eq!(
+            header(req, HEADER_SIGNATURE_V2).unwrap(),
+            sign_v2("s3cret-fleet", ts, &req.body)
+        );
     }
 }

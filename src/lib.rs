@@ -43,6 +43,7 @@
 //! Plan-review join wall 2400s + OpenCode `plan_review_slot` clock and pin-OOS prompt: track **0039**.
 //! Opt-in per-`run_epoch` detached worktree under the project state dir: track **0066**.
 //! Epoch checkpoint ref before `implement`, plus operator restore: track **0067**.
+//! Opt-in Hermes fleet summary (`notify fleet-summary` and serve cadence): track **0068**.
 
 pub mod api;
 pub mod checkpoint;

@@ -179,6 +179,8 @@ pub enum NotifyCommands {
         #[arg(long)]
         progress: bool,
     },
+    /// Post one fleet status summary (no artifact, no toast).
+    FleetSummary,
 }
 
 #[derive(Debug, Subcommand)]
@@ -704,6 +706,20 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     }
                 }
             }
+            NotifyCommands::FleetSummary => {
+                let event = crate::notify::build_fleet_summary_event(chrono::Utc::now())?;
+                match crate::notify::hermes::probe_fleet(&event) {
+                    crate::notify::hermes::ProbeOutcome::Skipped(reason) => {
+                        println!("hermes skipped: {reason}");
+                    }
+                    crate::notify::hermes::ProbeOutcome::Delivered { status } => {
+                        println!("hermes delivered HTTP {status}");
+                    }
+                    crate::notify::hermes::ProbeOutcome::Failed(e) => {
+                        return Err(e);
+                    }
+                }
+            }
         },
     }
     Ok(())
@@ -950,6 +966,15 @@ mod tests {
         assert!(
             hermes.get_arguments().any(|a| a.get_id() == "progress"),
             "hermes-test --progress"
+        );
+        let fleet = notify
+            .find_subcommand("fleet-summary")
+            .expect("fleet-summary");
+        assert!(
+            fleet
+                .get_arguments()
+                .all(|a| a.get_id().as_str() != "project"),
+            "fleet-summary has no --project"
         );
     }
 
