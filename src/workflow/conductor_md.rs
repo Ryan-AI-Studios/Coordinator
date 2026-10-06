@@ -220,6 +220,16 @@ pub fn is_cancelled(status_raw: &str) -> bool {
     status_token_matches(&status_clean(status_raw), "Cancelled")
 }
 
+/// Vocabulary `Proposed`, including house-style trailing detail (0074).
+fn is_proposed(status_raw: &str) -> bool {
+    status_token_matches(&status_clean(status_raw), "Proposed")
+}
+
+/// Vocabulary `Blocked`, including house-style trailing detail (0074).
+fn is_blocked(status_raw: &str) -> bool {
+    status_token_matches(&status_clean(status_raw), "Blocked")
+}
+
 /// Completed, Absorbed, or Cancelled. Does not change Ready aliases or the sticky overlay.
 pub fn is_terminal(status_raw: &str) -> bool {
     is_completed(status_raw) || is_absorbed(status_raw) || is_cancelled(status_raw)
@@ -775,17 +785,27 @@ fn row_overlay_eligible(row: &TrackRow, aliases: &[String], sticky: &[String]) -
     if is_eligible_ready_in(&row.status_raw, aliases) {
         return true;
     }
-    if is_completed(&row.status_raw) || is_in_progress(&row.status_raw) {
+    if explicit_non_ready(&row.status_raw) {
         return false;
     }
     sticky.iter().any(|s| track_ids_match(&row.id, s))
 }
 
+/// Statuses sticky must not override or retain (0074).
+///
+/// `In progress` and `is_terminal` (Completed, Absorbed, Cancelled) were
+/// already exempt. `Proposed` and `Blocked` are the explicit withholds.
+fn explicit_non_ready(status_raw: &str) -> bool {
+    is_in_progress(status_raw)
+        || is_terminal(status_raw)
+        || is_proposed(status_raw)
+        || is_blocked(status_raw)
+}
+
 fn sticky_keep_live(row: &TrackRow) -> bool {
     !is_hitl_marked(&row.id, &row.slug, &row.status_raw, &row.summary)
         && !row.nostart
-        && !is_completed(&row.status_raw)
-        && !is_in_progress(&row.status_raw)
+        && !explicit_non_ready(&row.status_raw)
 }
 
 /// Union-capture operator-Ready ids (0055). Missing/unparseable file → `prev`.
@@ -1820,17 +1840,34 @@ mod tests {
     }
 
     #[test]
-    fn sticky_overlay_picks_proposed_successor() {
-        let dir = tempdir().unwrap();
-        let ws = dir.path();
-        write_md(ws, &proposed_md("0002", "Next"));
-        mkdir_track(ws, "0001-Done");
-        mkdir_track(ws, "0002-Next");
-        let r = rec(ws);
-        assert_eq!(
-            pick_next_ready_excluding_sticky(&r, &[], None, &["0002".into()]).unwrap(),
-            "0002"
-        );
+    fn sticky_skips_explicit_non_ready_and_picks_later_ready() {
+        let cells = [
+            "**Proposed — placeholder, needs full spec/plan pass**",
+            "**Blocked — owner review pending**",
+            "**Cancelled** - note",
+            "**Absorbed — 0058 `204a258`**",
+        ];
+        for cell in cells {
+            let dir = tempdir().unwrap();
+            let ws = dir.path();
+            write_md(
+                ws,
+                &format!(
+                    "| Track | Execution path | Status | Summary |\n\
+                     | --- | --- | --- | --- |\n\
+                     | 0002-Held | `.` | {cell} | held |\n\
+                     | 0003-Go | `.` | **Ready — not started** | go |\n"
+                ),
+            );
+            mkdir_track(ws, "0002-Held");
+            mkdir_track(ws, "0003-Go");
+            let r = rec(ws);
+            assert_eq!(
+                pick_next_ready_excluding_sticky(&r, &[], None, &["0002".into()]).unwrap(),
+                "0003",
+                "{cell}"
+            );
+        }
     }
 
     #[test]
@@ -1947,7 +1984,7 @@ mod tests {
             ws,
             "| Track | Execution path | Status | Summary |\n\
              | --- | --- | --- | --- |\n\
-             | 0042-Queued | `.` | **Proposed — placeholder, needs full spec/plan pass** | later |\n",
+             | 0042-Queued | `.` | **Ready — folded @ sha1234** | later |\n",
         );
         assert_eq!(
             pick_next_ready_excluding_sticky(&r, &[], None, &sticky).unwrap(),
@@ -1963,7 +2000,7 @@ mod tests {
             ws,
             "| Track | Execution path | Status | Summary |\n\
              | --- | --- | --- | --- |\n\
-             | 0001-One | `.` | **Proposed — placeholder, needs full spec/plan pass** | a |\n\
+             | 0001-One | `.` | **Ready — folded @ sha1234** | a |\n\
              | 0002-Two | `.` | **Ready — not started** | b |\n",
         );
         mkdir_track(ws, "0001-One");
@@ -1978,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_capture_union_keeps_prev_proposed_adds_new_ready_drops_completed() {
+    fn sticky_capture_union_drops_prev_proposed_adds_new_ready_drops_completed() {
         let dir = tempdir().unwrap();
         let ws = dir.path();
         write_md(
@@ -1991,7 +2028,7 @@ mod tests {
         );
         let r = rec(ws);
         let out = capture_sticky_ready_ids(&r, &["0001".into(), "0002".into()]);
-        assert_eq!(out, vec!["0002".to_string(), "0003".to_string()]);
+        assert_eq!(out, vec!["0003".to_string()]);
     }
 
     #[test]

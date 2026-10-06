@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_full_auto_starts_sticky_ready_after_proposed_rewrite() {
+    fn advance_full_proposed_rewrite_does_not_autostart() {
         let dir = tempdir().unwrap();
         write_both_ready(dir.path());
         let mut r = rec(dir.path());
@@ -1157,6 +1157,38 @@ mod tests {
         save_run_state(&r, &state).unwrap();
         let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
         let view = write_and_apply(&r, o).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert_eq!(view.last_event, LAST_EVENT_BACKLOG_CLEAR);
+        assert_ne!(view.track_id.as_deref(), Some("0002"));
+        let after = std::fs::read(&cond).unwrap();
+        assert_eq!(before, after, "overlay must not write conductor.md");
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(!log.contains("sticky Ready 0002"), "{log}");
+        assert!(!log.contains("auto-start 0002"), "{log}");
+    }
+
+    #[test]
+    fn advance_full_auto_starts_sticky_after_unaliased_rewrite() {
+        let dir = tempdir().unwrap();
+        write_both_ready(dir.path());
+        let mut r = rec(dir.path());
+        r.auto_start = AutoStartPolicy::Full;
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let captured = load_run_state(&r).unwrap().sticky_ready_ids.clone();
+        assert!(captured.iter().any(|id| id == "0002"), "{captured:?}");
+        let cond = dir.path().join("conductor").join("conductor.md");
+        let rewritten = "\
+| Track | Execution path | Status | Summary |\n\
+| --- | --- | --- | --- |\n\
+| [0001-Example](0001-Example/spec.md) | `.` | **In progress** | one |\n\
+| [0002-Next](0002-Next/spec.md) | `.` | **Ready — folded @ sha1234** | next |\n";
+        std::fs::write(&cond, rewritten).unwrap();
+        let before = std::fs::read(&cond).unwrap();
+        let mut state = load_run_state(&r).unwrap();
+        state.phase = graph::PHASE_ADVANCE.into();
+        save_run_state(&r, &state).unwrap();
+        let o = PhaseOutcome::success(graph::PHASE_ADVANCE, OutcomeSource::Test, None, None, None);
+        let view = write_and_apply(&r, o).unwrap();
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.track_id.as_deref(), Some("0002"));
         assert!(
@@ -1168,9 +1200,7 @@ mod tests {
         assert_eq!(before, after, "overlay must not write conductor.md");
         let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
         assert!(
-            log.contains(
-                "sticky Ready 0002 (file=Proposed - placeholder, needs full spec/plan pass)"
-            ),
+            log.contains("sticky Ready 0002 (file=Ready - folded @ sha1234)"),
             "{log}"
         );
     }
