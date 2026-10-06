@@ -12,7 +12,7 @@ use serde_json::json;
 
 use crate::api::{
     self, HarnessPromptBody, OutcomeWriteBody, ProjectAddRequest, ProjectRefBody,
-    ProjectScanRequest, ProjectSetRequest,
+    ProjectScanRequest, ProjectSetRequest, RestoreBody,
 };
 use crate::config::{DEFAULT_SERVE_PORT, loopback_addr, require_loopback};
 use crate::error::CoordinatorError;
@@ -30,6 +30,7 @@ pub fn app() -> Router {
         .route("/v1/pause", post(post_pause))
         .route("/v1/resume", post(post_resume))
         .route("/v1/stop", post(post_stop))
+        .route("/v1/restore", post(post_restore))
         .route("/v1/outcome", get(get_outcome).post(post_outcome))
         .route("/v1/failure", get(get_failure))
         .route("/v1/harness/grok/start", post(post_grok_start))
@@ -117,6 +118,11 @@ async fn post_resume(Json(body): Json<ProjectRefBody>) -> Result<impl IntoRespon
 
 async fn post_stop(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
     let view = api::cmd_stop(body.project.as_deref(), false)?;
+    Ok(Json(view))
+}
+
+async fn post_restore(Json(body): Json<RestoreBody>) -> Result<impl IntoResponse, ApiError> {
+    let view = api::cmd_restore(body.project.as_deref(), body.discard, false)?;
     Ok(Json(view))
 }
 
@@ -304,6 +310,62 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["ok"], true);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn restore_route_refuses_running() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let body = serde_json::to_vec(&json!({ "path": proj.path().to_string_lossy() })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let run_body = serde_json::to_vec(&json!({ "driver": "stub", "track": "0067" })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(run_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = serde_json::to_vec(&json!({})).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/restore")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("stop first"), "{v}");
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
     }
 
     /// Holds std Mutex across awaits to serialize process-wide COORDINATOR_HOME.

@@ -139,6 +139,10 @@ pub struct RunState {
     /// Operator-Ready ids captured at `run` (0055). Overlay pick; not a Status JSON key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sticky_ready_ids: Vec<String>,
+    /// Branch `HEAD` named when this epoch's checkpoint ref was first created (0067).
+    /// `None` when that `HEAD` was detached. Not rewritten when the ref already exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_branch: Option<String>,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -229,6 +233,7 @@ impl RunState {
             plan_review_slot_ran: Vec::new(),
             address_findings_attempts: 0,
             sticky_ready_ids: Vec::new(),
+            checkpoint_branch: None,
         }
     }
 

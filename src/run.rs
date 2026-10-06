@@ -56,6 +56,7 @@ pub(crate) fn run_with_origin(
                     )));
                 }
                 let next_epoch = state.run_epoch.saturating_add(1);
+                crate::checkpoint::reap_abandoned(record, next_epoch)?;
                 crate::worktree::prepare_epoch(record, next_epoch)?;
                 let leftover = state.failure_class.is_some()
                     || crate::notify::artifact::existing_path(record).is_some();

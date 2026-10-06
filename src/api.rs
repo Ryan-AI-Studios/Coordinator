@@ -120,6 +120,15 @@ pub struct ProjectShowView {
     pub phase_timeouts: BTreeMap<String, PhaseTimeoutView>,
 }
 
+/// POST /v1/restore body. `discard` defaults false. Not added onto [`ProjectRefBody`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreBody {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub discard: bool,
+}
+
 /// POST /v1/outcome body: Phase Outcome fields + optional project selector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutcomeWriteBody {
@@ -544,6 +553,12 @@ pub fn cmd_stop(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
     run::stop(&rec)
 }
 
+/// CLI and `POST /v1/restore`. Project omit matches `stop` (`infer_cwd` is false for HTTP).
+pub fn cmd_restore(project: Option<&str>, discard: bool, infer_cwd: bool) -> Result<StatusView> {
+    let rec = resolve_selected(project, infer_cwd)?;
+    crate::checkpoint::restore(&rec, discard)
+}
+
 /// CLI/HTTP: write Phase Outcome and apply via the single apply path.
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_outcome_write(
@@ -862,6 +877,39 @@ mod tests {
         );
     }
 
+    /// Fold → implement refuses a missing git cwd. Full stub walks need a clean repo.
+    fn attach_clean_exec(rec: &ProjectRecord) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "checkpoint-walk@example.com"]);
+        git(&["config", "user.name", "checkpoint-walk"]);
+        std::fs::write(dir.path().join("README.md"), b"seed\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-m", "seed"]);
+        let mut reg = load_registry().unwrap();
+        let slot = reg
+            .projects
+            .iter_mut()
+            .find(|p| p.id == rec.id)
+            .expect("project");
+        slot.execution_repo = Some(dir.path().to_path_buf());
+        save_registry(&reg).unwrap();
+        dir
+    }
+
     fn add_isolated_project() -> (tempfile::TempDir, tempfile::TempDir, ProjectRecord) {
         let home = tempdir().unwrap();
         let proj = tempdir().unwrap();
@@ -906,6 +954,7 @@ mod tests {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
         }
         let (_home, _proj, rec) = add_isolated_project();
+        let _repo = attach_clean_exec(&rec);
         let view = cmd_run_cli(
             Some(&rec.id),
             Some("0020".into()),
@@ -1043,6 +1092,7 @@ mod tests {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
         }
         let (_home, _proj, rec) = add_isolated_project();
+        let _repo = attach_clean_exec(&rec);
         let port = spawn_health_once(r#"{"ok":true}"#);
         let view = cmd_run_cli(
             Some(&rec.id),
@@ -1119,6 +1169,7 @@ mod tests {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
         }
         let (_home, _proj, rec) = add_isolated_project();
+        let _repo = attach_clean_exec(&rec);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dead = listener.local_addr().unwrap().port();
         drop(listener);
@@ -1159,6 +1210,7 @@ mod tests {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
         }
         let (_home, _proj, rec) = add_isolated_project();
+        let _repo = attach_clean_exec(&rec);
         let hold = watch::spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
         crate::serve_lease::write_serve_lease(hold.port).unwrap();
         let other = spawn_health_once(r#"{"ok":true}"#);
@@ -1368,6 +1420,7 @@ mod tests {
         }
         project_add(a.path(), ProjectAddOptions::default()).unwrap();
         let rec_b = project_add(b.path(), ProjectAddOptions::default()).unwrap();
+        let _repo = attach_clean_exec(&rec_b);
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(b.path()).unwrap();
         let view = cmd_run_cli(
@@ -1903,6 +1956,7 @@ mod tests {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
         }
         let (_home, proj, rec) = add_isolated_project();
+        let _repo = attach_clean_exec(&rec);
         crate::workflow::conductor_md::write_ready_fixture(proj.path(), "0030").unwrap();
         let idle = cmd_run_cli(
             Some(&rec.id),

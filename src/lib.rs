@@ -42,8 +42,10 @@
 //! Adaptive ACP spawn (cursor `--yolo --trust acp`, `cursor_login`, `/summarize`, `roles use`): track **0038**.
 //! Plan-review join wall 2400s + OpenCode `plan_review_slot` clock and pin-OOS prompt: track **0039**.
 //! Opt-in per-`run_epoch` detached worktree under the project state dir: track **0066**.
+//! Epoch checkpoint ref before `implement`, plus operator restore: track **0067**.
 
 pub mod api;
+pub mod checkpoint;
 pub mod ci;
 pub mod cli;
 pub mod config;

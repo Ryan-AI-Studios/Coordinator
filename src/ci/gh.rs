@@ -1192,6 +1192,22 @@ mod parse_tests {
         let push = git_push_args("ledgerful", "track/0317-x");
         assert_eq!(push, ["push", "-u", "ledgerful", "track/0317-x"]);
         assert!(!push.iter().any(|a| a == "HEAD"));
+        assert!(
+            !push
+                .iter()
+                .any(|a| a.contains("refs/coordinator/checkpoints"))
+        );
+        let checkpoint_ref = "refs/coordinator/checkpoints/11111111-1111-1111-1111-111111111111/3";
+        assert!(!branch_is_track(checkpoint_ref, "0067"));
+        assert!(!branch_is_track(checkpoint_ref, "1111"));
+        assert!(!branch_is_track(
+            "checkpoints/11111111-1111-1111-1111-111111111111/3",
+            "0067"
+        ));
+        assert!(
+            std::any::type_name_of_val(&live_auto_publish).ends_with("live_auto_publish"),
+            "git_push_args stays on the live_auto_publish call site"
+        );
         let args = pr_create_args(
             "track(0010): foo",
             "body",
@@ -1210,6 +1226,11 @@ mod parse_tests {
         assert!(args.windows(2).any(|w| w == ["--repo", "owner/repo"]));
         assert!(!args.contains(&"--draft"));
         assert!(!args.contains(&"--fill"));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("refs/coordinator/checkpoints"))
+        );
         let no_repo = pr_create_args("t", "b", "main", "head", None);
         assert!(!no_repo.iter().any(|a| a == "--repo"));
         assert_eq!(GIT_PUSH_TIMEOUT, Duration::from_secs(120));
