@@ -347,10 +347,9 @@ fn find_closer(lines: &[Line<'_>], from: usize) -> Option<usize> {
 fn match_opener(line: &str) -> Option<Opener> {
     let (status, rest) = if let Some(rest) = line.strip_prefix(ACTIVE_PREFIX) {
         (BlockStatus::Active, rest)
-    } else if let Some(rest) = line.strip_prefix(SUPERSEDED_PREFIX) {
-        (BlockStatus::Superseded, rest)
     } else {
-        return None;
+        let rest = line.strip_prefix(SUPERSEDED_PREFIX)?;
+        (BlockStatus::Superseded, rest)
     };
     let (by, rest) = cut_at_quote(rest)?;
     if by.is_empty() {
