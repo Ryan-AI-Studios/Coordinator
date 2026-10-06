@@ -10,8 +10,8 @@ use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run
 
 use super::bundle::{self, review_file, reviews_dir};
 use super::graph::{
-    PHASE_COMPACT, PHASE_PLAN_REVIEW, is_canonical, is_recognized_role, resolve_track_dir,
-    review_slugs, role_phase,
+    PHASE_COMPACT, PHASE_PLAN, PHASE_PLAN_REVIEW, is_canonical, is_recognized_role,
+    resolve_track_dir, review_slugs, role_phase,
 };
 use super::prompts;
 use super::{WorkflowDriver, mark_driven};
@@ -179,12 +179,45 @@ impl Drop for SlowInjectGuard {
     }
 }
 
+/// First adapter inject of `plan`, when spec and plan are already files.
+/// Stub and file_wait never call this. A later tick returns before it.
+fn refresh_plan_evidence_stamp(record: &ProjectRecord, state: &RunState) -> Result<()> {
+    if state.phase != PHASE_PLAN {
+        return Ok(());
+    }
+    let Some(track_id) = state.track_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(dir) = resolve_track_dir(record, track_id) else {
+        return Ok(());
+    };
+    if !dir.join("spec.md").is_file() || !dir.join("plan.md").is_file() {
+        return Ok(());
+    }
+    let utc = super::evidence_stamp::utc_stamp_line(chrono::Utc::now());
+    super::evidence_stamp::refresh_evidence_file(
+        &dir.join("evidence.md"),
+        &super::evidence_stamp::version_line(),
+        &utc,
+    )
+}
+
 fn drive_adapter(
     record: &ProjectRecord,
     state: &RunState,
 ) -> Result<Option<crate::state::StatusView>> {
     if state.last_driven_phase.as_deref() == Some(state.phase.as_str()) {
         return Ok(None);
+    }
+
+    if let Err(err) = refresh_plan_evidence_stamp(record, state) {
+        return fail_phase(
+            record,
+            state,
+            FailureClass::Permission,
+            format!("evidence stamp: {err}"),
+            OutcomeSource::Adapter,
+        );
     }
 
     // Resolve the phase binding *before* live-session reuse so a non-grok
@@ -755,6 +788,75 @@ mod tests {
             auto_start: Default::default(),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    fn plan_state(record: &ProjectRecord, phase: &str, track: &str) -> crate::state::RunState {
+        let mut state = crate::state::RunState::idle(&record.id);
+        state.phase = phase.into();
+        state.track_id = Some(track.into());
+        state
+    }
+
+    #[test]
+    fn plan_refresh_keeps_evidence_body_when_spec_and_plan_exist() {
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0076-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join("spec.md"), "# spec\n").unwrap();
+        std::fs::write(track.join("plan.md"), "# plan\n").unwrap();
+        std::fs::write(
+            track.join("evidence.md"),
+            "coordinator 0.0.1\n2020-01-01T00:00:00Z\nOWNER-MARKER\n",
+        )
+        .unwrap();
+        let record = rec(dir.path());
+        let state = plan_state(&record, PHASE_PLAN, "0076");
+        refresh_plan_evidence_stamp(&record, &state).unwrap();
+        let text = std::fs::read_to_string(track.join("evidence.md")).unwrap();
+        let version = crate::workflow::evidence_stamp::version_line();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some(version.as_str()));
+        let stamp = lines.next().unwrap();
+        assert_eq!(stamp.len(), 20);
+        assert!(stamp.ends_with('Z'));
+        assert_ne!(stamp, "2020-01-01T00:00:00Z");
+        assert!(text.contains("OWNER-MARKER"));
+        assert!(!text.contains("coordinator 0.0.1"));
+    }
+
+    #[test]
+    fn non_plan_phase_does_not_refresh_evidence() {
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0076-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join("spec.md"), "# spec\n").unwrap();
+        std::fs::write(track.join("plan.md"), "# plan\n").unwrap();
+        let body = "coordinator 0.0.1\n2020-01-01T00:00:00Z\nOWNER-MARKER\n";
+        std::fs::write(track.join("evidence.md"), body).unwrap();
+        let record = rec(dir.path());
+        let state = plan_state(&record, "fold", "0076");
+        refresh_plan_evidence_stamp(&record, &state).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(track.join("evidence.md")).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn missing_plan_file_skips_evidence_refresh() {
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0076-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join("spec.md"), "# spec\n").unwrap();
+        let body = "keep-me\n";
+        std::fs::write(track.join("evidence.md"), body).unwrap();
+        let record = rec(dir.path());
+        let state = plan_state(&record, PHASE_PLAN, "0076");
+        refresh_plan_evidence_stamp(&record, &state).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(track.join("evidence.md")).unwrap(),
+            body
+        );
     }
 
     #[test]
