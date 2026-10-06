@@ -150,6 +150,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: NotifyCommands,
     },
+    /// Record, show, or list an owner decision on a track.
+    Decision {
+        #[command(subcommand)]
+        action: DecisionCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -181,6 +186,46 @@ pub enum NotifyCommands {
     },
     /// Post one fleet status summary (no artifact, no toast).
     FleetSummary,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DecisionCommands {
+    /// Record one owner decision into the track evidence file.
+    ///
+    /// The marker records that an operator declared this decision and supplied the name. It is not proof the named person typed it, not a signature, and not a tamper-proof or compliance control.
+    #[command(long_about = crate::workflow::decision::RECORD_LIMITATION)]
+    Record {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        track: String,
+        #[arg(long)]
+        by: String,
+        /// Mark the current active block superseded and append a new one.
+        #[arg(long)]
+        supersede: bool,
+        /// Read the sentence from this file instead of stdin.
+        #[arg(long = "sentence-file")]
+        sentence_file: Option<PathBuf>,
+    },
+    /// Show the one active owner decision.
+    Show {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        track: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List owner-decision blocks in file order.
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        track: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -721,8 +766,63 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 }
             }
         },
+        Commands::Decision { action } => match action {
+            DecisionCommands::Record {
+                project,
+                track,
+                by,
+                supersede,
+                sentence_file,
+            } => {
+                let sentence = read_decision_sentence(sentence_file.as_deref())?;
+                match api::cmd_decision_record(
+                    project.as_deref(),
+                    &track,
+                    &by,
+                    &sentence,
+                    supersede,
+                    true,
+                )? {
+                    crate::workflow::decision::RecordEffect::Wrote => {
+                        println!("decision recorded");
+                    }
+                    crate::workflow::decision::RecordEffect::Unchanged => {
+                        println!("decision unchanged");
+                    }
+                }
+            }
+            DecisionCommands::Show {
+                project,
+                track,
+                json,
+            } => {
+                let text = api::cmd_decision_show(project.as_deref(), &track, json, true)?;
+                print!("{text}");
+            }
+            DecisionCommands::List {
+                project,
+                track,
+                json,
+            } => {
+                let text = api::cmd_decision_list(project.as_deref(), &track, json, true)?;
+                print!("{text}");
+            }
+        },
     }
     Ok(())
+}
+
+fn read_decision_sentence(
+    sentence_file: Option<&std::path::Path>,
+) -> Result<String, CoordinatorError> {
+    let raw = if let Some(path) = sentence_file {
+        std::fs::read_to_string(path)?
+    } else {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        buf
+    };
+    crate::workflow::decision::normalize_sentence_input(&raw)
 }
 
 /// `serve --check`: print JSON, exit 0 if coordinator health, 1 otherwise.
@@ -1188,5 +1288,39 @@ mod tests {
         let failure = cmd.find_subcommand("failure").expect("failure");
         assert!(failure.find_subcommand("show").is_some());
         assert!(failure.find_subcommand("resolve").is_some());
+    }
+
+    #[test]
+    fn decision_record_help_states_the_limitation() {
+        let cmd = Cli::command();
+        let decision = cmd.find_subcommand("decision").expect("decision");
+        let record = decision.find_subcommand("record").expect("record");
+        assert!(record.get_arguments().any(|arg| arg.get_id() == "by"));
+        assert!(record.get_arguments().any(|arg| arg.get_id() == "track"));
+        assert!(
+            record
+                .get_arguments()
+                .any(|arg| arg.get_id() == "supersede")
+        );
+        assert!(
+            record
+                .get_arguments()
+                .any(|arg| arg.get_id() == "sentence_file")
+        );
+        assert!(
+            record.get_arguments().all(|arg| arg.get_id() != "sentence"),
+            "record must not take --sentence"
+        );
+        let mut help_cmd = record.clone();
+        let help = help_cmd.render_long_help().to_string();
+        assert!(
+            help.contains(crate::workflow::decision::RECORD_LIMITATION),
+            "{help}"
+        );
+        assert!(!help.contains("cryptographically verified"), "{help}");
+        let show = decision.find_subcommand("show").expect("show");
+        assert!(show.get_arguments().any(|arg| arg.get_id() == "json"));
+        let list = decision.find_subcommand("list").expect("list");
+        assert!(list.get_arguments().any(|arg| arg.get_id() == "json"));
     }
 }
