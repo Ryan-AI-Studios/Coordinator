@@ -378,6 +378,7 @@ pub async fn poll_once_async(record: &ProjectRecord) -> Result<Option<StatusView
 
 /// Background poll all registered projects that are Running or Paused.
 pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    let mut last_fleet: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
         if *shutdown.borrow() {
             break;
@@ -410,6 +411,7 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
                 // Registry missing/unreadable: skip tick.
             }
         }
+        crate::notify::fleet_tick(&mut last_fleet, chrono::Utc::now());
 
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
