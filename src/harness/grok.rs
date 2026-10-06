@@ -28,6 +28,10 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::Notify;
 
 use crate::error::{CoordinatorError, Result};
+use crate::harness::capabilities::{
+    APPROVALS_AUTO_ALLOWED, ContextUsage, QUESTIONS_AUTO_SKIPPED, context_usage_from_message,
+    tool_title_from_message,
+};
 use crate::outcome::FailureClass;
 use crate::registry::ProjectRecord;
 
@@ -207,6 +211,12 @@ pub struct GrokSession {
     terminals: crate::harness::terminal::TerminalHub,
     /// Bounded redacted stderr. Absent on the mock transport.
     stderr: Option<StderrShare>,
+    /// Latest `usage_update`. Absent until the session emits one.
+    pub context_usage: Option<ContextUsage>,
+    /// Last auto-answer label. Cancel and `cursor/create_plan` leave this unchanged.
+    pub last_signal: Option<String>,
+    /// Last non-empty tool title. An update that omits `title` does not clear it.
+    pub last_tool_title: Option<String>,
 }
 
 /// Cloneable stdin writer so abort can send `session/cancel` without the pool lock.
@@ -387,6 +397,9 @@ impl GrokSession {
             cancel_requested,
             terminals: crate::harness::terminal::TerminalHub::new(),
             stderr,
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         session.terminals.set_adapter(harness);
         session.handshake(timeout).await?;
@@ -455,6 +468,9 @@ impl GrokSession {
             cancel_requested,
             terminals: crate::harness::terminal::TerminalHub::new(),
             stderr: None,
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         session.terminals.set_adapter(harness);
         session.handshake(timeout).await?;
@@ -687,6 +703,12 @@ impl GrokSession {
             let v: Value = serde_json::from_str(&line)
                 .map_err(|e| CoordinatorError::Message(format!("invalid ACP JSON line: {e}")))?;
             if v.get("method").and_then(|m| m.as_str()) == Some("session/update") {
+                if let Some(usage) = context_usage_from_message(&v) {
+                    self.context_usage = Some(usage);
+                }
+                if let Some(title) = tool_title_from_message(&v) {
+                    self.last_tool_title = Some(title);
+                }
                 collect_update(&v, &mut self.collected_text);
                 self.terminals.apply_acp_tool_update(&v);
                 if let Some(ref rec) = self.progress_record {
@@ -713,6 +735,7 @@ impl GrokSession {
                             "result": { "outcome": "cancelled" }
                         })
                     } else {
+                        self.last_signal = Some(APPROVALS_AUTO_ALLOWED.to_string());
                         permission_allow_reply(perm_id, v.get("params"))
                     };
                     self.write_line(&reply.to_string()).await?;
@@ -731,7 +754,10 @@ impl GrokSession {
             {
                 if let Some(req_id) = v.get("id").cloned() {
                     let outcome = match method_name {
-                        "cursor/ask_question" => "skipped",
+                        "cursor/ask_question" => {
+                            self.last_signal = Some(QUESTIONS_AUTO_SKIPPED.to_string());
+                            "skipped"
+                        }
                         "cursor/create_plan" => "accepted",
                         _ => "cancelled",
                     };
@@ -2040,6 +2066,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_allow_records_approximated_signal() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-perm-label");
+        lines.push(session_request_permission(99, "sess-perm-label"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        assert!(session.last_signal.is_none());
+        assert!(session.context_usage.is_none());
+        let result = session.inject_prompt("ok", timeout()).await.unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            session.last_signal.as_deref(),
+            Some(super::APPROVALS_AUTO_ALLOWED)
+        );
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("permission result written");
+        assert_eq!(reply["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(reply["result"]["outcome"]["optionId"], "allow-once");
+
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-perm-cancel");
+        lines.push(session_request_permission(99, "sess-perm-cancel"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.cancel().await.unwrap();
+        session.inject_prompt("ok", timeout()).await.unwrap();
+        assert!(session.last_signal.is_none());
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("permission result written");
+        assert_eq!(reply["result"]["outcome"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn parses_usage_update_used_size_and_cost() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-usage");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": { "text": "hidden thought" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        lines.push(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"usage_update","used":12,"size":200,"cost":{"amount":0.01,"currency":"USD"}}}}"#
+                .to_string(),
+        );
+        lines.push(session_update_chunk("pong"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        let result = session.inject_prompt("ok", timeout()).await.unwrap();
+        assert_eq!(result.text, "pong");
+        assert!(!result.text.contains("hidden thought"));
+        let usage = session.context_usage.expect("usage");
+        assert_eq!(usage.used, 12);
+        assert_eq!(usage.size, 200);
+        assert_eq!(usage.cost.as_deref(), Some("0.01 USD"));
+    }
+
+    #[tokio::test]
+    async fn usage_update_without_cost_leaves_cost_absent() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-chunk");
+        lines.push(session_update_chunk("only text"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        let result = session.inject_prompt("ok", timeout()).await.unwrap();
+        assert_eq!(result.text, "only text");
+        assert!(session.context_usage.is_none());
+
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-nocost");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": { "sessionUpdate": "usage_update", "used": 4, "size": 9 }
+                }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("ok", timeout()).await.unwrap();
+        let usage = session.context_usage.expect("usage");
+        assert_eq!(usage.used, 4);
+        assert_eq!(usage.size, 9);
+        assert!(usage.cost.is_none());
+
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-badcost");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 7,
+                        "size": 11,
+                        "cost": { "amount": "1", "currency": "USD" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("ok", timeout()).await.unwrap();
+        let usage = session.context_usage.expect("usage");
+        assert_eq!(usage.used, 7);
+        assert_eq!(usage.size, 11);
+        assert!(usage.cost.is_none());
+    }
+
+    #[tokio::test]
+    async fn thought_chunk_stays_out_of_collected_text() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-thought");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": { "text": "secret thought" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        lines.push(session_update_chunk("visible"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        let result = session.inject_prompt("ok", timeout()).await.unwrap();
+        assert_eq!(result.text, "visible");
+    }
+
+    #[tokio::test]
+    async fn tool_title_kept_without_changing_tool_in_flight() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-title");
+        lines.push(session_update_tool_call("read file"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("ok", timeout()).await.unwrap();
+        assert!(session.terminals.tool_in_flight());
+        assert_eq!(session.last_tool_title.as_deref(), Some("read file"));
+
+        let dir = tempdir().unwrap();
+        let mut lines = mock_handshake_ok("sess-title-done");
+        lines.push(session_update_tool_call("read file"));
+        lines.push(session_update_tool_call_update("completed"));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(dir.path().to_path_buf(), lines, timeout())
+            .await
+            .unwrap();
+        session.inject_prompt("ok", timeout()).await.unwrap();
+        assert!(!session.terminals.tool_in_flight());
+        assert_eq!(session.last_tool_title.as_deref(), Some("read file"));
+    }
+
+    #[tokio::test]
     async fn terminal_create_during_prompt_returns_terminal_id() {
         let dir = tempdir().unwrap();
         let mut lines = mock_handshake_ok("sess-term");
@@ -2611,6 +2832,68 @@ mod tests {
             .expect("cursor/ask_question result written");
         assert_eq!(reply["result"]["outcome"]["outcome"], "skipped");
         assert!(reply.get("method").is_none());
+        assert_eq!(
+            session.last_signal.as_deref(),
+            Some(super::QUESTIONS_AUTO_SKIPPED)
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_ask_question_records_auto_skipped() {
+        let dir = tempdir().unwrap();
+        let mut lines = mock_cursor_handshake_ok("sess-ask-label");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "cursor/ask_question",
+                "params": { "sessionId": "sess-ask-label" }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session =
+            GrokSession::start_mock_for(dir.path().to_path_buf(), lines, timeout(), "cursor")
+                .await
+                .unwrap();
+        session.inject_prompt("ok", timeout()).await.unwrap();
+        assert_eq!(
+            session.last_signal.as_deref(),
+            Some(super::QUESTIONS_AUTO_SKIPPED)
+        );
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("cursor/ask_question result written");
+        assert_eq!(reply["result"]["outcome"]["outcome"], "skipped");
+
+        let dir = tempdir().unwrap();
+        let mut lines = mock_cursor_handshake_ok("sess-plan");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "cursor/create_plan",
+                "params": { "sessionId": "sess-plan" }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session =
+            GrokSession::start_mock_for(dir.path().to_path_buf(), lines, timeout(), "cursor")
+                .await
+                .unwrap();
+        session.inject_prompt("ok", timeout()).await.unwrap();
+        assert!(session.last_signal.is_none());
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(99)))
+            .expect("cursor/create_plan result written");
+        assert_eq!(reply["result"]["outcome"]["outcome"], "accepted");
     }
 
     #[cfg(windows)]

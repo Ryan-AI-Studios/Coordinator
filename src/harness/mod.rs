@@ -5,6 +5,7 @@
 //! TerminalHub JSONL command journal + `loop_suspect`: track **0034**.
 
 pub mod abort;
+pub mod capabilities;
 pub mod grok;
 pub mod journal;
 pub mod pool;

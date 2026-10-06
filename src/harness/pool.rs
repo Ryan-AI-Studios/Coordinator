@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{CoordinatorError, Result};
+use crate::harness::capabilities::ContextUsage;
 use crate::harness::grok::{
     ENV_ACP_HARNESS, ENV_CURSOR_BIN, ENV_GROK_BIN, GrokSession, PromptResult,
     failure_class_for_message, resolve_cursor_binary,
@@ -70,6 +71,9 @@ impl SessionPool {
             supports_compact: s.supports_compact,
             pid: s.pid,
             adapter: s.adapter.clone(),
+            context_usage: s.context_usage.clone(),
+            last_signal: s.last_signal.clone(),
+            last_tool_title: s.last_tool_title.clone(),
         })
     }
 }
@@ -86,6 +90,12 @@ pub struct GrokHarnessStatus {
     pub pid: Option<u32>,
     #[serde(default = "default_adapter")]
     pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_title: Option<String>,
 }
 
 impl GrokHarnessStatus {
@@ -97,6 +107,9 @@ impl GrokHarnessStatus {
             supports_compact: false,
             pid: None,
             adapter: default_adapter(),
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         }
     }
 }
@@ -158,6 +171,12 @@ struct PersistedGrokHandle {
     prompt_in_flight: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_usage: Option<ContextUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_tool_title: Option<String>,
 }
 
 impl PersistedGrokHandle {
@@ -169,6 +188,9 @@ impl PersistedGrokHandle {
             supports_compact: self.supports_compact,
             pid: self.pid,
             adapter: self.adapter.clone(),
+            context_usage: self.context_usage.clone(),
+            last_signal: self.last_signal.clone(),
+            last_tool_title: self.last_tool_title.clone(),
         }
     }
 }
@@ -242,6 +264,9 @@ fn write_session_persist(
         alive: true,
         prompt_in_flight,
         error: None,
+        context_usage: session.context_usage.clone(),
+        last_signal: session.last_signal.clone(),
+        last_tool_title: session.last_tool_title.clone(),
     };
     let _ = save_persist(record, &handle);
 }
@@ -268,6 +293,9 @@ fn save_attempt_persist(record: &ProjectRecord, harness: &str, error: Option<Str
         alive: false,
         prompt_in_flight: false,
         error,
+        context_usage: None,
+        last_signal: None,
+        last_tool_title: None,
     };
     let _ = save_persist(record, &handle);
 }
@@ -299,6 +327,17 @@ fn set_prompt_in_flight(record: &ProjectRecord, value: bool) {
         h.prompt_in_flight = value;
         let _ = save_persist(record, &h);
     }
+}
+
+/// Copy fidelity onto the existing persist file. Leaves `control_addr` and `prompt_in_flight` alone.
+fn remember_fidelity(record: &ProjectRecord, session: &GrokSession) {
+    let Ok(Some(mut handle)) = load_persist(record) else {
+        return;
+    };
+    handle.context_usage = session.context_usage.clone();
+    handle.last_signal = session.last_signal.clone();
+    handle.last_tool_title = session.last_tool_title.clone();
+    let _ = save_persist(record, &handle);
 }
 
 /// Holder `Cancel` RPC (no-op if no live control addr).
@@ -603,14 +642,7 @@ async fn spawn_in_process(
     session.set_progress_record(record.clone());
     crate::harness::abort::register_cancel_handle(record.id.clone(), session.cancel_handle());
     write_session_persist(record, &session, None, false);
-    let status = GrokHarnessStatus {
-        alive: true,
-        session_id: Some(session.session_id.clone()),
-        cwd: Some(session.cwd.clone()),
-        supports_compact: session.supports_compact,
-        pid: session.pid,
-        adapter: session.adapter.clone(),
-    };
+    let status = session_status(&session);
     global_pool()
         .lock()
         .await
@@ -1060,6 +1092,9 @@ async fn hold_accept_loop(rec: ProjectRecord, mut session: GrokSession) -> Resul
         alive: false,
         prompt_in_flight: false,
         error: None,
+        context_usage: session.context_usage.clone(),
+        last_signal: session.last_signal.clone(),
+        last_tool_title: session.last_tool_title.clone(),
     };
     let _ = save_persist(&rec, &dead);
     Ok(())
@@ -1187,6 +1222,10 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     }
                     let tally = {
                         let session = shared.session.lock().await;
+                        if let Ok(mut snap) = shared.snapshot.lock() {
+                            *snap = session_status(&session);
+                        }
+                        remember_fidelity(record, &session);
                         session.terminal_spawn_tally()
                     };
                     let view = apply_turn(
@@ -1222,34 +1261,46 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                 drop(session);
                 let mut session = shared.session.lock().await;
                 match session.compact(prompt_timeout_for(record)).await {
-                    Ok(pr) => (
-                        HoldResponse {
-                            ok: true,
-                            error: None,
-                            text: Some(pr.text),
-                            stop_reason: pr.stop_reason,
-                            status: None,
-                            harness: Some(session_status(&session)),
-                            applied: Some(false),
-                            skipped: None,
-                            failure_class: None,
-                        },
-                        false,
-                    ),
-                    Err(e) => (
-                        HoldResponse {
-                            ok: false,
-                            error: Some(e.to_string()),
-                            text: None,
-                            stop_reason: None,
-                            status: None,
-                            harness: Some(session_status(&session)),
-                            applied: Some(false),
-                            skipped: None,
-                            failure_class: Some(failure_class_for_message(&e.to_string())),
-                        },
-                        false,
-                    ),
+                    Ok(pr) => {
+                        if let Ok(mut snap) = shared.snapshot.lock() {
+                            *snap = session_status(&session);
+                        }
+                        remember_fidelity(record, &session);
+                        (
+                            HoldResponse {
+                                ok: true,
+                                error: None,
+                                text: Some(pr.text),
+                                stop_reason: pr.stop_reason,
+                                status: None,
+                                harness: Some(session_status(&session)),
+                                applied: Some(false),
+                                skipped: None,
+                                failure_class: None,
+                            },
+                            false,
+                        )
+                    }
+                    Err(e) => {
+                        if let Ok(mut snap) = shared.snapshot.lock() {
+                            *snap = session_status(&session);
+                        }
+                        remember_fidelity(record, &session);
+                        (
+                            HoldResponse {
+                                ok: false,
+                                error: Some(e.to_string()),
+                                text: None,
+                                stop_reason: None,
+                                status: None,
+                                harness: Some(session_status(&session)),
+                                applied: Some(false),
+                                skipped: None,
+                                failure_class: Some(failure_class_for_message(&e.to_string())),
+                            },
+                            false,
+                        )
+                    }
                 }
             }
         }
@@ -1258,6 +1309,8 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                 let _ = h.cancel().await;
             }
             let _ = shared.shutdown_tx.send(true);
+            let mut snap = snapshot_status(&shared);
+            snap.alive = false;
             (
                 HoldResponse {
                     ok: true,
@@ -1265,14 +1318,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     text: None,
                     stop_reason: None,
                     status: None,
-                    harness: Some(GrokHarnessStatus {
-                        alive: false,
-                        session_id: snapshot_status(&shared).session_id,
-                        cwd: snapshot_status(&shared).cwd,
-                        supports_compact: snapshot_status(&shared).supports_compact,
-                        pid: snapshot_status(&shared).pid,
-                        adapter: snapshot_status(&shared).adapter,
-                    }),
+                    harness: Some(snap),
                     applied: None,
                     skipped: None,
                     failure_class: None,
@@ -1296,6 +1342,9 @@ fn session_status(session: &GrokSession) -> GrokHarnessStatus {
         supports_compact: session.supports_compact,
         pid: session.pid,
         adapter: session.adapter.clone(),
+        context_usage: session.context_usage.clone(),
+        last_signal: session.last_signal.clone(),
+        last_tool_title: session.last_tool_title.clone(),
     }
 }
 
@@ -1395,6 +1444,12 @@ pub async fn prompt(
             );
         }
     }
+    {
+        let mut pool = global_pool().lock().await;
+        if let Some(session) = pool.get_mut(&rec.id) {
+            remember_fidelity(&rec, session);
+        }
+    }
     let harness = current_status(&rec).await;
     let tally = {
         let mut pool = global_pool().lock().await;
@@ -1436,26 +1491,32 @@ pub async fn compact(project: Option<&str>, infer_cwd: bool) -> Result<HarnessPr
     }
     // Compact is not a phase-completion signal (ADR-0021 skip-not-fail).
     match session.compact(prompt_timeout_for(&rec)).await {
-        Ok(pr) => Ok(HarnessPromptView {
-            text: Some(pr.text),
-            stop_reason: pr.stop_reason,
-            applied: false,
-            skipped: None,
-            error: None,
-            failure_class: None,
-            status: None,
-            harness: Some(session_status(session)),
-        }),
-        Err(e) => Ok(HarnessPromptView {
-            text: None,
-            stop_reason: None,
-            applied: false,
-            skipped: None,
-            error: Some(e.to_string()),
-            failure_class: Some(failure_class_for_message(&e.to_string())),
-            status: None,
-            harness: Some(session_status(session)),
-        }),
+        Ok(pr) => {
+            remember_fidelity(&rec, session);
+            Ok(HarnessPromptView {
+                text: Some(pr.text),
+                stop_reason: pr.stop_reason,
+                applied: false,
+                skipped: None,
+                error: None,
+                failure_class: None,
+                status: None,
+                harness: Some(session_status(session)),
+            })
+        }
+        Err(e) => {
+            remember_fidelity(&rec, session);
+            Ok(HarnessPromptView {
+                text: None,
+                stop_reason: None,
+                applied: false,
+                skipped: None,
+                error: Some(e.to_string()),
+                failure_class: Some(failure_class_for_message(&e.to_string())),
+                status: None,
+                harness: Some(session_status(session)),
+            })
+        }
     }
 }
 
@@ -1527,6 +1588,9 @@ pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarn
             alive: false,
             prompt_in_flight: false,
             error: None,
+            context_usage: session.context_usage.clone(),
+            last_signal: session.last_signal.clone(),
+            last_tool_title: session.last_tool_title.clone(),
         };
         let _ = save_persist(&rec, &dead);
         return Ok(dead.to_status());
@@ -1568,6 +1632,9 @@ fn persist_marked_dead(h: &PersistedGrokHandle) -> PersistedGrokHandle {
         alive: false,
         prompt_in_flight: false,
         error: None,
+        context_usage: h.context_usage.clone(),
+        last_signal: h.last_signal.clone(),
+        last_tool_title: h.last_tool_title.clone(),
     }
 }
 
@@ -2204,6 +2271,10 @@ mod tests {
             alive: true,
             prompt_in_flight: false,
             error: None,
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         save_persist(&rec, &handle).unwrap();
         let got = reuse_or_reap_existing(&rec, "grok").await.unwrap();
@@ -2247,6 +2318,10 @@ mod tests {
             alive: false,
             prompt_in_flight: false,
             error: Some("ACP authenticate: not logged in".into()),
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         save_persist(&rec, &stale).unwrap();
         assert!(load_persist(&rec).unwrap().unwrap().error.is_some());
@@ -2274,6 +2349,10 @@ mod tests {
             alive: true,
             prompt_in_flight: false,
             error: None,
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         assert_eq!(interpret_persist_after_spawn(&ready), PersistWait::Ready);
     }
@@ -2534,6 +2613,10 @@ mod tests {
             alive: true,
             prompt_in_flight: false,
             error: None,
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         save_persist(&rec, &handle).unwrap();
         assert!(
@@ -2590,6 +2673,10 @@ mod tests {
             alive: true,
             prompt_in_flight: false,
             error: None,
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         save_persist(&rec, &handle).unwrap();
 
@@ -2742,6 +2829,10 @@ Loop\r\n",
             alive: true,
             prompt_in_flight: false,
             error: None,
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         save_persist(&rec, &handle).unwrap();
         let _ = shutdown(Some(&rec.id), false).await;
@@ -2786,6 +2877,10 @@ Loop\r\n",
             alive: true,
             prompt_in_flight: false,
             error: None,
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         save_persist(&rec, &handle).unwrap();
         let reused = reuse_or_reap_existing(&rec, "cursor").await.unwrap();
@@ -3042,6 +3137,10 @@ Loop\r\n",
             alive: true,
             prompt_in_flight: true,
             error: None,
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         save_persist(&rec, &handle).unwrap();
         crate::harness::abort::abort_stuck_prompt_sync(
@@ -3153,6 +3252,10 @@ Loop\r\n",
             alive: true,
             prompt_in_flight: true,
             error: None,
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         };
         save_persist(&rec, &old).unwrap();
 
@@ -3216,6 +3319,102 @@ Loop\r\n",
         );
     }
 
+    #[tokio::test]
+    async fn remember_fidelity_keeps_control_addr() {
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: "fidelity".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: Default::default(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            created_at: chrono::Utc::now(),
+        };
+        let handle = PersistedGrokHandle {
+            version: 1,
+            project_id: rec.id.clone(),
+            session_id: Some("sess".into()),
+            cwd: Some(dir.path().to_path_buf()),
+            pid: Some(7),
+            holder_pid: Some(8),
+            control_addr: Some("127.0.0.1:9".into()),
+            adapter: "grok".into(),
+            supports_compact: true,
+            alive: true,
+            prompt_in_flight: true,
+            error: None,
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
+        };
+        save_persist(&rec, &handle).unwrap();
+        let mut session = GrokSession::start_mock(
+            dir.path().to_path_buf(),
+            mock_handshake_ok("sess"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        session.context_usage = Some(ContextUsage {
+            used: 4,
+            size: 8,
+            cost: Some("0.01 USD".into()),
+        });
+        session.last_signal = Some(crate::harness::capabilities::APPROVALS_AUTO_ALLOWED.into());
+        session.last_tool_title = Some("read file".into());
+        remember_fidelity(&rec, &session);
+        let loaded = load_persist(&rec).unwrap().unwrap();
+        assert_eq!(loaded.control_addr.as_deref(), Some("127.0.0.1:9"));
+        assert!(loaded.prompt_in_flight);
+        assert_eq!(loaded.holder_pid, Some(8));
+        let usage = loaded.context_usage.as_ref().expect("usage");
+        assert_eq!(usage.used, 4);
+        assert_eq!(usage.size, 8);
+        assert_eq!(usage.cost.as_deref(), Some("0.01 USD"));
+        assert_eq!(
+            loaded.last_signal.as_deref(),
+            Some(crate::harness::capabilities::APPROVALS_AUTO_ALLOWED)
+        );
+        assert_eq!(loaded.last_tool_title.as_deref(), Some("read file"));
+        let value = serde_json::to_value(loaded.to_status()).unwrap();
+        assert!(value.get("holder_pid").is_none());
+        assert_eq!(value["context_usage"]["used"], 4);
+        assert_eq!(value["last_tool_title"], "read file");
+    }
+
+    #[test]
+    fn old_harness_persist_without_fidelity_fields_loads() {
+        let raw = r#"{"version":1,"project_id":"p","adapter":"grok","supports_compact":true,"alive":true,"prompt_in_flight":false,"holder_pid":9}"#;
+        let handle: PersistedGrokHandle = serde_json::from_str(raw).unwrap();
+        assert!(handle.context_usage.is_none());
+        assert!(handle.last_signal.is_none());
+        assert!(handle.last_tool_title.is_none());
+        assert_eq!(handle.holder_pid, Some(9));
+        let value = serde_json::to_value(handle.to_status()).unwrap();
+        assert!(value.get("holder_pid").is_none());
+        assert!(value.get("context_usage").is_none());
+        assert!(value.get("last_signal").is_none());
+        assert!(value.get("last_tool_title").is_none());
+        let parsed: GrokHarnessStatus =
+            serde_json::from_str(r#"{"alive":false,"supports_compact":false,"adapter":"cursor"}"#)
+                .unwrap();
+        assert!(!parsed.alive);
+        assert!(parsed.context_usage.is_none());
+        assert_eq!(parsed.adapter, "cursor");
+    }
+
     fn harness_stub() -> GrokHarnessStatus {
         GrokHarnessStatus {
             alive: true,
@@ -3224,6 +3423,9 @@ Loop\r\n",
             supports_compact: false,
             pid: None,
             adapter: "grok".into(),
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
         }
     }
 
