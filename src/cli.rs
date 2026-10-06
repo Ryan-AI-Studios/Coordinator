@@ -93,6 +93,14 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Return the execution tree to this epoch's checkpoint ref
+    Restore {
+        #[arg(long)]
+        project: Option<String>,
+        /// Reset and `git clean -fd` even when `git status --porcelain` is non-empty
+        #[arg(long)]
+        discard: bool,
+    },
     /// Phase Outcome File writers / inspectors
     Outcome {
         #[command(subcommand)]
@@ -557,6 +565,10 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             let view = api::cmd_stop(project.as_deref(), true)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
+        Commands::Restore { project, discard } => {
+            let view = api::cmd_restore(project.as_deref(), discard, true)?;
+            println!("{}", serde_json::to_string_pretty(&view)?);
+        }
         Commands::Outcome { action } => match action {
             OutcomeCommands::Write {
                 project,
@@ -790,6 +802,31 @@ mod tests {
             help.contains("--serve-port"),
             "run --help should mention --serve-port: {help}"
         );
+    }
+
+    #[test]
+    fn restore_subcommand_parses_project_and_discard() {
+        let cmd = Cli::command();
+        let restore = cmd.find_subcommand("restore").expect("restore");
+        assert!(restore.get_arguments().any(|a| a.get_id() == "project"));
+        assert!(restore.get_arguments().any(|a| a.get_id() == "discard"));
+        let bare = Cli::try_parse_from(["coordinator", "restore"]).unwrap();
+        match bare.command {
+            Commands::Restore { project, discard } => {
+                assert!(project.is_none());
+                assert!(!discard);
+            }
+            other => panic!("expected restore, got {other:?}"),
+        }
+        let flagged =
+            Cli::try_parse_from(["coordinator", "restore", "--project", "p", "--discard"]).unwrap();
+        match flagged.command {
+            Commands::Restore { project, discard } => {
+                assert_eq!(project.as_deref(), Some("p"));
+                assert!(discard);
+            }
+            other => panic!("expected restore, got {other:?}"),
+        }
     }
 
     #[test]

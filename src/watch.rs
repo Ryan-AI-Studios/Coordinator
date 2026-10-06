@@ -462,6 +462,30 @@ mod tests {
         save_machine_config(&cfg).unwrap();
     }
 
+    fn clean_exec() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "checkpoint-walk@example.com"]);
+        git(&["config", "user.name", "checkpoint-walk"]);
+        std::fs::write(dir.path().join("README.md"), b"seed\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-m", "seed"]);
+        dir
+    }
+
     fn rec(path: &std::path::Path) -> ProjectRecord {
         ProjectRecord {
             id: Uuid::new_v4().to_string(),
@@ -810,7 +834,9 @@ mod tests {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
         }
         let dir = tempdir().unwrap();
-        let r = rec(dir.path());
+        let repo = clean_exec();
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(repo.path().to_path_buf());
         run_with_driver(&r, Some("0020".into()), WorkflowDriver::Stub).unwrap();
         let view = wait_for_outcome(&r, None).unwrap();
         assert_eq!(view.status, RunStatus::Idle);

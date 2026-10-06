@@ -113,6 +113,16 @@ pub fn on_success(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseO
     }
 
     if let Some(next) = successor(&state.phase) {
+        if state.phase == graph::PHASE_FOLD
+            && next == graph::PHASE_IMPLEMENT
+            && let Err(e) = crate::checkpoint::ensure_implement_ref(record, state)
+        {
+            state.status = RunStatus::Stopped;
+            state.failure_class = None;
+            state.last_event = e.to_string();
+            crate::progress_log::append(record, "checkpoint-refused", &state.last_event);
+            return;
+        }
         let from = state.phase.clone();
         state.phase = next.to_string();
         reset_phase_clock(state);
@@ -237,6 +247,7 @@ fn journal_advance_override(record: &ProjectRecord, planner_id: Option<&str>, ca
 }
 
 fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
+    let _ = crate::checkpoint::reap_completed(record);
     if let Some(id) = state
         .track_id
         .as_deref()
@@ -295,6 +306,7 @@ fn start_or_park(record: &ProjectRecord, state: &mut RunState, id: &str) {
 }
 
 fn apply_backlog_clear(record: &ProjectRecord, state: &mut RunState) {
+    let _ = crate::checkpoint::reap_completed(record);
     state.status = RunStatus::Idle;
     state.next_track = None;
     state.last_event = LAST_EVENT_BACKLOG_CLEAR.into();
@@ -515,6 +527,30 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    fn clean_exec() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "checkpoint-walk@example.com"]);
+        git(&["config", "user.name", "checkpoint-walk"]);
+        std::fs::write(dir.path().join("README.md"), b"seed\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-m", "seed"]);
+        dir
+    }
+
     fn rec(path: &std::path::Path) -> crate::registry::ProjectRecord {
         crate::registry::ProjectRecord {
             id: Uuid::new_v4().to_string(),
@@ -596,7 +632,9 @@ mod tests {
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
         }
         let dir = tempdir().unwrap();
-        let r = rec(dir.path());
+        let repo = clean_exec();
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(repo.path().to_path_buf());
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::Stub).unwrap();
         let view = wait_for_outcome(&r, Some(15)).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
@@ -614,7 +652,9 @@ mod tests {
     #[test]
     fn skip_events_visible() {
         let dir = tempdir().unwrap();
-        let r = rec(dir.path());
+        let repo = clean_exec();
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(repo.path().to_path_buf());
         run_with_driver(&r, None, WorkflowDriver::Stub).unwrap();
         let after_xmodel = walk_until(&r, |v| v.last_event.contains("cross-model: stub"));
         assert!(

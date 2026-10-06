@@ -515,6 +515,7 @@ coordinator run [--project <path|id>] [--track <id>] [--driver adapter|file_wait
 coordinator pause [--project <path|id>]
 coordinator resume [--project <path|id>]
 coordinator stop [--project <path|id>]
+coordinator restore [--project <path|id>] [--discard]
 coordinator outcome write --phase <id> --status success|failure
     [--failure-class <enum>] [--message <text>] [--project …]
     [--next-track <id>] [--source cli]
@@ -535,7 +536,9 @@ coordinator serve [--port <u16>] [--check]   # default 7420, 127.0.0.1 only
 
 `--project` stays optional. With more than one registered project, CLI omit infers unique cwd containment then last-used (`{COORDINATOR_HOME}/last-used.json`, not a secret, not `config.json`). HTTP never infers from the serve cwd.
 
-HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver` and `skip_preflight`), `GET /v1/doctor` (200 `DoctorReport` even when `ok` is false), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Adapter `POST /v1/run` without `skip_preflight` returns **409** + `DoctorReport` JSON when a required harness is `missing` or `auth` (not `{"error": …}`). `stub` / `file_wait` skip preflight. `--skip-preflight` is the adapter escape. Preflight does **not** write run-state, `FAILURE.md`, or a toast.
+`coordinator restore` and `POST /v1/restore` (`{ project, discard }`, `discard` defaults false) share one API function. They return the product git cwd to `refs/coordinator/checkpoints/{project_id}/{run_epoch}` (the ref taken on the fold → implement edge). Restore refuses `Running`, `Paused`, a harness persist file with `alive` or `prompt_in_flight`, a missing ref, and a non-empty `git status --porcelain` unless discard is set. It runs `git clean -fd` only. It does not push, change `run_epoch`, or start the next `run`.
+
+HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1/projects/set`, `POST /v1/projects/scan`, plus run/status/outcome routes (`POST /v1/run` accepts optional `driver` and `skip_preflight`), `POST /v1/restore`, `GET /v1/doctor` (200 `DoctorReport` even when `ok` is false), `GET /v1/failure` (200 `{path, body}` or 404), and `/v1/harness/grok/{start,prompt,compact,status,shutdown}`. Adapter `POST /v1/run` without `skip_preflight` returns **409** + `DoctorReport` JSON when a required harness is `missing` or `auth` (not `{"error": …}`). `stub` / `file_wait` skip preflight. `--skip-preflight` is the adapter escape. Preflight does **not** write run-state, `FAILURE.md`, or a toast.
 
 **Harness preflight (`doctor`):** probes each Role Binding row plus synthetic `ci`/`gh`. Env pin (`COORDINATOR_*_BIN`) wins when trim-nonempty. Never `grok --help`, never `gh auth status --show-token`. Tokens are never stored or printed. Login commands are printed only — Coordinator does not exec a login TUI.
 
