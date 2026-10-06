@@ -1008,6 +1008,8 @@ mod tests {
             .expect("project");
         slot.execution_repo = Some(dir.path().to_path_buf());
         save_registry(&reg).unwrap();
+        // Fold → implement allows this row. The git repo stays the other temp dir.
+        crate::workflow::conductor_md::write_ready_fixture(rec.path.as_path(), "0020").unwrap();
         dir
     }
 
@@ -1522,6 +1524,7 @@ mod tests {
         project_add(a.path(), ProjectAddOptions::default()).unwrap();
         let rec_b = project_add(b.path(), ProjectAddOptions::default()).unwrap();
         let _repo = attach_clean_exec(&rec_b);
+        crate::workflow::conductor_md::write_ready_fixture(b.path(), "0029").unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(b.path()).unwrap();
         let view = cmd_run_cli(
@@ -2058,7 +2061,18 @@ mod tests {
         }
         let (_home, proj, rec) = add_isolated_project();
         let _repo = attach_clean_exec(&rec);
-        crate::workflow::conductor_md::write_ready_fixture(proj.path(), "0030").unwrap();
+        // 0020 is In progress so fold allows it and the later omit-pick stays on Ready 0030.
+        let cond = proj.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0020-Fixture")).unwrap();
+        std::fs::create_dir_all(cond.join("0030-Fixture")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0020-Fixture | `.` | **In progress** | current |\n\
+             | 0030-Fixture | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
         let idle = cmd_run_cli(
             Some(&rec.id),
             Some("0020".into()),

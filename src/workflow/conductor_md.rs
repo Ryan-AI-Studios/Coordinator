@@ -835,6 +835,41 @@ pub fn capture_sticky_ready_ids(record: &ProjectRecord, prev: &[String]) -> Vec<
     out
 }
 
+/// Whether a finished `fold` may enter `implement` (0075).
+///
+/// Ready aliases win. `Proposed`, `Blocked`, and [`is_terminal`] withhold.
+/// `In progress` and any other non-token cell allow. This reader does not
+/// call `explicit_non_ready`, which also treats `In progress` as excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldAdvance {
+    Allow,
+    Withhold { status_clean: String },
+    Unreadable,
+}
+
+/// Read the registry row for `track_id`. Missing id, file, or row is [`FoldAdvance::Unreadable`].
+pub fn fold_advance(record: &ProjectRecord, track_id: Option<&str>) -> FoldAdvance {
+    let Some(key) = track_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return FoldAdvance::Unreadable;
+    };
+    let Some(rows) = load_track_rows(record) else {
+        return FoldAdvance::Unreadable;
+    };
+    let Some(row) = rows.iter().find(|r| row_matches_track(r, key)) else {
+        return FoldAdvance::Unreadable;
+    };
+    let aliases = ready_aliases_for(record);
+    if is_eligible_ready_in(&row.status_raw, &aliases) {
+        return FoldAdvance::Allow;
+    }
+    if is_proposed(&row.status_raw) || is_blocked(&row.status_raw) || is_terminal(&row.status_raw) {
+        return FoldAdvance::Withhold {
+            status_clean: status_clean(&row.status_raw),
+        };
+    }
+    FoldAdvance::Allow
+}
+
 /// `Some(status_clean)` when `id` was picked but the live cell is not Ready.
 pub fn overlay_file_status(record: &ProjectRecord, id: &str) -> Option<String> {
     let rows = load_track_rows(record)?;
@@ -917,6 +952,105 @@ mod tests {
 
     fn mkdir_track(ws: &Path, name: &str) {
         std::fs::create_dir_all(ws.join("conductor").join(name)).unwrap();
+    }
+
+    fn one_row(status: &str, summary: &str, nostart: bool) -> String {
+        let summary = if nostart {
+            format!("{summary} <!-- nostart -->")
+        } else {
+            summary.to_string()
+        };
+        format!(
+            "| Track | Status | Summary |\n\
+             | --- | --- | --- |\n\
+             | [0001-One](0001-One/spec.md) | {status} | {summary} |\n"
+        )
+    }
+
+    #[test]
+    fn fold_advance_matrix() {
+        let dir = tempdir().unwrap();
+        let mut record = rec(dir.path());
+
+        assert_eq!(fold_advance(&record, None), FoldAdvance::Unreadable);
+        assert_eq!(fold_advance(&record, Some("   ")), FoldAdvance::Unreadable);
+        assert_eq!(
+            fold_advance(&record, Some("0001")),
+            FoldAdvance::Unreadable,
+            "missing conductor.md"
+        );
+
+        write_md(dir.path(), &one_row("**Ready — not started**", "ok", false));
+        // File parses, asked id is absent.
+        write_md(
+            dir.path(),
+            "| Track | Status | Summary |\n\
+             | --- | --- | --- |\n\
+             | [0002-Two](0002-Two/spec.md) | **Ready — not started** | ok |\n",
+        );
+        assert_eq!(fold_advance(&record, Some("0001")), FoldAdvance::Unreadable);
+
+        let withhold = |record: &ProjectRecord, status: &str| {
+            write_md(record.path.as_path(), &one_row(status, "ok", false));
+            match fold_advance(record, Some("0001")) {
+                FoldAdvance::Withhold { status_clean: got } => {
+                    assert_eq!(got, status_clean(status), "{status}");
+                    got
+                }
+                other => panic!("{status} -> {other:?}"),
+            }
+        };
+        let proposed = withhold(
+            &record,
+            "**Proposed — placeholder, needs full spec/plan pass**",
+        );
+        assert!(proposed.starts_with("Proposed - placeholder"), "{proposed}");
+        withhold(&record, "**Blocked — owner review pending**");
+        withhold(&record, "**Cancelled** - note");
+        withhold(&record, "**Absorbed — 0058 `204a258`**");
+        withhold(
+            &record,
+            "**Completed** 2026-10-06 - PR **#69** squash 2f3a1ea",
+        );
+
+        let allow = |record: &ProjectRecord, status: &str, summary: &str, nostart: bool| {
+            write_md(record.path.as_path(), &one_row(status, summary, nostart));
+            assert_eq!(
+                fold_advance(record, Some("0001")),
+                FoldAdvance::Allow,
+                "{status} {summary} nostart={nostart}"
+            );
+        };
+        allow(&record, "**Ready — not started**", "ok", false);
+        allow(&record, "**In progress**", "ok", false);
+        allow(&record, "**Ready — folded @ sha1234**", "ok", false);
+        allow(
+            &record,
+            "**Ready — not started**",
+            "needs hitl review",
+            false,
+        );
+        allow(&record, "**Ready — not started**", "ok", true);
+        allow(&record, "   ", "ok", false);
+
+        write_md(
+            dir.path(),
+            &one_row(
+                "**Proposed — placeholder, needs full spec/plan pass**",
+                "ok",
+                true,
+            ),
+        );
+        assert!(matches!(
+            fold_advance(&record, Some("0001")),
+            FoldAdvance::Withhold { .. }
+        ));
+
+        record.ready_aliases = vec!["Proposed".into()];
+        write_md(dir.path(), &one_row("**Proposed**", "ok", false));
+        assert_eq!(fold_advance(&record, Some("0001")), FoldAdvance::Allow);
+        record.ready_aliases = vec!["Ready — folded @ sha1234".into()];
+        allow(&record, "**Ready — folded @ sha1234**", "ok", false);
     }
 
     #[test]

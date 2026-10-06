@@ -845,6 +845,7 @@ mod tests {
         let repo = clean_exec();
         let mut r = rec(dir.path());
         r.execution_repo = Some(repo.path().to_path_buf());
+        crate::workflow::conductor_md::write_ready_fixture(dir.path(), "0020").unwrap();
         run_with_driver(&r, Some("0020".into()), WorkflowDriver::Stub).unwrap();
         let view = wait_for_outcome(&r, None).unwrap();
         assert_eq!(view.status, RunStatus::Idle);

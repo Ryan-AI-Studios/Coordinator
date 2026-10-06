@@ -91,6 +91,24 @@ pub enum AddressCiFollowUp {
     Stopped { message: String },
 }
 
+const FOLD_WITHHELD_KIND: &str = "fold-withheld";
+const FOLD_WITHHELD_UNREADABLE: &str = "workflow: fold withheld (cannot read track row)";
+
+fn fold_withheld_status(status_clean: &str) -> String {
+    let capped = cap_fold_status(status_clean);
+    format!("workflow: fold withheld (row status: {capped})")
+}
+
+/// At most 120 Unicode scalar values. A longer status keeps 119 and appends `…`.
+fn cap_fold_status(status_clean: &str) -> String {
+    if status_clean.chars().count() <= 120 {
+        return status_clean.to_string();
+    }
+    let mut out: String = status_clean.chars().take(119).collect();
+    out.push('\u{2026}');
+    out
+}
+
 /// Apply-table hook: canonical success → successor (stay Running/Paused) or advance.
 pub fn on_success(
     record: &ProjectRecord,
@@ -142,15 +160,36 @@ pub fn on_success(
     }
 
     if let Some(next) = successor(&state.phase) {
-        if state.phase == graph::PHASE_FOLD
-            && next == graph::PHASE_IMPLEMENT
-            && let Err(e) = crate::checkpoint::ensure_implement_ref(record, state)
-        {
-            state.status = RunStatus::Stopped;
-            state.failure_class = None;
-            state.last_event = e.to_string();
-            crate::progress_log::append(record, "checkpoint-refused", &state.last_event);
-            return AddressCiFollowUp::Continue;
+        if state.phase == graph::PHASE_FOLD && next == graph::PHASE_IMPLEMENT {
+            match conductor_md::fold_advance(record, state.track_id.as_deref()) {
+                conductor_md::FoldAdvance::Allow => {
+                    if let Err(e) = crate::checkpoint::ensure_implement_ref(record, state) {
+                        state.status = RunStatus::Stopped;
+                        state.failure_class = None;
+                        state.last_event = e.to_string();
+                        crate::progress_log::append(
+                            record,
+                            "checkpoint-refused",
+                            &state.last_event,
+                        );
+                        return AddressCiFollowUp::Continue;
+                    }
+                }
+                conductor_md::FoldAdvance::Withhold { status_clean } => {
+                    state.status = RunStatus::Stopped;
+                    state.failure_class = None;
+                    state.last_event = fold_withheld_status(&status_clean);
+                    crate::progress_log::append(record, FOLD_WITHHELD_KIND, &state.last_event);
+                    return AddressCiFollowUp::Continue;
+                }
+                conductor_md::FoldAdvance::Unreadable => {
+                    state.status = RunStatus::Stopped;
+                    state.failure_class = None;
+                    state.last_event = FOLD_WITHHELD_UNREADABLE.to_string();
+                    crate::progress_log::append(record, FOLD_WITHHELD_KIND, &state.last_event);
+                    return AddressCiFollowUp::Continue;
+                }
+            }
         }
         let from = state.phase.clone();
         state.phase = next.to_string();
@@ -567,6 +606,28 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    #[test]
+    fn fold_withheld_status_caps_at_120_scalars() {
+        assert_eq!(
+            fold_withheld_status("Proposed"),
+            "workflow: fold withheld (row status: Proposed)"
+        );
+        let exact = "b".repeat(120);
+        assert_eq!(
+            fold_withheld_status(&exact),
+            format!("workflow: fold withheld (row status: {exact})")
+        );
+        let long = "a".repeat(121);
+        let msg = fold_withheld_status(&long);
+        let inside = msg
+            .strip_prefix("workflow: fold withheld (row status: ")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap();
+        assert_eq!(inside.chars().count(), 120);
+        assert!(inside.ends_with('\u{2026}'));
+        assert!(!msg.contains("checkpoint"));
+    }
+
     fn clean_exec() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
@@ -678,6 +739,7 @@ mod tests {
         let repo = clean_exec();
         let mut r = rec(dir.path());
         r.execution_repo = Some(repo.path().to_path_buf());
+        conductor_md::write_ready_fixture(dir.path(), "0001").unwrap();
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::Stub).unwrap();
         let view = wait_for_outcome(&r, Some(15)).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
@@ -698,7 +760,8 @@ mod tests {
         let repo = clean_exec();
         let mut r = rec(dir.path());
         r.execution_repo = Some(repo.path().to_path_buf());
-        run_with_driver(&r, None, WorkflowDriver::Stub).unwrap();
+        conductor_md::write_ready_fixture(dir.path(), "0001").unwrap();
+        run_with_driver(&r, Some("0001".into()), WorkflowDriver::Stub).unwrap();
         let after_xmodel = walk_until(&r, |v| v.last_event.contains("cross-model: stub"));
         assert!(
             after_xmodel

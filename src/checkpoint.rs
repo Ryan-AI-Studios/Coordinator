@@ -394,6 +394,7 @@ mod tests {
             Some(state.path().to_path_buf()),
             on,
         );
+        write_row(ws.path(), "**Ready — not started**");
         (repo, ws, state, rec)
     }
 
@@ -405,7 +406,20 @@ mod tests {
         state.run_epoch = epoch;
         state.workflow = Some(crate::workflow::WORKFLOW_ID.into());
         state.driver = WorkflowDriver::FileWait;
+        state.track_id = Some("0001".into());
         save_run_state(rec, &state).unwrap();
+    }
+
+    /// Registry lives on the workspace temp dir so the git execution repo stays clean.
+    fn write_row(ws: &std::path::Path, status: &str) {
+        let cond = ws.join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        let md = format!(
+            "| Track | Status | Summary |\n\
+             | --- | --- | --- |\n\
+             | [0001-One](0001-One/spec.md) | {status} | ok |\n"
+        );
+        std::fs::write(cond.join("conductor.md"), md).unwrap();
     }
 
     fn head(cwd: &Path) -> String {
@@ -437,6 +451,109 @@ mod tests {
         assert!(state.checkpoint_branch.is_none());
         let back = serde_json::to_string(&state).unwrap();
         assert!(!back.contains("checkpoint_branch"));
+    }
+
+    #[test]
+    fn fold_proposed_stops_before_implement_ref() {
+        let (repo, ws, _state, rec) = fixture(false);
+        write_row(
+            ws.path(),
+            "**Proposed — placeholder, needs full spec/plan pass**",
+        );
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 4);
+        let view = fold_success(&rec, 4);
+        assert_eq!(view.status, RunStatus::Stopped, "{}", view.last_event);
+        assert_eq!(view.phase, PHASE_FOLD);
+        assert!(view.failure_class.is_none());
+        assert!(
+            view.last_event
+                .starts_with("workflow: fold withheld (row status: Proposed - placeholder"),
+            "{}",
+            view.last_event
+        );
+        assert!(log_text(&rec).contains("fold-withheld"));
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        let listed = git(
+            repo.path(),
+            &["rev-parse", "--verify", "--quiet", &ref_name(&rec.id, 4)],
+        )
+        .unwrap();
+        assert!(!listed.ok);
+    }
+
+    #[test]
+    fn fold_allow_rows_create_ref_and_implement() {
+        for status in [
+            "**Ready — not started**",
+            "**In progress**",
+            "**Ready — folded @ sha1234**",
+        ] {
+            let (repo, ws, _state, rec) = fixture(false);
+            write_row(ws.path(), status);
+            save_phase(&rec, RunStatus::Running, PHASE_FOLD, 4);
+            let view = fold_success(&rec, 4);
+            assert_eq!(
+                view.phase,
+                crate::workflow::graph::PHASE_IMPLEMENT,
+                "{status} {}",
+                view.last_event
+            );
+            assert_eq!(view.status, RunStatus::Running);
+            assert!(view.failure_class.is_none());
+            assert_eq!(
+                git_stdout(repo.path(), &["rev-parse", &ref_name(&rec.id, 4)]),
+                head(repo.path())
+            );
+        }
+    }
+
+    #[test]
+    fn fold_proposed_dirty_reports_withhold_not_checkpoint() {
+        let (repo, ws, _state, rec) = fixture(false);
+        write_row(
+            ws.path(),
+            "**Proposed — placeholder, needs full spec/plan pass**",
+        );
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 2);
+        std::fs::write(repo.path().join("dirty.rs"), b"x\n").unwrap();
+        let view = fold_success(&rec, 2);
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.phase, PHASE_FOLD);
+        assert!(view.failure_class.is_none());
+        assert!(
+            view.last_event.starts_with("workflow: fold withheld"),
+            "{}",
+            view.last_event
+        );
+        assert!(
+            !view.last_event.contains("checkpoint refused"),
+            "{}",
+            view.last_event
+        );
+        assert!(repo.path().join("dirty.rs").is_file());
+    }
+
+    #[test]
+    fn fold_missing_conductor_stops_unreadable() {
+        let (repo, ws, _state, rec) = fixture(false);
+        std::fs::remove_file(ws.path().join("conductor").join("conductor.md")).unwrap();
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 1);
+        let view = fold_success(&rec, 1);
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.phase, PHASE_FOLD);
+        assert!(view.failure_class.is_none());
+        assert_eq!(
+            view.last_event,
+            "workflow: fold withheld (cannot read track row)"
+        );
+        assert!(log_text(&rec).contains("fold-withheld"));
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        let listed = git(
+            repo.path(),
+            &["rev-parse", "--verify", "--quiet", &ref_name(&rec.id, 1)],
+        )
+        .unwrap();
+        assert!(!listed.ok);
     }
 
     #[test]
@@ -507,6 +624,7 @@ mod tests {
             Some(state.path().to_path_buf()),
             false,
         );
+        write_row(ws.path(), "**Ready — not started**");
         save_phase(&rec, RunStatus::Running, PHASE_FOLD, 1);
         let view = fold_success(&rec, 1);
         assert_eq!(view.status, RunStatus::Stopped);
