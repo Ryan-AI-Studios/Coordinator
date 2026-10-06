@@ -156,11 +156,10 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
         PHASE_PLAN => {
             let path = workspace_skill(record, "plan");
             format!(
-                "If spec.md and plan.md already exist in the track folder: write \
-                 evidence.md there now. Use `coordinator --version` and an ISO-8601 \
-                 UTC timestamp only. Do not load the plan skill. Do not run cargo, \
-                 ledgerful, or ai-brains. Do not read Coordinator product source. \
-                 Then end this turn.\n\
+                "If spec.md and plan.md already exist in the track folder: Coordinator \
+                 has refreshed the evidence.md stamp. Do not write evidence.md. Do not \
+                 load the plan skill. Do not run cargo, ledgerful, or ai-brains. Do not \
+                 read Coordinator product source. Then end this turn.\n\
                  Otherwise:\n\
                  {}\n\
                  {RESEARCH}\n\
@@ -174,6 +173,7 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
             format!(
                 "{}\n\
                  Fold the track `*-review.md` files (agy-review / opencode-review) into spec and plan.\n\
+                 Do not write or truncate evidence.md. Do not reconstruct owner sentences from recall.\n\
                  {END_TURN}\n",
                 honor_skill("foldin", &path)
             )
@@ -185,8 +185,9 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                 "Honor project skills. This phase loads the `implement` skill from {implement} \
                  and the `onboarding` skill from {onboarding}.\n\
                  Honor the track spec execution path.\n\
-                 If the spec execution path is the workspace (planning-only), write \
-                 evidence.md there. Do not edit the execution repo and do not run \
+                 If the spec execution path is the workspace (planning-only): if evidence.md \
+                 is absent, you may create it; if evidence.md exists, do not replace it and \
+                 do not reduce it to a stamp. Do not edit the execution repo and do not run \
                  cargo, ledgerful, or ai-brains there.\n\
                  {RESEARCH}\n\
                  {END_TURN}\n"
@@ -445,7 +446,9 @@ mod tests {
         assert!(text.contains("already exist"));
         assert!(text.contains("Otherwise:"));
         assert!(text.contains("evidence.md"));
-        assert!(text.contains("coordinator --version"));
+        assert!(text.contains("Do not write evidence.md"));
+        assert!(!text.contains("timestamp only"));
+        assert!(!text.contains("coordinator --version"));
         assert!(text.contains("Do not load the plan skill"));
         assert!(text.contains("Do not run cargo"));
         assert!(text.contains("end this turn") || text.contains("end the turn"));
@@ -473,6 +476,8 @@ mod tests {
             text.contains("*-review.md")
                 || (text.contains("agy-review") && text.contains("opencode-review"))
         );
+        assert!(text.contains("Do not write or truncate evidence.md"));
+        assert!(text.contains("Do not reconstruct owner sentences from recall"));
         assert!(text.contains("end this turn") || text.contains("end the turn"));
         assert!(text.contains("Do not") && text.contains("outcome write"));
         assert!(text.contains("Honor project skills"));
@@ -509,6 +514,8 @@ mod tests {
         assert!(text.contains("execution path"));
         assert!(text.contains("planning-only"));
         assert!(text.contains("evidence.md"));
+        assert!(text.contains("do not replace it"));
+        assert!(text.contains("do not reduce it to a stamp"));
         assert!(text.contains("end this turn") || text.contains("end the turn"));
         assert!(text.contains("Do not") && text.contains("outcome write"));
         assert!(text.contains("Honor project skills"));

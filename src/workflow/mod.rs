@@ -3,6 +3,7 @@
 pub mod bundle;
 pub mod conductor_md;
 pub mod drive;
+pub mod evidence_stamp;
 pub mod graph;
 pub mod plan_review;
 pub mod prompts;
