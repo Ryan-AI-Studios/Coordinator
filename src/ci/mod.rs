@@ -1018,6 +1018,9 @@ fn try_auto_publish_target(
                 CiTarget::PullRequest { number, .. } => *number,
                 CiTarget::HeadSha { .. } => 0,
             };
+            if let Some(id) = state.track_id.as_deref() {
+                crate::workflow::reuse::note_ci_target(record, id, &target);
+            }
             persist_watch(record, Some(&format!("ci-wait: opened #{n}")), |ci| {
                 apply_target(ci, &target);
                 ci.publish_attempted_sha = latch_sha_from_target(&target);
@@ -1128,6 +1131,11 @@ fn stamp_poll(
 }
 
 fn persist_target(record: &ProjectRecord, target: &CiTarget) -> Result<()> {
+    if let Ok(state) = load_run_state(record)
+        && let Some(id) = state.track_id.as_deref()
+    {
+        crate::workflow::reuse::note_ci_target(record, id, target);
+    }
     persist_watch(record, None, |ci| apply_target(ci, target)).map(|_| ())
 }
 

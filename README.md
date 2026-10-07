@@ -247,7 +247,7 @@ Self-check is step-bounded, does not move `phase_started_at`, and writes the pro
 
 ### Canonical workflow (`canonical_v1`)
 
-`coordinator run` starts **`plan`**, not `stub:active`. Phase Outcome apply advances the graph (status stays **Running** until `advance` completes).
+`coordinator run` starts **`plan`**, not `stub:active`. When `spec.md`, `plan.md`, the review-track skill, both slot reviews, and a `gh pr view` of the receipt PR still match, `run` starts at `ci-wait` with that PR number. Phase Outcome apply advances the graph (status stays **Running** until `advance` completes).
 
 ```
 plan → plan-review (agy + opencode join) → fold → implement
@@ -255,7 +255,7 @@ plan → plan-review (agy + opencode join) → fold → implement
   → compact → advance
 ```
 
-GateFail on `cross-model-review` with `address_findings_attempts < 2` does **not** Stop. Coordinator archives live `review.{slug}.md` → `review.{slug}.gate{n}.md` **and** `{state_dir}/reviews/cross-model-{slug}.md` → `cross-model-{slug}.gate{n}.md`, injects **`address-findings`** (implementor), then a **fresh** Codex→Claude→OpenCode gate (`review` cleared). After two address-findings entries this `run_epoch`, the next GateFail Stops with `difficulty` + Failure Artifact + toast (`last_event` contains `address-findings exhausted`). Other failure classes (permission / exhaustion / crash / timeout) and difficulty from any other phase still Stop. **Archive lifetime is in-run:** a fresh `run` `remove_dir_all`s `{state_dir}/reviews/` (existing `clear_plan_review_artifacts`). Track-dir `*.gate{n}.md` may remain on disk like leftover `review.codex.md` — they are not the next gate. Happy-path stub walk never visits `address-findings`.
+GateFail on `cross-model-review` with `address_findings_attempts < 2` does **not** Stop. Coordinator archives live `review.{slug}.md` → `review.{slug}.gate{n}.md` **and** `{state_dir}/reviews/cross-model-{slug}.md` → `cross-model-{slug}.gate{n}.md`, injects **`address-findings`** (implementor), then a **fresh** Codex→Claude→OpenCode gate (`review` cleared). After two address-findings entries this `run_epoch`, the next GateFail Stops with `difficulty` + Failure Artifact + toast (`last_event` contains `address-findings exhausted`). Other failure classes (permission / exhaustion / crash / timeout) and difficulty from any other phase still Stop. **Archive lifetime is in-run:** a fresh `run` `remove_dir_all`s `{state_dir}/reviews/` (existing `clear_plan_review_artifacts`). A matching track review is kept. An unmatched track review is copied to `prior/{epoch}-{slug}-review.md` and then removed. Track-dir `*.gate{n}.md` may remain on disk like leftover `review.codex.md` — they are not the next gate. Happy-path stub walk never visits `address-findings`.
 
 | Driver | CLI / env | Behavior |
 |--------|-----------|----------|

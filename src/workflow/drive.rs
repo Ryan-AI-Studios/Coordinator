@@ -618,8 +618,26 @@ fn adopt_track_review_if_missing(record: &ProjectRecord, slug: &str) -> Result<(
     Ok(())
 }
 
-/// Drop leftover role/review files so a fresh `run` cannot join stale slots.
-pub fn clear_plan_review_artifacts(record: &ProjectRecord) {
+/// Which track reviews to archive before a fresh start deletes mailboxes.
+pub struct ArtifactClear {
+    pub track_id: Option<String>,
+    pub closed_epoch: u64,
+    pub archive_slugs: Vec<String>,
+}
+
+/// `Cleared` archived every requested slug. `StayPlan` left a live file because
+/// `prior/` already held different bytes or the copy failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearEffect {
+    Cleared,
+    StayPlan,
+}
+
+/// Drop leftover role/review mailboxes so a fresh `run` cannot join stale slots.
+///
+/// Does not load run-state. Archives only `archive_slugs`, then deletes those
+/// live track files. A conflict leaves the live file in place.
+pub fn clear_plan_review_artifacts(record: &ProjectRecord, clear: &ArtifactClear) -> ClearEffect {
     if let Ok(dir) = outcome_roles_dir(record)
         && dir.exists()
     {
@@ -630,13 +648,24 @@ pub fn clear_plan_review_artifacts(record: &ProjectRecord) {
     {
         let _ = std::fs::remove_dir_all(&dir);
     }
-    if let Ok(state) = load_run_state(record)
-        && let Some(ref track_id) = state.track_id
+    let mut stay = false;
+    if let Some(track_id) = clear.track_id.as_deref()
         && let Some(track_dir) = resolve_track_dir(record, track_id)
     {
-        for slug in review_slugs() {
-            let _ = std::fs::remove_file(track_dir.join(format!("{slug}-review.md")));
+        for slug in &clear.archive_slugs {
+            match super::reuse::archive_track_review(&track_dir, slug, clear.closed_epoch) {
+                super::reuse::ArchiveOutcome::Archived => {
+                    let _ = std::fs::remove_file(track_dir.join(format!("{slug}-review.md")));
+                }
+                super::reuse::ArchiveOutcome::Conflict => stay = true,
+                super::reuse::ArchiveOutcome::Absent => {}
+            }
         }
+    }
+    if stay {
+        ClearEffect::StayPlan
+    } else {
+        ClearEffect::Cleared
     }
 }
 
@@ -689,6 +718,9 @@ fn try_join(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
             OutcomeSource::Test,
         );
     }
+    if let Some(id) = state.track_id.as_deref() {
+        super::reuse::write_join_receipt(record, id);
+    }
     bundle::assemble(record, &state)?;
     let missing: Vec<&'static str> = review_slugs()
         .iter()
@@ -731,6 +763,9 @@ pub fn timeout_plan_review_outcome(
     let mut cleared = state.clone();
     cleared.pending_roles.clear();
     save_run_state(record, &cleared)?;
+    if let Some(id) = state.track_id.as_deref() {
+        super::reuse::write_join_receipt(record, id);
+    }
     bundle::assemble(record, &cleared)?;
     Ok(Some(PhaseOutcome::success(
         state.phase.clone(),
@@ -1471,5 +1506,43 @@ mod tests {
             saved.last_driven_phase.as_deref(),
             Some(crate::workflow::graph::PHASE_ADDRESS_CI)
         );
+    }
+
+    #[test]
+    fn timeout_join_writes_reuse_for_the_produced_slot() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let track = dir.path().join("conductor").join("0083-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join("spec.md"), b"spec").unwrap();
+        std::fs::write(track.join("plan.md"), b"plan").unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        std::fs::write(track.join("agy-review.md"), b"agy produced\n").unwrap();
+        let state_review = crate::workflow::bundle::review_file(&r, "agy").unwrap();
+        std::fs::create_dir_all(state_review.parent().unwrap()).unwrap();
+        std::fs::write(&state_review, b"agy produced\n").unwrap();
+        let mut state = crate::state::RunState::idle(&r.id);
+        state.status = crate::state::RunStatus::Running;
+        state.phase = super::PHASE_PLAN_REVIEW.into();
+        state.track_id = Some("0083".into());
+        state.pending_roles = vec!["opencode".into()];
+        state.run_epoch = 1;
+        crate::state::save_run_state(&r, &state).unwrap();
+        let outcome = timeout_plan_review_outcome(&r, &state)
+            .unwrap()
+            .expect("degraded join");
+        assert_eq!(outcome.source, crate::outcome::OutcomeSource::Timeout);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(track.join("reuse.json")).unwrap()).unwrap();
+        assert!(parsed["slots"]["agy"]["review_sha256"].is_string());
+        assert!(parsed["slots"].get("opencode").is_none());
+        assert!(parsed.get("pr").is_none());
     }
 }

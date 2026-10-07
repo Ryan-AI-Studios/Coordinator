@@ -354,6 +354,7 @@ struct ApplyCommit {
     view: StatusView,
     notify: Option<crate::notify::NotifyEvent>,
     progress: Option<crate::notify::ProgressEvent>,
+    reuse_probe: Option<Box<crate::workflow::reuse::ReuseProbe>>,
 }
 
 /// Single entry for mutating run-state from a Phase Outcome.
@@ -364,12 +365,43 @@ struct ApplyCommit {
 ///
 /// Hard-failure notify runs **after** both locks drop (track 0009).
 pub fn apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView> {
-    let commit = {
+    let mut commit = {
         let _guard = apply_lock()
             .lock()
             .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
         with_run_state_lock(record, || apply_locked(record, outcome))?
     };
+    if let Some(probe) = commit.reuse_probe.take() {
+        let answer = crate::workflow::reuse::probe_resume(record, probe.number);
+        let _guard = apply_lock()
+            .lock()
+            .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
+        let view = with_run_state_lock(record, || {
+            crate::workflow::commit_probed_successor(record, &probe, &answer)
+        })?;
+        let planted = view.run_epoch != commit.view.run_epoch
+            || view.phase != commit.view.phase
+            || view.track_id != commit.view.track_id;
+        if planted {
+            if let Some(progress) = commit.progress.as_mut() {
+                progress.to_phase = if view.status == RunStatus::Idle {
+                    "idle".into()
+                } else {
+                    view.phase.clone()
+                };
+                progress.last_event = view.last_event.clone();
+                progress.next_track = if view.run_epoch != progress.run_epoch {
+                    view.track_id.clone()
+                } else {
+                    view.next_track.clone()
+                };
+            }
+        } else {
+            commit.progress = None;
+            commit.notify = None;
+        }
+        commit.view = view;
+    }
     fire_pending_notify(record, &commit);
     crate::worktree::release_if_idle(record, &commit.view);
     Ok(refresh_failure_artifact(record, commit.view))
@@ -442,6 +474,7 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
             view: StatusView::from_record(record, &base),
             notify: None,
             progress: None,
+            reuse_probe: None,
         });
     }
 
@@ -492,13 +525,18 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
     let canonical = crate::workflow::is_canonical(&outcome.phase);
     let mut bounced = false;
     let mut address_ci_stop: Option<String> = None;
+    let mut reuse_probe = None;
     match outcome.status {
         OutcomeStatus::Success => {
             if canonical {
-                if let crate::workflow::AddressCiFollowUp::Stopped { message } =
-                    crate::workflow::on_success(record, &mut state, &outcome)
-                {
-                    address_ci_stop = Some(message);
+                match crate::workflow::on_success(record, &mut state, &outcome) {
+                    crate::workflow::AddressCiFollowUp::Stopped { message } => {
+                        address_ci_stop = Some(message);
+                    }
+                    crate::workflow::AddressCiFollowUp::Continue => {}
+                    crate::workflow::AddressCiFollowUp::ReuseProbe(probe) => {
+                        reuse_probe = Some(probe);
+                    }
                 }
             } else {
                 state.phase = STUB_PHASE_COMPLETED.into();
@@ -573,6 +611,7 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
             view: StatusView::from_record(record, &fresh),
             notify: None,
             progress: None,
+            reuse_probe: None,
         });
     }
     if fresh.run_epoch != base.run_epoch
@@ -677,6 +716,7 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
         view: StatusView::from_record(record, &state),
         notify,
         progress,
+        reuse_probe,
     })
 }
 
