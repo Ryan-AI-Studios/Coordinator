@@ -243,6 +243,12 @@ pub struct CiWatchState {
     /// HEAD SHA of the last auto-publish spawn (0053). Not a Status JSON key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_attempted_sha: Option<String>,
+    /// Transient publish misses for `publish_transient_sha` (0082). Old files load as 0.
+    #[serde(default)]
+    pub publish_transient_attempts: u32,
+    /// HEAD the transient counter is counting. Absent on old files and after `Opened`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_transient_sha: Option<String>,
 }
 
 /// One failing check from the judged slice handed to `address-ci` (0071).

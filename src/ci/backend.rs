@@ -173,7 +173,10 @@ pub enum AutoPublishResult {
     Opened(CiTarget),
     Skipped {
         event: String,
+        /// Counter key when `retryable`. The drive must not copy this onto
+        /// `publish_attempted_sha` on that arm. A terminal skip still latches it.
         attempted_sha: Option<String>,
+        retryable: bool,
     },
 }
 
@@ -182,6 +185,7 @@ impl AutoPublishResult {
         Self::Skipped {
             event: event.into(),
             attempted_sha: None,
+            retryable: false,
         }
     }
 
@@ -189,6 +193,16 @@ impl AutoPublishResult {
         Self::Skipped {
             event: event.into(),
             attempted_sha: Some(sha.into()),
+            retryable: false,
+        }
+    }
+
+    /// `head` is the transient-counter key only. `Some` skips a second HEAD read.
+    pub fn skipped_retryable(event: impl Into<String>, head: Option<String>) -> Self {
+        Self::Skipped {
+            event: event.into(),
+            attempted_sha: head,
+            retryable: true,
         }
     }
 }

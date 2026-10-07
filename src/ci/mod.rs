@@ -36,6 +36,8 @@ pub use gh::{GhCli, GhMergedTrackProbe};
 
 const TWO_MIN: Duration = Duration::from_secs(120);
 const TEN_MIN: Duration = Duration::from_secs(600);
+/// Transient push/create misses before `ci_failed`. Separate from `CI_FIX_CAP`.
+const PUBLISH_TRANSIENT_CAP: u32 = 2;
 
 #[cfg(test)]
 thread_local! {
@@ -158,6 +160,7 @@ pub fn drive_with(
                     Some(t)
                 }
                 Ok(AutoPublishDrive::Wait) => return Ok(None),
+                Ok(AutoPublishDrive::Stopped(view)) => return Ok(view.map(|view| *view)),
                 Err(e) => return classify_backend_err(record, state, e),
             }
         }
@@ -823,6 +826,9 @@ fn ci_merged_probe() -> Option<GhMergedTrackProbe> {
 enum AutoPublishDrive {
     Opened(CiTarget),
     Wait,
+    /// Publish exhaustion. Not an `Err`, so `classify_backend_err` cannot swallow it.
+    /// Boxed like `MutationGate::Stop` so the enum stays small.
+    Stopped(Option<Box<StatusView>>),
 }
 
 fn publish_already_attempted(state: &RunState, cwd: &Path) -> bool {
@@ -894,6 +900,77 @@ fn persist_policy_hold(record: &ProjectRecord, gate: &crate::policy::StateGate) 
     })
 }
 
+/// `Some` head from the publish result is the counter key. `None` reads HEAD once.
+/// A missing read does not reset the previous head's count.
+fn next_transient_attempt(
+    state: &RunState,
+    cwd: &Path,
+    attempted_sha: Option<String>,
+) -> (u32, Option<String>) {
+    let prev_attempts = state
+        .ci
+        .as_ref()
+        .map(|c| c.publish_transient_attempts)
+        .unwrap_or(0);
+    let prev_sha = state
+        .ci
+        .as_ref()
+        .and_then(|c| c.publish_transient_sha.clone());
+    let key = match attempted_sha {
+        Some(sha) => Some(sha),
+        None => gh::git_head_sha(cwd),
+    };
+    let mut attempts = prev_attempts;
+    if let Some(ref k) = key
+        && prev_sha.as_deref() != Some(k.as_str())
+    {
+        attempts = 0;
+    }
+    (attempts.saturating_add(1), key)
+}
+
+fn drive_retryable_skip(
+    record: &ProjectRecord,
+    state: &RunState,
+    cwd: &Path,
+    now: chrono::DateTime<Utc>,
+    event: &str,
+    attempted_sha: Option<String>,
+) -> Result<AutoPublishDrive> {
+    let (attempts, key) = next_transient_attempt(state, cwd, attempted_sha);
+    if attempts >= PUBLISH_TRANSIENT_CAP {
+        persist_watch(record, None, |ci| {
+            ci.publish_transient_attempts = attempts;
+            if let Some(ref k) = key {
+                ci.publish_transient_sha = Some(k.clone());
+            }
+        })?;
+        let view = apply_failure(
+            record,
+            state,
+            FailureClass::CiFailed,
+            format!("ci-wait: publish exhausted ({attempts}/{PUBLISH_TRANSIENT_CAP}): {event}"),
+        )?;
+        return Ok(AutoPublishDrive::Stopped(view.map(Box::new)));
+    }
+    let summary = format!("publish retry {attempts}");
+    persist_watch(record, Some(event), |ci| {
+        ci.head_sha = None;
+        ci.publish_transient_attempts = attempts;
+        if let Some(ref k) = key {
+            ci.publish_transient_sha = Some(k.clone());
+        }
+        stamp_poll(
+            ci,
+            now,
+            &summary,
+            "wait-pr",
+            next_interval_ms(elapsed(state, now), false),
+        );
+    })?;
+    Ok(AutoPublishDrive::Wait)
+}
+
 fn try_auto_publish_target(
     record: &ProjectRecord,
     state: &RunState,
@@ -944,6 +1021,8 @@ fn try_auto_publish_target(
             persist_watch(record, Some(&format!("ci-wait: opened #{n}")), |ci| {
                 apply_target(ci, &target);
                 ci.publish_attempted_sha = latch_sha_from_target(&target);
+                ci.publish_transient_attempts = 0;
+                ci.publish_transient_sha = None;
                 stamp_poll(
                     ci,
                     now,
@@ -957,7 +1036,11 @@ fn try_auto_publish_target(
         Ok(AutoPublishResult::Skipped {
             event,
             attempted_sha,
+            retryable,
         }) => {
+            if retryable {
+                return drive_retryable_skip(record, state, cwd, now, &event, attempted_sha);
+            }
             persist_watch(record, Some(&event), |ci| {
                 ci.head_sha = None;
                 if let Some(sha) = attempted_sha {
@@ -3267,6 +3350,15 @@ mod tests {
             st.last_event
         );
         assert_ne!(st.failure_class, Some(FailureClass::Permission));
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(
+            loaded
+                .ci
+                .as_ref()
+                .map(|c| c.publish_transient_attempts)
+                .unwrap_or(0),
+            0
+        );
         assert_eq!(counts.merge_n(), 0);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
@@ -3334,8 +3426,233 @@ mod tests {
         save_run_state(r, &st).unwrap();
     }
 
+    fn seed_transient(r: &ProjectRecord, attempts: u32, sha: Option<&str>) {
+        let mut st = load_run_state(r).unwrap();
+        st.ci = Some(CiWatchState {
+            publish_transient_attempts: attempts,
+            publish_transient_sha: sha.map(str::to_string),
+            ..Default::default()
+        });
+        save_run_state(r, &st).unwrap();
+    }
+
     #[test]
-    fn push_rejected_latches_once() {
+    fn push_rejected_retries_then_opens() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped_retryable(
+            "ci-wait: push rejected — waiting for PR",
+            None,
+        )));
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(99, false, false))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pending)])));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        force_due(&r);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            st.last_event.contains("opened #99"),
+            "last_event={}",
+            st.last_event
+        );
+        let loaded = load_run_state(&r).unwrap();
+        let ci = loaded.ci.as_ref().unwrap();
+        assert_eq!(ci.publish_attempted_sha.as_deref(), Some("abc"));
+        assert_eq!(ci.publish_transient_attempts, 0);
+        assert!(ci.publish_transient_sha.is_none());
+        assert_eq!(counts.publish_n(), 2);
+        assert_eq!(counts.merge_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn publish_retry_waits_for_the_poll_interval() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped_retryable(
+            "ci-wait: push rejected — waiting for PR",
+            Some("abc".into()),
+        )));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let loaded = load_run_state(&r).unwrap();
+        let ci = loaded.ci.as_ref().unwrap();
+        assert!(ci.last_poll_at.is_some());
+        assert!(ci.next_interval_ms.is_some());
+        assert_eq!(ci.publish_transient_attempts, 1);
+        assert_eq!(ci.last_summary.as_deref(), Some("publish retry 1"));
+        assert!(ci.publish_attempted_sha.is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+        }
+        let mut st = load_run_state(&r).unwrap();
+        let ci = st.ci.as_mut().unwrap();
+        ci.last_poll_at = Some(Utc::now());
+        ci.next_interval_ms = Some(60_000);
+        save_run_state(&r, &st).unwrap();
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        assert_eq!(counts.publish_n(), 1);
+        let held = load_run_state(&r).unwrap();
+        assert_eq!(held.ci.as_ref().unwrap().publish_transient_attempts, 1);
+        force_due(&r);
+        assert!(crate::workflow::tick(&r).unwrap().is_some());
+        assert_eq!(counts.publish_n(), 2);
+        let stopped = load_run_state(&r).unwrap();
+        assert_eq!(stopped.status, RunStatus::Stopped);
+        assert_eq!(stopped.failure_class, Some(FailureClass::CiFailed));
+        assert_eq!(stopped.ci.as_ref().unwrap().publish_transient_attempts, 2);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn publish_retry_exhausts_without_address_ci() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.ci_fix_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped_retryable(
+            "ci-wait: waiting for PR",
+            Some("abc".into()),
+        )));
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped_retryable(
+            "ci-wait: waiting for PR",
+            Some("abc".into()),
+        )));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        force_due(&r);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_some());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(st.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            st.last_event.contains("publish exhausted"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_ne!(st.phase, graph::PHASE_ADDRESS_CI);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        let loaded = load_run_state(&r).unwrap();
+        assert_eq!(loaded.ci_fix_attempts, 0);
+        let ci = loaded.ci.as_ref().unwrap();
+        assert!(ci.publish_attempted_sha.is_none());
+        assert_eq!(ci.publish_transient_attempts, 2);
+        assert_eq!(ci.publish_transient_sha.as_deref(), Some("abc"));
+        assert_eq!(counts.publish_n(), 2);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn publish_retry_first_miss_stores_repo_head() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let head = init_track_repo(dir.path());
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped_retryable(
+            "ci-wait: push rejected — waiting for PR",
+            None,
+        )));
+        let (_hook, _counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        let loaded = load_run_state(&r).unwrap();
+        let ci = loaded.ci.as_ref().unwrap();
+        assert_eq!(ci.publish_transient_attempts, 1);
+        assert_eq!(ci.publish_transient_sha.as_deref(), Some(head.as_str()));
+        assert!(ci.publish_attempted_sha.is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn publish_retry_uses_result_head_as_counter_key() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_transient(&r, 2, Some("old"));
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped_retryable(
+            "ci-wait: push rejected — waiting for PR",
+            Some("new".into()),
+        )));
+        let (_hook, _counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        let ci = load_run_state(&r).unwrap().ci.unwrap();
+        assert_eq!(ci.publish_transient_attempts, 1);
+        assert_eq!(ci.publish_transient_sha.as_deref(), Some("new"));
+        assert!(ci.publish_attempted_sha.is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn publish_retry_missing_head_does_not_reset() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_transient(&r, 1, Some("old"));
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped_retryable(
+            "ci-wait: waiting for PR",
+            None,
+        )));
+        let (_hook, _counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_some());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(st.failure_class, Some(FailureClass::CiFailed));
+        let ci = load_run_state(&r).unwrap().ci.unwrap();
+        assert_eq!(ci.publish_transient_attempts, 2);
+        assert_eq!(ci.publish_transient_sha.as_deref(), Some("old"));
+        assert!(ci.publish_attempted_sha.is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn terminal_skip_latches_across_due_ticks() {
         let _g = poll_env();
         let dir = tempdir().unwrap();
         let r = rec(dir.path(), true);
@@ -3343,24 +3660,24 @@ mod tests {
         let s = ScriptedBackend::new();
         s.push_resolve(Ok(None));
         s.push_publish(Ok(AutoPublishResult::skipped_latched(
-            "ci-wait: push rejected — waiting for PR",
+            "ci-wait: detached HEAD — waiting for PR",
             "abc",
         )));
         s.push_resolve(Ok(None));
-        s.push_publish(Ok(AutoPublishResult::Opened(pr(99, false, false))));
         let (_hook, counts) = hook(s);
         assert!(crate::workflow::tick(&r).unwrap().is_none());
         force_due(&r);
         assert!(crate::workflow::tick(&r).unwrap().is_none());
         let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
         assert!(
             st.last_event.contains("publish attempted"),
             "last_event={}",
             st.last_event
         );
+        let ci = load_run_state(&r).unwrap().ci.unwrap();
+        assert_eq!(ci.publish_attempted_sha.as_deref(), Some("abc"));
         assert_eq!(counts.publish_n(), 1);
-        assert_eq!(counts.merge_n(), 0);
-        assert!(crate::notify::artifact::existing_path(&r).is_none());
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
