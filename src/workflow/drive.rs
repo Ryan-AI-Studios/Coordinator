@@ -982,6 +982,164 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_plan_still_refreshes_evidence_body() {
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0076-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join("spec.md"), "# spec\n").unwrap();
+        let plan = "> Template. Phased checklist; map each phase to the DoD items in spec.md\n";
+        assert!(crate::workflow::prompts::plan_markdown_is_placeholder(plan));
+        std::fs::write(track.join("plan.md"), plan).unwrap();
+        std::fs::write(
+            track.join("evidence.md"),
+            "coordinator 0.0.1\n2020-01-01T00:00:00Z\nOWNER-MARKER\n",
+        )
+        .unwrap();
+        let record = rec(dir.path());
+        let state = plan_state(&record, PHASE_PLAN, "0076");
+        refresh_plan_evidence_stamp(&record, &state).unwrap();
+        let text = std::fs::read_to_string(track.join("evidence.md")).unwrap();
+        let version = crate::workflow::evidence_stamp::version_line();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some(version.as_str()));
+        let stamp = lines.next().unwrap();
+        assert_eq!(stamp.len(), 20);
+        assert!(stamp.ends_with('Z'));
+        assert_ne!(stamp, "2020-01-01T00:00:00Z");
+        assert!(text.contains("OWNER-MARKER"));
+        assert!(!text.contains("coordinator 0.0.1"));
+    }
+
+    const MINTED_TEMPLATE_PLAN: &str = "# 0000 \u{2014} <Track Title> \u{2014} Plan\n\n> Template. Phased checklist; map each phase to the DoD items in spec.md.\n";
+
+    fn minted_track(root: &std::path::Path, with_skill: bool) -> PathBuf {
+        let track = root.join("conductor").join("0001-Minted");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join("spec.md"), "# template spec\n").unwrap();
+        std::fs::write(track.join("plan.md"), MINTED_TEMPLATE_PLAN).unwrap();
+        std::fs::write(
+            track.join("evidence.md"),
+            "coordinator 0.0.1\n2020-01-01T00:00:00Z\nOWNER-MARKER\n",
+        )
+        .unwrap();
+        if with_skill {
+            let skill = root.join(".agents").join("skills").join("plan");
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "plan skill\n").unwrap();
+        }
+        track
+    }
+
+    fn planner_home() -> IsolatedHome {
+        let home = IsolatedHome::enter();
+        let planner = dummy(home._home.path(), "valid-planner.exe");
+        home.write_bindings(|b| {
+            b.get_mut(ROLE_PLANNER).unwrap().command = planner.to_string_lossy().into();
+        });
+        home
+    }
+
+    fn clear_last_driven(record: &ProjectRecord) {
+        crate::state::with_run_state_lock(record, || {
+            let mut state = load_run_state(record)?;
+            state.last_driven_phase = None;
+            crate::state::save_run_state(record, &state)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn minted_template_tick_expands_then_real_plan_fast_skips() {
+        let _home = planner_home();
+        let dir = tempdir().unwrap();
+        let track = minted_track(dir.path(), true);
+        let record = rec(dir.path());
+        let original = std::fs::read(track.join("plan.md")).unwrap();
+        run_with_driver(&record, Some("0001".into()), WorkflowDriver::Adapter).unwrap();
+        // refresh_plan_evidence_stamp runs in drive_adapter before role/binary
+        // resolution and before the capture return (stamp call, then prompt build).
+        // The evidence assertions depend on that order.
+        let _capture = arm_capture_prompts();
+        let first = tick(&record).unwrap();
+        assert!(first.is_none(), "capture returns before a harness starts");
+        let prompts = captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        let prompt = &prompts[0];
+        assert!(prompt.contains("Honor project skills"), "{prompt}");
+        assert!(prompt.contains("Write spec.md and plan.md"), "{prompt}");
+        assert!(
+            prompt.contains("Remove any placeholder-marker line"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("Do not load the plan skill"), "{prompt}");
+        assert!(
+            !prompt.contains("placeholder present, skill absent"),
+            "{prompt}"
+        );
+        assert_eq!(std::fs::read(track.join("plan.md")).unwrap(), original);
+        let evidence = std::fs::read_to_string(track.join("evidence.md")).unwrap();
+        assert!(evidence.contains("OWNER-MARKER"), "{evidence}");
+        assert!(
+            evidence.contains(&crate::workflow::evidence_stamp::version_line()),
+            "{evidence}"
+        );
+        assert!(!evidence.contains("coordinator 0.0.1"), "{evidence}");
+        drop(_capture);
+
+        std::fs::write(track.join("spec.md"), "# spec\n").unwrap();
+        std::fs::write(track.join("plan.md"), "# plan\n").unwrap();
+        let written = std::fs::read(track.join("plan.md")).unwrap();
+        assert_ne!(written, original);
+        assert!(!crate::workflow::prompts::plan_markdown_is_placeholder(
+            "# plan\n"
+        ));
+
+        clear_last_driven(&record);
+        let _capture = arm_capture_prompts();
+        let second = tick(&record).unwrap();
+        assert!(second.is_none());
+        let prompts = captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        let prompt = &prompts[0];
+        assert!(prompt.contains("already exist"), "{prompt}");
+        assert!(prompt.contains("Do not run cargo"), "{prompt}");
+        assert!(prompt.contains("Do not load the plan skill"), "{prompt}");
+        assert!(!prompt.contains("Write spec.md and plan.md"), "{prompt}");
+        assert_eq!(std::fs::read(track.join("plan.md")).unwrap(), written);
+    }
+
+    #[test]
+    fn placeholder_without_skill_file_is_explicit_degrade() {
+        let _home = planner_home();
+        let dir = tempdir().unwrap();
+        let track = minted_track(dir.path(), false);
+        let record = rec(dir.path());
+        let original = std::fs::read(track.join("plan.md")).unwrap();
+        run_with_driver(&record, Some("0001".into()), WorkflowDriver::Adapter).unwrap();
+        // Same stamp-before-capture order as minted_template_tick_expands_then_real_plan_fast_skips.
+        let _capture = arm_capture_prompts();
+        let view = tick(&record).unwrap();
+        assert!(view.is_none(), "capture returns before a harness starts");
+        let prompts = captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains("placeholder present, skill absent"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Write spec.md and plan.md"), "{prompt}");
+        assert!(!prompt.contains("Do not load the plan skill"), "{prompt}");
+        assert_eq!(std::fs::read(track.join("plan.md")).unwrap(), original);
+        let evidence = std::fs::read_to_string(track.join("evidence.md")).unwrap();
+        assert!(evidence.contains("OWNER-MARKER"), "{evidence}");
+        assert!(
+            evidence.contains(&crate::workflow::evidence_stamp::version_line()),
+            "{evidence}"
+        );
+        assert!(!evidence.contains("2020-01-01T00:00:00Z"), "{evidence}");
+    }
+
+    #[test]
     fn prefixed_start_error_retries_without_artifact() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());

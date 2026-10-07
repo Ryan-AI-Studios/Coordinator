@@ -153,27 +153,145 @@ fn list_gate_archives(
     out
 }
 
+/// On-disk `plan.md` for the plan-phase branch. A read error is `Unreadable`
+/// (fast-skip when `spec.md` is a file). It is not a panic and not `Err`.
+enum PlanOnDisk {
+    Missing,
+    Unreadable,
+    Text(String),
+}
+
+/// Content predicate. Case-sensitive. No byte or line threshold.
+/// One leading U+FEFF is ignored. Empty trim is a placeholder.
+pub(crate) fn plan_markdown_is_placeholder(body: &str) -> bool {
+    let body = body.strip_prefix('\u{FEFF}').unwrap_or(body);
+    if body.trim().is_empty() {
+        return true;
+    }
+    body.lines().any(|line| {
+        let line = line.trim();
+        is_unfilled_heading(line) || is_placeholder_comment(line) || is_template_blockquote(line)
+    })
+}
+
+fn is_placeholder_dash(dash: char) -> bool {
+    matches!(dash, '\u{2014}' | '-' | '\u{2013}')
+}
+
+/// Unfilled skeleton only: number `0000`, title token `<Track Title>`, same dash both sides.
+fn is_unfilled_heading(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("# 0000 ") else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    let Some(dash) = chars.next() else {
+        return false;
+    };
+    if !is_placeholder_dash(dash) {
+        return false;
+    }
+    let Some(rest) = chars.as_str().strip_prefix(" <Track Title> ") else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    let Some(dash2) = chars.next() else {
+        return false;
+    };
+    dash == dash2 && chars.as_str() == " Plan"
+}
+
+fn is_placeholder_comment(line: &str) -> bool {
+    line == "<!-- coordinator:placeholder-plan -->" || line == "<!--coordinator:placeholder-plan-->"
+}
+
+fn is_template_blockquote(line: &str) -> bool {
+    line.starts_with("> Template. Phased checklist")
+        || line.starts_with("> Template. Replace placeholders")
+}
+
+fn plan_on_disk_is_fast_skip(plan: &PlanOnDisk) -> bool {
+    match plan {
+        PlanOnDisk::Unreadable => true,
+        PlanOnDisk::Text(body) => !plan_markdown_is_placeholder(body),
+        PlanOnDisk::Missing => false,
+    }
+}
+
+fn read_plan_markdown(path: &Path) -> PlanOnDisk {
+    if !path.is_file() {
+        return PlanOnDisk::Missing;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => PlanOnDisk::Text(text),
+        Err(_) => PlanOnDisk::Unreadable,
+    }
+}
+
+/// `(spec.md is a file, plan.md)`. No track id or no dir is spec-missing and plan `Missing`.
+fn read_plan_inputs(record: &ProjectRecord, track_id: Option<&str>) -> (bool, PlanOnDisk) {
+    let Some(id) = track_id else {
+        return (false, PlanOnDisk::Missing);
+    };
+    let Some(dir) = resolve_track_dir(record, id) else {
+        return (false, PlanOnDisk::Missing);
+    };
+    (
+        dir.join("spec.md").is_file(),
+        read_plan_markdown(&dir.join("plan.md")),
+    )
+}
+
+fn plan_fast_skip_body() -> String {
+    format!(
+        "If spec.md and plan.md already exist in the track folder: Coordinator \
+         has refreshed the evidence.md stamp. Do not write evidence.md. Do not \
+         load the plan skill. Do not run cargo, ledgerful, or ai-brains. Do not \
+         read Coordinator product source. Then end this turn.\n\
+         {END_TURN}\n"
+    )
+}
+
+fn plan_expand_write() -> String {
+    format!(
+        "{RESEARCH}\n\
+         Write spec.md and plan.md in the track folder. Remove any placeholder-marker line \
+         from plan.md. Mark the track Ready.\n\
+         {END_TURN}\n"
+    )
+}
+
+/// One branch. Fast-skip is `spec.md` present and a real or unreadable plan.
+/// The stamp gate stays on file presence and does not call this.
+fn plan_prompt_body(record: &ProjectRecord, track_id: Option<&str>) -> String {
+    let path = workspace_skill(record, "plan");
+    let (spec_is_file, plan) = read_plan_inputs(record, track_id);
+    if spec_is_file && plan_on_disk_is_fast_skip(&plan) {
+        return plan_fast_skip_body();
+    }
+    let skill_is_file = skill_md(&crate::layout::resolve(record).workspace_root, "plan").is_file();
+    let placeholder =
+        matches!(plan, PlanOnDisk::Text(ref body) if plan_markdown_is_placeholder(body));
+    let write = plan_expand_write();
+    if skill_is_file {
+        format!("{}\n{write}", honor_skill("plan", &path))
+    } else if placeholder {
+        format!(
+            "placeholder present, skill absent. The `plan` skill file at {path} was not \
+             loaded. This is not a fast-skip. Do not claim the skill was loaded.\n\
+             {write}"
+        )
+    } else {
+        format!("Plan skill file is absent at {path}. This is not a fast-skip.\n{write}")
+    }
+}
+
 /// Injected into Grok-bound phases (plan / fold / implement / advance).
 pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>) -> String {
     let track = track_id.unwrap_or("(none)");
     let layout = layout_block(record, track_id, phase);
     let clause = super::self_check::phase_clause(record);
     let body = match phase {
-        PHASE_PLAN => {
-            let path = workspace_skill(record, "plan");
-            format!(
-                "If spec.md and plan.md already exist in the track folder: Coordinator \
-                 has refreshed the evidence.md stamp. Do not write evidence.md. Do not \
-                 load the plan skill. Do not run cargo, ledgerful, or ai-brains. Do not \
-                 read Coordinator product source. Then end this turn.\n\
-                 Otherwise:\n\
-                 {}\n\
-                 {RESEARCH}\n\
-                 Write spec.md and plan.md in the track folder. Mark the track Ready.\n\
-                 {END_TURN}\n",
-                honor_skill("plan", &path)
-            )
-        }
+        PHASE_PLAN => plan_prompt_body(record, track_id),
         PHASE_FOLD => {
             let path = workspace_skill(record, "foldin");
             let limitation = super::decision::RECORD_LIMITATION;
@@ -393,7 +511,6 @@ mod tests {
             text.contains("outside"),
             "planning-outside-product rule missing: {text}"
         );
-        assert!(text.contains("Honor project skills"));
         assert!(text.contains("Execution repo:"));
         assert!(!text.contains("Execution repo: (unset)"));
         assert!(
@@ -509,36 +626,331 @@ mod tests {
         );
     }
 
+    const LIVE_TEMPLATE_HEADING: &str = "# 0000 \u{2014} <Track Title> \u{2014} Plan";
+    const ORCA_0099_HEADING: &str = "# 0099 \u{2014} Coordinator Dogfood Probe \u{2014} Plan";
+
+    fn temp_project(root: &std::path::Path) -> ProjectRecord {
+        ProjectRecord {
+            id: "0085-temp".into(),
+            path: root.to_path_buf(),
+            display_name: None,
+            layout_profile: LayoutProfile::Nested,
+            conductor_dir: Some(root.join("conductor")),
+            execution_repo: Some(root.join("exec")),
+            execution_repos: BTreeMap::new(),
+            state_dir: None,
+            auto_merge: false,
+            phase_timeouts_secs: BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn write_track(root: &std::path::Path, spec: Option<&str>, plan: Option<&str>) {
+        let track = root.join("conductor").join("0001-Minted");
+        std::fs::create_dir_all(&track).unwrap();
+        if let Some(body) = spec {
+            std::fs::write(track.join("spec.md"), body).unwrap();
+        }
+        if let Some(body) = plan {
+            std::fs::write(track.join("plan.md"), body).unwrap();
+        }
+    }
+
+    fn write_plan_skill(root: &std::path::Path) {
+        let skill = root.join(".agents").join("skills").join("plan");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "plan skill\n").unwrap();
+    }
+
+    fn assert_fast_skip(text: &str) {
+        for needle in [
+            "already exist",
+            "Do not write evidence.md",
+            "Do not load the plan skill",
+            "Do not run cargo",
+            "Do not read Coordinator product source",
+            "end this turn",
+            "outcome write",
+        ] {
+            assert!(text.contains(needle), "missing {needle}: {text}");
+        }
+        for needle in [
+            "Otherwise:",
+            "Write spec.md and plan.md",
+            "Honor project skills",
+            "Knowledge is stale",
+            "placeholder present, skill absent",
+        ] {
+            assert!(!text.contains(needle), "unexpected {needle}: {text}");
+        }
+        assert!(!text.contains("timestamp only"), "{text}");
+        assert!(!text.contains("coordinator --version"), "{text}");
+    }
+
+    fn assert_expand_with_skill(text: &str, skill_path: &str) {
+        let honor = text.find("Honor project skills").expect(text);
+        let research = text.find("Knowledge is stale").expect(text);
+        let write = text
+            .find("Write spec.md and plan.md in the track folder")
+            .expect(text);
+        let remove = text.find("Remove any placeholder-marker line").expect(text);
+        let ready = text.find("Mark the track Ready").expect(text);
+        let end = text.find("end this turn").expect(text);
+        assert!(
+            honor < research && research < write && write < remove && remove < ready && ready < end,
+            "{text}"
+        );
+        assert!(text.contains(skill_path), "{text}");
+        assert!(text.contains("outcome write"), "{text}");
+        assert!(!text.contains("Do not load the plan skill"), "{text}");
+        assert!(
+            !text.contains("placeholder present, skill absent"),
+            "{text}"
+        );
+        assert!(!text.contains("Otherwise:"), "{text}");
+    }
+
     #[test]
-    fn plan_contract_names_skill_research_and_forbids_cli_write() {
-        let rec = nested_record();
-        let text = phase_prompt(&rec, "plan", Some("0099-CoordinatorDogfoodProbe"));
-        assert!(contains_skill(&text, "plan"), "plan skill path: {text}");
-        assert!(text.contains("Honor project skills"));
-        assert!(text.contains("stale") && text.contains("primary sources"));
-        assert!(text.contains("spec.md"));
-        assert!(text.contains("plan.md"));
-        assert!(text.contains("already exist"));
-        assert!(text.contains("Otherwise:"));
-        assert!(text.contains("evidence.md"));
-        assert!(text.contains("Do not write evidence.md"));
-        assert!(!text.contains("timestamp only"));
-        assert!(!text.contains("coordinator --version"));
-        assert!(text.contains("Do not load the plan skill"));
-        assert!(text.contains("Do not run cargo"));
-        assert!(text.contains("end this turn") || text.contains("end the turn"));
-        assert!(text.contains("Do not") && text.contains("outcome write"));
-        assert!(!contains_skill(&text, "foldin"));
-        assert!(!contains_skill(&text, "implement"));
-        let n = text.replace('\\', "/");
+    fn empty_whitespace_and_bom_comment_are_placeholders() {
+        assert!(plan_markdown_is_placeholder(""));
+        assert!(plan_markdown_is_placeholder(" \n\t \n"));
+        assert!(plan_markdown_is_placeholder(
+            "\u{FEFF}<!-- coordinator:placeholder-plan -->\n"
+        ));
+    }
+
+    #[test]
+    fn crlf_comment_is_placeholder() {
+        assert!(plan_markdown_is_placeholder(
+            "<!--coordinator:placeholder-plan-->\r\n"
+        ));
+    }
+
+    #[test]
+    fn live_template_heading_and_dash_skeletons_are_placeholders() {
+        assert!(plan_markdown_is_placeholder(LIVE_TEMPLATE_HEADING));
+        assert!(plan_markdown_is_placeholder(
+            "# 0000 - <Track Title> - Plan"
+        ));
+        assert!(plan_markdown_is_placeholder(
+            "# 0000 \u{2013} <Track Title> \u{2013} Plan"
+        ));
+        assert!(!plan_markdown_is_placeholder(
+            "# 0000 \u{2014} <Track Title> - Plan"
+        ));
+        assert!(!plan_markdown_is_placeholder(
+            "# 0001 \u{2014} <Track Title> \u{2014} Plan"
+        ));
+        assert!(!plan_markdown_is_placeholder(
+            "# 0000 \u{2014} Product Repo Bootstrap \u{2014} Plan"
+        ));
+    }
+
+    #[test]
+    fn blockquote_prefixes_match_and_other_template_lines_do_not() {
+        assert!(plan_markdown_is_placeholder(
+            "> Template. Phased checklist; map each phase to the DoD items in spec.md\n"
+        ));
+        assert!(plan_markdown_is_placeholder(
+            "> Template. Replace placeholders; map phases to spec section 7.\n"
+        ));
+        assert!(!plan_markdown_is_placeholder(
+            "> Template. This sentence is a finished note.\n"
+        ));
+    }
+
+    #[test]
+    fn comment_spellings_match_and_other_spacing_does_not() {
+        assert!(plan_markdown_is_placeholder(
+            "<!-- coordinator:placeholder-plan -->"
+        ));
+        assert!(plan_markdown_is_placeholder(
+            "<!--coordinator:placeholder-plan-->"
+        ));
+        assert!(!plan_markdown_is_placeholder(
+            "<!--  coordinator:placeholder-plan -->"
+        ));
+        assert!(!plan_markdown_is_placeholder(
+            "<!-- coordinator:placeholder-plan-->"
+        ));
+        assert!(!plan_markdown_is_placeholder(
+            "<!--coordinator:placeholder-plan -->"
+        ));
+    }
+
+    #[test]
+    fn short_real_plan_and_filled_headings_are_not_placeholders() {
+        assert!(!plan_markdown_is_placeholder("# plan\n"));
+        assert!(!plan_markdown_is_placeholder(&format!(
+            "{ORCA_0099_HEADING}\n"
+        )));
+        assert!(!plan_markdown_is_placeholder(
+            "The words > Template. Phased checklist appear in this sentence.\n"
+        ));
+        assert!(!plan_markdown_is_placeholder(&format!(
+            "See {LIVE_TEMPLATE_HEADING} in the template.\n"
+        )));
+    }
+
+    #[test]
+    fn plan_on_disk_fast_skip_matches_predicate() {
+        assert!(plan_on_disk_is_fast_skip(&PlanOnDisk::Unreadable));
+        assert!(!plan_on_disk_is_fast_skip(&PlanOnDisk::Missing));
+        assert!(plan_on_disk_is_fast_skip(&PlanOnDisk::Text(
+            "# plan\n".into()
+        )));
+        assert!(!plan_on_disk_is_fast_skip(&PlanOnDisk::Text(
+            "> Template. Phased checklist\n".into()
+        )));
+    }
+
+    #[test]
+    fn real_plan_prompt_fast_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        write_track(dir.path(), Some("# spec\n"), Some("# plan\n"));
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001-Minted"));
+        assert_fast_skip(&text);
         assert!(
-            n.contains("C:/dev/Orca/.agents/skills/plan/SKILL.md"),
-            "plan skill under workspace: {text}"
+            text.contains("spec.md") && text.contains("plan.md"),
+            "{text}"
         );
+    }
+
+    #[test]
+    fn placeholder_plan_prompt_loads_skill_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        write_track(
+            dir.path(),
+            Some("# spec\n"),
+            Some(&format!("{LIVE_TEMPLATE_HEADING}\n")),
+        );
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001"));
+        let skill = skill_md(dir.path(), "plan");
+        assert_expand_with_skill(&text, &skill.display().to_string());
+    }
+
+    #[test]
+    fn placeholder_plan_prompt_when_skill_file_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_track(
+            dir.path(),
+            Some("# spec\n"),
+            Some("> Template. Replace placeholders\n"),
+        );
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001"));
+        let skill = skill_md(dir.path(), "plan").display().to_string();
+        assert!(text.contains("placeholder present, skill absent"), "{text}");
+        assert!(text.contains(&skill), "{text}");
+        assert!(text.contains("This is not a fast-skip"), "{text}");
+        assert!(text.contains("Do not claim the skill was loaded"), "{text}");
+        assert!(text.contains("Write spec.md and plan.md"), "{text}");
+        assert!(text.contains("Mark the track Ready"), "{text}");
+        assert!(text.contains("Knowledge is stale"), "{text}");
+        assert!(text.contains("end this turn"), "{text}");
+        assert!(text.contains("outcome write"), "{text}");
         assert!(
-            !n.contains("OrcaSlicer-ZR/.agents/skills/plan/SKILL.md"),
-            "plan skill must not be under execution_repo: {text}"
+            text.contains("Remove any placeholder-marker line"),
+            "{text}"
         );
+        assert!(!text.contains("Do not load the plan skill"), "{text}");
+        assert!(!text.contains("Honor project skills"), "{text}");
+        assert!(!text.contains("Otherwise:"), "{text}");
+    }
+
+    #[test]
+    fn missing_plan_prompt_expands_when_skill_file_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_track(dir.path(), Some("# spec\n"), None);
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001"));
+        let skill = skill_md(dir.path(), "plan").display().to_string();
+        assert!(text.contains("Plan skill file is absent"), "{text}");
+        assert!(text.contains(&skill), "{text}");
+        assert!(text.contains("This is not a fast-skip"), "{text}");
+        assert!(text.contains("Write spec.md and plan.md"), "{text}");
+        assert!(text.contains("Knowledge is stale"), "{text}");
+        assert!(text.contains("end this turn"), "{text}");
+        assert!(text.contains("outcome write"), "{text}");
+        assert!(
+            !text.contains("placeholder present, skill absent"),
+            "{text}"
+        );
+        assert!(!text.contains("Do not load the plan skill"), "{text}");
+        assert!(!text.contains("Honor project skills"), "{text}");
+    }
+
+    #[test]
+    fn missing_plan_prompt_loads_skill_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        write_track(dir.path(), Some("# spec\n"), None);
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001"));
+        let skill = skill_md(dir.path(), "plan");
+        assert_expand_with_skill(&text, &skill.display().to_string());
+    }
+
+    #[test]
+    fn missing_spec_forces_expand_even_when_real_plan_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        write_track(dir.path(), None, Some("# plan\n"));
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001"));
+        let skill = skill_md(dir.path(), "plan");
+        assert_expand_with_skill(&text, &skill.display().to_string());
+        assert!(!text.contains("Do not load the plan skill"), "{text}");
+    }
+
+    #[test]
+    fn no_track_id_or_dir_expands() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conductor")).unwrap();
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let missing_id = phase_prompt(&rec, "plan", None);
+        let skill = skill_md(dir.path(), "plan");
+        assert_expand_with_skill(&missing_id, &skill.display().to_string());
+        let missing_dir = phase_prompt(&rec, "plan", Some("0099"));
+        assert_expand_with_skill(&missing_dir, &skill.display().to_string());
+        assert!(!missing_dir.contains("placeholder present, skill absent"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_plan_file_fast_skips_without_panic() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_track(
+            dir.path(),
+            Some("# spec\n"),
+            Some("<!-- coordinator:placeholder-plan -->\n"),
+        );
+        let plan = dir
+            .path()
+            .join("conductor")
+            .join("0001-Minted")
+            .join("plan.md");
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&plan)
+            .unwrap();
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001"));
+        assert_fast_skip(&text);
     }
 
     #[test]
