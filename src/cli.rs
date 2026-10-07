@@ -10,7 +10,9 @@ use crate::api;
 use crate::config::DEFAULT_SERVE_PORT;
 use crate::error::CoordinatorError;
 use crate::layout::LayoutProfile;
-use crate::registry::{AutoStartPolicy, ProjectAddOptions, ProjectSetOptions};
+use crate::registry::{
+    AutoStartPolicy, ProjectAddOptions, ProjectSetOptions, parse_skill_alias, parse_skill_alias_key,
+};
 use crate::server;
 use crate::workflow::timeouts::parse_phase_timeout;
 
@@ -339,6 +341,15 @@ pub enum ProjectCommands {
         /// Repeatable. Canonical phase id or `plan_review_slot` = seconds (>0).
         #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
         phase_timeouts: Vec<(String, u64)>,
+        /// Repeatable. Canonical skill name = directory segment (`plan=plan-track`).
+        #[arg(long = "skill-alias", value_name = "KEY=NAME", value_parser = parse_skill_alias)]
+        skill_aliases: Vec<(String, String)>,
+        /// Repeatable. Drop one skill-alias key. A no-op on add because the map starts empty.
+        #[arg(long = "clear-skill-alias", value_name = "KEY", value_parser = parse_skill_alias_key)]
+        clear_skill_alias: Vec<String>,
+        /// Wipe skill aliases before the overlay. A no-op on add.
+        #[arg(long = "clear-skill-aliases")]
+        clear_skill_aliases: bool,
     },
     /// List registered projects (JSON; includes profile + execution summary)
     List,
@@ -399,6 +410,15 @@ pub enum ProjectCommands {
         /// full | hitl | never (omit = leave unchanged)
         #[arg(long = "auto-start", value_parser = parse_auto_start)]
         auto_start: Option<AutoStartPolicy>,
+        /// Repeatable. Canonical skill name = directory segment (`plan=plan-track`). Last duplicate wins.
+        #[arg(long = "skill-alias", value_name = "KEY=NAME", value_parser = parse_skill_alias)]
+        skill_aliases: Vec<(String, String)>,
+        /// Repeatable. Drop one stored skill-alias key before the overlay.
+        #[arg(long = "clear-skill-alias", value_name = "KEY", value_parser = parse_skill_alias_key)]
+        clear_skill_alias: Vec<String>,
+        /// Wipe stored skill aliases before the per-key clears and the overlay.
+        #[arg(long = "clear-skill-aliases")]
+        clear_skill_aliases: bool,
     },
     /// Scan roots for conductor/conductor.md markers
     Scan {
@@ -490,8 +510,15 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 auto_merge,
                 auto_start,
                 phase_timeouts,
+                skill_aliases,
+                clear_skill_alias,
+                clear_skill_aliases,
             } => {
                 let layout_profile = LayoutProfile::parse(&profile)?;
+                let mut alias_map = BTreeMap::new();
+                for (key, value) in skill_aliases {
+                    alias_map.insert(key, value);
+                }
                 let opts = ProjectAddOptions {
                     layout_profile,
                     execution_repo,
@@ -503,6 +530,9 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     auto_merge,
                     phase_timeouts_secs: phase_timeouts.into_iter().collect(),
                     auto_start,
+                    skill_aliases: alias_map,
+                    clear_skill_aliases,
+                    clear_skill_alias,
                 };
                 let rec = api::project_add(&path, opts)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
@@ -535,6 +565,9 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 status_words_ready,
                 clear_status_words_ready,
                 auto_start,
+                skill_aliases,
+                clear_skill_alias,
+                clear_skill_aliases,
             } => {
                 let layout_profile = match profile {
                     Some(s) => Some(LayoutProfile::parse(&s)?),
@@ -553,6 +586,15 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     None
                 } else {
                     Some(status_words_ready)
+                };
+                let skill_alias_map = if skill_aliases.is_empty() {
+                    None
+                } else {
+                    let mut map = BTreeMap::new();
+                    for (key, value) in skill_aliases {
+                        map.insert(key, value);
+                    }
+                    Some(map)
                 };
                 let opts = ProjectSetOptions {
                     layout_profile,
@@ -576,6 +618,9 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     ready_aliases,
                     clear_ready_aliases: clear_status_words_ready,
                     auto_start,
+                    skill_aliases: skill_alias_map,
+                    clear_skill_aliases,
+                    clear_skill_alias,
                 };
                 let rec = api::project_set(project.as_deref(), opts, true)?;
                 println!("{}", serde_json::to_string_pretty(&rec)?);
@@ -1247,6 +1292,84 @@ mod tests {
         assert!(
             add.get_arguments().any(|a| a.get_id() == "auto_start"),
             "add --auto-start"
+        );
+    }
+
+    #[test]
+    fn project_set_and_add_have_skill_alias_flags() {
+        let mut cmd = Cli::command();
+        let project = cmd.find_subcommand_mut("project").unwrap();
+        let set = project.find_subcommand_mut("set").unwrap();
+        assert!(set.get_arguments().any(|a| a.get_id() == "skill_aliases"));
+        assert!(
+            set.get_arguments()
+                .any(|a| a.get_id() == "clear_skill_alias")
+        );
+        assert!(
+            set.get_arguments()
+                .any(|a| a.get_id() == "clear_skill_aliases")
+        );
+        let add = project.find_subcommand_mut("add").unwrap();
+        assert!(add.get_arguments().any(|a| a.get_id() == "skill_aliases"));
+        assert!(
+            add.get_arguments()
+                .any(|a| a.get_id() == "clear_skill_alias")
+        );
+        assert!(
+            add.get_arguments()
+                .any(|a| a.get_id() == "clear_skill_aliases")
+        );
+    }
+
+    #[test]
+    fn project_set_skill_alias_last_flag_wins_and_rejects() {
+        let cli = Cli::try_parse_from([
+            "coordinator",
+            "project",
+            "set",
+            "--skill-alias",
+            "plan=plan-track",
+            "--skill-alias",
+            "plan=other-plan",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Project {
+                action: ProjectCommands::Set { skill_aliases, .. },
+            } => {
+                assert_eq!(
+                    skill_aliases,
+                    vec![
+                        ("plan".into(), "plan-track".into()),
+                        ("plan".into(), "other-plan".into()),
+                    ]
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["coordinator", "project", "set", "--skill-alias", "nope=x"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "coordinator",
+                "project",
+                "set",
+                "--skill-alias",
+                "plan=../x"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "coordinator",
+                "project",
+                "set",
+                "--clear-skill-alias",
+                "nope"
+            ])
+            .is_err()
         );
     }
 

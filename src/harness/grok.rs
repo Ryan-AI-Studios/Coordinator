@@ -2514,6 +2514,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         });
         session.inject_prompt("read", timeout()).await.unwrap();
@@ -2558,6 +2559,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         };
 

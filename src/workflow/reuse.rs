@@ -123,22 +123,121 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_lower(Sha256::digest(bytes).as_slice())
 }
 
-fn skill_file(root: &Path) -> PathBuf {
+fn skill_markdown(root: &Path, dir_name: &str) -> PathBuf {
     root.join(".agents")
         .join("skills")
-        .join("review-track")
+        .join(dir_name)
         .join("SKILL.md")
 }
 
-/// Workspace skill, else `{conductor_dir.parent()}/.agents/skills/review-track/SKILL.md`.
-pub fn review_track_skill_candidates(record: &ProjectRecord) -> (PathBuf, PathBuf) {
+/// Alias directory segment, or the canonical name when the map has no entry.
+pub fn skill_directory_name(record: &ProjectRecord, canonical: &str) -> String {
+    record
+        .skill_aliases
+        .get(canonical)
+        .cloned()
+        .unwrap_or_else(|| canonical.to_string())
+}
+
+/// Primary `{workspace}/.agents/skills/{dir}/SKILL.md`, then conductor-parent fallback.
+pub fn workspace_skill_candidates(record: &ProjectRecord, canonical: &str) -> (PathBuf, PathBuf) {
+    let dir_name = skill_directory_name(record, canonical);
     let paths = crate::layout::resolve(record);
-    let primary = skill_file(&paths.workspace_root);
+    let primary = skill_markdown(&paths.workspace_root, &dir_name);
     let fallback = match paths.conductor_dir.parent() {
-        Some(parent) => skill_file(parent),
+        Some(parent) => skill_markdown(parent, &dir_name),
         None => primary.clone(),
     };
     (primary, fallback)
+}
+
+/// Workspace skill, else `{conductor_dir.parent()}/.agents/skills/{alias}/SKILL.md`.
+pub fn review_track_skill_candidates(record: &ProjectRecord) -> (PathBuf, PathBuf) {
+    workspace_skill_candidates(record, "review-track")
+}
+
+/// Execution root `execution_skill` already uses. No conductor-parent fallback.
+pub fn execution_skill_path(record: &ProjectRecord, canonical: &str) -> PathBuf {
+    let dir_name = skill_directory_name(record, canonical);
+    let paths = crate::layout::resolve(record);
+    let fallback = paths.execution_repo.clone().unwrap_or(paths.workspace_root);
+    let root = crate::worktree::active_epoch_dir(record).unwrap_or(fallback);
+    skill_markdown(&root, &dir_name)
+}
+
+/// Chosen file when one exists, otherwise the primary path and `false`.
+pub fn chosen_workspace_skill(record: &ProjectRecord, canonical: &str) -> (PathBuf, bool) {
+    let (primary, fallback) = workspace_skill_candidates(record, canonical);
+    if primary.is_file() {
+        return (primary, true);
+    }
+    if fallback != primary && fallback.is_file() {
+        return (fallback, true);
+    }
+    (primary, false)
+}
+
+/// Paths to name when neither workspace candidate is a file.
+pub fn missing_workspace_skill(record: &ProjectRecord, canonical: &str) -> Vec<PathBuf> {
+    let (primary, fallback) = workspace_skill_candidates(record, canonical);
+    if primary.is_file() || (fallback != primary && fallback.is_file()) {
+        return Vec::new();
+    }
+    if primary == fallback {
+        vec![primary]
+    } else {
+        vec![primary, fallback]
+    }
+}
+
+fn missing_execution_skill(record: &ProjectRecord, canonical: &str) -> Vec<PathBuf> {
+    let path = execution_skill_path(record, canonical);
+    if path.is_file() {
+        Vec::new()
+    } else {
+        vec![path]
+    }
+}
+
+/// Skills this phase must have on disk before an adapter inject or plan-review spawn.
+///
+/// Plan shares `plan_phase_requires_skill` with the prompt body. A workspace name is
+/// satisfied when either candidate is a file.
+pub fn missing_required_skill_paths(
+    record: &ProjectRecord,
+    phase: &str,
+    track_id: Option<&str>,
+) -> Vec<PathBuf> {
+    use super::graph::{
+        PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT, PHASE_PLAN,
+        PHASE_PLAN_REVIEW,
+    };
+    match phase {
+        PHASE_PLAN => {
+            if !super::prompts::plan_phase_requires_skill(record, track_id) {
+                return Vec::new();
+            }
+            missing_workspace_skill(record, "plan")
+        }
+        PHASE_FOLD => missing_workspace_skill(record, "foldin"),
+        PHASE_ADVANCE => missing_workspace_skill(record, "plan"),
+        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS => {
+            let mut missing = missing_execution_skill(record, "implement");
+            missing.extend(missing_execution_skill(record, "onboarding"));
+            missing
+        }
+        PHASE_PLAN_REVIEW => missing_workspace_skill(record, "review-track"),
+        _ => Vec::new(),
+    }
+}
+
+pub fn skill_missing_message(paths: &[PathBuf]) -> String {
+    let listed = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("skill_missing: {listed}")
 }
 
 pub fn review_track_skill_file(record: &ProjectRecord) -> Option<PathBuf> {
@@ -595,6 +694,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
     }

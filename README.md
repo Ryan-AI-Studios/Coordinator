@@ -408,7 +408,7 @@ After a successful Review Gate, Coordinator watches CI **outside** any model Ses
 | Fail | `failure_class=ci_failed` → Stopped + Failure Artifact + toast. Opt-in `address-ci` may route the gate's failing checks first (cap 2). No auto-retry of the workflow. Publish exhaustion is the same `ci_failed` stop and does not enter `address-ci` (there is no PR) |
 | Process cap | `git push` 120s then kill (transient, `ci-wait: git timed out`). Other `gh`/`git` spawns: 30s then kill (transient, `ci-wait: gh timed out` for `gh`; `ci-wait: git timed out` for `git`) |
 
-`project add` / `project set` accept `--auto-merge true|false` (omit = default on / leave unchanged) and `--auto-start full|hitl|never` (add omit = hitl; set omit = leave unchanged). HTTP `POST /v1/projects` and `/v1/projects/set` take optional `auto_merge` and `auto_start`. Old `registry.json` records without `auto_start` load as **hitl** (the key is omitted on save when hitl). `project set --notify-progress true|false` is additive (omit = leave unchanged; missing JSON field = **false**). HTTP set takes optional `notify_progress`.
+`project add` / `project set` accept `--auto-merge true|false` (omit = default on / leave unchanged) and `--auto-start full|hitl|never` (add omit = hitl; set omit = leave unchanged). HTTP `POST /v1/projects` and `/v1/projects/set` take optional `auto_merge` and `auto_start`. Old `registry.json` records without `auto_start` load as **hitl** (the key is omitted on save when hitl). `project set --notify-progress true|false` is additive (omit = leave unchanged; missing JSON field = **false**). HTTP set takes optional `notify_progress`. Both commands also accept repeatable `--skill-alias KEY=NAME` (`plan`, `foldin`, `implement`, `onboarding`, or `review-track` = one directory segment), repeatable `--clear-skill-alias KEY`, and `--clear-skill-aliases` (clears, then per-key drops, then the overlay; last duplicate key wins). An empty map keeps the canonical directory names. HTTP add/set bodies do not take skill aliases.
 
 Default `cargo test` uses a scripted `CiBackend` and never needs `gh` auth. Optional live smoke: `$env:COORDINATOR_GH_LIVE='1'; cargo test ci_live -- --ignored --nocapture`.
 
@@ -502,6 +502,7 @@ coordinator project add <path>
     [--display-name <name>] [--execution-repo-name <name>]
     [--auto-merge true|false] [--auto-start full|hitl|never]
     [--phase-timeout PHASE=SECS]...
+    [--skill-alias KEY=NAME]... [--clear-skill-alias KEY]... [--clear-skill-aliases]
 coordinator project list
 coordinator project show [--project <path|id>]
 coordinator project set [--project …]
@@ -510,6 +511,7 @@ coordinator project set [--project …]
     [--auto-merge true|false] [--auto-start full|hitl|never] [--notify-progress true|false]
     [--phase-timeout PHASE=SECS]... [--clear-phase-timeout PHASE]...
     [--clear-phase-timeouts]
+    [--skill-alias KEY=NAME]... [--clear-skill-alias KEY]... [--clear-skill-aliases]
 coordinator project scan [--root <path>]... [--add] [--dry-run] [--save-root]
 coordinator status [--project <path|id>]
 coordinator doctor [--project <path|id>]

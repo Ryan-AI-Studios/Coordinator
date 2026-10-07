@@ -55,16 +55,18 @@ pub enum FailureClass {
     HarnessCrash,
     Timeout,
     CiFailed,
+    SkillMissing,
 }
 
 impl FailureClass {
-    pub const ALL: [FailureClass; 6] = [
+    pub const ALL: [FailureClass; 7] = [
         Self::Permission,
         Self::ModelExhaustion,
         Self::Difficulty,
         Self::HarnessCrash,
         Self::Timeout,
         Self::CiFailed,
+        Self::SkillMissing,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -75,6 +77,7 @@ impl FailureClass {
             Self::HarnessCrash => "harness_crash",
             Self::Timeout => "timeout",
             Self::CiFailed => "ci_failed",
+            Self::SkillMissing => "skill_missing",
         }
     }
 
@@ -86,6 +89,7 @@ impl FailureClass {
             "harness_crash" => Ok(Self::HarnessCrash),
             "timeout" => Ok(Self::Timeout),
             "ci_failed" => Ok(Self::CiFailed),
+            "skill_missing" => Ok(Self::SkillMissing),
             other => Err(CoordinatorError::Message(format!(
                 "unknown failure_class: {other}"
             ))),
@@ -954,6 +958,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
     }

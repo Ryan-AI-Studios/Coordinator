@@ -230,6 +230,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: on,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
     }

@@ -1666,12 +1666,55 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
     }
 
+    fn write_review_track_skill(dir: &std::path::Path) {
+        let skill = dir.join(".agents").join("skills").join("review-track");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "review-track\n").unwrap();
+    }
+
     fn setup_track(dir: &std::path::Path, id: &str) {
         std::fs::create_dir_all(dir.join("conductor").join(format!("{id}-Example"))).unwrap();
+        write_review_track_skill(dir);
+    }
+
+    #[test]
+    fn plan_review_missing_skill_stops_without_spawn() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conductor").join("0001-Example")).unwrap();
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let view = tick_retry(&r).unwrap().expect("skill missing view");
+        assert_eq!(view.failure_class, Some(FailureClass::SkillMissing));
+        assert_eq!(view.status, crate::state::RunStatus::Stopped);
+        let marker = view
+            .last_event
+            .find("skill_missing:")
+            .expect(&view.last_event);
+        assert!(
+            view.last_event[..marker].trim_end().ends_with('\u{2014}'),
+            "{}",
+            view.last_event
+        );
+        assert!(
+            view.last_event.contains("review-track"),
+            "{}",
+            view.last_event
+        );
+        let state = load_run_state(&r).unwrap();
+        assert_eq!(
+            state.pending_roles,
+            vec!["agy".to_string(), "opencode".to_string()]
+        );
+        if let Ok(reviews) = crate::workflow::bundle::reviews_dir(&r) {
+            assert!(!reviews.join("agy-review.md").is_file());
+            assert!(!reviews.join("opencode-review.md").is_file());
+        }
     }
 
     fn enter_plan_review(r: &ProjectRecord, track: &str) {
@@ -2742,6 +2785,7 @@ mod tests {
     fn advance_auto_start_clears_spawned_and_respawns() {
         let _env = IsolatedHome::enter();
         let dir = tempdir().unwrap();
+        write_review_track_skill(dir.path());
         std::fs::create_dir_all(dir.path().join("conductor").join("0001-Example")).unwrap();
         std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
         std::fs::write(
@@ -3707,6 +3751,7 @@ mod tests {
 
     fn adopt_on_disk_body(dir: &std::path::Path, folder: &str, track_id: &str) {
         mkdir_track(dir, folder);
+        write_review_track_skill(dir);
         let r = rec(dir);
         enter_plan_review(&r, track_id);
         let backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
@@ -3746,6 +3791,7 @@ mod tests {
         let dir = tempdir().unwrap();
         mkdir_track(dir.path(), "track720");
         mkdir_track(dir.path(), "720-Foo");
+        write_review_track_skill(dir.path());
         let r = rec(dir.path());
         enter_plan_review(&r, "72");
         let _hook = install_test_backend(&r.id, Arc::new(ScriptedBackend::empty()));
@@ -3770,6 +3816,7 @@ mod tests {
         let _env = IsolatedHome::enter();
         let dir = tempdir().unwrap();
         mkdir_track(dir.path(), "track720");
+        write_review_track_skill(dir.path());
         let r = rec(dir.path());
         enter_plan_review(&r, "72");
         {

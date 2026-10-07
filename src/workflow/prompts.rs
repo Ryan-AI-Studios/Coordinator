@@ -75,6 +75,7 @@ pub(crate) fn layout_block(record: &ProjectRecord, track_id: Option<&str>, phase
     )
 }
 
+#[cfg(test)]
 fn skill_md(root: &Path, name: &str) -> PathBuf {
     root.join(".agents")
         .join("skills")
@@ -83,15 +84,22 @@ fn skill_md(root: &Path, name: &str) -> PathBuf {
 }
 
 fn workspace_skill(record: &ProjectRecord, name: &str) -> String {
-    let paths = crate::layout::resolve(record);
-    skill_md(&paths.workspace_root, name).display().to_string()
+    super::reuse::chosen_workspace_skill(record, name)
+        .0
+        .display()
+        .to_string()
 }
 
 fn execution_skill(record: &ProjectRecord, name: &str) -> String {
-    let paths = crate::layout::resolve(record);
-    let fallback = paths.execution_repo.clone().unwrap_or(paths.workspace_root);
-    let root = crate::worktree::active_epoch_dir(record).unwrap_or(fallback);
-    skill_md(&root, name).display().to_string()
+    super::reuse::execution_skill_path(record, name)
+        .display()
+        .to_string()
+}
+
+/// True when the plan inject must load the plan skill. Fast-skip does not.
+pub(crate) fn plan_phase_requires_skill(record: &ProjectRecord, track_id: Option<&str>) -> bool {
+    let (spec_is_file, plan) = read_plan_inputs(record, track_id);
+    !(spec_is_file && plan_on_disk_is_fast_skip(&plan))
 }
 
 fn honor_skill(name: &str, path: &str) -> String {
@@ -263,12 +271,12 @@ fn plan_expand_write() -> String {
 /// One branch. Fast-skip is `spec.md` present and a real or unreadable plan.
 /// The stamp gate stays on file presence and does not call this.
 fn plan_prompt_body(record: &ProjectRecord, track_id: Option<&str>) -> String {
-    let path = workspace_skill(record, "plan");
-    let (spec_is_file, plan) = read_plan_inputs(record, track_id);
-    if spec_is_file && plan_on_disk_is_fast_skip(&plan) {
+    let (path_buf, skill_is_file) = super::reuse::chosen_workspace_skill(record, "plan");
+    let path = path_buf.display().to_string();
+    let (_spec_is_file, plan) = read_plan_inputs(record, track_id);
+    if !plan_phase_requires_skill(record, track_id) {
         return plan_fast_skip_body();
     }
-    let skill_is_file = skill_md(&crate::layout::resolve(record).workspace_root, "plan").is_file();
     let placeholder =
         matches!(plan, PlanOnDisk::Text(ref body) if plan_markdown_is_placeholder(body));
     let write = plan_expand_write();
@@ -482,6 +490,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
     }
@@ -553,6 +562,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
     }
@@ -648,6 +658,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
     }
@@ -667,6 +678,201 @@ mod tests {
         let skill = root.join(".agents").join("skills").join("plan");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(skill.join("SKILL.md"), "plan skill\n").unwrap();
+    }
+
+    fn slash(path: &std::path::Path) -> String {
+        path.display().to_string().replace('\\', "/")
+    }
+
+    #[test]
+    fn default_skill_paths_match_today() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = temp_project(dir.path());
+        let plan = phase_prompt(&rec, "plan", Some("0001"));
+        let primary_plan = skill_md(dir.path(), "plan");
+        assert!(plan.contains(&primary_plan.display().to_string()), "{plan}");
+        assert!(plan.contains("Plan skill file is absent"), "{plan}");
+        let fold = phase_prompt(&rec, "fold", None);
+        assert!(
+            fold.contains(&skill_md(dir.path(), "foldin").display().to_string()),
+            "{fold}"
+        );
+        let advance = phase_prompt(&rec, "advance", None);
+        assert!(
+            advance.contains(&skill_md(dir.path(), "plan").display().to_string()),
+            "{advance}"
+        );
+        let implement = phase_prompt(&rec, "implement", None);
+        let exec = dir.path().join("exec");
+        assert!(
+            implement.contains(&skill_md(&exec, "implement").display().to_string()),
+            "{implement}"
+        );
+        assert!(
+            implement.contains(&skill_md(&exec, "onboarding").display().to_string()),
+            "{implement}"
+        );
+        let (primary, fallback) = crate::workflow::reuse::review_track_skill_candidates(&rec);
+        assert_eq!(primary, skill_md(dir.path(), "review-track"));
+        assert_eq!(fallback, primary);
+        let prompt = crate::workflow::reuse::review_track_skill_prompt(&rec);
+        assert!(slash_text(&prompt).contains(&slash(&primary)), "{prompt}");
+    }
+
+    #[test]
+    fn empty_map_parent_plan_and_foldin() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        let planning = root.path().join("planning");
+        std::fs::create_dir_all(planning.join("conductor")).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        for name in ["plan", "foldin"] {
+            let skill = planning.join(".agents").join("skills").join(name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "skill\n").unwrap();
+        }
+        let mut rec = temp_project(&ws);
+        rec.conductor_dir = Some(planning.join("conductor"));
+        let plan = phase_prompt(&rec, "plan", None);
+        let parent_plan = planning
+            .join(".agents")
+            .join("skills")
+            .join("plan")
+            .join("SKILL.md");
+        assert!(plan.contains(&parent_plan.display().to_string()), "{plan}");
+        assert!(
+            !slash_text(&plan).contains("/ws/.agents/skills/plan/SKILL.md"),
+            "{plan}"
+        );
+        let fold = phase_prompt(&rec, "fold", None);
+        let parent_fold = planning
+            .join(".agents")
+            .join("skills")
+            .join("foldin")
+            .join("SKILL.md");
+        assert!(fold.contains(&parent_fold.display().to_string()), "{fold}");
+    }
+
+    #[test]
+    fn alias_plan_prompt_uses_plan_track_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = temp_project(dir.path());
+        rec.skill_aliases.insert("plan".into(), "plan-track".into());
+        let text = phase_prompt(&rec, "plan", None);
+        let aliased = skill_md(dir.path(), "plan-track");
+        assert!(text.contains(&aliased.display().to_string()), "{text}");
+        assert!(
+            !slash_text(&text).contains("/.agents/skills/plan/SKILL.md"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn alias_advance_prompt_uses_plan_track_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = temp_project(dir.path());
+        rec.skill_aliases.insert("plan".into(), "plan-track".into());
+        let text = phase_prompt(&rec, "advance", None);
+        let aliased = skill_md(dir.path(), "plan-track");
+        assert!(text.contains(&aliased.display().to_string()), "{text}");
+        assert!(
+            !slash_text(&text).contains("/.agents/skills/plan/SKILL.md"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn alias_falls_back_to_conductor_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        let planning = root.path().join("planning");
+        std::fs::create_dir_all(&ws).unwrap();
+        let skill = planning.join(".agents").join("skills").join("plan-track");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "aliased\n").unwrap();
+        let mut rec = temp_project(&ws);
+        rec.conductor_dir = Some(planning.join("conductor"));
+        std::fs::create_dir_all(planning.join("conductor")).unwrap();
+        rec.skill_aliases.insert("plan".into(), "plan-track".into());
+        let text = phase_prompt(&rec, "plan", None);
+        let parent = skill.join("SKILL.md");
+        assert!(text.contains(&parent.display().to_string()), "{text}");
+        assert!(text.contains("Honor project skills"), "{text}");
+    }
+
+    fn slash_text(text: &str) -> String {
+        text.replace('\\', "/")
+    }
+
+    #[test]
+    fn phase_skill_roots() {
+        let _lock = crate::config::test_env_lock();
+        let prev_wt = std::env::var("COORDINATOR_WORKTREE").ok();
+        let prev_state = std::env::var(crate::config::ENV_COORDINATOR_STATE_DIR).ok();
+        unsafe {
+            std::env::remove_var("COORDINATOR_WORKTREE");
+            std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+        }
+        struct Restore(&'static str, Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.1 {
+                        Some(value) => std::env::set_var(self.0, value),
+                        None => std::env::remove_var(self.0),
+                    }
+                }
+            }
+        }
+        let _wt = Restore("COORDINATOR_WORKTREE", prev_wt);
+        let _state = Restore(crate::config::ENV_COORDINATOR_STATE_DIR, prev_state);
+
+        let dir = tempfile::tempdir().unwrap();
+        let exec = dir.path().join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        let mut rec = temp_project(dir.path());
+        rec.execution_repo = Some(exec.clone());
+        for (name, root_kind) in [
+            ("plan", "workspace"),
+            ("fold", "workspace"),
+            ("advance", "workspace"),
+        ] {
+            let canonical = if name == "fold" { "foldin" } else { "plan" };
+            let (primary, fallback) =
+                crate::workflow::reuse::workspace_skill_candidates(&rec, canonical);
+            assert_eq!(
+                slash(&primary),
+                slash(&skill_md(dir.path(), canonical)),
+                "{name}"
+            );
+            assert_eq!(primary, fallback, "{name} {root_kind}");
+        }
+        for phase in ["address-ci", "compact", "ci-wait", "cross-model-review"] {
+            assert!(
+                crate::workflow::reuse::missing_required_skill_paths(&rec, phase, None).is_empty(),
+                "{phase}"
+            );
+        }
+        for phase in ["implement", "address-findings"] {
+            let missing = crate::workflow::reuse::missing_required_skill_paths(&rec, phase, None);
+            assert_eq!(missing.len(), 2, "{phase} {missing:?}");
+            assert_eq!(slash(&missing[0]), slash(&skill_md(&exec, "implement")));
+            assert_eq!(slash(&missing[1]), slash(&skill_md(&exec, "onboarding")));
+        }
+
+        rec.worktree_isolation = true;
+        rec.state_dir = Some(dir.path().join("state"));
+        let mut state = crate::state::RunState::idle(&rec.id);
+        state.run_epoch = 3;
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let epoch = dir.path().join("state").join("worktrees").join("3");
+        std::fs::create_dir_all(&epoch).unwrap();
+        for phase in ["implement", "address-findings"] {
+            let missing = crate::workflow::reuse::missing_required_skill_paths(&rec, phase, None);
+            assert_eq!(missing.len(), 2, "{phase} {missing:?}");
+            assert_eq!(slash(&missing[0]), slash(&skill_md(&epoch, "implement")));
+            assert_eq!(slash(&missing[1]), slash(&skill_md(&epoch, "onboarding")));
+        }
     }
 
     fn assert_fast_skip(text: &str) {
@@ -1001,6 +1207,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
     }
@@ -1151,6 +1358,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         };
         run_with_driver(&rec, Some("0031".into()), WorkflowDriver::FileWait).unwrap();
