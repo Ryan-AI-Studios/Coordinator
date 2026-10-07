@@ -384,6 +384,59 @@ fn looks_like_unknown_flag(stderr: &str) -> bool {
     s.contains("unknown flag") || s.contains("unknown command") || s.contains("unknown shorthand")
 }
 
+/// Resume probe payload. `state` stays raw (`OPEN` / `CLOSED` / `MERGED`).
+///
+/// Test builds never call `gh`; the live wrapper stays for production resumes.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct GhPrHead {
+    pub state: String,
+    pub head_oid: String,
+    pub head_ref: String,
+}
+
+/// `gh pr view <number> --json` for the reuse probe. Exit 4 is auth.
+/// A non-ok exit or a missing head oid is `Ok(None)`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn pr_view_resume(cwd: &Path, number: u64) -> Result<Option<GhPrHead>> {
+    let n = number.to_string();
+    let args = ["pr", "view", n.as_str(), "--json", PR_VIEW_JSON_FIELDS];
+    let out = gh_capture(cwd, &args)?;
+    if out.exit == 4 {
+        return Err(CoordinatorError::Message("gh auth required".into()));
+    }
+    if !out.ok {
+        return Ok(None);
+    }
+    parse_pr_head(&out.stdout)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn parse_pr_head(stdout: &str) -> Result<Option<GhPrHead>> {
+    let v: serde_json::Value = match serde_json::from_str(stdout) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let head_oid = v
+        .get("headRefOid")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    let head_ref = v
+        .get("headRefName")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    if state.is_empty() || head_oid.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(GhPrHead {
+        state: state.to_string(),
+        head_oid: head_oid.to_string(),
+        head_ref: head_ref.to_string(),
+    }))
+}
+
 fn pr_view(cwd: &Path, number: Option<u64>) -> Result<Option<CiTarget>> {
     let n = number.map(|v| v.to_string());
     let mut args = vec!["pr", "view"];

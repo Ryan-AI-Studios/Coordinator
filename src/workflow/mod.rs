@@ -8,6 +8,7 @@ pub mod evidence_stamp;
 pub mod graph;
 pub mod plan_review;
 pub mod prompts;
+pub mod reuse;
 pub mod self_check;
 pub mod shipped;
 pub mod timeouts;
@@ -88,7 +89,11 @@ pub fn resolve_driver(explicit: Option<&str>) -> Result<WorkflowDriver> {
 /// `address-ci` success with no tracked diff stops inside this apply.
 pub enum AddressCiFollowUp {
     Continue,
-    Stopped { message: String },
+    Stopped {
+        message: String,
+    },
+    /// Successor reuse still needs `gh pr view`. Caller probes after both locks drop.
+    ReuseProbe(Box<reuse::ReuseProbe>),
 }
 
 const FOLD_WITHHELD_KIND: &str = "fold-withheld";
@@ -155,7 +160,9 @@ pub fn on_success(
     }
 
     if state.phase == graph::PHASE_ADVANCE {
-        apply_advance(record, state);
+        if let Some(probe) = apply_advance(record, state) {
+            return AddressCiFollowUp::ReuseProbe(Box::new(probe));
+        }
         return AddressCiFollowUp::Continue;
     }
 
@@ -265,13 +272,13 @@ pub fn reset_phase_clock(state: &mut RunState) {
 
 /// `advance` success: Ready-walk successor, then `full` auto-starts;
 /// hitl/never/`nostart` park. Idle when no eligible Ready. Pause holds until resume.
-pub fn apply_advance(record: &ProjectRecord, state: &mut RunState) {
+pub fn apply_advance(record: &ProjectRecord, state: &mut RunState) -> Option<reuse::ReuseProbe> {
     if state.status == RunStatus::Paused {
         state.last_driven_phase = Some(graph::PHASE_ADVANCE.into());
         state.last_event = "workflow: advance held until resume".into();
-        return;
+        return None;
     }
-    finish_advance(record, state);
+    finish_advance(record, state)
 }
 
 /// First eligible Ready after excluding `state.track_id` (0030 sequencer, no `gh`).
@@ -323,7 +330,7 @@ fn journal_advance_override(record: &ProjectRecord, planner_id: Option<&str>, ca
     }
 }
 
-fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
+fn finish_advance(record: &ProjectRecord, state: &mut RunState) -> Option<reuse::ReuseProbe> {
     let _ = crate::checkpoint::reap_completed(record);
     if let Some(id) = state
         .track_id
@@ -338,7 +345,7 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
     match advance_successor(record, state) {
         Ok(cand) => {
             journal_advance_override(record, planner.as_deref(), Some(cand.as_str()));
-            start_or_park(record, state, &cand);
+            start_or_park(record, state, &cand)
         }
         Err(e) => {
             journal_advance_override(record, planner.as_deref(), None);
@@ -350,6 +357,7 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) {
             };
             crate::progress_log::append(record, "advance", &detail);
             apply_backlog_clear(record, state);
+            None
         }
     }
 }
@@ -361,24 +369,65 @@ fn skip_merged_detail(state: &RunState, id: &str) -> String {
     }
 }
 
-fn start_or_park(record: &ProjectRecord, state: &mut RunState, id: &str) {
+fn start_or_park(
+    record: &ProjectRecord,
+    state: &mut RunState,
+    id: &str,
+) -> Option<reuse::ReuseProbe> {
     if let Some(policy) = park_policy(record, id) {
         park_next(record, state, id, policy);
-    } else {
-        let next_epoch = state.run_epoch.saturating_add(1);
-        if let Err(e) = crate::worktree::prepare_epoch(record, next_epoch) {
-            state.status = RunStatus::Stopped;
-            state.failure_class = Some(FailureClass::HarnessCrash);
-            state.last_event = e.to_string();
-            state.phase_started_at = None;
-            state.pause_started_at = None;
-            return;
+        return None;
+    }
+    match reuse::decide_resume(record, Some(id)) {
+        reuse::ResumeChoice::Probe {
+            number,
+            head_sha,
+            head_ref,
+        } => {
+            // Keep the phase marked driven so a tick during `gh` does not inject advance again.
+            state.last_driven_phase = Some(graph::PHASE_ADVANCE.into());
+            Some(reuse::ReuseProbe {
+                successor_id: id.to_string(),
+                closed_epoch: state.run_epoch,
+                snap_epoch: state.run_epoch,
+                snap_track: state.track_id.clone(),
+                snap_status: state.status,
+                number,
+                head_sha,
+                head_ref,
+            })
         }
-        auto_start(state, id);
-        crate::outcome::clear_active_outcome_file(record);
-        crate::workflow::drive::clear_plan_review_artifacts(record);
-        crate::notify::clear_artifact(record);
-        crate::workflow::watchdog::clear_progress(record);
+        reuse::ResumeChoice::Plan {
+            archive_slugs,
+            journal_unreadable,
+        } => {
+            let next_epoch = state.run_epoch.saturating_add(1);
+            if let Err(e) = crate::worktree::prepare_epoch(record, next_epoch) {
+                state.status = RunStatus::Stopped;
+                state.failure_class = Some(FailureClass::HarnessCrash);
+                state.last_event = e.to_string();
+                state.phase_started_at = None;
+                state.pause_started_at = None;
+                return None;
+            }
+            let closed = state.run_epoch;
+            if journal_unreadable {
+                crate::progress_log::append(record, "reuse", "reuse: receipt unreadable");
+            }
+            auto_start(state, id);
+            crate::outcome::clear_active_outcome_file(record);
+            drive::clear_plan_review_artifacts(
+                record,
+                &drive::ArtifactClear {
+                    track_id: Some(id.to_string()),
+                    closed_epoch: closed,
+                    archive_slugs,
+                },
+            );
+            crate::notify::clear_artifact(record);
+            watchdog::clear_progress(record);
+            None
+        }
     }
 }
 
@@ -577,10 +626,78 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
 }
 
 /// Resume after `advance` succeeded while Paused.
-pub fn apply_advance_on_resume(record: &ProjectRecord, state: &mut RunState) {
+///
+/// Returns a probe when the successor still needs `gh pr view`. The caller must
+/// not invoke `gh` while holding the run-state lock.
+pub fn apply_advance_on_resume(
+    record: &ProjectRecord,
+    state: &mut RunState,
+) -> Option<reuse::ReuseProbe> {
     state.status = RunStatus::Running;
     state.pause_started_at = None;
-    finish_advance(record, state);
+    finish_advance(record, state)
+}
+
+/// Commit a successor after `gh pr view` returned. Caller holds the run-state lock.
+pub fn commit_probed_successor(
+    record: &ProjectRecord,
+    probe: &reuse::ReuseProbe,
+    answer: &Result<Option<reuse::ResumePr>>,
+) -> Result<crate::state::StatusView> {
+    let mut state = load_run_state(record)?;
+    if state.run_epoch != probe.snap_epoch
+        || state.track_id != probe.snap_track
+        || state.status != probe.snap_status
+    {
+        return Ok(crate::state::StatusView::from_record(record, &state));
+    }
+    let next_epoch = state.run_epoch.saturating_add(1);
+    if let Err(e) = crate::worktree::prepare_epoch(record, next_epoch) {
+        state.status = RunStatus::Stopped;
+        state.failure_class = Some(FailureClass::HarnessCrash);
+        state.last_event = e.to_string();
+        state.phase_started_at = None;
+        state.pause_started_at = None;
+        state.updated_at = chrono::Utc::now();
+        save_run_state(record, &state)?;
+        return Ok(crate::state::StatusView::from_record(record, &state));
+    }
+    let kept_hash = state.last_applied_outcome_hash.clone();
+    let closed = probe.closed_epoch;
+    auto_start(&mut state, &probe.successor_id);
+    state.last_applied_outcome_hash = kept_hash;
+    if reuse::probe_accepts(&probe.successor_id, &probe.head_sha, answer) {
+        state.phase = graph::PHASE_CI_WAIT.into();
+        state.ci = Some(crate::state::CiWatchState {
+            pr_number: Some(probe.number),
+            head_sha: Some(probe.head_sha.clone()),
+            ..Default::default()
+        });
+        state.last_event = format!(
+            "run: started {WORKFLOW_ID} resume ci-wait pr {}",
+            probe.number
+        );
+    }
+    crate::outcome::clear_active_outcome_file(record);
+    drive::clear_plan_review_artifacts(
+        record,
+        &drive::ArtifactClear {
+            track_id: Some(probe.successor_id.clone()),
+            closed_epoch: closed,
+            archive_slugs: Vec::new(),
+        },
+    );
+    crate::notify::clear_artifact(record);
+    watchdog::clear_progress(record);
+    state.updated_at = chrono::Utc::now();
+    save_run_state(record, &state)?;
+    let track = state.track_id.as_deref().unwrap_or("-");
+    crate::progress_log::append(
+        record,
+        "start",
+        &format!("track={track} phase={}  {}", state.phase, state.last_event),
+    );
+    Ok(crate::state::StatusView::from_record(record, &state))
 }
 
 pub fn mark_driven(record: &ProjectRecord, phase: &str) -> Result<()> {
@@ -705,6 +822,207 @@ mod tests {
             Some(WORKFLOW_ID)
         );
         assert_eq!(s.track_id.as_deref(), Some("0008"));
+    }
+
+    const REUSE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn seed_track(root: &std::path::Path, id: &str) -> std::path::PathBuf {
+        let track = root.join("conductor").join(format!("{id}-Example"));
+        std::fs::create_dir_all(&track).unwrap();
+        track
+    }
+
+    fn seed_matching_receipt(root: &std::path::Path, id: &str) -> crate::registry::ProjectRecord {
+        let r = rec(root);
+        let track = seed_track(root, id);
+        std::fs::write(track.join("spec.md"), b"spec-v1").unwrap();
+        std::fs::write(track.join("plan.md"), b"plan-v1").unwrap();
+        let skill = root
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill-v1").unwrap();
+        std::fs::write(track.join("agy-review.md"), b"agy body\n").unwrap();
+        std::fs::write(track.join("opencode-review.md"), b"oc body\n").unwrap();
+        reuse::write_join_receipt(&r, id);
+        r
+    }
+
+    fn install_open(branch: &str) -> reuse::TestProbeGuard {
+        let branch = branch.to_string();
+        reuse::install_test_probe(std::sync::Arc::new(move |_| {
+            Ok(Some(reuse::ResumePr {
+                state: "OPEN".into(),
+                head_oid: REUSE_SHA.into(),
+                head_ref: branch.clone(),
+            }))
+        }))
+    }
+
+    #[test]
+    fn corrupt_receipt_is_plan() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let track = seed_track(dir.path(), "0083");
+        std::fs::write(track.join("reuse.json"), b"{").unwrap();
+        let view = run::run(&r, Some("0083".into())).unwrap();
+        assert_eq!(view.phase, graph::PHASE_PLAN);
+        let log = std::fs::read_to_string(dir.path().join("status.md")).unwrap();
+        assert!(log.contains("reuse: receipt unreadable"), "{log}");
+    }
+
+    #[test]
+    fn matching_pr_selects_ci_wait() {
+        let dir = tempdir().unwrap();
+        let r = seed_matching_receipt(dir.path(), "0083");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        let _probe = install_open("track/0083-Slug");
+        let view = run::run(&r, Some("0083".into())).unwrap();
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(
+            view.last_event,
+            format!("run: started {WORKFLOW_ID} resume ci-wait pr 80")
+        );
+    }
+
+    #[test]
+    fn gh_error_selects_plan() {
+        let dir = tempdir().unwrap();
+        let r = seed_matching_receipt(dir.path(), "0083");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        let _probe = reuse::install_test_probe(std::sync::Arc::new(|_| {
+            Err(crate::error::CoordinatorError::Message(
+                "gh auth required".into(),
+            ))
+        }));
+        let view = run::run(&r, Some("0083".into())).unwrap();
+        assert_eq!(view.phase, graph::PHASE_PLAN);
+        assert!(
+            dir.path()
+                .join("conductor")
+                .join("0083-Example")
+                .join("agy-review.md")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn closed_pr_selects_plan() {
+        let dir = tempdir().unwrap();
+        let r = seed_matching_receipt(dir.path(), "0083");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        let _probe = reuse::install_test_probe(std::sync::Arc::new(|_| {
+            Ok(Some(reuse::ResumePr {
+                state: "CLOSED".into(),
+                head_oid: REUSE_SHA.into(),
+                head_ref: "track/0083-Slug".into(),
+            }))
+        }));
+        let view = run::run(&r, Some("0083".into())).unwrap();
+        assert_eq!(view.phase, graph::PHASE_PLAN);
+    }
+
+    #[test]
+    fn foreign_head_ref_selects_plan() {
+        let dir = tempdir().unwrap();
+        let r = seed_matching_receipt(dir.path(), "0083");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        let _probe = install_open("track/0084-Other");
+        let view = run::run(&r, Some("0083".into())).unwrap();
+        assert_eq!(view.phase, graph::PHASE_PLAN);
+    }
+
+    #[test]
+    fn bare_track_ref_selects_ci_wait() {
+        let dir = tempdir().unwrap();
+        let r = seed_matching_receipt(dir.path(), "0083");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083");
+        let _probe = install_open("track/0083");
+        let view = run::run(&r, Some("0083".into())).unwrap();
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+    }
+
+    #[test]
+    fn probe_runs_outside_the_run_state_lock() {
+        let _env = test_env_lock();
+        let prev = std::env::var_os(crate::config::ENV_COORDINATOR_STATE_DIR);
+        unsafe {
+            std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+        }
+        struct RestoreStateDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreStateDir {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(v) => {
+                            std::env::set_var(crate::config::ENV_COORDINATOR_STATE_DIR, v);
+                        }
+                        None => std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreStateDir(prev);
+        let dir = tempdir().unwrap();
+        let r = seed_matching_receipt(dir.path(), "0083");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        let lock = crate::state::resolve_state_dir(&r)
+            .unwrap()
+            .join(".run-state.lock");
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = seen.clone();
+        let _probe = reuse::install_test_probe(std::sync::Arc::new(move |_| {
+            if !lock.exists() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(Some(reuse::ResumePr {
+                state: "OPEN".into(),
+                head_oid: REUSE_SHA.into(),
+                head_ref: "track/0083-Slug".into(),
+            }))
+        }));
+        let view = run::run(&r, Some("0083".into())).unwrap();
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "run-state lock was visible during gh probe"
+        );
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+    }
+
+    #[test]
+    fn resume_ci_wait_plants_pr_number_without_publish_latch() {
+        let dir = tempdir().unwrap();
+        let r = seed_matching_receipt(dir.path(), "0083");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        let _probe = install_open("track/0083-Slug");
+        let view = run::run(&r, Some("0083".into())).unwrap();
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        let state = crate::state::load_run_state(&r).unwrap();
+        let ci = state.ci.expect("ci planted");
+        assert_eq!(ci.pr_number, Some(80));
+        assert_eq!(ci.head_sha.as_deref(), Some(REUSE_SHA));
+        assert!(ci.publish_attempted_sha.is_none());
+        assert!(ci.merge.is_none());
+        assert!(ci.last_poll_at.is_none());
+        assert_eq!(ci.publish_transient_attempts, 0);
+        assert!(ci.publish_transient_sha.is_none());
+    }
+
+    #[test]
+    fn prior_archive_survives_clear() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let track = seed_track(dir.path(), "0083");
+        run::run(&r, Some("0083".into())).unwrap();
+        run::stop(&r).unwrap();
+        std::fs::write(track.join("agy-review.md"), b"kept-review").unwrap();
+        assert!(!track.join("prior").exists());
+        run::run(&r, Some("0083".into())).unwrap();
+        let archived = track.join("prior").join("1-agy-review.md");
+        assert_eq!(std::fs::read(&archived).unwrap(), b"kept-review");
+        assert!(!track.join("agy-review.md").exists());
     }
 
     #[test]

@@ -226,17 +226,11 @@ pub fn opencode_prompt(record: &ProjectRecord, track_id: Option<&str>) -> String
 }
 
 fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> String {
-    let paths = crate::layout::resolve(record);
     let track_dir = track_id
         .and_then(|id| resolve_track_dir(record, id))
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(track dir unresolved)".into());
-    let skill = paths
-        .workspace_root
-        .join(".agents")
-        .join("skills")
-        .join("review-track")
-        .join("SKILL.md");
+    let skill = super::reuse::review_track_skill_prompt(record);
     let file = format!("{slug}-review.md");
     let layout = crate::workflow::prompts::layout_block(record, track_id, "plan-review");
     let research = if slug == REVIEW_SLUG_OPENCODE {
@@ -253,7 +247,7 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
     };
     format!(
         "You are reviewing a Coordinator conductor-track plan (review-track).\n\
-         This slot loads the `review-track` skill from {}.\n\
+         This slot loads the `review-track` skill from {skill}.\n\
          \n\
          {layout}\
          \n\
@@ -270,8 +264,7 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
          - Do not require a Verdict/PASS header. This is not the post-implement \
          cross-model review gate.\n\
          - You may inspect product source under the execution repo when it is available.\n\
-         - Do not run `coordinator outcome write`.\n",
-        skill.display(),
+         - Do not run `coordinator outcome write`.\n"
     )
 }
 
@@ -376,9 +369,51 @@ pub fn maybe_spawn_plan_review(record: &ProjectRecord, state: &RunState) -> Resu
     maybe_spawn_opencode(record, state)
 }
 
+/// Byte-copy a matching track review into the state mailbox and skip the child.
+/// Copy failure returns false so the caller spawns.
+fn try_reuse_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Result<bool> {
+    let Some(track_id) = state.track_id.as_deref() else {
+        return Ok(false);
+    };
+    if !super::reuse::slot_matches(record, track_id, slug) {
+        return Ok(false);
+    }
+    let Some(track_dir) = resolve_track_dir(record, track_id) else {
+        return Ok(false);
+    };
+    let src = track_dir.join(format!("{slug}-review.md"));
+    let dest = match super::bundle::review_file(record, slug) {
+        Ok(path) => path,
+        Err(_) => return Ok(false),
+    };
+    let bytes = match std::fs::read(&src) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false),
+    };
+    if let Ok(dir) = super::bundle::reviews_dir(record)
+        && std::fs::create_dir_all(&dir).is_err()
+    {
+        return Ok(false);
+    }
+    if crate::persist::atomic_write(&dest, &bytes).is_err() {
+        return Ok(false);
+    }
+    with_run_state_lock(record, || {
+        let mut saved = load_run_state(record)?;
+        saved.pending_roles.retain(|x| x != slug);
+        saved.updated_at = chrono::Utc::now();
+        save_run_state(record, &saved)
+    })?;
+    crate::progress_log::append(record, "plan-review", &format!("plan-review: reuse {slug}"));
+    Ok(true)
+}
+
 fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Result<()> {
     let live = load_run_state(record).unwrap_or_else(|_| state.clone());
     if !live.pending_roles.iter().any(|s| s == slug) {
+        return Ok(());
+    }
+    if try_reuse_slot(record, &live, slug)? {
         return Ok(());
     }
 
@@ -1942,6 +1977,43 @@ mod tests {
             !oc.contains("Verify pins, APIs, and hooks against primary sources (crates.io"),
             "opencode must not instruct crates.io pin crawls: {oc}"
         );
+    }
+
+    #[test]
+    fn matching_receipt_does_not_spawn_and_joins() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0083");
+        let r = rec(dir.path());
+        let track = dir.path().join("conductor").join("0083-Example");
+        std::fs::write(track.join("spec.md"), b"spec").unwrap();
+        std::fs::write(track.join("plan.md"), b"plan").unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        let agy = b"agy\r\nreview\r\n";
+        let oc = b"oc\r\nreview\r\n";
+        std::fs::write(track.join("agy-review.md"), agy).unwrap();
+        std::fs::write(track.join("opencode-review.md"), oc).unwrap();
+        super::super::reuse::write_join_receipt(&r, "0083");
+        let backend = RecordingBackend::wrap(Arc::new(ScriptedBackend::empty()));
+        let counts = backend.counts.clone();
+        let _guard = install_test_backend(&r.id, Arc::new(backend));
+        enter_plan_review(&r, "0083");
+        let view = tick_retry(&r).unwrap().expect("joined");
+        assert_eq!(counts.n(), 0);
+        assert_eq!(view.phase, graph::PHASE_FOLD);
+        let state = load_run_state(&r).unwrap();
+        assert!(state.plan_review_spawned.is_empty());
+        let copied = crate::workflow::bundle::review_file(&r, "agy").unwrap();
+        assert_eq!(std::fs::read(copied).unwrap(), agy);
+        let log = std::fs::read_to_string(dir.path().join("status.md")).unwrap();
+        assert!(log.contains("plan-review: reuse agy"), "{log}");
+        assert!(log.contains("plan-review: reuse opencode"), "{log}");
     }
 
     #[test]
