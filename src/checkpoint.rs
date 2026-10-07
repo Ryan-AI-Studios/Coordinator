@@ -14,6 +14,7 @@ use crate::state::{
 };
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+const DIRT_PATH_CAP: usize = 20;
 
 pub(crate) fn ref_name(project_id: &str, epoch: u64) -> String {
     format!("refs/coordinator/checkpoints/{project_id}/{epoch}")
@@ -24,18 +25,19 @@ pub(crate) fn ref_name(project_id: &str, epoch: u64) -> String {
 /// Does not take the run-state lock. On failure the caller keeps phase `fold`.
 pub(crate) fn ensure_implement_ref(record: &ProjectRecord, state: &mut RunState) -> Result<()> {
     let cwd = require_cwd(record)?;
-    let porcelain = git_ok(&cwd, &["status", "--porcelain"])?;
-    if !porcelain.trim().is_empty() {
-        return Err(CoordinatorError::Message(
-            "checkpoint refused: dirty tree".into(),
-        ));
-    }
     let sha = git_ok(&cwd, &["rev-parse", "HEAD"])?;
     let sha = sha.trim();
     if sha.is_empty() {
         return Err(CoordinatorError::Message(
             "checkpoint: git rev-parse HEAD: empty".into(),
         ));
+    }
+    let dirt = committable_dirt(&cwd)?;
+    if !dirt.is_empty() {
+        return Err(CoordinatorError::Message(dirt_message(
+            "checkpoint refused: dirty tree",
+            &dirt,
+        )));
     }
     let name = ref_name(&record.id, state.run_epoch);
     let fmt = git(&cwd, &["check-ref-format", &name])?;
@@ -83,9 +85,11 @@ fn restore_locked(record: &ProjectRecord, discard: bool) -> Result<StatusView> {
         Err(e) => return refuse(record, &e.to_string()),
     };
     if !discard {
-        match git_ok(&cwd, &["status", "--porcelain"]) {
-            Ok(porcelain) if porcelain.trim().is_empty() => {}
-            Ok(_) => return refuse(record, "restore refused: dirty tree"),
+        match committable_dirt(&cwd) {
+            Ok(paths) if paths.is_empty() => {}
+            Ok(paths) => {
+                return refuse(record, &dirt_message("restore refused: dirty tree", &paths));
+            }
             Err(e) => return refuse(record, &e.to_string()),
         }
     }
@@ -289,6 +293,42 @@ fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
         )));
     }
     Ok(out.stdout)
+}
+
+/// Paths a plain `git commit` would record, plus non-ignored untracked files.
+///
+/// `git diff HEAD` is the worktree. `git diff --cached HEAD` is the index.
+/// A line-ending phantom is absent from both, so it is not committable.
+fn committable_dirt(cwd: &Path) -> Result<Vec<String>> {
+    let worktree = git_ok(cwd, &["diff", "-z", "--name-only", "HEAD"])?;
+    let index = git_ok(cwd, &["diff", "-z", "--cached", "--name-only", "HEAD"])?;
+    let untracked = git_ok(cwd, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    let mut paths = Vec::new();
+    push_nul_paths(&mut paths, &worktree);
+    push_nul_paths(&mut paths, &index);
+    push_nul_paths(&mut paths, &untracked);
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn push_nul_paths(paths: &mut Vec<String>, stdout: &str) {
+    paths.extend(
+        stdout
+            .split('\0')
+            .filter(|field| !field.is_empty())
+            .map(str::to_string),
+    );
+}
+
+fn dirt_message(prefix: &str, paths: &[String]) -> String {
+    let shown = if paths.len() <= DIRT_PATH_CAP {
+        paths.join(", ")
+    } else {
+        let extra = paths.len() - DIRT_PATH_CAP;
+        format!("{} (+{extra})", paths[..DIRT_PATH_CAP].join(", "))
+    };
+    format!("{prefix}: {shown}")
 }
 
 #[cfg(test)]
@@ -603,6 +643,7 @@ mod tests {
         assert_eq!(view.phase, PHASE_FOLD);
         assert!(view.failure_class.is_none());
         assert!(view.last_event.contains("checkpoint refused: dirty tree"));
+        assert!(view.last_event.contains("dirty.rs"), "{}", view.last_event);
         let listed = git(
             repo.path(),
             &["rev-parse", "--verify", "--quiet", &ref_name(&rec.id, 2)],
@@ -743,9 +784,183 @@ mod tests {
         std::fs::write(repo.path().join("keep-me.rs"), b"stay\n").unwrap();
         let err = restore(&rec, false).unwrap_err();
         assert!(err.to_string().contains("dirty tree"), "{err}");
+        assert!(err.to_string().contains("keep-me.rs"), "{err}");
         assert!(repo.path().join("keep-me.rs").is_file());
         assert!(log_text(&rec).contains("restore-refused"));
         assert!(log_text(&rec).contains("dirty tree"));
+    }
+
+    #[test]
+    fn autocrlf_phantom_fold_creates_ref() {
+        let (repo, _ws, _state, rec) = fixture(false);
+        git_cmd(repo.path(), &["config", "core.autocrlf", "true"]);
+        git_cmd(repo.path(), &["config", "core.safecrlf", "false"]);
+        std::fs::write(repo.path().join("README.md"), b"seed\r\n").unwrap();
+        let porcelain = porcelain(repo.path());
+        assert!(
+            !porcelain.is_empty(),
+            "porcelain must be dirty so the old guard would refuse: {porcelain:?}"
+        );
+        assert!(
+            git_stdout(repo.path(), &["diff", "--name-only", "HEAD"]).is_empty(),
+            "worktree diff"
+        );
+        assert!(
+            git_stdout(repo.path(), &["diff", "--cached", "--name-only", "HEAD"]).is_empty(),
+            "index diff"
+        );
+        let before = head(repo.path());
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 4);
+        let view = fold_success(&rec, 4);
+        assert_eq!(
+            view.phase,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            "{}",
+            view.last_event
+        );
+        assert_eq!(view.status, RunStatus::Running);
+        assert!(view.failure_class.is_none());
+        assert_eq!(
+            git_stdout(repo.path(), &["rev-parse", &ref_name(&rec.id, 4)]),
+            before
+        );
+    }
+
+    #[test]
+    fn tracked_content_change_refuses_fold() {
+        let (repo, _ws, _state, rec) = fixture(false);
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 2);
+        std::fs::write(repo.path().join("README.md"), b"seed2\n").unwrap();
+        let view = fold_success(&rec, 2);
+        assert_refused_fold(&rec, &repo, &view, "README.md");
+    }
+
+    #[test]
+    fn staged_content_change_refuses_fold() {
+        let (repo, _ws, _state, rec) = fixture(false);
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 2);
+        std::fs::write(repo.path().join("README.md"), b"seed2\n").unwrap();
+        git_cmd(repo.path(), &["add", "README.md"]);
+        assert!(
+            !git_stdout(repo.path(), &["diff", "--name-only", "HEAD"]).is_empty(),
+            "staged worktree must differ from HEAD"
+        );
+        let view = fold_success(&rec, 2);
+        assert_refused_fold(&rec, &repo, &view, "README.md");
+    }
+
+    #[test]
+    fn staged_index_only_change_refuses_fold() {
+        let (repo, _ws, _state, rec) = fixture(false);
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 2);
+        std::fs::write(repo.path().join("staged-only.rs"), b"fn x() {}\n").unwrap();
+        git_cmd(repo.path(), &["add", "staged-only.rs"]);
+        std::fs::remove_file(repo.path().join("staged-only.rs")).unwrap();
+        assert!(
+            git_stdout(repo.path(), &["diff", "--name-only", "HEAD"]).is_empty(),
+            "worktree diff must be empty"
+        );
+        assert_eq!(
+            git_stdout(repo.path(), &["diff", "--cached", "--name-only", "HEAD"]),
+            "staged-only.rs"
+        );
+        let view = fold_success(&rec, 2);
+        assert_refused_fold(&rec, &repo, &view, "staged-only.rs");
+    }
+
+    #[test]
+    fn ignored_env_file_does_not_refuse_fold() {
+        let (repo, _ws, _state, rec) = fixture(false);
+        std::fs::write(repo.path().join(".env"), b"SECRET=1\n").unwrap();
+        let before = head(repo.path());
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 4);
+        let view = fold_success(&rec, 4);
+        assert_eq!(
+            view.phase,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            "{}",
+            view.last_event
+        );
+        assert_eq!(view.status, RunStatus::Running);
+        assert!(view.failure_class.is_none());
+        assert_eq!(
+            git_stdout(repo.path(), &["rev-parse", &ref_name(&rec.id, 4)]),
+            before
+        );
+    }
+
+    #[test]
+    fn autocrlf_phantom_restore_without_discard_succeeds() {
+        let (repo, _ws, _state, rec) = fixture(false);
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 3);
+        fold_success(&rec, 3);
+        run::stop(&rec).unwrap();
+        git_cmd(repo.path(), &["config", "core.autocrlf", "true"]);
+        git_cmd(repo.path(), &["config", "core.safecrlf", "false"]);
+        std::fs::write(repo.path().join("README.md"), b"seed\r\n").unwrap();
+        let view = restore(&rec, false).unwrap();
+        assert!(
+            !view.last_event.contains("dirty tree"),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(
+            std::fs::read(repo.path().join("README.md")).unwrap(),
+            b"seed\r\n"
+        );
+    }
+
+    #[test]
+    fn dirty_path_list_truncation_caps_at_twenty() {
+        let names25: Vec<String> = (0..25).map(|i| format!("p{i:02}")).collect();
+        let (repo, _ws, _state, rec) = fixture(false);
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 2);
+        for name in &names25 {
+            std::fs::write(repo.path().join(name), b"x\n").unwrap();
+        }
+        let view = fold_success(&rec, 2);
+        let shown = names25[..20].join(", ");
+        assert_eq!(
+            view.last_event,
+            format!("checkpoint refused: dirty tree: {shown} (+5)")
+        );
+        assert!(!view.last_event.contains("p20"), "{}", view.last_event);
+        assert!(!view.last_event.contains(", (+"), "{}", view.last_event);
+        assert_refused_fold(&rec, &repo, &view, "p00");
+
+        let names20: Vec<String> = (0..20).map(|i| format!("p{i:02}")).collect();
+        let (repo, _ws, _state, rec) = fixture(false);
+        save_phase(&rec, RunStatus::Running, PHASE_FOLD, 2);
+        for name in &names20 {
+            std::fs::write(repo.path().join(name), b"x\n").unwrap();
+        }
+        let view = fold_success(&rec, 2);
+        let shown = names20.join(", ");
+        assert_eq!(
+            view.last_event,
+            format!("checkpoint refused: dirty tree: {shown}")
+        );
+        assert!(!view.last_event.contains(" (+"), "{}", view.last_event);
+        assert_refused_fold(&rec, &repo, &view, "p19");
+    }
+
+    fn assert_refused_fold(rec: &ProjectRecord, repo: &TempDir, view: &StatusView, path: &str) {
+        assert_eq!(view.status, RunStatus::Stopped, "{}", view.last_event);
+        assert_eq!(view.phase, PHASE_FOLD);
+        assert!(view.failure_class.is_none());
+        assert!(
+            view.last_event.contains("checkpoint refused: dirty tree"),
+            "{}",
+            view.last_event
+        );
+        assert!(view.last_event.contains(path), "{}", view.last_event);
+        let listed = git(
+            repo.path(),
+            &["rev-parse", "--verify", "--quiet", &ref_name(&rec.id, 2)],
+        )
+        .unwrap();
+        assert!(!listed.ok);
+        assert!(crate::notify::artifact::existing_path(rec).is_none());
     }
 
     #[test]
