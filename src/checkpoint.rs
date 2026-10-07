@@ -474,6 +474,28 @@ mod tests {
         std::fs::read_to_string(crate::progress_log::path(rec)).unwrap_or_default()
     }
 
+    /// The `checkpoint-refused` progress detail is `last_event` (`progress_log` writes
+    /// `- {ts}  {kind}  {detail}`).
+    fn assert_checkpoint_refused_detail(rec: &ProjectRecord, last_event: &str) {
+        let log = log_text(rec);
+        let marker = "checkpoint-refused  ";
+        let detail = log
+            .lines()
+            .find_map(|line| line.find(marker).map(|index| &line[index + marker.len()..]));
+        assert_eq!(detail, Some(last_event), "{log}");
+    }
+
+    fn untracked_names(cwd: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            git_stdout(cwd, &["ls-files", "-z", "--others", "--exclude-standard"])
+                .split('\0')
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect();
+        names.sort();
+        names
+    }
+
     fn fold_success(rec: &ProjectRecord, epoch: u64) -> StatusView {
         write_and_apply(
             rec,
@@ -651,7 +673,7 @@ mod tests {
         .unwrap();
         assert!(!listed.ok);
         assert!(crate::notify::artifact::existing_path(&rec).is_none());
-        assert!(log_text(&rec).contains("checkpoint-refused"));
+        assert_checkpoint_refused_detail(&rec, &view.last_event);
         assert!(repo.path().join("dirty.rs").is_file());
     }
 
@@ -918,6 +940,7 @@ mod tests {
         for name in &names25 {
             std::fs::write(repo.path().join(name), b"x\n").unwrap();
         }
+        assert_eq!(untracked_names(repo.path()), names25);
         let view = fold_success(&rec, 2);
         let shown = names25[..20].join(", ");
         assert_eq!(
@@ -934,6 +957,7 @@ mod tests {
         for name in &names20 {
             std::fs::write(repo.path().join(name), b"x\n").unwrap();
         }
+        assert_eq!(untracked_names(repo.path()), names20);
         let view = fold_success(&rec, 2);
         let shown = names20.join(", ");
         assert_eq!(
@@ -961,6 +985,7 @@ mod tests {
         .unwrap();
         assert!(!listed.ok);
         assert!(crate::notify::artifact::existing_path(rec).is_none());
+        assert_checkpoint_refused_detail(rec, &view.last_event);
     }
 
     #[test]
