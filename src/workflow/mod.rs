@@ -823,6 +823,7 @@ mod tests {
 
     #[test]
     fn run_starts_canonical_at_plan() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         let s = run::run(&r, Some("0008".into())).unwrap();
@@ -874,6 +875,7 @@ mod tests {
 
     #[test]
     fn corrupt_receipt_is_plan() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         let track = seed_track(dir.path(), "0083");
@@ -886,6 +888,7 @@ mod tests {
 
     #[test]
     fn matching_pr_selects_ci_wait() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
         reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
@@ -900,6 +903,7 @@ mod tests {
 
     #[test]
     fn gh_error_selects_plan() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
         reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
@@ -921,6 +925,7 @@ mod tests {
 
     #[test]
     fn closed_pr_selects_plan() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
         reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
@@ -937,6 +942,7 @@ mod tests {
 
     #[test]
     fn foreign_head_ref_selects_plan() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
         reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
@@ -947,6 +953,7 @@ mod tests {
 
     #[test]
     fn bare_track_ref_selects_ci_wait() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
         reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083");
@@ -1004,6 +1011,7 @@ mod tests {
 
     #[test]
     fn resume_ci_wait_plants_pr_number_without_publish_latch() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
         reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
@@ -1023,6 +1031,7 @@ mod tests {
 
     #[test]
     fn prior_archive_survives_clear() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         let track = seed_track(dir.path(), "0083");
@@ -1038,6 +1047,7 @@ mod tests {
 
     #[test]
     fn next_track_cleared_on_run_track_retained() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         run_stub(&r, Some("0004".into())).unwrap();
@@ -1368,6 +1378,7 @@ mod tests {
 
     #[test]
     fn stop_during_plan_sets_stub_stopped() {
+        let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         run::run(&r, Some("0008".into())).unwrap();
