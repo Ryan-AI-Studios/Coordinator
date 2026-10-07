@@ -97,7 +97,7 @@ pub enum Commands {
     Restore {
         #[arg(long)]
         project: Option<String>,
-        /// Reset and `git clean -fd` even when `git status --porcelain` is non-empty
+        /// Reset and `git clean -fd` even when the tree has committable changes
         #[arg(long)]
         discard: bool,
     },
