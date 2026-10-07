@@ -293,6 +293,16 @@ fn plan_prompt_body(record: &ProjectRecord, track_id: Option<&str>) -> String {
     }
 }
 
+/// `track/{id}` when the id is `NNNN` or `NNNN-*`. Otherwise the branch cannot be named.
+fn implement_branch_line(track_id: Option<&str>) -> String {
+    match track_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) if crate::notify::artifact::numeric_track_id(id).is_some() => format!(
+            "The git branch for this turn must be `track/{id}`. Do not create or commit on any other prefix, including `feature/`.\n"
+        ),
+        _ => "The git branch for this turn cannot be named from the track id. Do not invent a `track/` branch name.\n".into(),
+    }
+}
+
 /// Injected into Grok-bound phases (plan / fold / implement / advance).
 pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>) -> String {
     let track = track_id.unwrap_or("(none)");
@@ -321,6 +331,7 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
         PHASE_IMPLEMENT => {
             let implement = execution_skill(record, "implement");
             let onboarding = execution_skill(record, "onboarding");
+            let branch_line = implement_branch_line(track_id);
             format!(
                 "Honor project skills. This phase loads the `implement` skill from {implement} \
                  and the `onboarding` skill from {onboarding}.\n\
@@ -329,6 +340,7 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                  is absent, you may create it; if evidence.md exists, do not replace it and \
                  do not reduce it to a stamp. Do not edit the execution repo and do not run \
                  cargo, ledgerful, or ai-brains there.\n\
+                 {branch_line}\
                  {RESEARCH}\n\
                  {clause}\
                  {END_TURN}\n"
@@ -1257,6 +1269,32 @@ mod tests {
         assert!(bad.contains("active decision: invalid\n"), "{bad}");
         assert!(bad.contains("authenticate nothing"), "{bad}");
         assert_eq!(std::fs::read_to_string(&many_path).unwrap(), many);
+    }
+
+    #[test]
+    fn implement_prompt_names_track_branch() {
+        let rec = nested_record();
+        let named = phase_prompt(
+            &rec,
+            "implement",
+            Some("0087-PublishRequiresTrackBranchName"),
+        );
+        assert!(named.contains(
+            "The git branch for this turn must be `track/0087-PublishRequiresTrackBranchName`."
+        ));
+        assert!(named.contains("including `feature/`"));
+        let short = phase_prompt(&rec, "implement", Some("0099"));
+        assert!(short.contains("The git branch for this turn must be `track/0099`."));
+        let missing = phase_prompt(&rec, "implement", None);
+        assert!(missing.contains("cannot be named from the track id"));
+        assert!(!missing.contains("must be `track/"));
+        let rejected = phase_prompt(&rec, "implement", Some("nope"));
+        assert!(rejected.contains("cannot be named from the track id"));
+        assert!(!rejected.contains("must be `track/"));
+        let fold = phase_prompt(&rec, "fold", Some("0087-PublishRequiresTrackBranchName"));
+        let advance = phase_prompt(&rec, "advance", Some("0087-PublishRequiresTrackBranchName"));
+        assert!(!fold.contains("The git branch for this turn must be"));
+        assert!(!advance.contains("The git branch for this turn must be"));
     }
 
     #[test]

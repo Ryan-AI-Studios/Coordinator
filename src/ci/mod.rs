@@ -1034,7 +1034,9 @@ fn try_auto_publish_target(
         })?;
         return Ok(AutoPublishDrive::Wait);
     };
-    if publish_already_attempted(state, cwd) {
+    let yield_latch = gh::symbolic_head_branch(cwd)
+        .is_some_and(|branch| gh::misname_latch_yields(&branch, numeric, &state.last_event));
+    if publish_already_attempted(state, cwd) && !yield_latch {
         persist_watch(
             record,
             Some("ci-wait: publish attempted — waiting for PR"),
@@ -1083,9 +1085,12 @@ fn try_auto_publish_target(
             if retryable {
                 return drive_retryable_skip(record, state, cwd, now, &event, attempted_sha);
             }
+            let clear_latch = event.starts_with("ci-wait: branch '");
             persist_watch(record, Some(&event), |ci| {
                 ci.head_sha = None;
-                if let Some(sha) = attempted_sha {
+                if clear_latch {
+                    ci.publish_attempted_sha = None;
+                } else if let Some(sha) = attempted_sha {
                     ci.publish_attempted_sha = Some(sha);
                 }
                 stamp_poll(
@@ -3917,6 +3922,172 @@ mod tests {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
         }
+    }
+
+    fn misname_event() -> String {
+        crate::ci::gh::misnamed_branch_event("feature/0412-foo", "0412")
+    }
+
+    fn seed_latch(r: &ProjectRecord, track: &str, sha: &str, last_event: &str) {
+        let mut st = load_run_state(r).unwrap();
+        st.track_id = Some(track.into());
+        st.last_event = last_event.into();
+        let mut ci = st.ci.take().unwrap_or_default();
+        ci.publish_attempted_sha = Some(sha.into());
+        ci.head_sha = None;
+        ci.last_poll_at = None;
+        st.ci = Some(ci);
+        save_run_state(r, &st).unwrap();
+    }
+
+    fn policies_off() {
+        unsafe {
+            std::env::set_var(crate::policy::ENV_STATE_POLICIES, "OFF");
+        }
+    }
+
+    #[test]
+    fn misnamed_branch_skip_does_not_latch_across_due_ticks() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let event = misname_event();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped(event.clone())));
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped(event.clone())));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        force_due(&r);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert!(st.failure_class.is_none());
+        assert_eq!(st.last_event, event);
+        let ci = load_run_state(&r).unwrap().ci.unwrap();
+        assert!(ci.publish_attempted_sha.is_none());
+        assert_eq!(counts.publish_n(), 2);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn latched_misname_retries_when_branch_cites_numeric() {
+        let _g = poll_env();
+        policies_off();
+        let dir = tempdir().unwrap();
+        init_one_commit(dir.path());
+        git_ok(dir.path(), &["switch", "-c", "feature/0412-foo"]);
+        let sha = head_of(dir.path());
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_latch(&r, "0412", &sha, "ci-wait: waiting for PR");
+        let event = misname_event();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped(event.clone())));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert!(st.failure_class.is_none());
+        assert_eq!(st.last_event, event);
+        assert!(
+            load_run_state(&r)
+                .unwrap()
+                .ci
+                .unwrap()
+                .publish_attempted_sha
+                .is_none()
+        );
+        assert_eq!(counts.publish_n(), 1);
+        drop(_hook);
+
+        git_ok(dir.path(), &["switch", "main"]);
+        seed_latch(&r, "0412", &head_of(dir.path()), "ci-wait: waiting for PR");
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert!(
+            st.last_event.contains("publish attempted"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_eq!(counts.publish_n(), 0);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+            std::env::remove_var(crate::policy::ENV_STATE_POLICIES);
+        }
+    }
+
+    #[test]
+    fn track_branch_after_generic_latch_retries_publish() {
+        let _g = poll_env();
+        policies_off();
+        let dir = tempdir().unwrap();
+        init_one_commit(dir.path());
+        git_ok(dir.path(), &["switch", "-c", "track/0412-foo"]);
+        let sha = head_of(dir.path());
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_latch(&r, "0412", &sha, "ci-wait: waiting for PR");
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(12, false, false))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pending)])));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        assert_eq!(counts.publish_n(), 1);
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert!(st.failure_class.is_none());
+        drop(_hook);
+
+        seed_latch(
+            &r,
+            "0412",
+            &sha,
+            "ci-wait: no GitHub remote \u{2014} waiting for PR",
+        );
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        assert_eq!(counts.publish_n(), 0);
+        let st = run::status(&r).unwrap();
+        assert!(
+            st.last_event.contains("publish attempted"),
+            "last_event={}",
+            st.last_event
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+            std::env::remove_var(crate::policy::ENV_STATE_POLICIES);
+        }
+    }
+
+    fn init_one_commit(dir: &std::path::Path) {
+        git_ok(dir, &["init", "-b", "main"]);
+        git_ok(dir, &["config", "user.email", "probe@example.com"]);
+        git_ok(dir, &["config", "user.name", "probe"]);
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        git_ok(dir, &["add", "f.txt"]);
+        git_ok(dir, &["commit", "-m", "base"]);
+    }
+
+    fn head_of(dir: &std::path::Path) -> String {
+        String::from_utf8(git_ok(dir, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string()
     }
 
     #[test]
