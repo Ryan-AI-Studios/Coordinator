@@ -208,7 +208,12 @@ impl AutoPublishResult {
 }
 
 pub trait CiBackend: Send + Sync {
-    fn resolve_pr(&self, cwd: &Path, hint: Option<&PrHint>) -> Result<Option<CiTarget>>;
+    fn resolve_pr(
+        &self,
+        cwd: &Path,
+        hint: Option<&PrHint>,
+        track_id: Option<&str>,
+    ) -> Result<Option<CiTarget>>;
     fn checks(&self, cwd: &Path, target: &CiTarget) -> Result<CheckSnapshot>;
     fn squash_merge(
         &self,
@@ -297,7 +302,12 @@ impl Default for ScriptedBackend {
 }
 
 impl CiBackend for ScriptedBackend {
-    fn resolve_pr(&self, _cwd: &Path, _hint: Option<&PrHint>) -> Result<Option<CiTarget>> {
+    fn resolve_pr(
+        &self,
+        _cwd: &Path,
+        _hint: Option<&PrHint>,
+        _track_id: Option<&str>,
+    ) -> Result<Option<CiTarget>> {
         let mut g = self.inner.lock().expect("scripted lock");
         let next = g
             .resolves
@@ -424,9 +434,14 @@ impl RecordingBackend {
 }
 
 impl CiBackend for RecordingBackend {
-    fn resolve_pr(&self, cwd: &Path, hint: Option<&PrHint>) -> Result<Option<CiTarget>> {
+    fn resolve_pr(
+        &self,
+        cwd: &Path,
+        hint: Option<&PrHint>,
+        track_id: Option<&str>,
+    ) -> Result<Option<CiTarget>> {
         self.counts.resolve.fetch_add(1, Ordering::SeqCst);
-        self.inner.resolve_pr(cwd, hint)
+        self.inner.resolve_pr(cwd, hint, track_id)
     }
 
     fn checks(&self, cwd: &Path, target: &CiTarget) -> Result<CheckSnapshot> {

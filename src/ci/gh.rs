@@ -45,18 +45,29 @@ fn pr_list_head_args(branch: &str, state: &str) -> Vec<String> {
 pub struct GhCli;
 
 impl CiBackend for GhCli {
-    fn resolve_pr(&self, cwd: &Path, hint: Option<&PrHint>) -> Result<Option<CiTarget>> {
+    fn resolve_pr(
+        &self,
+        cwd: &Path,
+        hint: Option<&PrHint>,
+        track_id: Option<&str>,
+    ) -> Result<Option<CiTarget>> {
+        let numeric = track_id.and_then(crate::notify::artifact::numeric_track_id);
         if let Some(h) = hint
             && let Some(n) = h.number
             && let Some(t) = pr_view(cwd, Some(n))?
+            && pull_request_kept(&t, numeric)
         {
             return Ok(Some(t));
         }
-        if let Some(t) = pr_view(cwd, None)? {
+        if let Some(t) = pr_view(cwd, None)?
+            && pull_request_kept(&t, numeric)
+        {
             return Ok(Some(t));
         }
-        if let Ok(branch) = git_stdout(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
-            && let Some(t) = pr_list_head(cwd, branch.trim())?
+        if let Some(numeric) = numeric
+            && let Some(branch) = list_head_branch(cwd, numeric)
+            && let Some(t) = pr_list_head(cwd, &branch)?
+            && pull_request_kept(&t, Some(numeric))
         {
             return Ok(Some(t));
         }
@@ -125,6 +136,77 @@ pub(crate) fn branch_is_track(branch: &str, numeric: &str) -> bool {
         name.strip_prefix(numeric),
         Some(rest) if rest.starts_with('-') && rest.len() > 1
     )
+}
+
+/// The single short name that passes [`branch_is_track`], when there is exactly one.
+pub(crate) fn sole_track_branch<'a>(
+    branches: impl IntoIterator<Item = &'a str>,
+    numeric: &str,
+) -> Option<&'a str> {
+    let mut found: Option<&'a str> = None;
+    for name in branches {
+        if !branch_is_track(name, numeric) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(name);
+    }
+    found
+}
+
+fn pull_request_kept(target: &CiTarget, numeric: Option<&str>) -> bool {
+    match (target, numeric) {
+        (CiTarget::PullRequest { .. }, None) => true,
+        (CiTarget::PullRequest { head_ref, .. }, Some(numeric)) => {
+            branch_is_track(head_ref, numeric)
+        }
+        (CiTarget::HeadSha { .. }, _) => true,
+    }
+}
+
+/// `refs/heads` short names. A spawn error or a non-zero exit is an empty list.
+fn local_head_short_names(cwd: &Path) -> Vec<String> {
+    let out = match run_process(
+        Path::new("git"),
+        &[
+            "for-each-ref",
+            "--format=%(objectname)%00%(refname:short)",
+            "refs/heads",
+        ],
+        cwd,
+    ) {
+        Ok(out) => out,
+        Err(_) => return Vec::new(),
+    };
+    if !out.ok {
+        return Vec::new();
+    }
+    out.stdout
+        .lines()
+        .filter_map(|line| {
+            let (_tip, name) = line.split_once('\0')?;
+            let name = name.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        })
+        .collect()
+}
+
+/// HEAD when it is this track's branch; otherwise the sole local track branch.
+fn list_head_branch(cwd: &Path, numeric: &str) -> Option<String> {
+    if let Ok(branch) = git_stdout(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        let branch = branch.trim();
+        if branch_is_track(branch, numeric) {
+            return Some(branch.to_string());
+        }
+    }
+    let names = local_head_short_names(cwd);
+    sole_track_branch(names.iter().map(String::as_str), numeric).map(str::to_string)
 }
 
 /// PR title for auto-publish. Keeps an existing `track(NNNN):` prefix; otherwise adds one.
@@ -350,7 +432,7 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
             title: title.clone(),
         }));
     }
-    match cli.resolve_pr(cwd, None) {
+    match cli.resolve_pr(cwd, None, Some(track_id)) {
         Ok(Some(t)) => Ok(AutoPublishResult::Opened(t)),
         Ok(None) => Ok(AutoPublishResult::skipped_retryable(
             "ci-wait: waiting for PR",
@@ -501,6 +583,60 @@ fn parse_pr_view(stdout: &str) -> Result<Option<CiTarget>> {
         head_ref,
         title,
     }))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIRM: std::cell::RefCell<Option<CiTarget>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ConfirmTrackPrGuard;
+
+#[cfg(test)]
+impl Drop for ConfirmTrackPrGuard {
+    fn drop(&mut self) {
+        TEST_CONFIRM.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_confirm_track_pr(target: Option<CiTarget>) -> ConfirmTrackPrGuard {
+    TEST_CONFIRM.with(|slot| *slot.borrow_mut() = target);
+    ConfirmTrackPrGuard
+}
+
+fn confirmed_track_pr(target: Option<CiTarget>, number: u64, numeric: &str) -> Option<CiTarget> {
+    let Some(CiTarget::PullRequest {
+        number: found,
+        head_ref,
+        ..
+    }) = &target
+    else {
+        return None;
+    };
+    if *found == number && branch_is_track(head_ref, numeric) {
+        target
+    } else {
+        None
+    }
+}
+
+/// Re-view a title-probe number and keep it only when the head is this track.
+/// `cfg(test)` reads the thread-local and does not spawn `gh`.
+pub(crate) fn confirm_track_pr(cwd: &Path, number: u64, numeric: &str) -> Result<Option<CiTarget>> {
+    #[cfg(test)]
+    {
+        let _ = cwd;
+        let local = TEST_CONFIRM.with(|slot| slot.borrow().clone());
+        Ok(confirmed_track_pr(local, number, numeric))
+    }
+    #[cfg(not(test))]
+    {
+        let viewed = pr_view(cwd, Some(number))?;
+        Ok(confirmed_track_pr(viewed, number, numeric))
+    }
 }
 
 fn pr_list_head(cwd: &Path, branch: &str) -> Result<Option<CiTarget>> {
@@ -1475,6 +1611,70 @@ mod parse_tests {
         }
         assert!(!branch_is_track("track/0412-foo", "412"));
         assert!(!branch_is_track("track/0412-foo", "04120"));
+    }
+
+    #[test]
+    fn sole_track_branch_zero_one_and_many() {
+        assert_eq!(sole_track_branch(std::iter::empty(), "0030"), None);
+        assert_eq!(
+            sole_track_branch(["main", "track/0029-camera"], "0030"),
+            None
+        );
+        assert_eq!(
+            sole_track_branch(["track/0030-Fixture", "main"], "0030"),
+            Some("track/0030-Fixture")
+        );
+        assert_eq!(
+            sole_track_branch(["track/0030", "track/0030-other"], "0030"),
+            None
+        );
+        assert_eq!(
+            sole_track_branch(["track/0029-camera", "track/0031-other"], "0030"),
+            None
+        );
+    }
+
+    fn sample_pr(number: u64, head: &str) -> CiTarget {
+        CiTarget::PullRequest {
+            number,
+            url: String::new(),
+            is_draft: false,
+            merged: true,
+            head_oid: None,
+            merge_state: MergeStateStatus::Unspecified,
+            head_ref: head.into(),
+            title: String::new(),
+        }
+    }
+
+    #[test]
+    fn confirm_track_pr_rejects_foreign_thread_local() {
+        let cwd = Path::new(".");
+        assert!(confirm_track_pr(cwd, 66, "0010").unwrap().is_none());
+        {
+            let _g = install_confirm_track_pr(Some(sample_pr(66, "track/0029-camera")));
+            assert!(confirm_track_pr(cwd, 66, "0010").unwrap().is_none());
+        }
+        {
+            let _g = install_confirm_track_pr(Some(sample_pr(66, "track/0010-Fixture")));
+            match confirm_track_pr(cwd, 66, "0010").unwrap() {
+                Some(CiTarget::PullRequest {
+                    number, head_ref, ..
+                }) => {
+                    assert_eq!(number, 66);
+                    assert_eq!(head_ref, "track/0010-Fixture");
+                }
+                other => panic!("expected owned pr, got {other:?}"),
+            }
+        }
+        {
+            let _g = install_confirm_track_pr(Some(sample_pr(66, "track/0010-Fixture")));
+            assert!(confirm_track_pr(cwd, 67, "0010").unwrap().is_none());
+        }
+        {
+            let _g = install_confirm_track_pr(Some(CiTarget::HeadSha { sha: "abc".into() }));
+            assert!(confirm_track_pr(cwd, 66, "0010").unwrap().is_none());
+        }
     }
 
     #[test]

@@ -199,6 +199,7 @@ pub fn drive_with(
     if let CiTarget::PullRequest {
         merged: true,
         number,
+        head_ref,
         ..
     } = &target
     {
@@ -210,7 +211,7 @@ pub fn drive_with(
         return apply_success(
             record,
             state,
-            format!("ci-wait: merged #{number}"),
+            pr_merged_event(*number, head_ref, ""),
             OutcomeSource::Adapter,
         );
     }
@@ -218,14 +219,21 @@ pub fn drive_with(
     if state.ci.as_ref().and_then(|c| c.merge.as_deref()) == Some("done")
         || state.ci.as_ref().and_then(|c| c.merge.as_deref()) == Some("queued")
     {
-        let n = match &target {
-            CiTarget::PullRequest { number, .. } => *number,
-            CiTarget::HeadSha { .. } => 0,
-        };
-        let msg = if state.ci.as_ref().and_then(|c| c.merge.as_deref()) == Some("queued") {
-            format!("ci-wait: merged #{n} (queued)")
-        } else {
-            format!("ci-wait: merged #{n}")
+        let queued = state.ci.as_ref().and_then(|c| c.merge.as_deref()) == Some("queued");
+        let msg = match &target {
+            CiTarget::PullRequest {
+                number, head_ref, ..
+            } => {
+                let tail = if queued { " (queued)" } else { "" };
+                pr_merged_event(*number, head_ref, tail)
+            }
+            CiTarget::HeadSha { .. } => {
+                if queued {
+                    "ci-wait: merged #0 (queued)".to_string()
+                } else {
+                    "ci-wait: merged #0".to_string()
+                }
+            }
         };
         persist_watch(record, None, |ci| {
             stamp_poll(ci, now, "already merged", &set_key(&target, &[]), 15_000);
@@ -314,7 +322,10 @@ fn finish_green(
             )
         }
         CiTarget::PullRequest {
-            number, head_oid, ..
+            number,
+            head_oid,
+            head_ref,
+            ..
         } => {
             if !record.auto_merge {
                 persist_watch(record, None, |ci| {
@@ -355,9 +366,9 @@ fn finish_green(
                 );
             }
             let (field, event) = if merge.queued {
-                ("queued", format!("ci-wait: merged #{number} (queued)"))
+                ("queued", pr_merged_event(*number, head_ref, " (queued)"))
             } else {
-                ("done", format!("ci-wait: merged #{number}"))
+                ("done", pr_merged_event(*number, head_ref, ""))
             };
             persist_watch(record, None, |ci| {
                 ci.merge = Some(field.into());
@@ -365,9 +376,10 @@ fn finish_green(
             match apply_success(record, state, event.clone(), OutcomeSource::Adapter) {
                 Ok(v) => Ok(v),
                 Err(e) => {
-                    let msg = format!(
-                        "ci-wait: merged #{number} (state apply failed: {})",
-                        truncate_msg(&e.to_string())
+                    let msg = pr_merged_event(
+                        *number,
+                        head_ref,
+                        &format!(" (state apply failed: {})", truncate_msg(&e.to_string())),
                     );
                     persist_watch(record, Some(&msg), |ci| {
                         ci.merge = Some(field.into());
@@ -768,6 +780,7 @@ fn resolve_target(
     cwd: &Path,
     hint: Option<&PrHint>,
 ) -> Result<Option<CiTarget>> {
+    let track_id = state.track_id.as_deref();
     if let Some(ci) = state.ci.as_ref()
         && let Some(n) = ci.pr_number
     {
@@ -775,15 +788,24 @@ fn resolve_target(
             number: Some(n),
             url: ci.pr_url.clone(),
         };
-        if let Some(t) = backend.resolve_pr(cwd, Some(&hinted))? {
-            return Ok(accept_resolved_target(state, cwd, Some(t)));
+        // A stored number is tried once. A dropped PullRequest or a miss gets one
+        // unhinted resolve. A dropped HeadSha does not. Never a third call.
+        match backend.resolve_pr(cwd, Some(&hinted), track_id)? {
+            first @ Some(CiTarget::HeadSha { .. }) => {
+                return Ok(accept_resolved_target(state, cwd, first));
+            }
+            Some(pr @ CiTarget::PullRequest { .. }) => {
+                let kept = accept_resolved_target(state, cwd, Some(pr));
+                if kept.is_some() {
+                    return Ok(kept);
+                }
+            }
+            None => {}
         }
-        // Hinted view miss is not sticky. Unhinted walks open then merged --head.
-        // Do not invent is_draft=false. Do not map the persisted PR oid to HeadSha.
-        let resolved = backend.resolve_pr(cwd, None)?;
+        let resolved = backend.resolve_pr(cwd, None, track_id)?;
         return Ok(accept_resolved_target(state, cwd, resolved));
     }
-    let resolved = backend.resolve_pr(cwd, hint)?;
+    let resolved = backend.resolve_pr(cwd, hint, track_id)?;
     Ok(accept_resolved_target(state, cwd, resolved))
 }
 
@@ -808,7 +830,24 @@ fn accept_resolved_target(
                 Some(CiTarget::HeadSha { sha })
             }
         }
-        other => other,
+        Some(pr @ CiTarget::PullRequest { .. }) => {
+            let CiTarget::PullRequest { head_ref, .. } = &pr else {
+                return None;
+            };
+            let Some(numeric) = state
+                .track_id
+                .as_deref()
+                .and_then(crate::notify::artifact::numeric_track_id)
+            else {
+                return Some(pr);
+            };
+            if gh::branch_is_track(head_ref, numeric) {
+                Some(pr)
+            } else {
+                None
+            }
+        }
+        None => None,
     }
 }
 
@@ -1070,16 +1109,8 @@ fn try_merged_track_target(state: &RunState, cwd: &Path) -> Option<CiTarget> {
         .as_deref()
         .and_then(crate::notify::artifact::numeric_track_id)?;
     let n = ci_merged_probe().and_then(|p| p.merged_pr_for_track(cwd, numeric).ok().flatten())?;
-    Some(CiTarget::PullRequest {
-        number: n,
-        url: String::new(),
-        is_draft: false,
-        merged: true,
-        head_oid: None,
-        merge_state: MergeStateStatus::Unspecified,
-        head_ref: String::new(),
-        title: String::new(),
-    })
+    let confirmed = gh::confirm_track_pr(cwd, n, numeric).ok().flatten()?;
+    accept_resolved_target(state, cwd, Some(confirmed))
 }
 
 fn set_key(target: &CiTarget, items: &[CheckItem]) -> String {
@@ -1156,6 +1187,10 @@ fn persist_watch(
         save_run_state(record, &s)?;
         Ok(StatusView::from_record(record, &s))
     })
+}
+
+fn pr_merged_event(number: u64, head_ref: &str, tail: &str) -> String {
+    format!("ci-wait: merged #{number} ({head_ref}){tail}")
 }
 
 fn apply_success(
@@ -1368,6 +1403,14 @@ mod tests {
         pr_state(n, draft, merged, MergeStateStatus::Unspecified)
     }
 
+    fn pr_with_head(n: u64, draft: bool, merged: bool, head: &str) -> CiTarget {
+        let mut target = pr(n, draft, merged);
+        if let CiTarget::PullRequest { head_ref, .. } = &mut target {
+            *head_ref = head.into();
+        }
+        target
+    }
+
     fn pr_state(n: u64, draft: bool, merged: bool, merge_state: MergeStateStatus) -> CiTarget {
         CiTarget::PullRequest {
             number: n,
@@ -1376,7 +1419,7 @@ mod tests {
             merged,
             head_oid: Some("abc".into()),
             merge_state,
-            head_ref: String::new(),
+            head_ref: "track/0010-Fixture".into(),
             title: String::new(),
         }
     }
@@ -2957,6 +3000,187 @@ mod tests {
         assert!(st.ci.is_none());
     }
 
+    fn clear_poll_env() {
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn foreign_pr_is_not_merged() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_with_head(27, false, true, "track/0029-camera"))));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            !st.last_event.contains("ci-wait: merged"),
+            "last_event={}",
+            st.last_event
+        );
+        assert_eq!(counts.resolve_n(), 1);
+        clear_poll_env();
+    }
+
+    #[test]
+    fn empty_head_ref_is_not_merged() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_with_head(27, false, true, ""))));
+        let (_hook, _counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            !st.last_event.contains("ci-wait: merged"),
+            "last_event={}",
+            st.last_event
+        );
+        clear_poll_env();
+    }
+
+    #[test]
+    fn hinted_foreign_falls_through_to_owned_pr() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let mut st = load_run_state(&r).unwrap();
+        st.ci = Some(CiWatchState {
+            pr_number: Some(27),
+            ..Default::default()
+        });
+        save_run_state(&r, &st).unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_with_head(27, false, true, "track/0029-camera"))));
+        s.push_resolve(Ok(Some(pr(81, false, true))));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("owned merge");
+        assert!(
+            view.last_event
+                .contains("ci-wait: merged #81 (track/0010-Fixture)"),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(counts.resolve_n(), 2);
+        let done = load_run_state(&r).unwrap();
+        assert_eq!(done.ci.as_ref().and_then(|c| c.pr_number), Some(81));
+        clear_poll_env();
+    }
+
+    #[test]
+    fn accept_keeps_pull_request_when_numeric_missing() {
+        let dir = tempdir().unwrap();
+        let state = crate::state::RunState::idle("p");
+        let kept = accept_resolved_target(&state, dir.path(), Some(pr(505, false, false)));
+        match kept {
+            Some(CiTarget::PullRequest { number, .. }) => assert_eq!(number, 505),
+            other => panic!("kept {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merged_probe_without_confirming_head_waits() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        let (_hook, _counts) = hook(s);
+        let _pg = crate::workflow::shipped::install_test_merged_probe(Arc::new(
+            crate::workflow::shipped::ScriptedMergedProbe::found("0010", 66),
+        ));
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            !st.last_event.contains("ci-wait: merged"),
+            "last_event={}",
+            st.last_event
+        );
+        clear_poll_env();
+    }
+
+    #[test]
+    fn merged_probe_foreign_head_waits() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        let (_hook, _counts) = hook(s);
+        let _pg = crate::workflow::shipped::install_test_merged_probe(Arc::new(
+            crate::workflow::shipped::ScriptedMergedProbe::found("0010", 66),
+        ));
+        let _cg =
+            gh::install_confirm_track_pr(Some(pr_with_head(66, false, true, "track/0029-camera")));
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = run::status(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            !st.last_event.contains("ci-wait: merged"),
+            "last_event={}",
+            st.last_event
+        );
+        clear_poll_env();
+    }
+
+    #[test]
+    fn queued_merge_log_names_head() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(12, false, false))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pass)])));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: true,
+            message: "queued".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("queued merge");
+        assert!(
+            view.last_event.contains("ci-wait: merged #12"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(
+            view.last_event.contains("(track/0010-Fixture) (queued)"),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(counts.merge_n(), 1);
+        clear_poll_env();
+    }
+
+    #[test]
+    fn pr_merged_event_embeds_head() {
+        let head = "track/0010-Fixture";
+        for tail in ["", " (queued)", " (state apply failed: boom)"] {
+            let event = pr_merged_event(81, head, tail);
+            assert!(event.contains("(track/0010-Fixture)"), "{event}");
+            assert!(event.contains("ci-wait: merged #81"), "{event}");
+            assert!(event.ends_with(tail), "{event}");
+        }
+    }
+
     #[test]
     fn waiting_for_pr_merged_track_probe_succeeds() {
         let _g = poll_env();
@@ -2969,12 +3193,14 @@ mod tests {
         let _pg = crate::workflow::shipped::install_test_merged_probe(Arc::new(
             crate::workflow::shipped::ScriptedMergedProbe::found("0010", 66),
         ));
+        let _cg = gh::install_confirm_track_pr(Some(pr(66, false, true)));
         let view = crate::workflow::tick(&r)
             .unwrap()
             .expect("merged via title probe");
         assert_eq!(view.phase, graph::PHASE_COMPACT);
         assert!(
-            view.last_event.contains("ci-wait: merged #66"),
+            view.last_event
+                .contains("ci-wait: merged #66 (track/0010-Fixture)"),
             "last_event={}",
             view.last_event
         );
@@ -3072,7 +3298,7 @@ mod tests {
             "last_event={}",
             view.last_event
         );
-        assert!(counts.resolve_n() >= 2, "resolve_n={}", counts.resolve_n());
+        assert_eq!(counts.resolve_n(), 2, "resolve_n={}", counts.resolve_n());
         assert_eq!(counts.merge_n(), 0);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
@@ -3805,7 +4031,7 @@ mod tests {
         latch_track(&r, Some(main_sha.clone()));
         let s = ScriptedBackend::new();
         s.push_resolve(Ok(Some(CiTarget::HeadSha { sha: main_sha })));
-        s.push_resolve(Ok(Some(pr(7, false, false))));
+        s.push_resolve(Ok(Some(pr_with_head(7, false, false, "track/0412-foo"))));
         s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pass)])));
         s.push_merge(Ok(MergeResult {
             ok: true,
@@ -4724,7 +4950,7 @@ mod tests {
     fn foreign_head_ref_does_not_route() {
         let _env = RouteEnv::enter();
         let (_dir, r) = start_owned(true);
-        let (_hook, _counts) = script(
+        let (_hook, counts) = script(
             &r,
             owned_pr("feature/x", OWNED_TITLE),
             required_items(
@@ -4737,7 +4963,24 @@ mod tests {
                 Vec::new(),
             ),
         );
-        crate::workflow::tick(&r).unwrap().expect("foreign ref");
-        assert_declined(&r);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(st.failure_class, None);
+        assert_eq!(st.ci_fix_attempts, 0);
+        assert!(
+            !st.last_event.contains("ci-wait: merged"),
+            "last_event={}",
+            st.last_event
+        );
+        assert!(
+            !st.last_event.contains("address-ci"),
+            "last_event={}",
+            st.last_event
+        );
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        assert_eq!(counts.checks_n(), 0);
+        assert_eq!(counts.merge_n(), 0);
     }
 }
