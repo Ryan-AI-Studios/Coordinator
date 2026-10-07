@@ -120,6 +120,16 @@ pub fn on_success(
     state: &mut RunState,
     outcome: &PhaseOutcome,
 ) -> AddressCiFollowUp {
+    // 0088 DoD-1: a phase session must not be able to leave a `Ready` row downgraded.
+    // The snapshot was taken before the inject; any surviving downgrade is undone here,
+    // on the single apply path.
+    let restored = crate::workflow::drive::restore_ready_rows_after_phase(record);
+    if !restored.is_empty() {
+        state.last_event = format!(
+            "workflow: restored Ready after downgrade ({})",
+            restored.join(", ")
+        );
+    }
     if let Some(ref meta) = outcome.metadata {
         if let Some(ref next) = meta.next_track {
             let t = next.trim();

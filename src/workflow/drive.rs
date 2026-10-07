@@ -374,6 +374,7 @@ fn drive_adapter(
         }
     } else {
         mark_driven(record, &state.phase)?;
+        snapshot_registry_before_phase(record, &state.phase)?;
         prompts::phase_prompt(record, &state.phase, state.track_id.as_deref())
     };
     // Inject-start heartbeat so a slow ACP start is not an immediate stall.
@@ -834,6 +835,71 @@ where
             })?
             .block_on(fut),
     }
+}
+
+/// Snapshot the registry status cells before an `advance`/`fold` inject (0088 DoD-1).
+///
+/// Only those two phases are guarded: `advance` is where the owner-GO inversion was
+/// observed, and `fold` is the phase that rewrites spec/plan banners and can carry the
+/// cell with it. Other phases are not snapshot, to avoid pointless state churn.
+fn snapshot_registry_before_phase(
+    record: &crate::registry::ProjectRecord,
+    phase: &str,
+) -> crate::error::Result<()> {
+    use crate::workflow::graph::{PHASE_ADVANCE, PHASE_FOLD};
+    if phase != PHASE_ADVANCE && phase != PHASE_FOLD {
+        return Ok(());
+    }
+    let snap = crate::workflow::conductor_md::status_snapshot_for(record);
+    if snap.is_empty() {
+        return Ok(());
+    }
+    crate::workflow::with_run_state_lock(record, || {
+        let mut state = crate::state::load_run_state(record)?;
+        state.registry_status_before = snap;
+        state.updated_at = chrono::Utc::now();
+        crate::state::save_run_state(record, &state)
+    })
+}
+
+/// Undo any `Ready` row this session downgraded (0088 DoD-1). Returns restored ids.
+pub fn restore_ready_rows_after_phase(record: &crate::registry::ProjectRecord) -> Vec<String> {
+    let state = match crate::state::load_run_state(record) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    if state.registry_status_before.is_empty() {
+        return Vec::new();
+    }
+    let path = crate::layout::resolve(record)
+        .conductor_dir
+        .join("conductor.md");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let aliases = crate::workflow::conductor_md::ready_aliases_for(record);
+    let (restored, body) = crate::workflow::conductor_md::restore_ready_rows(
+        &text,
+        &state.registry_status_before,
+        &aliases,
+    );
+    if let Some(body) = body
+        && std::fs::write(&path, body).is_ok()
+    {
+        crate::progress_log::append(
+            record,
+            "advance-downgrade-restored",
+            &format!("restored Ready: {}", restored.join(", ")),
+        );
+        crate::workflow::with_run_state_lock(record, || {
+            let mut s = crate::state::load_run_state(record)?;
+            s.registry_status_before.clear();
+            s.updated_at = chrono::Utc::now();
+            crate::state::save_run_state(record, &s)
+        })
+        .ok();
+    }
+    restored
 }
 
 #[cfg(test)]

@@ -386,6 +386,18 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                  Coordinator derives the next Ready row from `conductor.md`. \
                  The last line of your reply must be `next_track: <id>` or `next_track: null` \
                  (recorded; Coordinator overrides). Soft-next / `null` is not backlog-clear.\n\
+                 **Do not edit `conductor.md` in this phase.** Derive the next row and end the turn. \
+                 The status cell is the current state and the authority; a spec/plan *banner* is \
+                 prose written at mint time and is never authority over a status cell. \
+                 Never downgrade a `**Ready — not started**` row to `Proposed`, `Blocked`, or any \
+                 other value on the strength of a banner, a mint note, or a remembered intent. \
+                 If a status cell and a banner disagree, the cell wins and you leave it alone. \
+                 A `Ready` → non-`Ready` transition is an owner-class decision, not an advance \
+                 decision: if you believe a row should not auto-start, say so in your reply and \
+                 leave the registry untouched.\n\
+                 Never write a raw `|` into a registry cell — write the word `or`, a comma, or a \
+                 slash. A cell containing a bare `|` splits the row and the parser drops the whole \
+                 row silently.\n\
                  {END_TURN}\n",
                 honor_skill("plan", &path)
             )
