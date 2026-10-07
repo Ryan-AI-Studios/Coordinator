@@ -189,6 +189,21 @@ pub(crate) fn track_tip_blocks_head_sha(cwd: &Path, numeric: &str, descendant: &
     false
 }
 
+fn skip_terminal(cwd: &Path, event: impl Into<String>) -> AutoPublishResult {
+    let event = event.into();
+    match git_stdout(cwd, &["rev-parse", "HEAD"]) {
+        Ok(h) => {
+            let sha = h.trim().to_string();
+            if sha.is_empty() {
+                AutoPublishResult::skipped(event)
+            } else {
+                AutoPublishResult::skipped_latched(event, sha)
+            }
+        }
+        Err(_) => AutoPublishResult::skipped(event),
+    }
+}
+
 fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
     let numeric = crate::notify::artifact::numeric_track_id(track_id).unwrap_or(track_id);
 
@@ -196,14 +211,16 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
         Ok(b) => {
             let b = b.trim().to_string();
             if b.is_empty() || b == "HEAD" {
-                return Ok(AutoPublishResult::skipped(
+                return Ok(skip_terminal(
+                    cwd,
                     "ci-wait: detached HEAD — waiting for PR",
                 ));
             }
             b
         }
         Err(_) => {
-            return Ok(AutoPublishResult::skipped(
+            return Ok(skip_terminal(
+                cwd,
                 "ci-wait: detached HEAD — waiting for PR",
             ));
         }
@@ -229,13 +246,14 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
         Err(_) => String::new(),
     };
     if !default_branch.is_empty() && branch == default_branch {
-        return Ok(AutoPublishResult::skipped(
+        return Ok(skip_terminal(
+            cwd,
             "ci-wait: on default branch — waiting for PR",
         ));
     }
 
     if !branch_is_track(&branch, numeric) {
-        return Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"));
+        return Ok(skip_terminal(cwd, "ci-wait: waiting for PR"));
     }
 
     let subject = match git_stdout(cwd, &["log", "-1", "--format=%s"]) {
@@ -246,7 +264,8 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
     };
 
     let Some(remote) = resolve_live_push_remote(cwd)? else {
-        return Ok(AutoPublishResult::skipped(
+        return Ok(skip_terminal(
+            cwd,
             "ci-wait: no GitHub remote — waiting for PR",
         ));
     };
@@ -265,7 +284,8 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
         if let Ok(def_sha) = git_stdout(cwd, &["rev-parse", &def_ref])
             && def_sha.trim() == head
         {
-            return Ok(AutoPublishResult::skipped(
+            return Ok(skip_terminal(
+                cwd,
                 "ci-wait: on default branch — waiting for PR",
             ));
         }
@@ -279,15 +299,15 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
             if msg.contains("timed out") || msg.contains("auth required") {
                 return Err(e);
             }
-            return Ok(AutoPublishResult::skipped_latched(
+            return Ok(AutoPublishResult::skipped_retryable(
                 "ci-wait: push rejected — waiting for PR",
-                head,
+                Some(head),
             ));
         }
         Ok(out) if !out.ok => {
-            return Ok(AutoPublishResult::skipped_latched(
+            return Ok(AutoPublishResult::skipped_retryable(
                 "ci-wait: push rejected — waiting for PR",
-                head,
+                Some(head),
             ));
         }
         Ok(_) => {}
@@ -332,14 +352,14 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
     }
     match cli.resolve_pr(cwd, None) {
         Ok(Some(t)) => Ok(AutoPublishResult::Opened(t)),
-        Ok(None) => Ok(AutoPublishResult::skipped_latched(
+        Ok(None) => Ok(AutoPublishResult::skipped_retryable(
             "ci-wait: waiting for PR",
-            head,
+            Some(head),
         )),
         Err(e) if e.to_string().contains("auth required") => Err(e),
-        Err(_) => Ok(AutoPublishResult::skipped_latched(
+        Err(_) => Ok(AutoPublishResult::skipped_retryable(
             "ci-wait: waiting for PR",
-            head,
+            Some(head),
         )),
     }
 }
@@ -1470,6 +1490,37 @@ mod parse_tests {
             .unwrap()
             .trim()
             .to_string()
+    }
+
+    #[test]
+    fn skip_terminal_latches_a_commit_and_skips_outside_a_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        init_main(repo.path());
+        let head = head_sha(repo.path());
+        match skip_terminal(repo.path(), "ci-wait: detached HEAD — waiting for PR") {
+            AutoPublishResult::Skipped {
+                attempted_sha,
+                retryable,
+                ..
+            } => {
+                assert_eq!(attempted_sha.as_deref(), Some(head.as_str()));
+                assert!(!retryable);
+            }
+            other => panic!("committed repo: {other:?}"),
+        }
+
+        let bare = tempfile::tempdir().unwrap();
+        match skip_terminal(bare.path(), "ci-wait: waiting for PR") {
+            AutoPublishResult::Skipped {
+                attempted_sha,
+                retryable,
+                ..
+            } => {
+                assert!(attempted_sha.is_none());
+                assert!(!retryable);
+            }
+            other => panic!("non-repo: {other:?}"),
+        }
     }
 
     #[test]
