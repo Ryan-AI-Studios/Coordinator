@@ -464,6 +464,12 @@ mod tests {
         save_machine_config(&cfg).unwrap();
     }
 
+    fn write_plan_skill(root: &std::path::Path) {
+        let skill = root.join(".agents").join("skills").join("plan");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "plan skill\n").unwrap();
+    }
+
     fn clean_exec() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
@@ -507,6 +513,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -597,6 +604,7 @@ mod tests {
                 state_policies: Vec::new(),
                 self_continuation: false,
                 ci_fix_routing: false,
+                skill_aliases: std::collections::BTreeMap::new(),
                 created_at: chrono::Utc::now(),
             };
             let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::File, None, None, None);
@@ -729,6 +737,7 @@ mod tests {
         }
         pin_dummy_adapter_bindings(home.path());
         let dir = tempdir().unwrap();
+        write_plan_skill(dir.path());
         let r = rec(dir.path());
         run_with_driver(&r, Some("0013".into()), WorkflowDriver::Adapter).unwrap();
         let _inject = arm_slow_adapter_inject(Duration::from_secs(30));
@@ -788,6 +797,7 @@ mod tests {
         let mut reg = Registry::default();
         let r = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        write_plan_skill(proj.path());
         run_with_driver(&r, Some("0013".into()), WorkflowDriver::Adapter).unwrap();
 
         let session = crate::harness::GrokSession::start_mock(

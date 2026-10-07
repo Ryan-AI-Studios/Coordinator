@@ -337,6 +337,23 @@ fn drive_adapter(
         }
     };
 
+    if !continuing {
+        let missing = super::reuse::missing_required_skill_paths(
+            record,
+            &state.phase,
+            state.track_id.as_deref(),
+        );
+        if !missing.is_empty() {
+            return fail_phase(
+                record,
+                state,
+                FailureClass::SkillMissing,
+                super::reuse::skill_missing_message(&missing),
+                OutcomeSource::Adapter,
+            );
+        }
+    }
+
     let live = crate::harness::status_bundle_sync(record).and_then(|b| b.grok);
     let recycle_mismatch = live.as_ref().is_some_and(|g| {
         if !g.alive {
@@ -467,6 +484,22 @@ fn drive_plan_review(
     record: &ProjectRecord,
     state: &RunState,
 ) -> Result<Option<crate::state::StatusView>> {
+    if state.driver == WorkflowDriver::Adapter {
+        let missing = super::reuse::missing_required_skill_paths(
+            record,
+            PHASE_PLAN_REVIEW,
+            state.track_id.as_deref(),
+        );
+        if !missing.is_empty() {
+            return fail_phase(
+                record,
+                state,
+                FailureClass::SkillMissing,
+                super::reuse::skill_missing_message(&missing),
+                OutcomeSource::Adapter,
+            );
+        }
+    }
     ensure_plan_review_pending(record, state)?;
     match state.driver {
         WorkflowDriver::Stub => write_stub_reviews(record, state)?,
@@ -908,6 +941,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -1108,27 +1142,39 @@ mod tests {
         assert_eq!(std::fs::read(track.join("plan.md")).unwrap(), written);
     }
 
+    fn write_plan_skill(root: &std::path::Path) {
+        let skill = root.join(".agents").join("skills").join("plan");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "plan skill\n").unwrap();
+    }
+
     #[test]
-    fn placeholder_without_skill_file_is_explicit_degrade() {
+    fn expand_without_skill_stops_skill_missing() {
         let _home = planner_home();
         let dir = tempdir().unwrap();
         let track = minted_track(dir.path(), false);
         let record = rec(dir.path());
         let original = std::fs::read(track.join("plan.md")).unwrap();
         run_with_driver(&record, Some("0001".into()), WorkflowDriver::Adapter).unwrap();
-        // Same stamp-before-capture order as minted_template_tick_expands_then_real_plan_fast_skips.
         let _capture = arm_capture_prompts();
-        let view = tick(&record).unwrap();
-        assert!(view.is_none(), "capture returns before a harness starts");
-        let prompts = captured_prompts();
-        assert_eq!(prompts.len(), 1, "{prompts:?}");
-        let prompt = &prompts[0];
+        let view = tick(&record).unwrap().expect("skill missing");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::SkillMissing));
+        let marker = view
+            .last_event
+            .find("skill_missing:")
+            .expect(&view.last_event);
         assert!(
-            prompt.contains("placeholder present, skill absent"),
-            "{prompt}"
+            view.last_event[..marker].trim_end().ends_with('\u{2014}'),
+            "{}",
+            view.last_event
         );
-        assert!(prompt.contains("Write spec.md and plan.md"), "{prompt}");
-        assert!(!prompt.contains("Do not load the plan skill"), "{prompt}");
+        assert!(
+            view.last_event.contains("plan") && view.last_event.contains("SKILL.md"),
+            "{}",
+            view.last_event
+        );
+        assert!(captured_prompts().is_empty(), "{:?}", captured_prompts());
         assert_eq!(std::fs::read(track.join("plan.md")).unwrap(), original);
         let evidence = std::fs::read_to_string(track.join("evidence.md")).unwrap();
         assert!(evidence.contains("OWNER-MARKER"), "{evidence}");
@@ -1137,6 +1183,28 @@ mod tests {
             "{evidence}"
         );
         assert!(!evidence.contains("2020-01-01T00:00:00Z"), "{evidence}");
+        let state = load_run_state(&record).unwrap();
+        assert!(state.last_driven_phase.is_none());
+    }
+
+    #[test]
+    fn fast_skip_without_skill_file_still_injects() {
+        let _home = planner_home();
+        let dir = tempdir().unwrap();
+        let track = minted_track(dir.path(), false);
+        std::fs::write(track.join("plan.md"), "# plan\n").unwrap();
+        let record = rec(dir.path());
+        run_with_driver(&record, Some("0001".into()), WorkflowDriver::Adapter).unwrap();
+        let _capture = arm_capture_prompts();
+        let view = tick(&record).unwrap();
+        assert!(view.is_none(), "fast-skip still injects");
+        let prompts = captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].contains("already exist"), "{}", prompts[0]);
+        assert!(!prompts[0].contains("skill_missing"), "{}", prompts[0]);
+        let state = load_run_state(&record).unwrap();
+        assert_eq!(state.status, RunStatus::Running);
+        assert!(state.failure_class.is_none());
     }
 
     #[test]
@@ -1348,6 +1416,7 @@ mod tests {
         let mut reg = Registry::default();
         let r = reg.add(dir.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&registry_path().unwrap()).unwrap();
+        write_plan_skill(dir.path());
         run_with_driver(&r, Some("0038".into()), WorkflowDriver::Adapter).unwrap();
         let session = crate::harness::GrokSession::start_mock(
             crate::harness::grok_cwd(&r),
@@ -1416,6 +1485,7 @@ mod tests {
         });
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
+        write_plan_skill(dir.path());
         run_with_driver(&r, Some("0019".into()), WorkflowDriver::Adapter).unwrap();
         let first = tick(&r).unwrap();
         assert!(first.is_none(), "inject is fire-and-forget");

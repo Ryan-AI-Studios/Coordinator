@@ -22,6 +22,9 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
         FailureClass::CiFailed => {
             "Do not merge. Inspect CI; re-run after fix (0010). Opt-in address-ci is off or its cap is exhausted (0071)."
         }
+        FailureClass::SkillMissing => {
+            "Create the missing skill file or set skill_aliases; do not blind-retry."
+        }
     }
 }
 
@@ -30,7 +33,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_six_classes_have_stable_text() {
+    fn all_classes_have_stable_text() {
         assert_eq!(
             recommended_action(FailureClass::Permission),
             "Fix auth or PATH; do not blind-retry."
@@ -54,6 +57,10 @@ mod tests {
         assert_eq!(
             recommended_action(FailureClass::CiFailed),
             "Do not merge. Inspect CI; re-run after fix (0010). Opt-in address-ci is off or its cap is exhausted (0071)."
+        );
+        assert_eq!(
+            recommended_action(FailureClass::SkillMissing),
+            "Create the missing skill file or set skill_aliases; do not blind-retry."
         );
     }
 }

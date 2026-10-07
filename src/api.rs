@@ -208,6 +208,9 @@ fn opts_from_add_request(req: &ProjectAddRequest) -> Result<ProjectAddOptions> {
         auto_merge: req.auto_merge,
         phase_timeouts_secs: req.phase_timeouts_secs.clone().unwrap_or_default(),
         auto_start: req.auto_start,
+        skill_aliases: BTreeMap::new(),
+        clear_skill_aliases: false,
+        clear_skill_alias: Vec::new(),
     })
 }
 
@@ -319,6 +322,9 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         ready_aliases: req.ready_aliases,
         clear_ready_aliases: req.clear_ready_aliases.unwrap_or(false),
         auto_start: req.auto_start,
+        skill_aliases: None,
+        clear_skill_aliases: false,
+        clear_skill_alias: Vec::new(),
     };
     project_set(req.project.as_deref(), opts, false)
 }

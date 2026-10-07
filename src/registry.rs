@@ -33,6 +33,12 @@ pub struct ProjectAddOptions {
     pub phase_timeouts_secs: BTreeMap<String, u64>,
     /// Omit = default hitl (0044).
     pub auto_start: Option<AutoStartPolicy>,
+    /// Initial skill-directory aliases. Empty keeps canonical names.
+    pub skill_aliases: BTreeMap<String, String>,
+    /// Accepted on add for clap symmetry. The map starts empty, so this clears nothing.
+    pub clear_skill_aliases: bool,
+    /// Drop these keys before the add overlay. Unknown keys error.
+    pub clear_skill_alias: Vec<String>,
 }
 
 /// Fields mutatable via `project set` (workspace `path` is immutable this track).
@@ -70,6 +76,12 @@ pub struct ProjectSetOptions {
     pub clear_ready_aliases: bool,
     /// Omit = leave unchanged.
     pub auto_start: Option<AutoStartPolicy>,
+    /// Overlay keys (None = no overlay). Merge; does not replace the map.
+    pub skill_aliases: Option<BTreeMap<String, String>>,
+    /// Wipe stored skill aliases before the per-key clears and the overlay.
+    pub clear_skill_aliases: bool,
+    /// Drop these stored keys before the overlay.
+    pub clear_skill_alias: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +134,9 @@ pub struct ProjectRecord {
     /// Missing field on old records = off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ci_fix_routing: bool,
+    /// Canonical skill name → directory segment. Empty omits the key on save.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skill_aliases: BTreeMap<String, String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -166,6 +181,108 @@ fn default_true() -> bool {
 
 fn default_auto_start_hitl() -> AutoStartPolicy {
     AutoStartPolicy::Hitl
+}
+
+/// Closed set. Advance uses `plan`. Unknown keys do not write the registry.
+pub const SKILL_ALIAS_KEYS: &[&str] =
+    &["plan", "foldin", "implement", "onboarding", "review-track"];
+
+pub fn skill_alias_key_ok(key: &str) -> bool {
+    SKILL_ALIAS_KEYS.contains(&key)
+}
+
+/// One directory segment: ASCII alphanumeric, then alphanumeric, `_`, or `-`.
+pub fn skill_alias_value_ok(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+pub fn parse_skill_alias(s: &str) -> std::result::Result<(String, String), String> {
+    let Some((key_raw, val_raw)) = s.split_once('=') else {
+        return Err(format!("skill alias must be KEY=NAME (got '{s}')"));
+    };
+    let key = key_raw.trim();
+    let value = val_raw.trim();
+    if !skill_alias_key_ok(key) {
+        return Err(unknown_skill_alias_key(key));
+    }
+    if !skill_alias_value_ok(value) {
+        return Err(illegal_skill_alias_value(value));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+pub fn parse_skill_alias_key(s: &str) -> std::result::Result<String, String> {
+    let key = s.trim();
+    if !skill_alias_key_ok(key) {
+        return Err(unknown_skill_alias_key(key));
+    }
+    Ok(key.to_string())
+}
+
+fn unknown_skill_alias_key(key: &str) -> String {
+    format!(
+        "unknown skill alias key '{key}'; expected plan | foldin | implement | onboarding | review-track"
+    )
+}
+
+fn illegal_skill_alias_value(value: &str) -> String {
+    format!("illegal skill alias name '{value}'")
+}
+
+fn validate_skill_alias_change(
+    clear_keys: &[String],
+    overlay: Option<&BTreeMap<String, String>>,
+) -> Result<()> {
+    for key in clear_keys {
+        if !skill_alias_key_ok(key) {
+            return Err(CoordinatorError::Message(unknown_skill_alias_key(key)));
+        }
+    }
+    if let Some(map) = overlay {
+        for (key, value) in map {
+            if !skill_alias_key_ok(key) {
+                return Err(CoordinatorError::Message(unknown_skill_alias_key(key)));
+            }
+            if !skill_alias_value_ok(value) {
+                return Err(CoordinatorError::Message(illegal_skill_alias_value(value)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_skill_alias_change(
+    map: &mut BTreeMap<String, String>,
+    clear_all: bool,
+    clear_keys: &[String],
+    overlay: Option<BTreeMap<String, String>>,
+) {
+    if clear_all {
+        map.clear();
+    }
+    for key in clear_keys {
+        map.remove(key);
+    }
+    if let Some(over) = overlay {
+        map.extend(over);
+    }
+}
+
+fn initial_skill_aliases(opts: &ProjectAddOptions) -> Result<BTreeMap<String, String>> {
+    validate_skill_alias_change(&opts.clear_skill_alias, Some(&opts.skill_aliases))?;
+    let mut map = BTreeMap::new();
+    apply_skill_alias_change(
+        &mut map,
+        opts.clear_skill_aliases,
+        &opts.clear_skill_alias,
+        Some(opts.skill_aliases.clone()),
+    );
+    Ok(map)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -228,6 +345,8 @@ impl Registry {
             return Ok(existing.clone());
         }
 
+        let skill_aliases = initial_skill_aliases(&opts)?;
+
         let display_name = opts.display_name.or_else(|| {
             canonical
                 .file_name()
@@ -284,6 +403,7 @@ impl Registry {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            skill_aliases,
             created_at: Utc::now(),
         };
         self.projects.push(record.clone());
@@ -304,6 +424,7 @@ impl Registry {
         for phase in &opts.clear_phase_timeout {
             crate::workflow::timeouts::validate_phase_timeout_key(phase)?;
         }
+        validate_skill_alias_change(&opts.clear_skill_alias, opts.skill_aliases.as_ref())?;
 
         let rec = &mut self.projects[idx];
         if let Some(p) = opts.layout_profile {
@@ -373,6 +494,12 @@ impl Registry {
         if let Some(v) = opts.auto_start {
             rec.auto_start = v;
         }
+        apply_skill_alias_change(
+            &mut rec.skill_aliases,
+            opts.clear_skill_aliases,
+            &opts.clear_skill_alias,
+            opts.skill_aliases,
+        );
         Ok(rec.clone())
     }
 
@@ -881,6 +1008,149 @@ mod tests {
             !text.contains("self_continuation"),
             "false self_continuation must omit the key: {text}"
         );
+    }
+
+    #[test]
+    fn skill_aliases_round_trip_and_reject() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        assert!(rec.skill_aliases.is_empty());
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        let text = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(!text.contains("skill_aliases"), "{text}");
+        let loaded = Registry::load(&reg_path).unwrap();
+        assert!(loaded.projects[0].skill_aliases.is_empty());
+
+        let mut reg = loaded;
+        let set = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    skill_aliases: Some(BTreeMap::from([
+                        ("plan".into(), "plan-track".into()),
+                        ("foldin".into(), "fold-in".into()),
+                    ])),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            set.skill_aliases.get("plan").map(String::as_str),
+            Some("plan-track")
+        );
+        reg.save(&reg_path).unwrap();
+        let again = Registry::load(&reg_path).unwrap();
+        assert_eq!(
+            again.projects[0]
+                .skill_aliases
+                .get("foldin")
+                .map(String::as_str),
+            Some("fold-in")
+        );
+
+        let mut reg = again;
+        let kept = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    auto_merge: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!kept.auto_merge);
+        assert_eq!(
+            kept.skill_aliases.get("plan").map(String::as_str),
+            Some("plan-track")
+        );
+
+        let err = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    skill_aliases: Some(BTreeMap::from([("nope".into(), "x".into())])),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown skill alias key"), "{err}");
+        assert_eq!(
+            reg.find_by_id(&rec.id)
+                .unwrap()
+                .skill_aliases
+                .get("plan")
+                .map(String::as_str),
+            Some("plan-track")
+        );
+
+        let err = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    skill_aliases: Some(BTreeMap::from([("plan".into(), "../x".into())])),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("illegal skill alias"), "{err}");
+        assert_eq!(
+            reg.find_by_id(&rec.id)
+                .unwrap()
+                .skill_aliases
+                .get("plan")
+                .map(String::as_str),
+            Some("plan-track")
+        );
+
+        let cleared_one = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    clear_skill_alias: vec!["plan".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!cleared_one.skill_aliases.contains_key("plan"));
+        assert_eq!(
+            cleared_one.skill_aliases.get("foldin").map(String::as_str),
+            Some("fold-in")
+        );
+
+        let overlaid = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    clear_skill_aliases: true,
+                    skill_aliases: Some(BTreeMap::from([(
+                        "implement".into(),
+                        "implement-track".into(),
+                    )])),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(overlaid.skill_aliases.len(), 1);
+        assert_eq!(
+            overlaid.skill_aliases.get("implement").map(String::as_str),
+            Some("implement-track")
+        );
+
+        let before = reg.find_by_id(&rec.id).unwrap().skill_aliases.clone();
+        let err = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    clear_skill_alias: vec!["not-a-key".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown skill alias key"), "{err}");
+        assert_eq!(reg.find_by_id(&rec.id).unwrap().skill_aliases, before);
     }
 
     #[test]
