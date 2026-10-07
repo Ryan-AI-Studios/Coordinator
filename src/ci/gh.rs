@@ -138,6 +138,40 @@ pub(crate) fn branch_is_track(branch: &str, numeric: &str) -> bool {
     )
 }
 
+/// Distinct `last_event` when publish refuses a branch that is not `track/{numeric}`.
+pub(crate) fn misnamed_branch_event(branch: &str, numeric: &str) -> String {
+    format!("ci-wait: branch '{branch}' is not track/{numeric} \u{2014} waiting for PR")
+}
+
+/// One `/` or `-` segment equals the four-digit id (`feature/0412-foo`, `0412-foo`).
+pub(crate) fn branch_cites_numeric(name: &str, numeric: &str) -> bool {
+    let numeric = numeric.trim();
+    if numeric.is_empty() {
+        return false;
+    }
+    name.split(['/', '-']).any(|seg| seg == numeric)
+}
+
+/// A latched HEAD may still publish. Non-track names yield only when they cite the id.
+/// A `track/` name yields when the previous event was the generic wait or this misname.
+pub(crate) fn misname_latch_yields(branch: &str, numeric: &str, last_event: &str) -> bool {
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return false;
+    }
+    if !branch_is_track(branch, numeric) {
+        return branch_cites_numeric(branch, numeric);
+    }
+    last_event == "ci-wait: waiting for PR" || last_event.starts_with("ci-wait: branch '")
+}
+
+pub(crate) fn symbolic_head_branch(cwd: &Path) -> Option<String> {
+    git_stdout(cwd, &["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "HEAD")
+}
+
 /// The single short name that passes [`branch_is_track`], when there is exactly one.
 pub(crate) fn sole_track_branch<'a>(
     branches: impl IntoIterator<Item = &'a str>,
@@ -335,7 +369,9 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
     }
 
     if !branch_is_track(&branch, numeric) {
-        return Ok(skip_terminal(cwd, "ci-wait: waiting for PR"));
+        return Ok(AutoPublishResult::skipped(misnamed_branch_event(
+            &branch, numeric,
+        )));
     }
 
     let subject = match git_stdout(cwd, &["log", "-1", "--format=%s"]) {
@@ -1599,6 +1635,8 @@ mod parse_tests {
             "track/04120-x",
             "track/0412-",
             "track/0412/extra",
+            "feature/0412-foo",
+            "0412-foo",
             "chore/foo",
             "dependabot/x",
             "main",
@@ -1611,6 +1649,42 @@ mod parse_tests {
         }
         assert!(!branch_is_track("track/0412-foo", "412"));
         assert!(!branch_is_track("track/0412-foo", "04120"));
+    }
+
+    #[test]
+    fn misnamed_branch_event_names_the_branch() {
+        let event = misnamed_branch_event("feature/0412-foo", "0412");
+        assert_eq!(
+            event,
+            "ci-wait: branch 'feature/0412-foo' is not track/0412 \u{2014} waiting for PR"
+        );
+        assert!(!branch_is_track("feature/0412-foo", "0412"));
+        assert!(branch_cites_numeric("feature/0412-foo", "0412"));
+        assert!(branch_cites_numeric("0412-foo", "0412"));
+        assert!(!branch_cites_numeric("main", "0412"));
+        assert!(!branch_cites_numeric("track/04120-x", "0412"));
+        assert!(misname_latch_yields(
+            "feature/0412-foo",
+            "0412",
+            "ci-wait: waiting for PR"
+        ));
+        assert!(!misname_latch_yields(
+            "main",
+            "0412",
+            "ci-wait: waiting for PR"
+        ));
+        assert!(misname_latch_yields(
+            "track/0412-foo",
+            "0412",
+            "ci-wait: waiting for PR"
+        ));
+        assert!(misname_latch_yields("track/0412-foo", "0412", &event));
+        assert!(!misname_latch_yields(
+            "track/0412-foo",
+            "0412",
+            "ci-wait: no GitHub remote \u{2014} waiting for PR"
+        ));
+        assert!(!misname_latch_yields("", "0412", "ci-wait: waiting for PR"));
     }
 
     #[test]
