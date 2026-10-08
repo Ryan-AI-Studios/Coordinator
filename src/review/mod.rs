@@ -10,7 +10,6 @@ pub mod slot_quality;
 pub mod spawn;
 
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -474,7 +473,7 @@ fn publish_preconditions_ok(track_dir: Option<&Path>, exec_repo: &Path) -> bool 
 }
 
 fn git_worktree_clean(exec_repo: &Path) -> bool {
-    let out = Command::new("git")
+    let out = crate::git_command::command()
         .args(["status", "--porcelain"])
         .current_dir(exec_repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -1322,7 +1321,7 @@ mod tests {
     }
 
     fn run_git(dir: &std::path::Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = crate::git_command::command()
             .args(args)
             .current_dir(dir)
             .env("GIT_OPTIONAL_LOCKS", "0")

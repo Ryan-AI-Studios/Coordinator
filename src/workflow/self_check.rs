@@ -378,7 +378,7 @@ struct JournalDur {
 }
 
 pub(crate) fn diff_fingerprint(cwd: &std::path::Path) -> std::result::Result<String, ()> {
-    let out = std::process::Command::new("git")
+    let out = crate::git_command::command()
         .args(["diff", "--name-only", "HEAD"])
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -658,7 +658,7 @@ mod tests {
     fn clean_repo_fingerprint_is_the_empty_hash_and_a_non_repo_errors() {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::git_command::command()
                 .args(args)
                 .current_dir(dir.path())
                 .env("GIT_OPTIONAL_LOCKS", "0")

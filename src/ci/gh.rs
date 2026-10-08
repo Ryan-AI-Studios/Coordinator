@@ -1215,6 +1215,7 @@ fn run_process_timeout(bin: &Path, args: &[&str], cwd: &Path, dur: Duration) -> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if bin_is_git(bin) {
+        crate::git_command::clear_repository_env(&mut cmd);
         cmd.env("GIT_OPTIONAL_LOCKS", "0");
     }
     let mut child = match cmd.spawn() {
@@ -1786,7 +1787,7 @@ mod parse_tests {
     }
 
     fn git_ok(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
-        let out = std::process::Command::new("git")
+        let out = crate::git_command::command()
             .args(args)
             .current_dir(cwd)
             .env("GIT_AUTHOR_NAME", "probe")

@@ -55,6 +55,7 @@ pub mod ci;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub(crate) mod git_command;
 pub mod harness;
 pub mod layout;
 pub mod notify;
