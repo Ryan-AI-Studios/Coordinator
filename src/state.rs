@@ -170,6 +170,10 @@ pub struct RunState {
     /// Per-track committed failure count (0069). Fresh `run` does not clear it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub consecutive_failures: BTreeMap<String, u32>,
+    /// Registry status cells captured before an `advance`/`fold` inject (0088 DoD-1).
+    /// `id -> status cell`. Used to undo a `Ready` row downgraded by the session.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registry_status_before: BTreeMap<String, String>,
     /// `run_epoch` captured by a successful operator restore (0069). Cleared on publish/merge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restored_epoch: Option<u64>,
@@ -292,6 +296,7 @@ impl RunState {
             ci: None,
             review: None,
             stalled_at: None,
+            registry_status_before: BTreeMap::new(),
             pause_spans: Vec::new(),
             stall_recycles: 0,
             aborted_session_id: None,

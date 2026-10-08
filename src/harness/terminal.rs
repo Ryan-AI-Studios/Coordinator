@@ -41,6 +41,28 @@ fn saturating_dec(counter: &AtomicU64) {
 }
 
 const HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Test-build probe budget.
+///
+/// The 2s production deadline is a real latency contract, but unit tests spawn many
+/// real Windows processes in parallel, so that budget is not deterministic under load
+/// and the probe intermittently reports `terminal host probe timed out` — a false
+/// failure about process scheduling, not about the probe's logic. Test builds get a
+/// wider budget so these tests measure what they assert (shell availability, cache
+/// reuse, journaling) rather than CPU contention. Production behaviour is unchanged.
+#[allow(dead_code)] // referenced only when `cfg!(test)` is true
+const HOST_PROBE_TIMEOUT_TEST: Duration = Duration::from_secs(60);
+
+/// Probe budget for the current build; see [`HOST_PROBE_TIMEOUT_TEST`].
+///
+/// Uses `cfg!` rather than `#[cfg]` so both constants stay referenced in every
+/// build (a gated `const` would read as dead code to `-D warnings`).
+fn host_probe_timeout() -> Duration {
+    if cfg!(test) {
+        HOST_PROBE_TIMEOUT_TEST
+    } else {
+        HOST_PROBE_TIMEOUT
+    }
+}
 const HOST_PROBE_LINE: &str = "echo coordinator-spawn-probe";
 
 /// Per-prompt `terminal/create` spawn counters (reset at `session/prompt`).
@@ -277,7 +299,7 @@ impl TerminalHub {
         let mut child = cmd.spawn().map_err(|e| {
             format!("terminal host probe spawn: {e} (no Windows shell for terminal/create)")
         })?;
-        match tokio::time::timeout(HOST_PROBE_TIMEOUT, child.wait()).await {
+        match tokio::time::timeout(host_probe_timeout(), child.wait()).await {
             Ok(Ok(status)) if status.success() => {
                 self.probe_ok.store(true, Ordering::SeqCst);
                 Ok(())

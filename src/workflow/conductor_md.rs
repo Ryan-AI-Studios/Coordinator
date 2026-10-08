@@ -329,12 +329,35 @@ fn contains_owner_only(lower: &str) -> bool {
 const NOSTART_LITERAL: &str = "<!-- nostart -->";
 
 /// Strip the exact `<!-- nostart -->` literal. No general HTML-comment parser.
+///
+/// **The marker only counts when it terminates a cell** — that is, when the next
+/// non-space character after it is a `|` or the end of the line (0088). A line that
+/// merely *mentions* the literal in prose — a registry summary describing this very
+/// marker, or quoting a row that carries it — must not gate its own row forever.
+/// Observed live 2026-10-07: 0088's own summary contained the literal twice (once as
+/// prose describing the defect, once as the real marker), and 0087's summary quoted it
+/// as `\`Proposed <!-- nostart -->\`` inside a code span.
+///
+/// All terminated occurrences are removed; prose mentions are preserved verbatim and
+/// do not set the flag.
 pub fn strip_nostart_literal(line: &str) -> (String, bool) {
-    if line.contains(NOSTART_LITERAL) {
-        (line.replace(NOSTART_LITERAL, ""), true)
-    } else {
-        (line.to_string(), false)
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut active = false;
+    while let Some(pos) = rest.find(NOSTART_LITERAL) {
+        let after = &rest[pos + NOSTART_LITERAL.len()..];
+        let tail = after.trim_start();
+        let terminates = tail.is_empty() || tail.starts_with('|');
+        out.push_str(&rest[..pos]);
+        if terminates {
+            active = true;
+        } else {
+            out.push_str(NOSTART_LITERAL);
+        }
+        rest = after;
     }
+    out.push_str(rest);
+    (out, active)
 }
 
 /// True when the matching conductor row carries `<!-- nostart -->`.
@@ -349,6 +372,219 @@ pub fn track_row_nostart(record: &ProjectRecord, id: &str) -> bool {
 struct PipeRow {
     cells: Vec<String>,
     nostart: bool,
+}
+
+/// Path to this project's `conductor.md`.
+fn conductor_md_path(record: &ProjectRecord) -> std::path::PathBuf {
+    crate::layout::resolve(record)
+        .conductor_dir
+        .join("conductor.md")
+}
+
+/// One row whose cell count differs from its table header's (0088 DoD-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidthDeviation {
+    /// 1-based line number in `conductor.md`.
+    pub line: usize,
+    /// Cell count found on the row.
+    pub got: usize,
+    /// Cell count of the owning table's header.
+    pub want: usize,
+    /// Leading text of the row, for the report.
+    pub preview: String,
+}
+
+/// Rows that `parse_conductor_md` will **skip silently** because their width differs
+/// from the header's (0088 DoD-3).
+///
+/// The parse contract drops such rows, which is how a raw `|` written into a summary
+/// erased 0474's Completed row and 0111's row on the HelpMeMove registry. A deviation
+/// is now *reportable* rather than invisible. Read-only; never writes.
+pub fn width_deviations(text: &str) -> Vec<WidthDeviation> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut out = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_table_start(&lines, i) {
+            i += 1;
+            continue;
+        }
+        let (header_line, _) = strip_nostart_literal(lines[i]);
+        let want = split_unescaped_pipes(&header_line).len();
+        let header_line_no = i + 1;
+        i += 2;
+        while i < lines.len() {
+            if lines[i].trim().is_empty() || is_thematic_break(lines[i]) {
+                i += 1;
+                continue;
+            }
+            if !looks_like_row(lines[i]) || is_table_start(&lines, i) {
+                break;
+            }
+            let (stripped, _) = strip_nostart_literal(lines[i]);
+            let got = split_unescaped_pipes(&stripped).len();
+            if got != want {
+                let preview: String = lines[i].trim().chars().take(96).collect();
+                out.push(WidthDeviation {
+                    line: i + 1,
+                    got,
+                    want,
+                    preview,
+                });
+            }
+            let _ = header_line_no;
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Replace the content of the `idx`-th cell (0-based, counting only unescaped `|`
+/// separators) in a single table row line. Returns `None` when the row has too few
+/// cells. Leading/trailing single spaces around the new content are normalized.
+fn replace_cell(line: &str, idx: usize, content: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut boundaries: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'|' {
+            boundaries.push(i);
+        }
+        i += 1;
+    }
+    // Cell `idx` lives between boundaries[idx] and boundaries[idx + 1].
+    if idx + 1 >= boundaries.len() {
+        return None;
+    }
+    let start = boundaries[idx];
+    let end = boundaries[idx + 1];
+    let mut out = String::with_capacity(line.len() + content.len());
+    out.push_str(&line[..=start]);
+    out.push(' ');
+    out.push_str(content);
+    out.push(' ');
+    out.push_str(&line[end..]);
+    Some(out)
+}
+
+/// Snapshot every row's id → trimmed status cell, for later downgrade detection.
+pub fn status_snapshot(text: &str) -> std::collections::BTreeMap<String, String> {
+    match parse_conductor_md(text) {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| (r.id, r.status_raw.trim().to_string()))
+            .collect(),
+        Err(_) => std::collections::BTreeMap::new(),
+    }
+}
+
+/// Snapshot for a record's live registry.
+pub fn status_snapshot_for(record: &ProjectRecord) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(conductor_md_path(record))
+        .map(|t| status_snapshot(&t))
+        .unwrap_or_default()
+}
+
+/// Undo a `Ready` → non-`Ready` downgrade an `advance`/`fold` session wrote into the
+/// registry (0088 DoD-1).
+///
+/// `before` is a [`status_snapshot`] taken **before** the phase ran. For every id that
+/// was an eligible `Ready` row and is no longer one, the status cell is rewritten back
+/// to its previous text. Returns the restored ids and the new file body (or `None` when
+/// nothing changed, so the caller does not rewrite the file needlessly).
+///
+/// The banner is deliberately **not** consulted: the status cell is the state, and a
+/// mint-time banner is not authority over it.
+pub fn restore_ready_rows(
+    text: &str,
+    before: &std::collections::BTreeMap<String, String>,
+    aliases: &[String],
+) -> (Vec<String>, Option<String>) {
+    let after = match parse_conductor_md(text) {
+        Ok(rows) => rows,
+        Err(_) => return (Vec::new(), None),
+    };
+    let mut downgraded: Vec<(String, String)> = Vec::new();
+    for row in &after {
+        let Some(prev) = before.get(&row.id) else {
+            continue;
+        };
+        let was_ready = is_eligible_ready_in(prev, aliases);
+        let now_ready = is_eligible_ready_in(&row.status_raw, aliases);
+        if was_ready && !now_ready {
+            downgraded.push((row.id.clone(), prev.clone()));
+        }
+    }
+    if downgraded.is_empty() {
+        return (Vec::new(), None);
+    }
+    let owned: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut lines: Vec<String> = owned.clone();
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let mut restored: Vec<String> = Vec::new();
+    for (id, prev) in &downgraded {
+        let mut i = 0;
+        while i < lines.len() {
+            if !is_table_start(&refs, i) {
+                i += 1;
+                continue;
+            }
+            let (header_line, _) = strip_nostart_literal(refs[i]);
+            let headers: Vec<String> = split_unescaped_pipes(&header_line)
+                .iter()
+                .map(|c| c.trim().to_string())
+                .collect();
+            let status_col = headers.iter().position(|h| is_status_header(h));
+            i += 2;
+            while i < lines.len() {
+                if lines[i].trim().is_empty() || is_thematic_break(&lines[i]) {
+                    i += 1;
+                    continue;
+                }
+                if !looks_like_row(&lines[i]) || is_table_start(&refs, i) {
+                    break;
+                }
+                let (stripped, _) = strip_nostart_literal(&lines[i]);
+                let cells = split_unescaped_pipes(&stripped);
+                if let Some(sc) = status_col
+                    && let Some(track_cell) = cells.first()
+                    && let Some((rid, _)) = parse_leading_id(&unwrap_md_link(track_cell.trim()))
+                    && track_ids_match(&rid, id)
+                {
+                    // The status cell index in the *original* line: header cell 0 is the
+                    // text before the first pipe, so the cell index equals `status_col`.
+                    if let Some(new_line) = replace_cell(&lines[i], sc, prev) {
+                        lines[i] = new_line;
+                        if !restored.iter().any(|e| track_ids_match(e, id)) {
+                            restored.push(id.clone());
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    if restored.is_empty() {
+        return (Vec::new(), None);
+    }
+    let trailing_newline = text.ends_with('\n');
+    let mut body = lines.join("\n");
+    if trailing_newline {
+        body.push('\n');
+    }
+    (restored, Some(body))
+}
+
+/// [`width_deviations`] for a record's live registry.
+pub fn width_deviations_for(record: &ProjectRecord) -> Vec<WidthDeviation> {
+    std::fs::read_to_string(conductor_md_path(record))
+        .map(|t| width_deviations(&t))
+        .unwrap_or_default()
 }
 
 /// Every GFM table with Track/Id + Status columns, concatenated, by header name.
@@ -893,6 +1129,144 @@ pub fn write_ready_fixture(ws: &std::path::Path, id: &str) -> std::io::Result<()
          | {id}-Fixture | `.` | **Ready — not started** | fixture |\n"
     );
     std::fs::write(cond.join("conductor.md"), md)
+}
+
+#[cfg(test)]
+mod tests_0088 {
+    use super::*;
+    use std::path::Path;
+
+    fn rec(path: &Path) -> ProjectRecord {
+        ProjectRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            path: path.to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: AutoStartPolicy::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn write_md(ws: &Path, md: &str) {
+        let cond = ws.join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        std::fs::write(cond.join("conductor.md"), md).unwrap();
+    }
+
+    /// DoD-4: `status=Ready` + a banner saying "do not auto-start" ⇒ the row stays Ready,
+    /// and a downgrade written into the cell is undone.
+    #[test]
+    fn ready_row_downgraded_by_advance_is_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let before_md = "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0475-V1](0475-V1/spec.md) | `.` | **Ready — not started** | go |\n\
+             | [0476-V2](0476-V2/spec.md) | `.` | **Ready — not started** | go |\n";
+        write_md(ws, before_md);
+        let r = rec(ws);
+        let before = status_snapshot(before_md);
+        assert_eq!(
+            before.get("0475").map(String::as_str),
+            Some("**Ready — not started**")
+        );
+
+        // The "advance" session downgraded 0475 on the strength of a stale banner.
+        let after_md = "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0475-V1](0475-V1/spec.md) | `.` | **Proposed** <!-- nostart --> | go |\n\
+             | [0476-V2](0476-V2/spec.md) | `.` | **Ready — not started** | go |\n";
+        let aliases = ready_aliases_for(&r);
+        let (restored, body) = restore_ready_rows(after_md, &before, &aliases);
+        assert_eq!(restored, vec!["0475".to_string()]);
+        let body = body.expect("body rewritten");
+        let reparsed = parse_conductor_md(&body).unwrap();
+        let row = reparsed.iter().find(|x| x.id == "0475").unwrap();
+        assert!(
+            is_eligible_ready_in(&row.status_raw, &aliases),
+            "restored cell must be Ready again, got {:?}",
+            row.status_raw
+        );
+    }
+
+    /// A row already non-Ready before the phase is left alone — no false restore.
+    #[test]
+    fn non_ready_row_is_not_touched() {
+        let ws_md = "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0475-V1](0475-V1/spec.md) | `.` | **Proposed** | go |\n";
+        let dir = tempfile::tempdir().unwrap();
+        write_md(dir.path(), ws_md);
+        let r = rec(dir.path());
+        let before = status_snapshot(ws_md);
+        let aliases = ready_aliases_for(&r);
+        let (restored, body) = restore_ready_rows(ws_md, &before, &aliases);
+        assert!(restored.is_empty(), "{restored:?}");
+        assert!(body.is_none());
+    }
+
+    /// 0088 self-reference trap: a summary that *mentions* `<!-- nostart -->` in prose
+    /// (or quotes it) must not set the flag; only a marker that terminates a cell does.
+    #[test]
+    fn prose_mention_of_marker_does_not_gate_the_row() {
+        let prose = "| [0088-X](0088-X/spec.md) | `C:\\dev` | **Proposed** | Describes the fix: write `Proposed <!-- nostart -->` back to the cell |";
+        let (stripped, flagged) = strip_nostart_literal(prose);
+        assert!(!flagged, "a prose mention must not set nostart");
+        assert!(
+            stripped.contains("<!-- nostart -->"),
+            "prose is preserved verbatim"
+        );
+
+        let real = "| [0088-X](0088-X/spec.md) | `C:\\dev` | **Proposed** | do not start <!-- nostart --> |";
+        let (stripped2, flagged2) = strip_nostart_literal(real);
+        assert!(flagged2, "a terminating marker must set nostart");
+        assert!(!stripped2.contains("<!-- nostart -->"), "marker removed");
+
+        // End-of-line form also counts.
+        let eol = "| [0088-X](0088-X/spec.md) | **Proposed** | x <!-- nostart -->";
+        assert!(strip_nostart_literal(eol).1);
+    }
+
+    /// DoD-3: a row whose width differs from the header is REPORTED, not silently dropped.
+    #[test]
+    fn width_deviation_is_reported_not_silent() {
+        let md = "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0474-G](0474-G/spec.md) | `.` | **Completed** | uses `graphml | cypher` |\n\
+             | [0475-V](0475-V/spec.md) | `.` | **Ready — not started** | ok |\n";
+        let devs = width_deviations(md);
+        assert_eq!(devs.len(), 1, "{devs:?}");
+        // Header is `| Track | Execution path | Status | Summary |` => 4 cells (5 pipes).
+        // The stray `|` makes this row 5 cells.
+        assert_eq!(devs[0].want, 4);
+        assert_eq!(devs[0].got, 5);
+        assert!(devs[0].preview.contains("0474"), "{}", devs[0].preview);
+        // The parse still drops it — but now the drop is visible.
+        let rows = parse_conductor_md(md).unwrap();
+        assert!(!rows.iter().any(|r| r.id == "0474"));
+    }
+
+    /// The escaped form is legitimate and must not be reported as a deviation.
+    #[test]
+    fn escaped_pipe_is_not_a_deviation() {
+        let md = "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0474-G](0474-G/spec.md) | `.` | **Completed** | uses graphml \\| cypher |\n";
+        assert!(width_deviations(md).is_empty());
+    }
 }
 
 #[cfg(test)]
