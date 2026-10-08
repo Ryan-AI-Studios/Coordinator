@@ -604,8 +604,15 @@ fn consume_role_files(record: &ProjectRecord) -> Result<()> {
         if outcome.status == OutcomeStatus::Success {
             adopt_track_review_if_missing(record, &slug)?;
         }
-        let _ = std::fs::remove_file(&path);
+        // Save the acknowledgment BEFORE deleting the mailbox (0088 follow-up).
+        //
+        // The reverse order is unrecoverable: if `remove_pending` fails to persist, the
+        // mailbox is already gone, so the retry finds nothing to read, the slug stays in
+        // `pending_roles` forever, and the join never completes. Observed as
+        // `slots still pending: ["agy"]` in `join_zero_output_retries_then_pass`.
+        // Retaining the mailbox on a failed save makes the retry idempotent.
         remove_pending(record, &slug)?;
+        let _ = std::fs::remove_file(&path);
     }
     Ok(())
 }
