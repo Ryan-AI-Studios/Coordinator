@@ -3613,7 +3613,7 @@ mod tests {
     }
 
     fn git_ok(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
-        let out = std::process::Command::new("git")
+        let out = crate::git_command::command()
             .args(args)
             .current_dir(cwd)
             .env("GIT_AUTHOR_NAME", "probe")

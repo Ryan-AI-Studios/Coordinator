@@ -4,7 +4,6 @@
 //! directory under the project state dir is the product cwd. Flag off is a no-op.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use crate::error::{CoordinatorError, Result};
@@ -404,7 +403,7 @@ fn git(cwd: &Path, args: &[&str]) -> Result<()> {
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
     let shown = args.join(" ");
-    let out = Command::new(Path::new("git"))
+    let out = crate::git_command::command()
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -434,7 +433,6 @@ mod tests {
         PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_IMPLEMENT, PHASE_PLAN,
     };
     use chrono::Utc;
-    use std::process::Command;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -509,7 +507,7 @@ mod tests {
     }
 
     fn git_ok(cwd: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = crate::git_command::command()
             .args(args)
             .current_dir(cwd)
             .output()
@@ -537,7 +535,7 @@ mod tests {
     }
 
     fn porcelain(cwd: &Path) -> String {
-        let out = Command::new("git")
+        let out = crate::git_command::command()
             .args(["status", "--porcelain"])
             .current_dir(cwd)
             .output()
@@ -547,7 +545,7 @@ mod tests {
     }
 
     fn branch_exists(cwd: &Path, name: &str) -> bool {
-        let out = Command::new("git")
+        let out = crate::git_command::command()
             .args(["branch", "--list", name])
             .current_dir(cwd)
             .output()
