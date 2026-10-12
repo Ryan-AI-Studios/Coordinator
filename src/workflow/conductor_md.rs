@@ -490,13 +490,18 @@ pub fn status_snapshot_for(record: &ProjectRecord) -> std::collections::BTreeMap
         .unwrap_or_default()
 }
 
-/// Undo a `Ready` → non-`Ready` downgrade an `advance`/`fold` session wrote into the
-/// registry (0088 DoD-1).
+/// Undo a non-terminal `Ready` downgrade an `advance`/`fold` session wrote into the
+/// registry (0088 DoD-1, narrowed by 0090).
 ///
 /// `before` is a [`status_snapshot`] taken **before** the phase ran. For every id that
-/// was an eligible `Ready` row and is no longer one, the status cell is rewritten back
-/// to its previous text. Returns the restored ids and the new file body (or `None` when
-/// nothing changed, so the caller does not rewrite the file needlessly).
+/// was an eligible `Ready` row, is no longer one, and whose live cell is not
+/// [`is_terminal`], the status cell is rewritten back to its previous text. A terminal
+/// live cell is left as written. Returns the restored ids and the new file body (or
+/// `None` when nothing changed, so the caller does not rewrite the file needlessly).
+///
+/// The caller parses once so a parse error stays distinct from nothing to restore.
+/// This function parses again. That second parse is intentional. The return type stays
+/// `(Vec<String>, Option<String>)`.
 ///
 /// The banner is deliberately **not** consulted: the status cell is the state, and a
 /// mint-time banner is not authority over it.
@@ -516,7 +521,7 @@ pub fn restore_ready_rows(
         };
         let was_ready = is_eligible_ready_in(prev, aliases);
         let now_ready = is_eligible_ready_in(&row.status_raw, aliases);
-        if was_ready && !now_ready {
+        if was_ready && !now_ready && !is_terminal(&row.status_raw) {
             downgraded.push((row.id.clone(), prev.clone()));
         }
     }
@@ -1216,6 +1221,98 @@ mod tests_0088 {
         let (restored, body) = restore_ready_rows(ws_md, &before, &aliases);
         assert!(restored.is_empty(), "{restored:?}");
         assert!(body.is_none());
+    }
+
+    fn registry(rows: &str) -> String {
+        format!(
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             {rows}"
+        )
+    }
+
+    fn linked(id: &str, status: &str) -> String {
+        format!("| [{id}-T]({id}-T/spec.md) | `.` | {status} | go |\n")
+    }
+
+    fn ready_before(ids: &[&str]) -> std::collections::BTreeMap<String, String> {
+        ids.iter()
+            .map(|id| ((*id).to_string(), "**Ready — not started**".to_string()))
+            .collect()
+    }
+
+    /// DoD-1: a terminal live cell is left, and a terminal-only table returns no body.
+    #[test]
+    fn terminal_cells_are_not_restored() {
+        let completed = "**Completed** 2026-10-12 — PR **#87** squash `b9dc76e`";
+        let absorbed = "**Absorbed — 0058 `204a258`**";
+        let cancelled = "**Cancelled** - note";
+        let text = registry(&format!(
+            "{}{}{}",
+            linked("0001", completed),
+            linked("0002", absorbed),
+            linked("0003", cancelled),
+        ));
+        let before = ready_before(&["0001", "0002", "0003"]);
+        let aliases = ready_aliases_for(&rec(std::path::Path::new(".")));
+        let (restored, body) = restore_ready_rows(&text, &before, &aliases);
+        assert!(restored.is_empty(), "{restored:?}");
+        assert!(body.is_none());
+    }
+
+    /// DoD-2: Proposed stays covered by the 0088 test. These four stay restored too.
+    #[test]
+    fn non_terminal_downgrades_are_still_restored() {
+        let text = registry(&format!(
+            "{}{}{}{}",
+            linked("0001", "**Blocked**"),
+            linked("0002", ""),
+            linked("0003", "garbage"),
+            linked("0004", "**In progress**"),
+        ));
+        let before = ready_before(&["0001", "0002", "0003", "0004"]);
+        let aliases = ready_aliases_for(&rec(std::path::Path::new(".")));
+        let (restored, body) = restore_ready_rows(&text, &before, &aliases);
+        assert_eq!(
+            restored,
+            vec![
+                "0001".to_string(),
+                "0002".to_string(),
+                "0003".to_string(),
+                "0004".to_string()
+            ]
+        );
+        let body = body.expect("rewritten");
+        let rows = parse_conductor_md(&body).unwrap();
+        assert_eq!(rows.len(), 4);
+        for row in rows {
+            assert!(
+                is_eligible_ready_in(&row.status_raw, &aliases),
+                "{} stayed {:?}",
+                row.id,
+                row.status_raw
+            );
+        }
+    }
+
+    /// DoD-3: a Completed sibling stays. Only the Proposed id is restored.
+    #[test]
+    fn mixed_terminal_and_proposed_restores_only_the_proposed_row() {
+        let completed = "**Completed** 2026-10-12 — PR **#87** squash `b9dc76e`";
+        let text = registry(&format!(
+            "{}{}",
+            linked("0001", completed),
+            "| [0002-T](0002-T/spec.md) | `.` | **Proposed** <!-- nostart --> | go |\n",
+        ));
+        let before = ready_before(&["0001", "0002"]);
+        let aliases = ready_aliases_for(&rec(std::path::Path::new(".")));
+        let (restored, body) = restore_ready_rows(&text, &before, &aliases);
+        assert_eq!(restored, vec!["0002".to_string()]);
+        let rows = parse_conductor_md(&body.expect("rewritten")).unwrap();
+        let done = rows.iter().find(|row| row.id == "0001").unwrap();
+        assert_eq!(done.status_raw, completed);
+        let proposed = rows.iter().find(|row| row.id == "0002").unwrap();
+        assert!(is_eligible_ready_in(&proposed.status_raw, &aliases));
     }
 
     /// 0088 self-reference trap: a summary that *mentions* `<!-- nostart -->` in prose

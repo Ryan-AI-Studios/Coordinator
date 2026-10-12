@@ -171,7 +171,9 @@ pub struct RunState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub consecutive_failures: BTreeMap<String, u32>,
     /// Registry status cells captured before an `advance`/`fold` inject (0088 DoD-1).
-    /// `id -> status cell`. Used to undo a `Ready` row downgraded by the session.
+    /// `id -> status cell`. `on_success` clears this in-memory map when the helper
+    /// reports the snapshot consumed (0090). `begin_fresh_run` clears it on a new epoch.
+    /// Used to undo a non-terminal `Ready` row downgraded by the session.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub registry_status_before: BTreeMap<String, String>,
     /// `run_epoch` captured by a successful operator restore (0069). Cleared on publish/merge.

@@ -869,44 +869,63 @@ fn snapshot_registry_before_phase(
     })
 }
 
-/// Undo any `Ready` row this session downgraded (0088 DoD-1). Returns restored ids.
-pub fn restore_ready_rows_after_phase(record: &crate::registry::ProjectRecord) -> Vec<String> {
+/// Restored ids plus whether the Ready snapshot was consumed (0090).
+///
+/// `consumed` is true only after the registry file was read and parsed, and either
+/// nothing needed a rewrite or that rewrite was written. The caller clears the
+/// in-memory map. This value does not itself save run state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyRestore {
+    pub restored: Vec<String>,
+    pub consumed: bool,
+}
+
+/// Undo a non-terminal Ready downgrade captured before advance/fold (0088, 0090).
+///
+/// Does not call [`crate::state::with_run_state_lock`] or [`crate::state::save_run_state`].
+/// `apply` already holds the lock around `on_success`, and that later save is what
+/// persists an in-memory clear. A nested lock from here would time out.
+pub fn restore_ready_rows_after_phase(record: &crate::registry::ProjectRecord) -> ReadyRestore {
+    let keep = || ReadyRestore {
+        restored: Vec::new(),
+        consumed: false,
+    };
     let state = match crate::state::load_run_state(record) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => return keep(),
     };
     if state.registry_status_before.is_empty() {
-        return Vec::new();
+        return keep();
     }
     let path = crate::layout::resolve(record)
         .conductor_dir
         .join("conductor.md");
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+        return keep();
     };
+    if crate::workflow::conductor_md::parse_conductor_md(&text).is_err() {
+        return keep();
+    }
     let aliases = crate::workflow::conductor_md::ready_aliases_for(record);
     let (restored, body) = crate::workflow::conductor_md::restore_ready_rows(
         &text,
         &state.registry_status_before,
         &aliases,
     );
-    if let Some(body) = body
-        && std::fs::write(&path, body).is_ok()
-    {
+    if let Some(body) = body {
+        if std::fs::write(&path, body).is_err() {
+            return keep();
+        }
         crate::progress_log::append(
             record,
             "advance-downgrade-restored",
             &format!("restored Ready: {}", restored.join(", ")),
         );
-        crate::workflow::with_run_state_lock(record, || {
-            let mut s = crate::state::load_run_state(record)?;
-            s.registry_status_before.clear();
-            s.updated_at = chrono::Utc::now();
-            crate::state::save_run_state(record, &s)
-        })
-        .ok();
     }
-    restored
+    ReadyRestore {
+        restored,
+        consumed: true,
+    }
 }
 
 #[cfg(test)]
@@ -1845,5 +1864,269 @@ mod tests {
         assert!(parsed["slots"]["agy"]["review_sha256"].is_string());
         assert!(parsed["slots"].get("opencode").is_none());
         assert!(parsed.get("pr").is_none());
+    }
+
+    const READY_CELL: &str = "**Ready — not started**";
+    const COMPLETED_CELL: &str = "**Completed** 2026-10-12 — PR **#87** squash `b9dc76e`";
+
+    fn write_registry(ws: &std::path::Path, rows: &str) {
+        let cond = ws.join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        let md = format!(
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             {rows}"
+        );
+        std::fs::write(cond.join("conductor.md"), md).unwrap();
+    }
+
+    fn linked_row(id: &str, status: &str) -> String {
+        format!("| [{id}-T]({id}-T/spec.md) | `.` | {status} | go |\n")
+    }
+
+    fn seed_snapshot(record: &ProjectRecord, id: &str, cell: &str) {
+        let mut state = crate::state::RunState::idle(&record.id);
+        state
+            .registry_status_before
+            .insert(id.to_string(), cell.to_string());
+        crate::state::save_run_state(record, &state).unwrap();
+    }
+
+    fn git_ok(cwd: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Local copy of the private checkpoint test helper. Not exported.
+    fn init_exec_repo() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        git_ok(dir.path(), &["init", "-b", "main"]);
+        git_ok(
+            dir.path(),
+            &["config", "user.email", "restore-test@example.com"],
+        );
+        git_ok(dir.path(), &["config", "user.name", "restore-test"]);
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            ".ledgerful/\n.env\n.coordinator/\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("README.md"), b"seed\n").unwrap();
+        git_ok(dir.path(), &["add", ".gitignore", "README.md"]);
+        git_ok(dir.path(), &["commit", "-m", "seed"]);
+        dir
+    }
+
+    #[test]
+    fn snapshot_consumed_when_terminal_row_is_left() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_registry(dir.path(), &linked_row("0090", COMPLETED_CELL));
+        seed_snapshot(&record, "0090", READY_CELL);
+        let ready = restore_ready_rows_after_phase(&record);
+        assert!(ready.consumed);
+        assert!(ready.restored.is_empty());
+        let text =
+            std::fs::read_to_string(dir.path().join("conductor").join("conductor.md")).unwrap();
+        assert!(text.contains(COMPLETED_CELL), "{text}");
+        assert!(
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .registry_status_before
+                .contains_key("0090")
+        );
+        let log = std::fs::read_to_string(dir.path().join("status.md")).unwrap_or_default();
+        assert!(!log.contains("advance-downgrade-restored"), "{log}");
+    }
+
+    #[test]
+    fn snapshot_consumed_when_row_stays_ready() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_registry(dir.path(), &linked_row("0090", READY_CELL));
+        seed_snapshot(&record, "0090", READY_CELL);
+        let ready = restore_ready_rows_after_phase(&record);
+        assert!(ready.consumed);
+        assert!(ready.restored.is_empty());
+        assert!(
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .registry_status_before
+                .contains_key("0090")
+        );
+        let log = std::fs::read_to_string(dir.path().join("status.md")).unwrap_or_default();
+        assert!(!log.contains("advance-downgrade-restored"), "{log}");
+    }
+
+    #[test]
+    fn snapshot_kept_when_conductor_missing() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        seed_snapshot(&record, "0090", READY_CELL);
+        let ready = restore_ready_rows_after_phase(&record);
+        assert!(!ready.consumed);
+        assert!(ready.restored.is_empty());
+        assert_eq!(
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .registry_status_before
+                .get("0090")
+                .map(String::as_str),
+            Some(READY_CELL)
+        );
+    }
+
+    #[test]
+    fn snapshot_kept_when_conductor_unparseable() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        let cond = dir.path().join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        std::fs::write(cond.join("conductor.md"), "not a table\n").unwrap();
+        seed_snapshot(&record, "0090", READY_CELL);
+        let ready = restore_ready_rows_after_phase(&record);
+        assert!(!ready.consumed);
+        assert!(
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .registry_status_before
+                .contains_key("0090")
+        );
+    }
+
+    #[test]
+    fn proposed_downgrade_restores_and_consumes_snapshot() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_registry(dir.path(), &linked_row("0090", "**Proposed**"));
+        seed_snapshot(&record, "0090", READY_CELL);
+        let ready = restore_ready_rows_after_phase(&record);
+        assert!(ready.consumed);
+        assert_eq!(ready.restored, vec!["0090".to_string()]);
+        let text =
+            std::fs::read_to_string(dir.path().join("conductor").join("conductor.md")).unwrap();
+        let rows = crate::workflow::conductor_md::parse_conductor_md(&text).unwrap();
+        assert!(crate::workflow::conductor_md::is_eligible_ready(
+            &rows[0].status_raw
+        ));
+        assert!(
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .registry_status_before
+                .contains_key("0090")
+        );
+        let log = std::fs::read_to_string(dir.path().join("status.md")).unwrap();
+        assert!(log.contains("advance-downgrade-restored"), "{log}");
+        assert!(log.contains("0090"), "{log}");
+    }
+
+    #[test]
+    fn fold_consume_survives_apply_and_completed_survives_implement() {
+        let _home = IsolatedHome::enter();
+        let ws = tempdir().unwrap();
+        let repo = init_exec_repo();
+        let mut record = rec(ws.path());
+        record.execution_repo = Some(repo.path().to_path_buf());
+        record.worktree_isolation = false;
+        write_registry(ws.path(), &linked_row("0090", READY_CELL));
+        let mut state = crate::state::RunState::idle(&record.id);
+        state.status = crate::state::RunStatus::Running;
+        state.phase = crate::workflow::graph::PHASE_FOLD.into();
+        state.track_id = Some("0090".into());
+        state.run_epoch = 3;
+        state.workflow = Some(crate::workflow::WORKFLOW_ID.into());
+        state
+            .registry_status_before
+            .insert("0090".into(), READY_CELL.to_string());
+        crate::state::save_run_state(&record, &state).unwrap();
+
+        let view = crate::outcome::write_and_apply(
+            &record,
+            crate::outcome::PhaseOutcome::success(
+                crate::workflow::graph::PHASE_FOLD,
+                crate::outcome::OutcomeSource::Test,
+                None,
+                None,
+                Some(3),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            view.phase,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            "{}",
+            view.last_event
+        );
+        assert_eq!(view.status, crate::state::RunStatus::Running);
+        assert!(
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .registry_status_before
+                .is_empty()
+        );
+
+        write_registry(ws.path(), &linked_row("0090", COMPLETED_CELL));
+        let view = crate::outcome::write_and_apply(
+            &record,
+            crate::outcome::PhaseOutcome::success(
+                crate::workflow::graph::PHASE_IMPLEMENT,
+                crate::outcome::OutcomeSource::Test,
+                None,
+                None,
+                Some(3),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            view.phase,
+            crate::workflow::graph::PHASE_CROSS_MODEL,
+            "{}",
+            view.last_event
+        );
+        let text =
+            std::fs::read_to_string(ws.path().join("conductor").join("conductor.md")).unwrap();
+        assert!(text.contains(COMPLETED_CELL), "{text}");
+        assert!(
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .registry_status_before
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapshot_skipped_for_plan_and_implement() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_registry(dir.path(), &linked_row("0090", READY_CELL));
+        crate::state::save_run_state(&record, &crate::state::RunState::idle(&record.id)).unwrap();
+        snapshot_registry_before_phase(&record, crate::workflow::graph::PHASE_PLAN).unwrap();
+        snapshot_registry_before_phase(&record, crate::workflow::graph::PHASE_IMPLEMENT).unwrap();
+        assert!(
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .registry_status_before
+                .is_empty()
+        );
+        snapshot_registry_before_phase(&record, crate::workflow::graph::PHASE_FOLD).unwrap();
+        let map = crate::state::load_run_state(&record)
+            .unwrap()
+            .registry_status_before;
+        assert_eq!(map.get("0090").map(String::as_str), Some(READY_CELL));
     }
 }
