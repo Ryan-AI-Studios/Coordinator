@@ -225,6 +225,7 @@ fn begin_fresh_run(
     state.aborted_session_id = None;
     state.acp_stdout_retries = 0;
     state.plan_review_spawned.clear();
+    state.registry_status_before.clear();
     state.plan_review_join_retries = 0;
     state.plan_review_slot_ran.clear();
     state.address_findings_attempts = 0;
@@ -570,6 +571,9 @@ mod tests {
                 pending_inject: true,
                 ..crate::state::SelfCheckState::default()
             });
+            state
+                .registry_status_before
+                .insert("0069".into(), "**Ready — not started**".into());
             save_run_state(&r, &state).unwrap();
         }
         let view = run(&r, Some("0069".into())).unwrap();
@@ -581,6 +585,7 @@ mod tests {
         assert_eq!(state.policy_approvals.len(), 1);
         assert!(state.state_gate.is_none());
         assert!(state.self_check.is_none());
+        assert!(state.registry_status_before.is_empty());
         assert!(!r.self_continuation);
     }
 
