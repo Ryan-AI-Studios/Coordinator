@@ -276,6 +276,8 @@ enum AcpTransport {
     Mock {
         incoming_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
         written: Arc<std::sync::Mutex<Vec<String>>>,
+        /// One-shot `read_line` failure. `mock_close` stays EOF.
+        pending_transport_error: Option<std::io::Error>,
     },
 }
 
@@ -452,6 +454,7 @@ impl GrokSession {
             transport: AcpTransport::Mock {
                 incoming_rx,
                 written,
+                pending_transport_error: None,
             },
             session_id: String::new(),
             cwd,
@@ -497,6 +500,17 @@ impl GrokSession {
             for line in lines {
                 let _ = tx.send(line);
             }
+        }
+    }
+
+    /// Next mock `read_line` returns this I/O error once. Live stdio is unchanged.
+    pub fn mock_transport_error(&mut self, err: std::io::Error) {
+        if let AcpTransport::Mock {
+            pending_transport_error,
+            ..
+        } = &mut self.transport
+        {
+            *pending_transport_error = Some(err);
         }
     }
 
@@ -665,7 +679,9 @@ impl GrokSession {
             "method": method,
             "params": params
         });
-        self.write_line(&payload.to_string()).await?;
+        if let Err(e) = self.write_line(&payload.to_string()).await {
+            return Err(self.map_transport_drop(method, e).await);
+        }
 
         let deadline = Instant::now() + timeout;
         loop {
@@ -677,19 +693,15 @@ impl GrokSession {
                     timeout.as_secs()
                 )));
             }
-            let line = tokio::time::timeout(remaining, self.read_line())
-                .await
-                .map_err(|_| {
-                    CoordinatorError::Message(format!(
+            let line = match tokio::time::timeout(remaining, self.read_line()).await {
+                Ok(Ok(value)) => value,
+                Ok(Err(e)) => return Err(self.map_transport_drop(method, e).await),
+                Err(_) => {
+                    self.in_flight_id.store(0, Ordering::SeqCst);
+                    return Err(CoordinatorError::Message(format!(
                         "ACP {method} timed out after {}s",
                         timeout.as_secs()
-                    ))
-                });
-            let line = match line {
-                Ok(inner) => inner?,
-                Err(e) => {
-                    self.in_flight_id.store(0, Ordering::SeqCst);
-                    return Err(e);
+                    )));
                 }
             };
             let Some(line) = line else {
@@ -934,6 +946,28 @@ impl GrokSession {
         !under_cwd
     }
 
+    /// Transport drops reset `in_flight_id`. Cancel becomes the stdout-close
+    /// "after cancel" message. Any other error is returned unchanged.
+    async fn map_transport_drop(
+        &mut self,
+        method: &str,
+        err: CoordinatorError,
+    ) -> CoordinatorError {
+        let is_transport = matches!(
+            &err,
+            CoordinatorError::Io(io) if crate::harness::abort::io_error_is_transport_drop(io)
+        );
+        if !is_transport {
+            return err;
+        }
+        self.in_flight_id.store(0, Ordering::SeqCst);
+        if !self.cancel_requested.load(Ordering::SeqCst) {
+            return err;
+        }
+        let msg = self.stdout_closed_message(method).await;
+        CoordinatorError::Message(msg)
+    }
+
     async fn write_line(&self, json_line: &str) -> Result<()> {
         self.writer.write_line(json_line).await
     }
@@ -993,10 +1027,19 @@ impl GrokSession {
                 }
                 Ok(Some(line))
             }
-            AcpTransport::Mock { incoming_rx, .. } => match incoming_rx.recv().await {
-                Some(line) => Ok(Some(line)),
-                None => Ok(None),
-            },
+            AcpTransport::Mock {
+                incoming_rx,
+                pending_transport_error,
+                ..
+            } => {
+                if let Some(err) = pending_transport_error.take() {
+                    return Err(CoordinatorError::Io(err));
+                }
+                match incoming_rx.recv().await {
+                    Some(line) => Ok(Some(line)),
+                    None => Ok(None),
+                }
+            }
         }
     }
 }
