@@ -1,6 +1,6 @@
 //! Recovery policy table (ADR-0009). Advisory text. Automatic recovery has stopped
-//! once `FAILURE.md` exists. An ACP stdout close restarts the session only before
-//! that file is written (bounded). Opt-in `address-ci` (0071) may route the ci-wait gate's
+//! once `FAILURE.md` exists. An ACP stdout close or a transport drop restarts the
+//! session only before that file is written (bounded). Opt-in `address-ci` (0071) may route the ci-wait gate's
 //! failing checks before that file exists. Nothing else auto-retries, and `FAILURE.md` ends auto-retry.
 
 use crate::outcome::FailureClass;
@@ -16,7 +16,7 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
             "Re-prompt Planner/Implementor with online research; adjust approach."
         }
         FailureClass::HarnessCrash => {
-            "For an ACP stdout close, bounded session restart already ran. Inspect exit status and stderr here. Other harness crashes are not auto-retried."
+            "For an ACP stdout close or a transport drop, bounded session restart already ran. Inspect exit status and stderr here. Other harness crashes are not auto-retried."
         }
         FailureClass::Timeout => "Increase the phase budget or split the work; then re-run.",
         FailureClass::CiFailed => {
@@ -48,7 +48,7 @@ mod tests {
         );
         assert_eq!(
             recommended_action(FailureClass::HarnessCrash),
-            "For an ACP stdout close, bounded session restart already ran. Inspect exit status and stderr here. Other harness crashes are not auto-retried."
+            "For an ACP stdout close or a transport drop, bounded session restart already ran. Inspect exit status and stderr here. Other harness crashes are not auto-retried."
         );
         assert_eq!(
             recommended_action(FailureClass::Timeout),

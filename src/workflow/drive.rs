@@ -464,6 +464,20 @@ fn finish_adapter_inject(
                         apply_adapter_failure(record, FailureClass::HarnessCrash, message);
                     }
                 }
+            } else if matches!(
+                &e,
+                CoordinatorError::Io(io)
+                    if crate::harness::abort::io_error_is_transport_drop(io)
+            ) {
+                match crate::harness::abort::note_transport_drop(record, &e, None) {
+                    crate::harness::abort::StdoutCloseDisposition::Ignore
+                    | crate::harness::abort::StdoutCloseDisposition::Retry => {}
+                    crate::harness::abort::StdoutCloseDisposition::Fail { message } => {
+                        let phase = load_run_state(record).map(|s| s.phase).unwrap_or_default();
+                        let message = crate::ci::with_green_pr_prefix(record, &phase, message);
+                        apply_adapter_failure(record, FailureClass::HarnessCrash, message);
+                    }
+                }
             } else {
                 apply_adapter_failure(record, FailureClass::HarnessCrash, msg);
             }
@@ -1347,6 +1361,78 @@ mod tests {
         assert_eq!(s.status, crate::state::RunStatus::Stopped);
         assert_eq!(s.failure_class, Some(FailureClass::HarnessCrash));
         assert_eq!(s.acp_stdout_retries, 0);
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+    }
+
+    #[test]
+    fn transport_drop_retries_without_artifact() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0091".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut s = load_run_state(&r)?;
+            s.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            s.last_driven_phase = Some("implement".into());
+            crate::state::save_run_state(&r, &s)
+        })
+        .unwrap();
+        finish_adapter_inject(
+            &r,
+            Err(CoordinatorError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            ))),
+        );
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, crate::state::RunStatus::Running);
+        assert_eq!(s.phase, "implement");
+        assert_eq!(s.acp_stdout_retries, 1);
+        assert!(s.last_driven_phase.is_none());
+        assert!(
+            s.last_event.contains("recycle: transport 1/2"),
+            "{}",
+            s.last_event
+        );
+        assert!(
+            s.last_event.contains("kind=ConnectionReset"),
+            "{}",
+            s.last_event
+        );
+        assert!(s.last_event.contains('\u{2014}'), "{}", s.last_event);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+    }
+
+    #[test]
+    fn transport_drop_at_cap_prefixes_green_pr() {
+        let _pr = crate::ci::set_test_open_green_pr(Some(91));
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0091".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut s = load_run_state(&r)?;
+            s.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            s.acp_stdout_retries = 2;
+            crate::state::save_run_state(&r, &s)
+        })
+        .unwrap();
+        finish_adapter_inject(
+            &r,
+            Err(CoordinatorError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            ))),
+        );
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, crate::state::RunStatus::Stopped);
+        assert_eq!(s.failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(s.acp_stdout_retries, 2);
+        assert!(
+            s.last_event.contains("PR #91 green; merge not performed"),
+            "{}",
+            s.last_event
+        );
+        assert!(s.last_event.contains("I/O error:"), "{}", s.last_event);
+        assert!(!s.last_event.starts_with("recycle:"), "{}", s.last_event);
         assert!(crate::notify::artifact::existing_path(&r).is_some());
     }
 

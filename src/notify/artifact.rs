@@ -197,7 +197,7 @@ fn render(event: &NotifyEvent) -> String {
     format!(
         "# Coordinator failure\n\
          \n\
-         Recommended action is **advisory**. This file means automatic recovery has stopped. An ACP stdout close restarts the session only before this file is written (bounded). Nothing else auto-retries.\n\
+         Recommended action is **advisory**. This file means automatic recovery has stopped. An ACP stdout close or a transport drop restarts the session only before this file is written (bounded). Nothing else auto-retries.\n\
          \n\
          - project_id: {project}\n\
          - track_id: {track}\n\
