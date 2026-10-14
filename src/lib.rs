@@ -7,6 +7,7 @@
 //! Token-idle CI wait + auto squash-merge: track **0010**.
 //! Cross-model review gate (Codex→Claude→OpenCode): track **0011**.
 //! Publish-only cross-model FAIL (no product blockers + evidence.md + clean tree) degrades to ci-wait: track **0051**.
+//! An in-flight shipping observation is not that degrade, and a Gate2 P1 still fails: track **0092**.
 //! Status Surface (Dioxus Desktop, default-on `ui`; `--no-default-features` escape): track **0014** / **0024**.
 //! Hermes inbound webhook notify adapter (opt-in HMAC V2): track **0015**.
 //! Coordinated multi-sibling dogfood (named-map prompt): track **0016**.

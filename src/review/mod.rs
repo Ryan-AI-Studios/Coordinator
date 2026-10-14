@@ -18,7 +18,7 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 
 use crate::error::Result;
 use crate::outcome::{
@@ -176,6 +176,13 @@ pub fn drive_with(
             .track_id
             .as_deref()
             .and_then(|id| graph::resolve_track_dir(record, id));
+        // One stamp per tier. Do not reuse it across roles in this loop.
+        let reviewed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let prompt_meta = prompt::AuditPromptMeta {
+            phase: &state.phase,
+            reviewed_at: &reviewed_at,
+            address_findings_attempts: state.address_findings_attempts,
+        };
         let req = ReviewRequest {
             slug: slug.to_string(),
             harness: binding.harness.clone(),
@@ -190,6 +197,7 @@ pub fn drive_with(
                 track_dir.as_deref(),
                 state.track_id.as_deref(),
                 &deferred,
+                &prompt_meta,
             ),
             remaining_timeout: remaining,
         };

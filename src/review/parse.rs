@@ -673,4 +673,35 @@ None at P0–P2 against the DoD-1–5 implementation itself.
             "No evidence the PR has been squash-merged"
         ));
     }
+
+    #[test]
+    fn lock_drift_p1_is_gate_fail_not_publish_only() {
+        let line = "| P1 | Lockfile diff exceeds the allowed set. Cargo.lock retargeted windows-sys, getrandom, and hashbrown outside the allowed package set. |";
+        let text = format!("## Verdict: FAIL\n\n## Findings\n\n{line}\n");
+        assert_eq!(parse_report(&text, ""), ParsedVerdict::GateFail);
+        assert!(!is_publish_only_fail(&text));
+        assert!(!is_gate2_finding(line));
+    }
+
+    #[test]
+    fn lock_drift_plus_evidence_p1_stays_gate_fail() {
+        let text = "## Verdict: FAIL\n\n## Findings\n\n| P1 | Lockfile diff exceeds the allowed set. Cargo.lock retargeted windows-sys, getrandom, and hashbrown outside the allowed package set. |\n| P1 | evidence.md missing |\n";
+        assert_eq!(parse_report(text, ""), ParsedVerdict::GateFail);
+        assert!(!is_publish_only_fail(text));
+    }
+
+    #[test]
+    fn in_flight_observation_under_verification_evidence_parses_pass() {
+        let text = "## Verdict: PASS\n\n## Findings\n\nNone.\n\n## Verification Evidence\n\n`evidence.md` not present as of 2026-10-14T01:13:36Z\n";
+        assert_eq!(parse_report(text, ""), ParsedVerdict::Pass);
+    }
+
+    #[test]
+    fn observation_sentence_as_findings_p1_stays_gate2() {
+        let line = "| P1 | evidence.md not present as of 2026-10-14T01:13:36Z |";
+        let text = format!("## Verdict: FAIL\n\n## Findings\n\n{line}\n");
+        assert!(is_gate2_finding(line));
+        assert!(!is_publish_only_fail(&text));
+        assert_eq!(parse_report(&text, ""), ParsedVerdict::GateFail);
+    }
 }
