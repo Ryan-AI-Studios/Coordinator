@@ -38,6 +38,9 @@ const TWO_MIN: Duration = Duration::from_secs(120);
 const TEN_MIN: Duration = Duration::from_secs(600);
 /// Transient push/create misses before `ci_failed`. Separate from `CI_FIX_CAP`.
 const PUBLISH_TRANSIENT_CAP: u32 = 2;
+/// Bounded retries for a merge tip that has not been read yet. Same shape and size as a transient
+/// publish miss: wait and re-read, then fall back to the fail-closed block if it truly never arrives.
+const MERGE_TIP_TRANSIENT_CAP: u32 = 2;
 
 #[cfg(test)]
 thread_local! {
@@ -338,9 +341,35 @@ fn finish_green(
                     OutcomeSource::Adapter,
                 );
             }
-            let merge_gate = match head_oid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            // An unresolved merge tip is a READ that did not arrive, not a policy violation.
+            // Treating it as a terminal block kills a run over a transient miss and leaves its work
+            // unlanded: measured 2026-10-15, 0510 stopped with `class=permission ... policy: block
+            // dependency-manifest: unreadable` while its PR #572 sat green (CLEAN, 17/17) and
+            // unmerged, and the same shape orphaned 0505's commits into a recovery PR. Wait and
+            // re-read, bounded exactly like a transient publish miss, and keep the fail-closed block
+            // for the case that genuinely never resolves. This mirrors the base-branch-policy wait
+            // immediately below, which already treats "not yet" as a wait rather than a failure.
+            let tip = head_oid.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let merge_gate = match tip {
                 Some(oid) => crate::policy::decide(record, state, cwd, oid),
-                None => crate::policy::unresolved_tip_block(record),
+                None => {
+                    let (attempts, key) = next_merge_tip_attempt(state, cwd);
+                    if attempts >= MERGE_TIP_TRANSIENT_CAP {
+                        crate::policy::unresolved_tip_block(record)
+                    } else {
+                        persist_watch(
+                            record,
+                            Some("ci-wait: waiting (merge tip not resolved yet)"),
+                            |ci| {
+                                ci.merge_tip_transient_attempts = attempts;
+                                if let Some(ref k) = key {
+                                    ci.merge_tip_transient_sha = Some(k.clone());
+                                }
+                            },
+                        )?;
+                        return Ok(None);
+                    }
+                }
             };
             if let MutationGate::Stop(view) = release_for_mutation(record, state, &merge_gate)? {
                 return Ok(view.map(|view| *view));
@@ -959,6 +988,28 @@ fn next_transient_attempt(
         Some(sha) => Some(sha),
         None => gh::git_head_sha(cwd),
     };
+    let mut attempts = prev_attempts;
+    if let Some(ref k) = key
+        && prev_sha.as_deref() != Some(k.as_str())
+    {
+        attempts = 0;
+    }
+    (attempts.saturating_add(1), key)
+}
+
+/// Bounded retry for an unresolved merge tip. Mirrors `next_transient_attempt`: the counter is keyed
+/// on the HEAD it is counting, and a missing read does not reset the previous count.
+fn next_merge_tip_attempt(state: &RunState, cwd: &Path) -> (u32, Option<String>) {
+    let prev_attempts = state
+        .ci
+        .as_ref()
+        .map(|c| c.merge_tip_transient_attempts)
+        .unwrap_or(0);
+    let prev_sha = state
+        .ci
+        .as_ref()
+        .and_then(|c| c.merge_tip_transient_sha.clone());
+    let key = gh::git_head_sha(cwd);
     let mut attempts = prev_attempts;
     if let Some(ref k) = key
         && prev_sha.as_deref() != Some(k.as_str())
@@ -3664,6 +3715,31 @@ mod tests {
             ci.last_poll_at = None;
         }
         save_run_state(r, &st).unwrap();
+    }
+
+    #[test]
+    fn merge_tip_transient_counts_toward_the_cap() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        // A merge tip that has not been read yet counts as one bounded attempt, not a verdict.
+        let st = load_run_state(&r).unwrap();
+        let (n1, key1) = next_merge_tip_attempt(&st, dir.path());
+        assert_eq!(n1, 1, "a first unresolved merge tip counts as one attempt");
+        // Persisted, the same head keeps counting toward the cap instead of resetting.
+        let mut st = load_run_state(&r).unwrap();
+        st.ci = Some(CiWatchState {
+            merge_tip_transient_attempts: n1,
+            merge_tip_transient_sha: key1.clone(),
+            ..Default::default()
+        });
+        save_run_state(&r, &st).unwrap();
+        let st = load_run_state(&r).unwrap();
+        let (n2, _) = next_merge_tip_attempt(&st, dir.path());
+        assert_eq!(n2, 2, "the same head keeps counting toward the cap");
+        assert!(
+            n2 >= MERGE_TIP_TRANSIENT_CAP,
+            "the second miss reaches the cap, where the fail-closed block takes over"
+        );
     }
 
     fn seed_transient(r: &ProjectRecord, attempts: u32, sha: Option<&str>) {

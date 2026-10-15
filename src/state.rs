@@ -255,6 +255,13 @@ pub struct CiWatchState {
     /// HEAD the transient counter is counting. Absent on old files and after `Opened`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_transient_sha: Option<String>,
+    /// Transient unresolved-merge-tip misses for `merge_tip_transient_sha`. Old files load as 0.
+    /// A merge tip that has not arrived yet is a read that failed, not a policy violation (0092).
+    #[serde(default)]
+    pub merge_tip_transient_attempts: u32,
+    /// HEAD the merge-tip counter is counting. Absent on old files and after `Opened`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_tip_transient_sha: Option<String>,
 }
 
 /// One failing check from the judged slice handed to `address-ci` (0071).
