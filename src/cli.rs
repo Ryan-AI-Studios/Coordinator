@@ -142,7 +142,7 @@ pub enum Commands {
         #[command(subcommand)]
         action: HarnessCommands,
     },
-    /// Show or toggle machine Role Bindings (planner/implementor ACP harness)
+    /// Show, toggle, or set machine Role Bindings (planner/implementor/reviewers)
     Roles {
         #[command(subcommand)]
         action: RolesCommands,
@@ -172,6 +172,23 @@ pub enum RolesCommands {
     Use {
         /// grok | cursor
         target: RolesTarget,
+    },
+    /// Set harness/model on ANY role binding (partial update; unsupplied fields are kept)
+    Set {
+        /// Role key, e.g. planner | implementor | fold | next | cross_model_primary
+        role: String,
+        /// Harness adapter name to write into the binding
+        #[arg(long)]
+        harness: Option<String>,
+        /// Command to spawn for this role
+        #[arg(long)]
+        command: Option<String>,
+        /// Model id passed to the harness verbatim (cursor base ids accept [effort=...])
+        #[arg(long)]
+        model: Option<String>,
+        /// Remove this role's model pin (harness default applies)
+        #[arg(long)]
+        clear_model: bool,
     },
 }
 
@@ -813,6 +830,22 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     RolesTarget::Cursor => "cursor",
                 };
                 let bindings = crate::harness::roles::roles_use(slug)?;
+                println!("{}", serde_json::to_string_pretty(&bindings)?);
+            }
+            RolesCommands::Set {
+                role,
+                harness,
+                command,
+                model,
+                clear_model,
+            } => {
+                let bindings = crate::harness::roles::roles_set(
+                    &role,
+                    harness.as_deref(),
+                    command.as_deref(),
+                    model.as_deref(),
+                    clear_model,
+                )?;
                 println!("{}", serde_json::to_string_pretty(&bindings)?);
             }
         },
@@ -1514,6 +1547,39 @@ mod tests {
         let roles = cmd.find_subcommand("roles").expect("roles");
         assert!(roles.find_subcommand("show").is_some(), "missing show");
         assert!(roles.find_subcommand("use").is_some(), "missing use");
+        assert!(
+            roles.find_subcommand("set").is_some(),
+            "missing set (per-role harness/model editor)"
+        );
+        let parsed = Cli::try_parse_from([
+            "coordinator",
+            "roles",
+            "set",
+            "planner",
+            "--harness",
+            "cursor",
+            "--model",
+            "claude-sonnet-5-5[effort=high]",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::Roles {
+                action:
+                    RolesCommands::Set {
+                        role,
+                        harness,
+                        model,
+                        clear_model,
+                        ..
+                    },
+            } => {
+                assert_eq!(role, "planner");
+                assert_eq!(harness.as_deref(), Some("cursor"));
+                assert_eq!(model.as_deref(), Some("claude-sonnet-5-5[effort=high]"));
+                assert!(!clear_model, "clear_model must default false");
+            }
+            other => panic!("expected roles set, got {other:?}"),
+        }
         let parsed = Cli::try_parse_from(["coordinator", "roles", "use", "cursor"]).unwrap();
         match parsed.command {
             Commands::Roles {
