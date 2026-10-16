@@ -113,11 +113,33 @@ pub fn track_ids_match(a: &str, b: &str) -> bool {
 }
 
 pub(crate) fn numeric_track_id(s: &str) -> Option<&str> {
-    if s.len() >= 4 && s.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
-        let rest = &s[4..];
-        if rest.is_empty() || rest.starts_with('-') {
-            return Some(&s[..4]);
+    let s = s.trim();
+    // Tolerate an alpha prefix: a registry may write `T374` where the engine canonicalises on
+    // `374` (see `conductor_md::parse_leading_id`). The digit run is what identifies the track,
+    // so compare on that. The bare form keeps its four-digit floor -- it is the canonical shape.
+    if s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+        let n = s[1..].bytes().take_while(u8::is_ascii_digit).count();
+        if n == 0 {
+            return None;
         }
+        let digits = &s[1..1 + n];
+        let rest = &s[1 + n..];
+        if rest.is_empty() || rest.starts_with('-') {
+            return Some(digits);
+        }
+        return None;
+    }
+    // The bare form must accept a digit run of ANY length, not only four. The engine launches
+    // AI-Brains as `374` while the registry prefixes the same id `T374`; comparing them requires
+    // both sides to yield the same digit run. A four-digit floor here left `("T374","374")`
+    // unmatchable -- the second half of the same defect (0075).
+    let n = s.bytes().take_while(u8::is_ascii_digit).count();
+    if n == 0 {
+        return None;
+    }
+    let rest = &s[n..];
+    if rest.is_empty() || rest.starts_with('-') {
+        return Some(&s[..n]);
     }
     None
 }
@@ -328,6 +350,22 @@ mod tests {
         assert!(!track_ids_match("0040", "0041"));
         assert!(!track_ids_match("null", "0040"));
         assert!(!track_ids_match("", "0040"));
+    }
+
+    #[test]
+    fn track_ids_match_tolerates_an_alpha_prefix() {
+        // A registry may write `| T374 | ... |` while the engine launches with `374`. Both must
+        // identify the same track, in either argument order, or the fold -> implement gate can
+        // never read such a project's row (0075).
+        assert!(track_ids_match("T374", "374"));
+        assert!(track_ids_match("374", "T374"));
+        assert!(track_ids_match("T374", "T374"));
+        assert!(!track_ids_match("T374", "T375"));
+        // A trailing slug is still tolerated, exactly as the bare form tolerates `0040-Slug`.
+        assert!(track_ids_match("T374-agy-stop-hook-quoting", "374"));
+        // A prefix with no digits is not an id.
+        assert!(!track_ids_match("Tabc", "374"));
+        assert!(!track_ids_match("T", "374"));
     }
 
     #[test]
