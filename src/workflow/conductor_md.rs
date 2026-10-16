@@ -257,6 +257,22 @@ fn row_matches_track(row: &TrackRow, key: &str) -> bool {
         || crate::notify::artifact::track_ids_match(&slug, key)
 }
 
+/// True when a row matching `key` is `Proposed` (not yet Ready, not Blocked).
+///
+/// A `Proposed` row whose spec/plan already exist must still run the planning
+/// skill. Those files may be a deliberate hold-boundary record that predates the
+/// track's "Before Ready" prerequisites, so a fast-skip decided on file presence
+/// alone leaves the required plan permanently un-writable and stalls every fold.
+pub(crate) fn track_row_proposed(record: &ProjectRecord, track_id: Option<&str>) -> bool {
+    let Some(key) = track_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    load_track_rows(record).is_some_and(|rows| {
+        rows.iter()
+            .any(|row| row_matches_track(row, key) && is_proposed(&row.status_raw))
+    })
+}
+
 /// True when a row matching `key` has status Completed.
 pub fn track_row_completed(rows: &[TrackRow], key: &str) -> bool {
     rows.iter()

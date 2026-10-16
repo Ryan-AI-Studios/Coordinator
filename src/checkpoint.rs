@@ -5,7 +5,6 @@
 //! do not take [`with_run_state_lock`].
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::error::{CoordinatorError, Result};
 use crate::registry::ProjectRecord;
@@ -270,7 +269,7 @@ struct GitOut {
 
 fn git(cwd: &Path, args: &[&str]) -> Result<GitOut> {
     let shown = args.join(" ");
-    let out = Command::new(Path::new("git"))
+    let out = crate::git_command::command()
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -344,7 +343,6 @@ mod tests {
     };
     use chrono::Utc;
     use std::path::Path;
-    use std::process::Command;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -378,7 +376,7 @@ mod tests {
     }
 
     fn git_cmd(cwd: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = crate::git_command::command()
             .args(args)
             .current_dir(cwd)
             .env("GIT_OPTIONAL_LOCKS", "0")
@@ -392,7 +390,7 @@ mod tests {
     }
 
     fn git_stdout(cwd: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::git_command::command()
             .args(args)
             .current_dir(cwd)
             .env("GIT_OPTIONAL_LOCKS", "0")
@@ -1080,7 +1078,7 @@ mod tests {
         assert_eq!(head(&epoch), shared);
         assert_eq!(head(repo.path()), shared);
         assert!(!epoch.join("local.txt").exists());
-        let sym = Command::new("git")
+        let sym = crate::git_command::command()
             .args(["symbolic-ref", "--short", "HEAD"])
             .current_dir(&epoch)
             .output()
@@ -1160,7 +1158,7 @@ mod tests {
         let (repo, _ws, _state, rec) = fixture(false);
         std::fs::write(repo.path().join("old.txt"), b"old\n").unwrap();
         git_cmd(repo.path(), &["add", "old.txt"]);
-        let mut cmd = Command::new("git");
+        let mut cmd = crate::git_command::command();
         cmd.args(["commit", "-m", "old"])
             .current_dir(repo.path())
             .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")

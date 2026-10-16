@@ -4,8 +4,7 @@
 //! and before `squash_merge`. An unreadable read is a block. `COORDINATOR_STATE_POLICIES=off`
 //! skips the read.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 #[cfg(test)]
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -594,7 +593,7 @@ struct GitCaptured {
 
 fn git(cwd: &Path, args: &[&str]) -> Result<GitCaptured> {
     let shown = args.join(" ");
-    let out = Command::new(PathBuf::from("git"))
+    let out = crate::git_command::command()
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -675,7 +674,6 @@ mod tests {
     use crate::config::{ENV_COORDINATOR_HOME, MachineConfig, save_machine_config, test_env_lock};
     use crate::layout::LayoutProfile;
     use crate::state::{RunState, save_run_state};
-    use std::process::Command;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -942,7 +940,7 @@ mod tests {
     }
 
     fn git(cwd: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = crate::git_command::command()
             .args(args)
             .current_dir(cwd)
             .env("GIT_OPTIONAL_LOCKS", "0")
@@ -956,7 +954,7 @@ mod tests {
     }
 
     fn git_stdout(cwd: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::git_command::command()
             .args(args)
             .current_dir(cwd)
             .env("GIT_OPTIONAL_LOCKS", "0")

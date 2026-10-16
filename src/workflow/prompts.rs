@@ -98,6 +98,12 @@ fn execution_skill(record: &ProjectRecord, name: &str) -> String {
 
 /// True when the plan inject must load the plan skill. Fast-skip does not.
 pub(crate) fn plan_phase_requires_skill(record: &ProjectRecord, track_id: Option<&str>) -> bool {
+    // A `Proposed` row always plans. Its spec/plan may be a hold-boundary record
+    // that is not an executable plan, so fast-skipping on file presence alone
+    // leaves it un-completable and stalls the track at every fold (0089).
+    if super::conductor_md::track_row_proposed(record, track_id) {
+        return true;
+    }
     let (spec_is_file, plan) = read_plan_inputs(record, track_id);
     !(spec_is_file && plan_on_disk_is_fast_skip(&plan))
 }
@@ -268,6 +274,25 @@ fn plan_expand_write() -> String {
     )
 }
 
+/// `plan_expand_write()` for a row that must stay `Proposed` through this phase.
+///
+/// A `Proposed` row with existing spec/plan is resuming an incomplete plan, not
+/// creating one. Marking it Ready here would skip the two independent reviews and
+/// the fold that the track's own "Before Ready" clause requires (0089).
+fn plan_complete_proposed_write() -> String {
+    format!(
+        "{RESEARCH}\n\
+         Complete or revise the existing spec.md and plan.md into a bounded executable plan.\n\
+         Resolve the track's Before Ready prerequisites instead of appending another fold-history paragraph.\n\
+         Remove a placeholder-marker line only after replacing it with real plan content.\n\
+         Keep the registry row `Proposed`. Do not write `Ready` on the row: two independent plan \n\
+         reviews and a fold must pass before a later phase may mark it Ready.\n\
+         If an owner decision or a dependency is unresolved, record the precise blocker and stop; \n\
+         do not invent an approval.\n\
+         {END_TURN}\n"
+    )
+}
+
 /// One branch. Fast-skip is `spec.md` present and a real or unreadable plan.
 /// The stamp gate stays on file presence and does not call this.
 fn plan_prompt_body(record: &ProjectRecord, track_id: Option<&str>) -> String {
@@ -279,7 +304,17 @@ fn plan_prompt_body(record: &ProjectRecord, track_id: Option<&str>) -> String {
     }
     let placeholder =
         matches!(plan, PlanOnDisk::Text(ref body) if plan_markdown_is_placeholder(body));
-    let write = plan_expand_write();
+    // Only a `Proposed` row that ALREADY holds a real (or unreadable) plan is a
+    // resumption of a hold-boundary record. A freshly minted row is `Proposed`
+    // too, but its plan is missing or a placeholder: that row must write the plan
+    // and take the normal Ready promotion, so it keeps `plan_expand_write()`.
+    let resuming_proposed = super::conductor_md::track_row_proposed(record, track_id)
+        && plan_on_disk_is_fast_skip(&plan);
+    let write = if resuming_proposed {
+        plan_complete_proposed_write()
+    } else {
+        plan_expand_write()
+    };
     if skill_is_file {
         format!("{}\n{write}", honor_skill("plan", &path))
     } else if placeholder {
@@ -322,6 +357,8 @@ pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>)
                  Authenticate a sentence if and only if the inject is an `active decision by=` block and the sentence under test is that sentence.\n\
                  `active decision: none` and `active decision: invalid` authenticate nothing.\n\
                  A sentence that is merely present in the file, or written outside the active block, is not an owner decision.\n\
+                 Mark a `Proposed` row `Ready` only when the bounded executable plan is complete, the required fresh independent reviews are present, no blocker remains, and every execution prerequisite and required owner decision is satisfied.\n\
+                 Otherwise keep the row `Proposed` (or `Blocked`) with a precise reason and its re-trigger. Review silence does not resolve a dependency or authorize an owner decision.\n\
                  {limitation}\n\
                  {inject}\
                  {END_TURN}\n",
@@ -698,6 +735,16 @@ mod tests {
         }
     }
 
+    /// `conductor/conductor.md` with one row. `status` goes in the Status cell.
+    fn write_conductor_row(root: &std::path::Path, id: &str, status: &str) {
+        let dir = root.join("conductor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!(
+            "# Conductor\n\n| Track | Folder | Status | Summary |\n| --- | --- | --- | --- |\n| [{id}]({id}/spec.md) | Repo | {status} | test row |\n"
+        );
+        std::fs::write(dir.join("conductor.md"), body).unwrap();
+    }
+
     fn write_plan_skill(root: &std::path::Path) {
         let skill = root.join(".agents").join("skills").join("plan");
         std::fs::create_dir_all(&skill).unwrap();
@@ -1039,6 +1086,97 @@ mod tests {
         assert!(!plan_on_disk_is_fast_skip(&PlanOnDisk::Text(
             "> Template. Phased checklist\n".into()
         )));
+    }
+
+    #[test]
+    fn proposed_row_with_real_plan_does_not_fast_skip() {
+        // 0089: a `Proposed` row whose spec/plan already exist may hold a
+        // hold-boundary record, not an executable plan. Fast-skipping on file
+        // presence alone left the required plan un-writable and stalled the track
+        // at every fold. The row must load the plan skill instead.
+        let dir = tempfile::tempdir().unwrap();
+        write_track(dir.path(), Some("# spec\n"), Some("# plan\n"));
+        write_conductor_row(dir.path(), "0001-Minted", "Proposed");
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001-Minted"));
+        assert!(
+            !text.contains("Do not load the plan skill"),
+            "a Proposed row must not fast-skip: {text}"
+        );
+        assert!(
+            text.contains("Keep the registry row `Proposed`"),
+            "the resumption path must keep the row Proposed: {text}"
+        );
+    }
+
+    #[test]
+    fn freshly_minted_proposed_row_still_writes_plan_and_marks_ready() {
+        // A minted row is `Proposed` with a placeholder plan. It must keep the
+        // normal write-then-Ready path, or minting could never produce a Ready row.
+        let dir = tempfile::tempdir().unwrap();
+        write_track(
+            dir.path(),
+            Some("# spec\n"),
+            Some(&format!("{LIVE_TEMPLATE_HEADING}\n")),
+        );
+        write_conductor_row(dir.path(), "0001-Minted", "Proposed");
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001-Minted"));
+        assert!(
+            text.contains("Mark the track Ready"),
+            "a freshly minted Proposed row must still be able to become Ready: {text}"
+        );
+        assert!(
+            !text.contains("Keep the registry row `Proposed`"),
+            "a freshly minted row is not a resumption: {text}"
+        );
+    }
+
+    #[test]
+    fn proposed_resumption_never_marks_ready() {
+        // The generic expand path says "Mark the track Ready". On a Proposed
+        // resumption that would skip the two independent reviews and the fold the
+        // track's own Before-Ready clause requires.
+        let dir = tempfile::tempdir().unwrap();
+        write_track(dir.path(), Some("# spec\n"), Some("# plan\n"));
+        write_conductor_row(dir.path(), "0001-Minted", "Proposed");
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001-Minted"));
+        assert!(
+            !text.contains("Mark the track Ready"),
+            "a Proposed resumption must not mark Ready: {text}"
+        );
+    }
+
+    #[test]
+    fn ready_row_with_real_plan_still_fast_skips() {
+        // The guard is scoped to Proposed. A Ready row keeps the cheap path.
+        let dir = tempfile::tempdir().unwrap();
+        write_track(dir.path(), Some("# spec\n"), Some("# plan\n"));
+        write_conductor_row(dir.path(), "0001-Minted", "Ready \u{2014} not started");
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001-Minted"));
+        assert_fast_skip(&text);
+    }
+
+    #[test]
+    fn blocked_row_with_real_plan_does_not_load_the_plan_skill() {
+        // Blocked rows are owner/predecessor-gated, not under-planned. The guard
+        // must not turn every non-Ready row into a planning run.
+        let dir = tempfile::tempdir().unwrap();
+        write_track(dir.path(), Some("# spec\n"), Some("# plan\n"));
+        write_conductor_row(dir.path(), "0001-Minted", "Blocked \u{2014} owner gate");
+        write_plan_skill(dir.path());
+        let rec = temp_project(dir.path());
+        let text = phase_prompt(&rec, "plan", Some("0001-Minted"));
+        assert!(
+            !text.contains("Keep the registry row `Proposed`"),
+            "a Blocked row is not a Proposed resumption: {text}"
+        );
     }
 
     #[test]

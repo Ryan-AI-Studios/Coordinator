@@ -1,7 +1,6 @@
 //! Opt-in route from the gate's failing checks into same-epoch `address-ci` (0071, 0079).
 
 use std::path::Path;
-use std::process::Command;
 
 use crate::error::Result;
 use crate::notify::artifact::numeric_track_id;
@@ -186,7 +185,7 @@ pub fn classify_diff(record: &ProjectRecord, state: &RunState) -> DiffClass {
 }
 
 fn git_text(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new(Path::new("git"))
+    let out = crate::git_command::command()
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -281,7 +280,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = crate::git_command::command()
             .args(args)
             .current_dir(dir)
             .env("GIT_OPTIONAL_LOCKS", "0")

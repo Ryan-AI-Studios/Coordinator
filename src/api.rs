@@ -988,7 +988,7 @@ mod tests {
     fn attach_clean_exec(rec: &ProjectRecord) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::git_command::command()
                 .args(args)
                 .current_dir(dir.path())
                 .env("GIT_OPTIONAL_LOCKS", "0")
