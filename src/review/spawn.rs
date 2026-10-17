@@ -138,14 +138,10 @@ fn claude_argv(req: &ReviewRequest, _schema_path: &Path) -> Vec<String> {
 
 /// 0011 OpenCode argv. Prompt is stdin (see LiveCli), never a positional —
 /// npm `opencode.cmd` forwards `%*` and cmd.exe truncates at `<LF>`.
+/// No `--dir`: the installed `opencode v2.0.32` rejects it; the child's cwd is
+/// already `req.exec_repo` (see `LiveCli::run`).
 fn opencode_argv(req: &ReviewRequest) -> Vec<String> {
-    let mut args = vec![
-        "run".into(),
-        "--dir".into(),
-        req.exec_repo.to_string_lossy().into_owned(),
-        "--format".into(),
-        "default".into(),
-    ];
+    let mut args = vec!["run".into(), "--format".into(), "default".into()];
     if let Some(ref model) = req.model
         && !model.trim().is_empty()
     {
@@ -486,10 +482,7 @@ mod tests {
         let args = argv_for(&r, Path::new("last.txt"), Path::new("schema.json"));
         assert_eq!(args[0], "run");
         assert!(!args.iter().any(|a| a == "--auto"));
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--dir" && w[1] == r"C:\dev\proj\app")
-        );
+        assert!(!args.iter().any(|a| a == "--dir"), "{args:?}");
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--format" && w[1] == "default")
@@ -498,6 +491,18 @@ mod tests {
             !args.iter().any(|a| a == "audit please" || a.contains('\n')),
             "prompt must be stdin, not argv: {args:?}"
         );
+    }
+
+    #[test]
+    fn opencode_model_variant_passes_byte_exact() {
+        let mut r = req("opencode");
+        r.model = Some("opencode-go/deepseek-v4.1-flash#high".into());
+        let args = argv_for(&r, Path::new("last.txt"), Path::new("schema.json"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "opencode-go/deepseek-v4.1-flash#high")
+        );
+        assert!(!args.iter().any(|a| a == "--dir"));
     }
 
     #[test]
