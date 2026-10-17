@@ -8,6 +8,7 @@ pub mod abort;
 pub mod capabilities;
 pub mod grok;
 pub mod journal;
+pub mod no_change;
 pub mod pool;
 pub mod preflight;
 pub mod roles;

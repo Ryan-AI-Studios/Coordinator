@@ -374,6 +374,8 @@ There are **no skip slots**. `cross-model-review` is a real one-shot gate (track
 
 ### Cross-model review gate
 
+**No-change implement leg (0095):** an adapter-driven `implement` or `address-findings` turn that leaves `HEAD`, `git status --porcelain` and the `git diff HEAD` hash exactly as the leg found them (sampled in the session cwd, so the epoch worktree under isolation) does not advance. It stops `harness_crash` with `implement leg produced no changes: …` naming the harness and last permission signal. If either git read fails the guard stays silent and the `ci-wait` empty-leg failure is the backstop. A plan that was already satisfied also trips it; advance that run by hand.
+
 After implement, Coordinator runs a **fresh, read-only CLI exec** (not a Grok Session) in Role Binding order **Codex → Claude → OpenCode**. Defaults ship `model: null` (omit `-m` / `--model`). File slug is the binding `harness` field (`review.codex.md`). Coordinator **does not** write `review.md`.
 
 | Item | Behavior |
