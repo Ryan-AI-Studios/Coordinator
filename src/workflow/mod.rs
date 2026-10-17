@@ -209,6 +209,20 @@ pub fn on_success(
                     crate::progress_log::append(record, FOLD_WITHHELD_KIND, &state.last_event);
                     return AddressCiFollowUp::Continue;
                 }
+                conductor_md::FoldAdvance::RowMissing { key, parsed } => {
+                    state.status = RunStatus::Stopped;
+                    state.failure_class = None;
+                    // The registry was readable and parsed; this row simply is not in the
+                    // table. Name it and the count -- the usual cause is a heading or `---`
+                    // that ended the table before the row.
+                    state.last_event = format!(
+                        "workflow: fold withheld (track {key} absent from the registry table; \
+                         {parsed} rows parsed - a heading or `---` may have ended the table \
+                         before its row)"
+                    );
+                    crate::progress_log::append(record, FOLD_WITHHELD_KIND, &state.last_event);
+                    return AddressCiFollowUp::Continue;
+                }
             }
         }
         let from = state.phase.clone();

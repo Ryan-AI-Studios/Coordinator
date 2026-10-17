@@ -1115,8 +1115,21 @@ pub fn capture_sticky_ready_ids(record: &ProjectRecord, prev: &[String]) -> Vec<
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FoldAdvance {
     Allow,
-    Withhold { status_clean: String },
+    Withhold {
+        status_clean: String,
+    },
+    /// Nothing could be read: no id given, or the registry is missing/unparseable.
     Unreadable,
+    /// The registry parsed cleanly, but no row matched `key`.
+    ///
+    /// Distinct from [`FoldAdvance::Unreadable`] on purpose. A row can sit OUTSIDE
+    /// the track table -- a heading or a `---` ends the table, so rows below it belong
+    /// to no table and are never parsed. Reporting the parsed-row count and the key
+    /// makes that self-evident instead of reading as a corrupt registry.
+    RowMissing {
+        key: String,
+        parsed: usize,
+    },
 }
 
 /// Read the registry row for `track_id`. Missing id, file, or row is [`FoldAdvance::Unreadable`].
@@ -1128,7 +1141,10 @@ pub fn fold_advance(record: &ProjectRecord, track_id: Option<&str>) -> FoldAdvan
         return FoldAdvance::Unreadable;
     };
     let Some(row) = rows.iter().find(|r| row_matches_track(r, key)) else {
-        return FoldAdvance::Unreadable;
+        return FoldAdvance::RowMissing {
+            key: key.to_string(),
+            parsed: rows.len(),
+        };
     };
     let aliases = ready_aliases_for(record);
     if is_eligible_ready_in(&row.status_raw, &aliases) {
@@ -1491,7 +1507,22 @@ mod tests {
              | --- | --- | --- |\n\
              | [0002-Two](0002-Two/spec.md) | **Ready — not started** | ok |\n",
         );
-        assert_eq!(fold_advance(&record, Some("0001")), FoldAdvance::Unreadable);
+        // Not `Unreadable`: the registry parsed. The row is simply not in it.
+        assert_eq!(
+            fold_advance(&record, Some("0001")),
+            FoldAdvance::RowMissing {
+                key: "0001".into(),
+                parsed: 1
+            }
+        );
+        // `key` is echoed verbatim, so a T-prefixed id is reported as asked.
+        assert_eq!(
+            fold_advance(&record, Some("T374")),
+            FoldAdvance::RowMissing {
+                key: "T374".into(),
+                parsed: 1
+            }
+        );
 
         let withhold = |record: &ProjectRecord, status: &str| {
             write_md(record.path.as_path(), &one_row(status, "ok", false));
