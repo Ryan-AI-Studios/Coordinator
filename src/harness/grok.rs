@@ -322,7 +322,7 @@ impl GrokSession {
         harness: &str,
     ) -> Result<Self> {
         let args = acp_agent_argv(harness, model);
-        Self::spawn_piped(cwd, timeout, bin, &args, harness).await
+        Self::spawn_piped(cwd, timeout, bin, &args, harness, model).await
     }
 
     /// Test peer: do not append `acp_agent_argv`.
@@ -333,7 +333,7 @@ impl GrokSession {
         bin: PathBuf,
         args: &[String],
     ) -> Result<Self> {
-        Self::spawn_piped(cwd, timeout, bin, args, "grok").await
+        Self::spawn_piped(cwd, timeout, bin, args, "grok", None).await
     }
 
     async fn spawn_piped(
@@ -342,6 +342,7 @@ impl GrokSession {
         bin: PathBuf,
         args: &[String],
         harness: &str,
+        model: Option<&str>,
     ) -> Result<Self> {
         let mut cmd = acp_spawn_command(&bin);
         for arg in args {
@@ -404,7 +405,7 @@ impl GrokSession {
             last_tool_title: None,
         };
         session.terminals.set_adapter(harness);
-        session.handshake(timeout).await?;
+        session.handshake(timeout, model).await?;
         if let Err(e) = session.terminals.probe_host_shell().await {
             let _ = session.shutdown().await;
             return Err(CoordinatorError::Message(e));
@@ -476,7 +477,7 @@ impl GrokSession {
             last_tool_title: None,
         };
         session.terminals.set_adapter(harness);
-        session.handshake(timeout).await?;
+        session.handshake(timeout, None).await?;
         Ok(session)
     }
 
@@ -554,7 +555,7 @@ impl GrokSession {
         self.progress_record = Some(record);
     }
 
-    async fn handshake(&mut self, timeout: Duration) -> Result<()> {
+    async fn handshake(&mut self, timeout: Duration, model: Option<&str>) -> Result<()> {
         let init = self
             .request(
                 "initialize",
@@ -571,16 +572,22 @@ impl GrokSession {
         self.compact_command = context_reduce_command(&init, &self.adapter);
         self.supports_compact = self.compact_command.is_some();
 
-        let method_id = pick_auth_method(&init, &self.adapter)?;
-        self.request(
-            "authenticate",
-            json!({
-                "methodId": method_id,
-                "_meta": { "headless": true }
-            }),
-            timeout,
-        )
-        .await?;
+        // grok/cursor authenticate over ACP. The npm adapters self-authenticate from
+        // their own CLI credentials and advertise no `authMethods`, so
+        // `pick_auth_method` would fail on them — skip it and go straight to
+        // `session/new`.
+        if !is_adaptor_session_harness(&self.adapter) {
+            let method_id = pick_auth_method(&init, &self.adapter)?;
+            self.request(
+                "authenticate",
+                json!({
+                    "methodId": method_id,
+                    "_meta": { "headless": true }
+                }),
+                timeout,
+            )
+            .await?;
+        }
 
         let cwd = self.cwd.to_string_lossy().into_owned();
         let created = self
@@ -602,6 +609,40 @@ impl GrokSession {
         self.session_id = session_id.to_string();
         if let Ok(mut shared) = self.session_id_shared.lock() {
             *shared = self.session_id.clone();
+        }
+        self.select_model(model, timeout).await?;
+        Ok(())
+    }
+
+    /// Select the phase-pinned model over JSON-RPC. Grok and cursor receive it in
+    /// argv (`-m` / `--model`); the npm adapters take a per-session call instead, and
+    /// their dialects differ:
+    /// - codex: `session/set_model { sessionId, modelId }`, effort inside the id;
+    /// - claude: `session/set_config_option { sessionId, configId: "model", value }`.
+    ///
+    /// A no-op for grok/cursor and for an absent or blank model.
+    async fn select_model(&mut self, model: Option<&str>, timeout: Duration) -> Result<()> {
+        let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+            return Ok(());
+        };
+        if self.adapter.eq_ignore_ascii_case("codex") {
+            self.request(
+                "session/set_model",
+                json!({ "sessionId": self.session_id, "modelId": m }),
+                timeout,
+            )
+            .await?;
+        } else if self.adapter.eq_ignore_ascii_case("claude") {
+            self.request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": self.session_id,
+                    "configId": "model",
+                    "value": m
+                }),
+                timeout,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1239,9 +1280,26 @@ pub fn harness_error_in_text(text: &str) -> Option<String> {
     None
 }
 
-/// Case-insensitive `grok` or `cursor` — harnesses that use this ACP client.
+/// Case-insensitive `grok`, `cursor`, or a published ACP-adapter harness — the
+/// harnesses driven on this ACP client.
 pub fn is_acp_session_harness(h: &str) -> bool {
-    h.eq_ignore_ascii_case("grok") || h.eq_ignore_ascii_case("cursor")
+    h.eq_ignore_ascii_case("grok")
+        || h.eq_ignore_ascii_case("cursor")
+        || is_adaptor_session_harness(h)
+}
+
+/// Harnesses driven through a published npm ACP adapter (`claude-agent-acp`,
+/// `codex-acp`). Each is a stdio server with no subcommand and authenticates from
+/// its own CLI credentials, so:
+/// - it takes **no argv** — the binding `command` must point at the adapter shim
+///   (`claude-agent-acp` / `codex-acp`), not at the plain product CLI;
+/// - `authenticate` is skipped (it advertises no `authMethods` to pick from);
+/// - the model is selected over JSON-RPC after `session/new`, because argv `-m` is
+///   grok-specific: codex uses `session/set_model { modelId }` (effort rides in the
+///   id, e.g. `gpt-6.1-sol[medium]`), claude uses
+///   `session/set_config_option { configId: "model", value }`.
+pub fn is_adaptor_session_harness(h: &str) -> bool {
+    h.eq_ignore_ascii_case("claude") || h.eq_ignore_ascii_case("codex")
 }
 
 /// `grok agent [-m {model}] stdio`. Omit `-m` when model is none/empty.
@@ -1258,7 +1316,10 @@ pub fn grok_agent_argv(model: Option<&str>) -> Vec<String> {
     args
 }
 
-/// ACP child argv for `harness`. Grok stays `agent [-m] stdio`; cursor is `--yolo --trust [--model] acp`.
+/// ACP child argv for `harness`. Grok stays `agent [-m] stdio`; cursor is
+/// `--yolo --trust [--model] acp`; the npm adapters take no argv at all (their shim
+/// is the whole command, and the model is a JSON-RPC call — see
+/// [`is_adaptor_session_harness`]).
 pub fn acp_agent_argv(harness: &str, model: Option<&str>) -> Vec<String> {
     if harness.eq_ignore_ascii_case("cursor") {
         let mut args = vec!["--yolo".into(), "--trust".into()];
@@ -1271,6 +1332,8 @@ pub fn acp_agent_argv(harness: &str, model: Option<&str>) -> Vec<String> {
         }
         args.push("acp".into());
         args
+    } else if is_adaptor_session_harness(harness) {
+        Vec::new()
     } else {
         grok_agent_argv(model)
     }
@@ -1753,7 +1816,13 @@ mod tests {
         assert_eq!(acp_agent_argv("grok", None), grok_agent_argv(None));
         assert!(is_acp_session_harness("grok"));
         assert!(is_acp_session_harness("CURSOR"));
+        assert!(is_acp_session_harness("claude"));
+        assert!(is_acp_session_harness("CODEX"));
         assert!(!is_acp_session_harness("opencode"));
+        assert!(!is_acp_session_harness("antigravity"));
+        assert!(is_adaptor_session_harness("claude"));
+        assert!(is_adaptor_session_harness("codex"));
+        assert!(!is_adaptor_session_harness("grok"));
     }
 
     #[test]

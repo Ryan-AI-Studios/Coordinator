@@ -271,8 +271,11 @@ pub fn capability_map_markdown() -> String {
     let mut out = String::new();
     out.push_str("# Capability map\n\n");
     out.push_str(
-        "Coordinator drives grok and cursor on one ACP client (`is_acp_session_harness`). \
-One-shot reviewers from `default_role_bindings` are separate rows. \
+        "Coordinator drives grok, cursor, and the published claude/codex ACP adapters on one \
+ACP client (`is_acp_session_harness`). The rows below still describe how the *shipped* \
+`default_role_bindings` drive each harness, where claude and codex are one-shot \
+reviewers; binding either as planner/implementor is an opt-in config change that routes \
+it through the adapter shim instead. \
 `gh` is the CI client and is not a row.\n\n",
     );
     out.push_str("Each cell is `native`, `approximated`, or `unavailable`.\n\n");
