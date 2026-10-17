@@ -168,19 +168,11 @@ pub fn agy_argv(
 
 /// Plan-review OpenCode argv. Prompt is stdin (see [`OpenCodeCli`]), never a
 /// positional — npm `opencode.cmd` forwards `%*` and cmd.exe truncates at `<LF>`.
-/// Never `--auto` / `--yolo` / `--dangerously-skip-permissions`.
-pub fn opencode_argv(
-    workspace_root: &Path,
-    model: Option<&str>,
-    title: Option<&str>,
-) -> Vec<String> {
-    let mut args = vec![
-        "run".into(),
-        "--dir".into(),
-        workspace_root.to_string_lossy().into_owned(),
-        "--format".into(),
-        "json".into(),
-    ];
+/// Never `--auto` / `--yolo` / `--dangerously-skip-permissions`. No `--dir`: the
+/// installed `opencode v2.0.32` rejects it, and the child's cwd is already the
+/// workspace root ([`OpenCodeCli::run`]).
+pub fn opencode_argv(model: Option<&str>, title: Option<&str>) -> Vec<String> {
+    let mut args = vec!["run".into(), "--format".into(), "json".into()];
     if let Some(m) = model
         && !m.trim().is_empty()
     {
@@ -490,11 +482,7 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
             let title = spawn_track_id
                 .as_deref()
                 .map(|id| format!("plan-review {id}"));
-            opencode_argv(
-                &paths.workspace_root,
-                binding.model.as_deref(),
-                title.as_deref(),
-            )
+            opencode_argv(binding.model.as_deref(), title.as_deref())
         }
         _ => {
             let add_dir = add_dir_arg(&paths.workspace_root, paths.execution_repo.as_deref());
@@ -1878,16 +1866,9 @@ mod tests {
 
     #[test]
     fn opencode_argv_pins_run_dir_json_and_forbids_auto() {
-        let args = opencode_argv(
-            Path::new(r"C:\dev\proj"),
-            Some("provider/model"),
-            Some("plan-review 0001"),
-        );
+        let args = opencode_argv(Some("provider/model"), Some("plan-review 0001"));
         assert_eq!(args[0], "run");
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--dir" && w[1] == r"C:\dev\proj")
-        );
+        assert!(!args.iter().any(|a| a == "--dir"), "{args:?}");
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--format" && w[1] == "json")
@@ -1916,8 +1897,16 @@ mod tests {
     }
 
     #[test]
+    fn opencode_argv_passes_model_variant_byte_exact() {
+        let m = "opencode-go/deepseek-v4.1-flash#high";
+        let args = opencode_argv(Some(m), None);
+        assert!(args.windows(2).any(|w| w[0] == "--model" && w[1] == m));
+        assert!(!args.iter().any(|a| a == "--dir"));
+    }
+
+    #[test]
     fn opencode_argv_omits_empty_model_and_title() {
-        let args = opencode_argv(Path::new(r"C:\dev\proj"), Some("  "), None);
+        let args = opencode_argv(Some("  "), None);
         assert!(!args.iter().any(|a| a == "--model" || a == "-m"));
         assert!(!args.iter().any(|a| a == "--title"));
     }
@@ -2112,11 +2101,7 @@ mod tests {
         let reqs = counts.requests.lock().unwrap();
         let oc = reqs.iter().find(|q| q.slug == "opencode").unwrap();
         assert_eq!(oc.workspace_root, dir.path());
-        assert!(
-            oc.argv
-                .windows(2)
-                .any(|w| w[0] == "--dir" && Path::new(&w[1]) == dir.path())
-        );
+        assert!(!oc.argv.iter().any(|a| a == "--dir"), "{:?}", oc.argv);
         assert_eq!(oc.argv[0], "run");
         assert!(!oc.argv.iter().any(|a| a == "--auto"));
         assert!(
@@ -3344,7 +3329,7 @@ mod tests {
             track_dir: Some(dir.path().join("conductor").join("0001-Example")),
             prompt: "review-track prompt".into(),
             remaining: Duration::from_secs(1200),
-            argv: opencode_argv(dir.path(), None, None),
+            argv: opencode_argv(None, None),
             extra_env: Vec::new(),
             spawn_epoch: state.run_epoch,
             spawn_track_id: Some("0001".into()),
