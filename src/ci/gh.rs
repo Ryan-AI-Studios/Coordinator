@@ -120,10 +120,16 @@ impl CiBackend for GhCli {
     }
 }
 
-/// `track/{numeric}` or `track/{numeric}-{slug}`. Numeric must be exactly four digits.
+/// `track/{numeric}` or `track/{numeric}-{slug}`. The id is any run of digits.
+///
+/// Not exactly four. A project may register `T374`, whose digit run is the three-digit
+/// `374`, while coordinated ids are four-digit. A four-digit floor here rejected every
+/// branch of a three-digit track, so publish wedged on each tick -- the same defect as the
+/// floor already removed from `numeric_track_id` (0075). Matching stays exact-digit, so
+/// `track/3740` still does not match `374`.
 pub(crate) fn branch_is_track(branch: &str, numeric: &str) -> bool {
     let numeric = numeric.trim();
-    if numeric.len() != 4 || !numeric.bytes().all(|b| b.is_ascii_digit()) {
+    if numeric.is_empty() || !numeric.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
     let Some(name) = branch.trim().strip_prefix("track/") else {
@@ -143,7 +149,7 @@ pub(crate) fn misnamed_branch_event(branch: &str, numeric: &str) -> String {
     format!("ci-wait: branch '{branch}' is not track/{numeric} \u{2014} waiting for PR")
 }
 
-/// One `/` or `-` segment equals the four-digit id (`feature/0412-foo`, `0412-foo`).
+/// One `/` or `-` segment equals the id exactly (`feature/0412-foo`, `0412-foo`).
 pub(crate) fn branch_cites_numeric(name: &str, numeric: &str) -> bool {
     let numeric = numeric.trim();
     if numeric.is_empty() {
@@ -1621,6 +1627,24 @@ mod parse_tests {
         assert_eq!(snap.items[0].bucket, CheckBucket::Pass);
         assert_eq!(snap.items[1].bucket, CheckBucket::Fail);
         assert_eq!(snap.items[2].bucket, CheckBucket::Pending);
+    }
+
+    /// A three-digit track id is a normal id, not an error: AI-Brains registers `T374`,
+    /// whose digit run is `374`. Requiring four digits here wedged publish on every tick.
+    #[test]
+    fn branch_is_track_accepts_a_short_digit_run() {
+        assert!(branch_is_track("track/374", "374"));
+        assert!(branch_is_track("track/374-agy-stop-hook-quoting", "374"));
+        assert!(branch_is_track("  track/374  ", "374"));
+        // Still exact-digit: a longer run is a different track, not a prefix match.
+        assert!(!branch_is_track("track/3740", "374"));
+        assert!(!branch_is_track("track/3740-x", "374"));
+        assert!(!branch_is_track("track/0412", "374"));
+        // Never a non-track prefix, and never an empty id.
+        assert!(!branch_is_track("feature/374", "374"));
+        assert!(!branch_is_track("track/", "374"));
+        assert!(!branch_is_track("track/374", ""));
+        assert!(!branch_is_track("track/374", "37a"));
     }
 
     #[test]
