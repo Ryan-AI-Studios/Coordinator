@@ -1544,6 +1544,8 @@ mod tests {
         assert!(crate::harness::is_acp_session_harness("cursor"));
         assert!(crate::harness::is_acp_session_harness("CURSOR"));
         assert!(crate::harness::is_acp_session_harness("grok"));
+        assert!(crate::harness::is_acp_session_harness("claude"));
+        assert!(crate::harness::is_acp_session_harness("codex"));
         assert!(!crate::harness::is_acp_session_harness("opencode"));
     }
 
