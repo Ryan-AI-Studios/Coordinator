@@ -685,10 +685,25 @@ fn unwrap_md_link(cell: &str) -> String {
 fn parse_leading_id(text: &str) -> Option<(String, String)> {
     let t = text.trim();
     let b = t.as_bytes();
-    if b.len() < 4 || !b[..4].iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let rest = &t[4..];
+    // Registries in the wild prefix the numeric id with an alpha marker (`| T374 | ... |`)
+    // while the engine canonicalises on the digits. Requiring the cell to START with four
+    // digits made every row of such a registry unreadable, which stops the fold -> implement
+    // gate on every track in that project (0075). Accept an optional alpha prefix and keep the
+    // digit run as the id, so `T374` parses as `374` and matches a run launched with that id.
+    let (digits, off) = if b.first().is_some_and(u8::is_ascii_alphabetic) {
+        let n = b[1..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if n == 0 {
+            return None;
+        }
+        (&t[1..1 + n], 1 + n)
+    } else {
+        let n = b.iter().take_while(|c| c.is_ascii_digit()).count();
+        if n < 4 {
+            return None;
+        }
+        (&t[..n], n)
+    };
+    let rest = &t[off..];
     if rest
         .chars()
         .next()
@@ -697,7 +712,7 @@ fn parse_leading_id(text: &str) -> Option<(String, String)> {
         return None;
     }
     let slug = rest.strip_prefix('-').unwrap_or(rest).to_string();
-    Some((t[..4].to_string(), slug))
+    Some((digits.to_string(), slug))
 }
 
 /// Split on unescaped `|`. Drop wrapping empty cells from leading/trailing pipes.
@@ -2664,5 +2679,54 @@ mod tests {
         let missing_dir = tempdir().unwrap();
         let missing = rec(missing_dir.path());
         assert_eq!(capture_sticky_ready_ids(&missing, &prev), prev);
+    }
+
+    #[test]
+    fn parse_leading_id_accepts_an_alpha_prefixed_id() {
+        // A registry may write `| T374 | ... |`. Requiring the cell to start with four digits
+        // made every row of such a registry unreadable, which stops the fold -> implement gate on
+        // every track in that project (0075). The digit run is the id; the engine launches `374`.
+        assert_eq!(
+            parse_leading_id("T374"),
+            Some(("374".to_string(), String::new()))
+        );
+        assert_eq!(
+            parse_leading_id("T374-nightly-symbol-backlog"),
+            Some(("374".to_string(), "nightly-symbol-backlog".to_string()))
+        );
+        // The bare four-digit form is unchanged, including its four-digit floor.
+        assert_eq!(
+            parse_leading_id("0374"),
+            Some(("0374".to_string(), String::new()))
+        );
+        assert_eq!(
+            parse_leading_id("374"),
+            None,
+            "bare form still needs four digits"
+        );
+        assert_eq!(parse_leading_id("T"), None, "prefix with no digits");
+        assert_eq!(parse_leading_id("Tabc"), None, "prefix with no digits");
+        assert_eq!(
+            parse_leading_id("0040-Slug-With-Dashes"),
+            Some(("0040".to_string(), "Slug-With-Dashes".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_conductor_md_reads_an_alpha_prefixed_registry() {
+        // End-to-end on the exact shape found in AI-Brains/conductor/conductor.md. Before this
+        // fix it returned Err("could not parse track registry ..."), which the fold gate
+        // surfaces as `fold withheld (cannot read track row)` and Stops the run.
+        let text = "| Track | Name | Status | Owner | Spec | Description |\n\
+                    | --- | --- | --- | --- | --- | --- |\n\
+                    | T374 | AGY stop-hook quoting | **Ready** | Grok | [T374](tracks/trackT374-x/spec.md) | desc |\n";
+        let rows = parse_conductor_md(text).expect("an alpha-prefixed registry must parse");
+        assert_eq!(rows.len(), 1, "the T-form row must be read");
+        assert_eq!(rows[0].id, "374");
+        assert!(
+            rows[0].status_raw.contains("Ready"),
+            "status cell was {}",
+            rows[0].status_raw
+        );
     }
 }
