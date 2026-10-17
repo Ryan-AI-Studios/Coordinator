@@ -601,6 +601,108 @@ pub fn restore_ready_rows(
     (restored, Some(body))
 }
 
+/// The status names the placeholder condition, e.g.
+/// `Proposed - placeholder, needs full spec/plan pass`.
+///
+/// A deliberate `Proposed - gated on ...` hold does not match, so it keeps its withhold.
+fn status_names_placeholder(status_raw: &str) -> bool {
+    status_clean(status_raw)
+        .to_ascii_lowercase()
+        .contains("placeholder")
+}
+
+/// The placeholder condition is satisfied: the track has a real `plan.md`.
+///
+/// `plan_markdown_is_placeholder` already treats an empty file, an unfilled heading, the
+/// `<!-- coordinator:placeholder-plan -->` comment, and the template blockquote as stubs,
+/// so this reuses it rather than matching the marker string again.
+fn placeholder_pass_complete(record: &ProjectRecord, key: &str) -> bool {
+    let Some(dir) = crate::workflow::graph::resolve_track_dir(record, key) else {
+        return false;
+    };
+    if !dir.join("spec.md").is_file() {
+        return false;
+    }
+    match std::fs::read_to_string(dir.join("plan.md")) {
+        Ok(body) => !crate::workflow::prompts::plan_markdown_is_placeholder(&body),
+        Err(_) => false,
+    }
+}
+
+/// Set the Status cell of the row matching `key` to `ready`, returning the new registry.
+///
+/// Pure, mirroring [`restore_ready_rows`]: the caller writes the body. `None` when no row
+/// matched, so a vanished row can never be reported as promoted.
+fn promote_placeholder_in(text: &str, key: &str, ready: &str) -> Option<String> {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let owned: Vec<String> = lines.clone();
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_table_start(&refs, i) {
+            i += 1;
+            continue;
+        }
+        let (header_line, _) = strip_nostart_literal(refs[i]);
+        let headers: Vec<String> = split_unescaped_pipes(&header_line)
+            .iter()
+            .map(|c| c.trim().to_string())
+            .collect();
+        let status_col = headers.iter().position(|h| is_status_header(h));
+        i += 2;
+        while i < lines.len() {
+            if lines[i].trim().is_empty() || is_thematic_break(&lines[i]) {
+                i += 1;
+                continue;
+            }
+            if !looks_like_row(&lines[i]) || is_table_start(&refs, i) {
+                break;
+            }
+            let (stripped, _) = strip_nostart_literal(&lines[i]);
+            let cells = split_unescaped_pipes(&stripped);
+            let matched = status_col.is_some_and(|sc| {
+                cells
+                    .first()
+                    .and_then(|c| parse_leading_id(&unwrap_md_link(c.trim())))
+                    .is_some_and(|(rid, _)| track_ids_match(&rid, key))
+                    .then_some(sc)
+                    .is_some()
+            });
+            if matched
+                && let Some(sc) = status_col
+                && let Some(new_line) = replace_cell(&lines[i], sc, ready)
+            {
+                let trailing_newline = text.ends_with('\n');
+                lines[i] = new_line;
+                let mut body = lines.join("\n");
+                if trailing_newline {
+                    body.push('\n');
+                }
+                return Some(body);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Promote `key`'s row to `ready` in the live registry. `Ok(false)` when no row matched.
+pub fn promote_placeholder(
+    record: &ProjectRecord,
+    key: &str,
+    ready: &str,
+) -> std::io::Result<bool> {
+    let path = crate::layout::resolve(record)
+        .conductor_dir
+        .join("conductor.md");
+    let text = std::fs::read_to_string(&path)?;
+    let Some(body) = promote_placeholder_in(&text, key, ready) else {
+        return Ok(false);
+    };
+    std::fs::write(&path, body)?;
+    Ok(true)
+}
+
 /// [`width_deviations`] for a record's live registry.
 pub fn width_deviations_for(record: &ProjectRecord) -> Vec<WidthDeviation> {
     std::fs::read_to_string(conductor_md_path(record))
@@ -1130,6 +1232,13 @@ pub enum FoldAdvance {
         key: String,
         parsed: usize,
     },
+    /// A `Proposed` row that names the placeholder condition and whose `plan.md` is no
+    /// longer the stub. The condition the status names is satisfied, so the caller
+    /// promotes the row and then advances exactly as for [`FoldAdvance::Allow`].
+    PromotePlaceholder {
+        key: String,
+        ready: String,
+    },
 }
 
 /// Read the registry row for `track_id`. Missing id, file, or row is [`FoldAdvance::Unreadable`].
@@ -1150,7 +1259,33 @@ pub fn fold_advance(record: &ProjectRecord, track_id: Option<&str>) -> FoldAdvan
     if is_eligible_ready_in(&row.status_raw, &aliases) {
         return FoldAdvance::Allow;
     }
-    if is_proposed(&row.status_raw) || is_blocked(&row.status_raw) || is_terminal(&row.status_raw) {
+    if is_proposed(&row.status_raw) {
+        // A placeholder row whose spec/plan pass has actually run has met the condition
+        // its own status names. Promote it rather than withholding forever: the fold will
+        // not advance a `Proposed` row, and the planner re-plans one on every tick, so a
+        // completed placeholder deadlocks (one track ran six cycles and never reached
+        // implement; the row has to be promoted from outside the fold either way).
+        // HITL and owner-only marks still win anywhere in the row, and a bare
+        // `Proposed - gated on ...` hold does not name the placeholder condition.
+        let clean = status_clean(&row.status_raw);
+        if !is_hitl_marked(&row.id, &row.slug, &clean, &row.summary)
+            && status_names_placeholder(&row.status_raw)
+            && placeholder_pass_complete(record, key)
+        {
+            let ready = aliases
+                .first()
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_READY_PHRASE.to_string());
+            return FoldAdvance::PromotePlaceholder {
+                key: key.to_string(),
+                ready: format!("**{ready}**"),
+            };
+        }
+        return FoldAdvance::Withhold {
+            status_clean: clean,
+        };
+    }
+    if is_blocked(&row.status_raw) || is_terminal(&row.status_raw) {
         return FoldAdvance::Withhold {
             status_clean: status_clean(&row.status_raw),
         };
@@ -1585,6 +1720,126 @@ mod tests {
         assert_eq!(fold_advance(&record, Some("0001")), FoldAdvance::Allow);
         record.ready_aliases = vec!["Ready — folded @ sha1234".into()];
         allow(&record, "**Ready — folded @ sha1234**", "ok", false);
+    }
+
+    /// A completed placeholder promotes instead of withholding forever. Proven strings
+    /// from `plan_markdown_is_placeholder`'s own tests: `# plan` is real, the
+    /// `<!-- coordinator:placeholder-plan -->` comment is the stub.
+    fn write_track_files(ws: &Path, name: &str, spec: &str, plan: &str) {
+        let dir = ws.join("conductor").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("spec.md"), spec).unwrap();
+        std::fs::write(dir.join("plan.md"), plan).unwrap();
+    }
+
+    const PLACEHOLDER_STATUS: &str = "**Proposed — placeholder, needs full spec/plan pass**";
+
+    #[test]
+    fn completed_placeholder_promotes() {
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_md(dir.path(), &one_row(PLACEHOLDER_STATUS, "ok", false));
+        write_track_files(dir.path(), "0001-One", "# spec\n", "# plan\n");
+        assert_eq!(
+            fold_advance(&record, Some("0001")),
+            FoldAdvance::PromotePlaceholder {
+                key: "0001".into(),
+                ready: "**Ready — not started**".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn placeholder_with_stub_plan_still_withholds() {
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_md(dir.path(), &one_row(PLACEHOLDER_STATUS, "ok", false));
+        // A plan that still carries the stub marker means the pass has NOT run.
+        write_track_files(
+            dir.path(),
+            "0001-One",
+            "# spec\n",
+            "<!-- coordinator:placeholder-plan -->\n",
+        );
+        assert!(matches!(
+            fold_advance(&record, Some("0001")),
+            FoldAdvance::Withhold { .. }
+        ));
+    }
+
+    #[test]
+    fn placeholder_without_spec_still_withholds() {
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_md(dir.path(), &one_row(PLACEHOLDER_STATUS, "ok", false));
+        let d = dir.path().join("conductor").join("0001-One");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("plan.md"), "# plan\n").unwrap();
+        assert!(matches!(
+            fold_advance(&record, Some("0001")),
+            FoldAdvance::Withhold { .. }
+        ));
+    }
+
+    /// A deliberate owner hold does not name the placeholder condition, so a real plan on
+    /// disk must NOT promote it.
+    #[test]
+    fn proposed_owner_hold_never_promotes() {
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_md(
+            dir.path(),
+            &one_row(
+                "**Proposed** — gated on first paid interest + owner GO",
+                "ok",
+                false,
+            ),
+        );
+        write_track_files(dir.path(), "0001-One", "# spec\n", "# plan\n");
+        assert!(matches!(
+            fold_advance(&record, Some("0001")),
+            FoldAdvance::Withhold { .. }
+        ));
+    }
+
+    /// An HITL / owner-only mark wins anywhere in the row, even on a completed placeholder.
+    #[test]
+    fn hitl_mark_blocks_promotion_of_completed_placeholder() {
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_md(
+            dir.path(),
+            &one_row(PLACEHOLDER_STATUS, "needs owner-only sign off", false),
+        );
+        write_track_files(dir.path(), "0001-One", "# spec\n", "# plan\n");
+        assert!(matches!(
+            fold_advance(&record, Some("0001")),
+            FoldAdvance::Withhold { .. }
+        ));
+    }
+
+    #[test]
+    fn promote_placeholder_in_touches_only_the_status_cell() {
+        // An escaped pipe inside another cell must survive, and so must the trailing LF.
+        let text = "| Track | Status | Summary |\n\
+                    | --- | --- | --- |\n\
+                    | [0001-One](0001-One/spec.md) | **Proposed — placeholder, needs full spec/plan pass** | a \\| b |\n";
+        let out = promote_placeholder_in(text, "0001", "**Ready — not started**").unwrap();
+        assert!(
+            out.contains("| **Ready — not started** | a \\| b |"),
+            "{out}"
+        );
+        assert!(!out.contains("needs full spec/plan pass"), "{out}");
+        assert!(out.ends_with('\n'));
+        assert_eq!(out.lines().count(), text.lines().count());
+    }
+
+    #[test]
+    fn promote_placeholder_in_unknown_key_is_none() {
+        let text = "| Track | Status | Summary |\n\
+                    | --- | --- | --- |\n\
+                    | [0001-One](0001-One/spec.md) | **Proposed — placeholder, needs full spec/plan pass** | ok |\n";
+        assert!(promote_placeholder_in(text, "9999", "**Ready — not started**").is_none());
     }
 
     #[test]

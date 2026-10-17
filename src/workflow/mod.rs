@@ -97,6 +97,8 @@ pub enum AddressCiFollowUp {
 }
 
 const FOLD_WITHHELD_KIND: &str = "fold-withheld";
+/// Progress-log kind when the fold promotes a completed placeholder row to Ready.
+const FOLD_PROMOTED_KIND: &str = "fold-promoted";
 const FOLD_WITHHELD_UNREADABLE: &str = "workflow: fold withheld (cannot read track row)";
 
 fn fold_withheld_status(status_clean: &str) -> String {
@@ -201,6 +203,46 @@ pub fn on_success(
                     state.last_event = fold_withheld_status(&status_clean);
                     crate::progress_log::append(record, FOLD_WITHHELD_KIND, &state.last_event);
                     return AddressCiFollowUp::Continue;
+                }
+                conductor_md::FoldAdvance::PromotePlaceholder { key, ready } => {
+                    let promoted = conductor_md::promote_placeholder(record, &key, &ready);
+                    match promoted {
+                        Ok(true) => {
+                            state.last_event = format!(
+                                "workflow: fold promoted {key} placeholder -> {ready} \
+                                 (spec/plan pass complete); advancing"
+                            );
+                            crate::progress_log::append(
+                                record,
+                                FOLD_PROMOTED_KIND,
+                                &state.last_event,
+                            );
+                            if let Err(e) = crate::checkpoint::ensure_implement_ref(record, state) {
+                                state.status = RunStatus::Stopped;
+                                state.failure_class = None;
+                                state.last_event = e.to_string();
+                                crate::progress_log::append(
+                                    record,
+                                    "checkpoint-refused",
+                                    &state.last_event,
+                                );
+                                return AddressCiFollowUp::Continue;
+                            }
+                        }
+                        // The row was there for the gate and gone for the write, or the
+                        // write failed. Fail closed: never advance on an unverified promotion.
+                        Ok(false) | Err(_) => {
+                            state.status = RunStatus::Stopped;
+                            state.failure_class = None;
+                            state.last_event = FOLD_WITHHELD_UNREADABLE.to_string();
+                            crate::progress_log::append(
+                                record,
+                                FOLD_WITHHELD_KIND,
+                                &state.last_event,
+                            );
+                            return AddressCiFollowUp::Continue;
+                        }
+                    }
                 }
                 conductor_md::FoldAdvance::Unreadable => {
                     state.status = RunStatus::Stopped;
