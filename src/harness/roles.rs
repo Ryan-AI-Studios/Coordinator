@@ -169,6 +169,65 @@ pub fn roles_use(target: &str) -> Result<BTreeMap<String, RoleBinding>> {
     Ok(cfg.role_bindings)
 }
 
+/// Set named fields on ONE role binding, leaving everything else alone.
+///
+/// `roles use` rewrites planner+implementor wholesale and clears `model` in the process.
+/// This is the per-role editor: a partial update must never wipe a field that was not
+/// supplied, so each option is applied only when present (`--clear-model` is the explicit
+/// way to drop a pin).
+///
+/// Any key already present in `role_bindings` is addressable, not just
+/// planner/implementor -- `fold`, `next` and the `cross_model_*` / `plan_reviewer_*` roles
+/// are all real bindings and all honoured by phase resolution.
+///
+/// Model ids are passed to the harness argv verbatim (see `acp_agent_argv`), so they are
+/// the harness's own vocabulary: for cursor a parameterized id such as
+/// `claude-sonnet-5-5[effort=high]` is valid, and for codex the value is whatever
+/// `codex --model` accepts. No effort knob exists here by design: effort comes from each
+/// harness's own configuration.
+pub fn roles_set(
+    role: &str,
+    harness: Option<&str>,
+    command: Option<&str>,
+    model: Option<&str>,
+    clear_model: bool,
+) -> Result<BTreeMap<String, RoleBinding>> {
+    let key = role.trim();
+    let mut cfg = load_machine_config()?;
+    if !cfg.role_bindings.contains_key(key) {
+        let mut known: Vec<String> = cfg.role_bindings.keys().cloned().collect();
+        known.sort();
+        return Err(CoordinatorError::Message(format!(
+            "unknown role {key} (known: {})",
+            known.join(", ")
+        )));
+    }
+    if let Some(b) = cfg.role_bindings.get_mut(key) {
+        if let Some(h) = harness {
+            let t = h.trim();
+            if !t.is_empty() {
+                b.harness = t.into();
+            }
+        }
+        if let Some(c) = command {
+            let t = c.trim();
+            if !t.is_empty() {
+                b.command = t.into();
+            }
+        }
+        if clear_model {
+            b.model = None;
+        } else if let Some(m) = model {
+            let t = m.trim();
+            if !t.is_empty() {
+                b.model = Some(t.into());
+            }
+        }
+    }
+    save_machine_config(&cfg)?;
+    Ok(cfg.role_bindings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
