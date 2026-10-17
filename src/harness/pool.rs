@@ -390,12 +390,26 @@ fn refuse_if_paused(record: &ProjectRecord) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn apply_turn(
     record: &ProjectRecord,
     turn: std::result::Result<PromptResult, CoordinatorError>,
     harness: GrokHarnessStatus,
     injected_phase: &str,
     spawn: SpawnTally,
+) -> Result<HarnessPromptView> {
+    apply_turn_checked(record, turn, harness, injected_phase, spawn, None).await
+}
+
+/// `no_change` is the unchanged-tree verdict (0095) computed beside the prompt, where the session
+/// cwd is known. `Some` turns a would-be success into a `HarnessCrash` failure.
+async fn apply_turn_checked(
+    record: &ProjectRecord,
+    turn: std::result::Result<PromptResult, CoordinatorError>,
+    harness: GrokHarnessStatus,
+    injected_phase: &str,
+    spawn: SpawnTally,
+    no_change: Option<String>,
 ) -> Result<HarnessPromptView> {
     let state = load_run_state(record)?;
     let drifted = state.phase != injected_phase;
@@ -473,13 +487,26 @@ async fn apply_turn(
                                     harness: Some(harness),
                                 });
                             }
-                            PhaseOutcome::success(
-                                injected_phase,
-                                OutcomeSource::Adapter,
-                                msg,
-                                next,
-                                Some(state.run_epoch),
-                            )
+                            match no_change {
+                                Some(m) => {
+                                    error = Some(m.clone());
+                                    failure_class = Some(FailureClass::HarnessCrash);
+                                    PhaseOutcome::failure(
+                                        injected_phase,
+                                        FailureClass::HarnessCrash,
+                                        OutcomeSource::Adapter,
+                                        Some(m),
+                                        Some(state.run_epoch),
+                                    )
+                                }
+                                None => PhaseOutcome::success(
+                                    injected_phase,
+                                    OutcomeSource::Adapter,
+                                    msg,
+                                    next,
+                                    Some(state.run_epoch),
+                                ),
+                            }
                         }
                     };
                     status = Some(write_and_apply(record, outcome)?);
@@ -1253,6 +1280,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             Some(&session.session_id),
                             false,
                         );
+                        note_leg_baseline(record, &injected_phase, &session.cwd);
                         session
                             .inject_prompt(&text, prompt_timeout_for(record))
                             .await
@@ -1271,20 +1299,24 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             );
                         }
                     }
-                    let tally = {
+                    let (tally, no_change) = {
                         let session = shared.session.lock().await;
                         if let Ok(mut snap) = shared.snapshot.lock() {
                             *snap = session_status(&session);
                         }
                         remember_fidelity(record, &session);
-                        session.terminal_spawn_tally()
+                        (
+                            session.terminal_spawn_tally(),
+                            leg_no_change(record, &injected_phase, &turn, &session),
+                        )
                     };
-                    let view = apply_turn(
+                    let view = apply_turn_checked(
                         record,
                         turn,
                         snapshot_status(&shared),
                         &injected_phase,
                         tally,
+                        no_change,
                     )
                     .await?;
                     (view_to_hold(view), false)
@@ -1480,6 +1512,7 @@ pub async fn prompt(
             Some(&session.session_id),
             false,
         );
+        note_leg_baseline(&rec, &injected_phase, &session.cwd);
         session.inject_prompt(&text, prompt_timeout_for(&rec)).await
     };
     let normal = matches!(&turn, Ok(pr) if !crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()));
@@ -1502,13 +1535,48 @@ pub async fn prompt(
         }
     }
     let harness = current_status(&rec).await;
-    let tally = {
+    let (tally, no_change) = {
         let mut pool = global_pool().lock().await;
-        pool.get_mut(&rec.id)
-            .map(|s| s.terminal_spawn_tally())
-            .unwrap_or_default()
+        match pool.get_mut(&rec.id) {
+            Some(s) => (
+                s.terminal_spawn_tally(),
+                leg_no_change(&rec, &injected_phase, &turn, s),
+            ),
+            None => (SpawnTally::default(), None),
+        }
     };
-    apply_turn(&rec, turn, harness, &injected_phase, tally).await
+    apply_turn_checked(&rec, turn, harness, &injected_phase, tally, no_change).await
+}
+
+/// Sample the leg baseline before a prompt (no-op outside adapter implement legs).
+fn note_leg_baseline(record: &ProjectRecord, phase: &str, cwd: &std::path::Path) {
+    if let Ok(state) = load_run_state(record) {
+        crate::harness::no_change::note_baseline(record, &state, phase, cwd);
+    }
+}
+
+/// Unchanged-tree verdict for a completed, non-cancelled turn (0095).
+fn leg_no_change(
+    record: &ProjectRecord,
+    phase: &str,
+    turn: &std::result::Result<PromptResult, CoordinatorError>,
+    session: &GrokSession,
+) -> Option<String> {
+    let Ok(pr) = turn else {
+        return None;
+    };
+    if crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()) {
+        return None;
+    }
+    let state = load_run_state(record).ok()?;
+    crate::harness::no_change::verdict_after_turn(
+        record,
+        &state,
+        phase,
+        &session.cwd,
+        &session.adapter,
+        session.last_signal.as_deref(),
+    )
 }
 
 pub async fn compact(project: Option<&str>, infer_cwd: bool) -> Result<HarnessPromptView> {
@@ -4211,6 +4279,194 @@ Loop\r\n",
         assert_eq!(st.phase, crate::workflow::graph::PHASE_PLAN);
         assert_eq!(st.track_id.as_deref(), Some("0002"));
         assert!(st.last_event.contains("auto-start"));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// Adapter run parked at `phase` in a real git repo. Returns the record and its tempdirs.
+    fn implement_leg_fixture(phase: &str) -> (ProjectRecord, tempfile::TempDir, tempfile::TempDir) {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        git_in(proj.path(), &["init", "-b", "main"]);
+        std::fs::write(proj.path().join("f.txt"), "base\n").unwrap();
+        git_in(proj.path(), &["add", "f.txt"]);
+        git_in(proj.path(), &["commit", "-m", "base"]);
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0095".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut st = crate::state::load_run_state(&rec)?;
+            st.phase = phase.into();
+            crate::state::save_run_state(&rec, &st)
+        })
+        .unwrap();
+        (rec, home, proj)
+    }
+
+    #[test]
+    fn leg_verdict_fires_only_when_the_tree_is_exactly_as_the_leg_found_it() {
+        let _guard = test_env_lock();
+        let (rec, _home, proj) = implement_leg_fixture(crate::workflow::graph::PHASE_IMPLEMENT);
+        let st = crate::state::load_run_state(&rec).unwrap();
+        let phase = crate::workflow::graph::PHASE_IMPLEMENT;
+        crate::harness::no_change::note_baseline(&rec, &st, phase, proj.path());
+        let v = crate::harness::no_change::verdict_after_turn(
+            &rec,
+            &st,
+            phase,
+            proj.path(),
+            "codex",
+            Some("approvals auto-allowed"),
+        );
+        let m = v.expect("unchanged tree must be a verdict");
+        assert!(m.starts_with(crate::harness::no_change::NO_CHANGE_PREFIX));
+        assert!(m.contains("codex") && m.contains("approvals auto-allowed"));
+        // a second turn of the same leg keeps the original baseline
+        std::fs::write(proj.path().join("new.txt"), "x\n").unwrap();
+        crate::harness::no_change::note_baseline(&rec, &st, phase, proj.path());
+        assert!(
+            crate::harness::no_change::verdict_after_turn(
+                &rec,
+                &st,
+                phase,
+                proj.path(),
+                "codex",
+                None
+            )
+            .is_none(),
+            "a written file is a change"
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[test]
+    fn leg_verdict_is_silent_for_other_phases_drivers_and_unreadable_trees() {
+        let _guard = test_env_lock();
+        let (rec, _home, proj) = implement_leg_fixture(crate::workflow::graph::PHASE_FOLD);
+        let mut st = crate::state::load_run_state(&rec).unwrap();
+        let fold = crate::workflow::graph::PHASE_FOLD;
+        crate::harness::no_change::note_baseline(&rec, &st, fold, proj.path());
+        assert!(
+            crate::harness::no_change::verdict_after_turn(
+                &rec,
+                &st,
+                fold,
+                proj.path(),
+                "codex",
+                None
+            )
+            .is_none(),
+            "fold is never checked"
+        );
+        let imp = crate::workflow::graph::PHASE_IMPLEMENT;
+        st.driver = crate::workflow::WorkflowDriver::Stub;
+        crate::harness::no_change::note_baseline(&rec, &st, imp, proj.path());
+        assert!(
+            crate::harness::no_change::verdict_after_turn(
+                &rec,
+                &st,
+                imp,
+                proj.path(),
+                "codex",
+                None
+            )
+            .is_none(),
+            "stub driver is never checked"
+        );
+        st.driver = crate::workflow::WorkflowDriver::Adapter;
+        crate::harness::no_change::note_baseline(&rec, &st, imp, proj.path());
+        let gone = proj.path().join("not-a-repo-dir");
+        assert!(
+            crate::harness::no_change::verdict_after_turn(&rec, &st, imp, &gone, "codex", None)
+                .is_none(),
+            "unreadable tree must not fire"
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn no_change_verdict_fails_the_leg_instead_of_advancing() {
+        let _guard = test_env_lock();
+        let (rec, _home, _proj) = implement_leg_fixture(crate::workflow::graph::PHASE_IMPLEMENT);
+        let turn = Ok(PromptResult {
+            text: "done".into(),
+            stop_reason: Some("end_turn".into()),
+        });
+        let msg = crate::harness::no_change::no_change_message("implement", "codex", None);
+        let view = apply_turn_checked(
+            &rec,
+            turn,
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            Some(msg.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(view.error.as_deref(), Some(msg.as_str()));
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.status, crate::state::RunStatus::Stopped);
+        assert_eq!(st.failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_IMPLEMENT);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn no_verdict_still_advances_the_leg() {
+        let _guard = test_env_lock();
+        let (rec, _home, _proj) = implement_leg_fixture(crate::workflow::graph::PHASE_IMPLEMENT);
+        let turn = Ok(PromptResult {
+            text: "done".into(),
+            stop_reason: Some("end_turn".into()),
+        });
+        let view = apply_turn_checked(
+            &rec,
+            turn,
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        assert!(view.failure_class.is_none());
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_ne!(st.status, crate::state::RunStatus::Stopped);
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_CROSS_MODEL);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
