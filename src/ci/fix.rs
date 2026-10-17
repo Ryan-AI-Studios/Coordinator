@@ -97,10 +97,12 @@ struct OwnedPr {
 }
 
 fn owned_pr(state: &RunState, target: &CiTarget) -> Option<OwnedPr> {
+    // Any digit run, not exactly four. A project may register `T374`, whose digit run is the
+    // three-digit `374`; a four-digit floor here returned None for such a track, so the chain
+    // could never remediate CI on its own PR. Same family as `branch_is_track` -- see the
+    // four-digit floor removed from `numeric_track_id` (0075). `numeric_track_id` already
+    // returns None for an empty or zero-digit run, so no further guard is needed here.
     let numeric = state.track_id.as_deref().and_then(numeric_track_id)?;
-    if numeric.len() != 4 {
-        return None;
-    }
     match target {
         CiTarget::PullRequest {
             number,
@@ -201,6 +203,7 @@ fn git_text(cwd: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ci::backend::MergeStateStatus;
     use crate::config::test_env_lock;
     use crate::layout::LayoutProfile;
     use crate::outcome::{OutcomeSource, PhaseOutcome, write_and_apply};
@@ -254,6 +257,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A three-digit track id is a normal id, not an error. AI-Brains registers `T374`, whose
+    /// digit run is `374`; the four-digit floor made `owned_pr` return None for it, so the chain
+    /// could never remediate CI on its own pull request. This is the same defect as the floor
+    /// already removed from `branch_is_track` and `numeric_track_id`.
+    #[test]
+    fn owned_pr_accepts_a_short_track_id() {
+        let mut state = RunState::idle("p");
+        state.track_id = Some("374".into());
+        let target = CiTarget::PullRequest {
+            number: 71,
+            url: "https://example/pr/71".into(),
+            is_draft: false,
+            merged: false,
+            head_oid: Some("abc111".into()),
+            merge_state: MergeStateStatus::Clean,
+            head_ref: "track/374".into(),
+            title: "track(374): agy stop-hook quoting".into(),
+        };
+        assert!(
+            owned_pr(&state, &target).is_some(),
+            "a three-digit id owns its own PR"
+        );
+        // A different id never owns it.
+        state.track_id = Some("375".into());
+        assert!(owned_pr(&state, &target).is_none());
+        // Nor does a run with no track at all.
+        state.track_id = None;
+        assert!(owned_pr(&state, &target).is_none());
     }
 
     #[test]

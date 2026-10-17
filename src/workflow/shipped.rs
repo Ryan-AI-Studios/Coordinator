@@ -14,11 +14,16 @@ pub fn merged_search_query(numeric_id: &str) -> String {
     format!("\"track({numeric_id})\" in:title")
 }
 
-/// After trim, case-insensitive prefix `track(NNNN):` (colon required).
+/// After trim, case-insensitive prefix `track(<digits>):` (colon required).
+///
+/// The id is any run of digits, not exactly four -- see `branch_is_track`. With a four-digit
+/// floor, a three-digit track's `track(374): ...` title was never recognised, which breaks
+/// merged-title discovery: the chain cannot see work that already shipped, so it can re-mint
+/// it and double-prefix the title.
 pub fn pr_title_is_track(title: &str, numeric_id: &str) -> bool {
     let title = title.trim();
     let id = numeric_id.trim();
-    if id.len() != 4 || !id.as_bytes().iter().all(u8::is_ascii_digit) {
+    if id.is_empty() || !id.as_bytes().iter().all(u8::is_ascii_digit) {
         return false;
     }
     let prefix = format!("track({id}):");
@@ -211,6 +216,22 @@ mod tests {
         assert!(!pr_title_is_track("track(0047):", "47"));
         // UTF-8: prefix-byte slice must not panic on a mid-char boundary.
         assert!(!pr_title_is_track("0123456789🎉 more", "0047"));
+        // A three-digit id is a normal id, not an error: AI-Brains registers `T374`, whose digit
+        // run is `374`. With the four-digit floor `track(374): ...` was never recognised, so
+        // merged-title discovery failed -- the chain could re-mint work that had already shipped
+        // and double-prefix the title.
+        assert!(pr_title_is_track(
+            "track(374): agy stop-hook quoting",
+            "374"
+        ));
+        assert!(pr_title_is_track("TRACK(374): x", "374"));
+        assert!(pr_title_is_track("  track(374): spaced", "374"));
+        // Still exact-digit, whatever the length: a different run never matches.
+        assert!(!pr_title_is_track("track(0374):", "374"));
+        assert!(!pr_title_is_track("track(374):", "0374"));
+        assert!(!pr_title_is_track("track(374):", ""));
+        assert!(!pr_title_is_track("track(374):", "37a"));
+        assert!(!pr_title_is_track("track(3740):", "374"));
     }
 
     #[test]
