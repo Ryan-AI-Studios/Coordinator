@@ -149,6 +149,25 @@ pub(crate) fn misnamed_branch_event(branch: &str, numeric: &str) -> String {
     format!("ci-wait: branch '{branch}' is not track/{numeric} \u{2014} waiting for PR")
 }
 
+/// Distinct event when a track branch has no commits ahead of its base (0094). The drive appends
+/// `review.verdict`; this layer has no run state.
+pub(crate) fn empty_leg_event(branch: &str, base: &str) -> String {
+    format!(
+        "ci-wait: empty implement leg \u{2014} branch '{branch}' has no commits ahead of {base}"
+    )
+}
+
+/// `git rev-list --count <base_ref>..HEAD`. `None` on any git failure or unparsable output, so the
+/// caller stays fail-closed: only a measured `0` is an empty leg.
+fn commits_ahead(cwd: &Path, base_ref: &str) -> Option<u64> {
+    let range = format!("{base_ref}..HEAD");
+    git_stdout(cwd, &["rev-list", "--count", &range])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// One `/` or `-` segment equals the id exactly (`feature/0412-foo`, `0412-foo`).
 pub(crate) fn branch_cites_numeric(name: &str, numeric: &str) -> bool {
     let numeric = numeric.trim();
@@ -405,6 +424,12 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
     }
     if !default_branch.is_empty() {
         let def_ref = format!("refs/remotes/{remote}/{default_branch}");
+        if commits_ahead(cwd, &def_ref) == Some(0) {
+            return Ok(AutoPublishResult::empty_leg(empty_leg_event(
+                &branch,
+                &format!("{remote}/{default_branch}"),
+            )));
+        }
         if let Ok(def_sha) = git_stdout(cwd, &["rev-parse", &def_ref])
             && def_sha.trim() == head
         {
@@ -1842,6 +1867,76 @@ mod parse_tests {
             .unwrap()
             .trim()
             .to_string()
+    }
+
+    /// `init_main` plus a fake remote-tracking ref at `main`, then `track/0001-x` checked out.
+    fn track_repo_at_remote_main(dir: &std::path::Path) {
+        init_main(dir);
+        git_ok(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_ok(dir, &["checkout", "-b", "track/0001-x"]);
+    }
+
+    fn commit_file(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), "x\n").unwrap();
+        git_ok(dir, &["add", name]);
+        git_ok(dir, &["commit", "-m", name]);
+    }
+
+    #[test]
+    fn commits_ahead_is_zero_for_an_empty_leg() {
+        let repo = tempfile::tempdir().unwrap();
+        track_repo_at_remote_main(repo.path());
+        assert_eq!(
+            commits_ahead(repo.path(), "refs/remotes/origin/main"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn commits_ahead_counts_work_on_the_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        track_repo_at_remote_main(repo.path());
+        commit_file(repo.path(), "a.txt");
+        assert_eq!(
+            commits_ahead(repo.path(), "refs/remotes/origin/main"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn commits_ahead_is_zero_when_the_branch_is_behind_the_default_tip() {
+        let repo = tempfile::tempdir().unwrap();
+        track_repo_at_remote_main(repo.path());
+        git_ok(repo.path(), &["checkout", "main"]);
+        commit_file(repo.path(), "m.txt");
+        git_ok(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git_ok(repo.path(), &["checkout", "track/0001-x"]);
+        assert_eq!(
+            commits_ahead(repo.path(), "refs/remotes/origin/main"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn commits_ahead_is_none_when_the_base_ref_is_unreadable() {
+        let repo = tempfile::tempdir().unwrap();
+        init_main(repo.path());
+        assert_eq!(commits_ahead(repo.path(), "refs/remotes/origin/main"), None);
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(
+            commits_ahead(outside.path(), "refs/remotes/origin/main"),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_leg_event_names_branch_and_base() {
+        let e = empty_leg_event("track/0001-x", "origin/main");
+        assert!(e.starts_with("ci-wait: empty implement leg"));
+        assert!(e.contains("'track/0001-x'") && e.contains("origin/main"));
     }
 
     #[test]

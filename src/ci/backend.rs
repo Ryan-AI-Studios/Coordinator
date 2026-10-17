@@ -178,9 +178,20 @@ pub enum AutoPublishResult {
         attempted_sha: Option<String>,
         retryable: bool,
     },
+    /// The track branch has no commits ahead of its base: the implement leg produced no work (0094).
+    /// Not a pending publish, so the drive fails it instead of latching and waiting.
+    EmptyLeg {
+        event: String,
+    },
 }
 
 impl AutoPublishResult {
+    pub fn empty_leg(event: impl Into<String>) -> Self {
+        Self::EmptyLeg {
+            event: event.into(),
+        }
+    }
+
     pub fn skipped(event: impl Into<String>) -> Self {
         Self::Skipped {
             event: event.into(),

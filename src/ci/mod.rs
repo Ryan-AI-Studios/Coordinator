@@ -1128,6 +1128,42 @@ fn try_auto_publish_target(
             })?;
             Ok(AutoPublishDrive::Opened(target))
         }
+        Ok(AutoPublishResult::EmptyLeg { event }) => {
+            // An empty leg never had a PR. A run that already recorded one (merged probe failed open)
+            // keeps the old latched wait rather than failing a delivered track.
+            if pr_hint(state).is_some() {
+                persist_watch(
+                    record,
+                    Some("ci-wait: on default branch \u{2014} waiting for PR"),
+                    |ci| {
+                        ci.head_sha = None;
+                        if let Some(sha) = gh::git_head_sha(cwd) {
+                            ci.publish_attempted_sha = Some(sha);
+                        }
+                        stamp_poll(
+                            ci,
+                            now,
+                            "waiting for PR",
+                            "wait-pr",
+                            next_interval_ms(elapsed(state, now), false),
+                        );
+                    },
+                )?;
+                return Ok(AutoPublishDrive::Wait);
+            }
+            let verdict = state
+                .review
+                .as_ref()
+                .and_then(|r| r.verdict.as_deref())
+                .unwrap_or("none");
+            let view = apply_failure(
+                record,
+                state,
+                FailureClass::CiFailed,
+                format!("{event}; review.verdict={verdict}"),
+            )?;
+            Ok(AutoPublishDrive::Stopped(view.map(Box::new)))
+        }
         Ok(AutoPublishResult::Skipped {
             event,
             attempted_sha,
@@ -3790,6 +3826,89 @@ mod tests {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
         }
+    }
+
+    const EMPTY_LEG_EVENT: &str = "ci-wait: empty implement leg \u{2014} branch 'track/0001-x' has no commits ahead of origin/main";
+
+    fn empty_leg_run(
+        verdict: Option<&str>,
+        recorded_pr: Option<u64>,
+    ) -> (ProjectRecord, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let mut st = load_run_state(&r).unwrap();
+        st.review = verdict.map(|v| crate::state::ReviewWatchState {
+            verdict: Some(v.into()),
+            ..Default::default()
+        });
+        if let Some(n) = recorded_pr {
+            st.ci.get_or_insert_with(Default::default).pr_number = Some(n);
+        }
+        save_run_state(&r, &st).unwrap();
+        (r, dir)
+    }
+
+    fn clear_ci_env() {
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+        }
+    }
+
+    #[test]
+    fn empty_leg_fails_fast_naming_itself_and_the_review_verdict() {
+        let _g = poll_env();
+        let (r, _dir) = empty_leg_run(Some("DEGRADED_PUBLISH"), None);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::empty_leg(EMPTY_LEG_EVENT)));
+        let (_hook, counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_some());
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(st.failure_class, Some(FailureClass::CiFailed));
+        let msg = run::status(&r).unwrap().last_event;
+        assert!(msg.contains("ci-wait: empty implement leg"), "{msg}");
+        assert!(msg.contains("track/0001-x"), "{msg}");
+        assert!(msg.ends_with("; review.verdict=DEGRADED_PUBLISH"), "{msg}");
+        let ci = st.ci.as_ref();
+        assert!(
+            ci.and_then(|c| c.publish_attempted_sha.as_deref())
+                .is_none()
+        );
+        assert_eq!(ci.map(|c| c.publish_transient_attempts).unwrap_or(0), 0);
+        assert_eq!(counts.merge_n(), 0);
+        clear_ci_env();
+    }
+
+    #[test]
+    fn empty_leg_without_a_review_verdict_says_none() {
+        let _g = poll_env();
+        let (r, _dir) = empty_leg_run(None, None);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::empty_leg(EMPTY_LEG_EVENT)));
+        let (_hook, _counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_some());
+        let msg = run::status(&r).unwrap().last_event;
+        assert!(msg.ends_with("; review.verdict=none"), "{msg}");
+        clear_ci_env();
+    }
+
+    #[test]
+    fn empty_leg_with_a_recorded_pr_keeps_waiting_instead_of_failing() {
+        let _g = poll_env();
+        let (r, _dir) = empty_leg_run(None, Some(7));
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::empty_leg(EMPTY_LEG_EVENT)));
+        let (_hook, _counts) = hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_ne!(st.failure_class, Some(FailureClass::CiFailed));
+        clear_ci_env();
     }
 
     #[test]
