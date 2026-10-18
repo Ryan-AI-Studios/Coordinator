@@ -233,6 +233,18 @@ pub trait CiBackend: Send + Sync {
         head_oid: Option<&str>,
     ) -> Result<MergeResult>;
     fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult>;
+    /// File paths changed by the PR itself (the input the external stepper reads).
+    fn pr_files(&self, cwd: &Path, pr_number: u64) -> Result<Vec<String>>;
+    /// Apply `label` to the PR unless it is already there or the repo lacks it.
+    fn ensure_label(&self, cwd: &Path, pr_number: u64, label: &str) -> Result<LabelOutcome>;
+}
+
+/// Result of [`CiBackend::ensure_label`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelOutcome {
+    Applied,
+    AlreadyPresent,
+    LabelMissing,
 }
 
 /// Programmed sequence of results. Exhausted sequences repeat the last value.
@@ -249,6 +261,9 @@ struct ScriptedInner {
     last_snap: Option<Result<CheckSnapshot>>,
     last_merge: Option<Result<MergeResult>>,
     last_publish: Option<Result<AutoPublishResult>>,
+    files: VecDeque<Result<Vec<String>>>,
+    labels: VecDeque<Result<LabelOutcome>>,
+    labelled: Vec<(u64, String)>,
 }
 
 impl ScriptedBackend {
@@ -263,6 +278,9 @@ impl ScriptedBackend {
                 last_snap: None,
                 last_merge: None,
                 last_publish: None,
+                files: VecDeque::new(),
+                labels: VecDeque::new(),
+                labelled: Vec::new(),
             }),
         }
     }
@@ -297,6 +315,23 @@ impl ScriptedBackend {
             .expect("scripted lock")
             .publishes
             .push_back(v);
+    }
+
+    pub fn push_files(&self, v: Result<Vec<String>>) {
+        self.inner.lock().expect("scripted lock").files.push_back(v);
+    }
+
+    pub fn push_label(&self, v: Result<LabelOutcome>) {
+        self.inner
+            .lock()
+            .expect("scripted lock")
+            .labels
+            .push_back(v);
+    }
+
+    /// `(pr, label)` of every `ensure_label` call, in order.
+    pub fn label_calls(&self) -> Vec<(u64, String)> {
+        self.inner.lock().expect("scripted lock").labelled.clone()
     }
 
     pub fn with_pr(self, target: CiTarget, snap: CheckSnapshot) -> Self {
@@ -376,6 +411,17 @@ impl CiBackend for ScriptedBackend {
         }
         Ok(AutoPublishResult::skipped("ci-wait: waiting for PR"))
     }
+
+    fn pr_files(&self, _cwd: &Path, _pr_number: u64) -> Result<Vec<String>> {
+        let mut g = self.inner.lock().expect("scripted lock");
+        g.files.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn ensure_label(&self, _cwd: &Path, pr_number: u64, label: &str) -> Result<LabelOutcome> {
+        let mut g = self.inner.lock().expect("scripted lock");
+        g.labelled.push((pr_number, label.to_string()));
+        g.labels.pop_front().unwrap_or(Ok(LabelOutcome::Applied))
+    }
 }
 
 fn clone_resolve(v: &Result<Option<CiTarget>>) -> Result<Option<CiTarget>> {
@@ -412,6 +458,8 @@ pub struct CallCounts {
     pub checks: Arc<AtomicUsize>,
     pub merge: Arc<AtomicUsize>,
     pub publish: Arc<AtomicUsize>,
+    pub pr_files: Arc<AtomicUsize>,
+    pub ensure_label: Arc<AtomicUsize>,
 }
 
 impl CallCounts {
@@ -426,6 +474,12 @@ impl CallCounts {
     }
     pub fn publish_n(&self) -> usize {
         self.publish.load(Ordering::SeqCst)
+    }
+    pub fn pr_files_n(&self) -> usize {
+        self.pr_files.load(Ordering::SeqCst)
+    }
+    pub fn ensure_label_n(&self) -> usize {
+        self.ensure_label.load(Ordering::SeqCst)
     }
 }
 
@@ -473,5 +527,15 @@ impl CiBackend for RecordingBackend {
     fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
         self.counts.publish.fetch_add(1, Ordering::SeqCst);
         self.inner.try_auto_publish(cwd, track_id)
+    }
+
+    fn pr_files(&self, cwd: &Path, pr_number: u64) -> Result<Vec<String>> {
+        self.counts.pr_files.fetch_add(1, Ordering::SeqCst);
+        self.inner.pr_files(cwd, pr_number)
+    }
+
+    fn ensure_label(&self, cwd: &Path, pr_number: u64, label: &str) -> Result<LabelOutcome> {
+        self.counts.ensure_label.fetch_add(1, Ordering::SeqCst);
+        self.inner.ensure_label(cwd, pr_number, label)
     }
 }

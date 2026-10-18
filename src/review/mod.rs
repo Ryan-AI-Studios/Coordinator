@@ -223,10 +223,12 @@ pub fn drive_with(
                         _ => ("FAIL", format!("cross-model: gate failed ({slug})")),
                     }
                 };
+                let reviewed_oid = exec_head_oid(&exec_repo);
                 persist_review(record, |rv| {
                     rv.active = Some(slug.to_string());
                     rv.verdict = Some(verdict.into());
                     rv.report = Some(format!("review.{slug}.md"));
+                    rv.reviewed_oid = reviewed_oid;
                 })?;
                 return if class == TierClass::GateFail && !degrade {
                     apply_failure(record, state, FailureClass::Difficulty, event)
@@ -490,6 +492,21 @@ fn git_worktree_clean(exec_repo: &Path) -> bool {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
         _ => false,
     }
+}
+
+/// Execution-repo `HEAD` at verdict time; `None` when unreadable (the label then never applies).
+fn exec_head_oid(exec_repo: &Path) -> Option<String> {
+    let out = crate::git_command::command()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(exec_repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 fn persist_review(record: &ProjectRecord, f: impl FnOnce(&mut ReviewWatchState)) -> Result<()> {

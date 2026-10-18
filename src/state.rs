@@ -216,6 +216,9 @@ pub struct ReviewWatchState {
     /// Relative name e.g. `review.codex.md`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<String>,
+    /// Execution-repo `HEAD` when `verdict` was persisted (0096). `ci-wait` labels only on a match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_oid: Option<String>,
     /// One-shot slugs killed by reviewer stall (0036). Never `RunState.stalled_at`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stalled: Vec<String>,
@@ -701,6 +704,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_reviewed_oid_is_additive() {
+        let old: ReviewWatchState = serde_json::from_str(r#"{"verdict":"PASS"}"#).unwrap();
+        assert!(old.reviewed_oid.is_none());
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("reviewed_oid")
+        );
+        let rv = ReviewWatchState {
+            reviewed_oid: Some("abc".into()),
+            ..Default::default()
+        };
+        let back: ReviewWatchState =
+            serde_json::from_str(&serde_json::to_string(&rv).unwrap()).unwrap();
+        assert_eq!(back.reviewed_oid.as_deref(), Some("abc"));
+    }
+
     use chrono::Utc;
     use std::path::Path;
     use tempfile::tempdir;
