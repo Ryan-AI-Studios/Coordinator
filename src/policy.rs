@@ -376,6 +376,22 @@ fn is_workflow(path: &str) -> bool {
     path.replace('\\', "/").starts_with(WORKFLOW_PREFIX)
 }
 
+/// A path the external merge stepper treats as mandatory-review: it contains the
+/// `.github/workflows/` segment, or its basename is exactly `Cargo.toml` (case-sensitive).
+pub fn is_mandatory_review_path(path: &str) -> bool {
+    let norm = path.replace('\\', "/");
+    let in_workflows = norm.starts_with(WORKFLOW_PREFIX) || norm.contains("/.github/workflows/");
+    in_workflows || norm.rsplit('/').next() == Some("Cargo.toml")
+}
+
+pub fn mandatory_review_paths(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|p| is_mandatory_review_path(p))
+        .cloned()
+        .collect()
+}
+
 fn fingerprint_for(name: &str, matched: &[String]) -> String {
     match name {
         NAME_FAILURES | NAME_RESTORE => matched.first().cloned().unwrap_or_default(),
@@ -670,6 +686,31 @@ impl PolicyRead for FixedRead {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mandatory_review_path_matches_stepper_class() {
+        for p in [
+            ".github/workflows/ci.yml",
+            r".github\workflows\ci.yml",
+            "sub/.github/workflows/x.yml",
+            "Cargo.toml",
+            "sub/Cargo.toml",
+            r"sub\Cargo.toml",
+        ] {
+            assert!(is_mandatory_review_path(p), "{p}");
+        }
+        for p in [
+            ".github/workflows",
+            "Cargo.lock",
+            "docs/Cargo.toml.md",
+            "cargo.toml",
+            "src/x.rs",
+        ] {
+            assert!(!is_mandatory_review_path(p), "{p}");
+        }
+        let all = vec!["a.rs".to_string(), "Cargo.toml".to_string()];
+        assert_eq!(mandatory_review_paths(&all), vec!["Cargo.toml".to_string()]);
+    }
+
     use super::*;
     use crate::config::{ENV_COORDINATOR_HOME, MachineConfig, save_machine_config, test_env_lock};
     use crate::layout::LayoutProfile;

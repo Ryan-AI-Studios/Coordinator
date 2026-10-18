@@ -10,7 +10,7 @@ use crate::error::{CoordinatorError, Result};
 
 use super::backend::{
     AutoPublishResult, CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend, CiTarget,
-    MergeResult, MergeStateStatus, PrHint,
+    LabelOutcome, MergeResult, MergeStateStatus, PrHint,
 };
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -118,6 +118,97 @@ impl CiBackend for GhCli {
     fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
         live_auto_publish(self, cwd, track_id)
     }
+
+    fn pr_files(&self, cwd: &Path, pr_number: u64) -> Result<Vec<String>> {
+        let args = pr_files_args(pr_number);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = gh_ok(cwd, &refs)?;
+        Ok(lines_of(&out.stdout))
+    }
+
+    fn ensure_label(&self, cwd: &Path, pr_number: u64, label: &str) -> Result<LabelOutcome> {
+        // 1. Already on the PR: one call, nothing else.
+        let args = pr_labels_args(pr_number);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let on_pr = gh_ok(cwd, &refs)?;
+        if lines_of(&on_pr.stdout).iter().any(|l| l == label) {
+            return Ok(LabelOutcome::AlreadyPresent);
+        }
+        // 2. The repo must have it (`--add-label` never creates one).
+        let args = label_search_args(label);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let in_repo = gh_ok(cwd, &refs)?;
+        if !lines_of(&in_repo.stdout).iter().any(|l| l == label) {
+            return Ok(LabelOutcome::LabelMissing);
+        }
+        // 3. Apply.
+        let n = pr_number.to_string();
+        gh_ok(cwd, &["pr", "edit", n.as_str(), "--add-label", label])?;
+        Ok(LabelOutcome::Applied)
+    }
+}
+
+/// `gh_capture` reports a non-zero exit as `ok: false`, never `Err`; this maps it to `Err`.
+fn gh_ok(cwd: &Path, args: &[&str]) -> Result<ProcOut> {
+    require_ok(gh_capture(cwd, args)?, args.first().copied().unwrap_or(""))
+}
+
+fn require_ok(out: ProcOut, sub: &str) -> Result<ProcOut> {
+    if out.exit == 4 {
+        return Err(CoordinatorError::Message("gh auth required".into()));
+    }
+    if !out.ok {
+        return Err(CoordinatorError::Message(format!(
+            "gh {sub} failed: {}",
+            truncate(&out.stderr)
+        )));
+    }
+    Ok(out)
+}
+
+fn lines_of(s: &str) -> Vec<String> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+pub(crate) fn pr_files_args(number: u64) -> Vec<String> {
+    vec![
+        "api".into(),
+        format!("repos/{{owner}}/{{repo}}/pulls/{number}/files"),
+        "--paginate".into(),
+        "-q".into(),
+        ".[].filename".into(),
+    ]
+}
+
+pub(crate) fn pr_labels_args(number: u64) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "view".into(),
+        number.to_string(),
+        "--json".into(),
+        "labels".into(),
+        "-q".into(),
+        ".labels[].name".into(),
+    ]
+}
+
+pub(crate) fn label_search_args(label: &str) -> Vec<String> {
+    vec![
+        "label".into(),
+        "list".into(),
+        "--search".into(),
+        label.into(),
+        "--limit".into(),
+        "100".into(),
+        "--json".into(),
+        "name".into(),
+        "-q".into(),
+        ".[].name".into(),
+    ]
 }
 
 /// `track/{numeric}` or `track/{numeric}-{slug}`. The id is any run of digits.
@@ -1198,6 +1289,7 @@ fn gh_bin() -> PathBuf {
     }
 }
 
+#[derive(Debug)]
 struct ProcOut {
     exit: i32,
     ok: bool,
@@ -1828,6 +1920,84 @@ mod parse_tests {
     }
 
     #[test]
+    fn label_argv_exact() {
+        assert_eq!(
+            pr_files_args(7),
+            [
+                "api",
+                "repos/{owner}/{repo}/pulls/7/files",
+                "--paginate",
+                "-q",
+                ".[].filename"
+            ]
+        );
+        assert_eq!(
+            pr_labels_args(7),
+            [
+                "pr",
+                "view",
+                "7",
+                "--json",
+                "labels",
+                "-q",
+                ".labels[].name"
+            ]
+        );
+        assert_eq!(
+            label_search_args("ai-reviewed"),
+            [
+                "label",
+                "list",
+                "--search",
+                "ai-reviewed",
+                "--limit",
+                "100",
+                "--json",
+                "name",
+                "-q",
+                ".[].name"
+            ]
+        );
+    }
+
+    #[test]
+    fn nonzero_gh_exit_is_an_error_not_success() {
+        let bad = ProcOut {
+            exit: 1,
+            ok: false,
+            stdout: String::new(),
+            stderr: "HTTP 403".into(),
+        };
+        let e = require_ok(bad, "pr").unwrap_err().to_string();
+        assert!(e.contains("gh pr failed") && e.contains("403"), "{e}");
+        let auth = ProcOut {
+            exit: 4,
+            ok: false,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert!(
+            require_ok(auth, "pr")
+                .unwrap_err()
+                .to_string()
+                .contains("auth")
+        );
+        let good = ProcOut {
+            exit: 0,
+            ok: true,
+            stdout: String::from(
+                "a
+
+ b 
+",
+            ),
+            stderr: String::new(),
+        };
+        let out = require_ok(good, "pr").unwrap();
+        assert_eq!(lines_of(&out.stdout), ["a", "b"]);
+    }
+
+    #[test]
     fn merge_base_is_ancestor_argv_exact() {
         assert_eq!(
             merge_base_is_ancestor_argv("abc", "def"),
@@ -2018,5 +2188,29 @@ mod live {
             .output()
             .expect("gh --version");
         assert!(out.status.success(), "gh --version failed");
+    }
+
+    /// Scratch PR in a repo that has `ai-reviewed`: `COORDINATOR_GH_LIVE_PR=<n>` (cwd = that repo).
+    /// First call applies (or finds) the label; the second must be `AlreadyPresent`.
+    #[test]
+    #[ignore]
+    fn ci_live_ensure_label_is_idempotent() {
+        if std::env::var(ENV_COORDINATOR_GH_LIVE).ok().as_deref() != Some("1") {
+            return;
+        }
+        let Some(n) = std::env::var("COORDINATOR_GH_LIVE_PR")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            return;
+        };
+        let cwd = std::env::current_dir().unwrap();
+        let first = GhCli.ensure_label(&cwd, n, "ai-reviewed").unwrap();
+        assert!(matches!(
+            first,
+            LabelOutcome::Applied | LabelOutcome::AlreadyPresent
+        ));
+        let second = GhCli.ensure_label(&cwd, n, "ai-reviewed").unwrap();
+        assert_eq!(second, LabelOutcome::AlreadyPresent);
     }
 }

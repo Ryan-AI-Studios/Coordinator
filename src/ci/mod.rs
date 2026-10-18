@@ -30,7 +30,8 @@ use crate::workflow::{MergedTrackProbe, WorkflowDriver};
 
 pub use backend::{
     AutoPublishResult, CallCounts, CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend,
-    CiTarget, MergeResult, MergeStateStatus, PrHint, RecordingBackend, ScriptedBackend,
+    CiTarget, LabelOutcome, MergeResult, MergeStateStatus, PrHint, RecordingBackend,
+    ScriptedBackend,
 };
 pub use gh::{GhCli, GhMergedTrackProbe};
 
@@ -374,6 +375,7 @@ fn finish_green(
             if let MutationGate::Stop(view) = release_for_mutation(record, state, &merge_gate)? {
                 return Ok(view.map(|view| *view));
             }
+            maybe_apply_ai_reviewed(record, state, cwd, backend, *number, head_oid.as_deref());
             let merge = match backend.squash_merge(cwd, *number, head_oid.as_deref()) {
                 Ok(m) => m,
                 Err(e) => return classify_backend_err(record, state, e),
@@ -1428,6 +1430,63 @@ pub(crate) fn with_green_pr_prefix(record: &ProjectRecord, phase: &str, message:
     match lookup_green_open_pr(record) {
         Ok(Some(n)) => format!("PR #{n} green; merge not performed \u{2014} {message}"),
         _ => message,
+    }
+}
+
+/// The external merge stepper's contract label, not a project setting.
+const AI_REVIEWED_LABEL: &str = "ai-reviewed";
+
+/// Satisfy the mandatory-review merge gate from this run's own cross-model verdict (0096).
+///
+/// Applies [`AI_REVIEWED_LABEL`] only when the verdict is `PASS`/`PASS_WITH_LOWS`, it was recorded
+/// at the PR's tip, and the PR's own files include a mandatory-review path. Each earlier miss makes
+/// no later `gh` call. Never fails the run: every problem is a progress line and the merge goes on.
+fn maybe_apply_ai_reviewed(
+    record: &ProjectRecord,
+    state: &RunState,
+    cwd: &Path,
+    backend: &dyn CiBackend,
+    number: u64,
+    head_oid: Option<&str>,
+) {
+    let log = |detail: String| {
+        crate::progress_log::append(record, "ci-wait", &truncate_msg(&detail));
+    };
+    let Some(review) = state.review.as_ref() else {
+        return;
+    };
+    if !matches!(review.verdict.as_deref(), Some("PASS" | "PASS_WITH_LOWS")) {
+        return;
+    }
+    let tip = head_oid.map(str::trim).filter(|s| !s.is_empty());
+    match (review.reviewed_oid.as_deref(), tip) {
+        (Some(a), Some(b)) if a == b => {}
+        (a, b) => {
+            log(format!(
+                "ci-wait: label skipped (verdict tip {} != pr tip {}), PR #{number}",
+                a.unwrap_or("none"),
+                b.unwrap_or("none")
+            ));
+            return;
+        }
+    }
+    match backend.pr_files(cwd, number) {
+        Ok(files) if crate::policy::mandatory_review_paths(&files).is_empty() => {}
+        Ok(_) => match backend.ensure_label(cwd, number, AI_REVIEWED_LABEL) {
+            Ok(LabelOutcome::Applied) => log(format!(
+                "ci-wait: label applied {AI_REVIEWED_LABEL} #{number}"
+            )),
+            Ok(LabelOutcome::AlreadyPresent) => {}
+            Ok(LabelOutcome::LabelMissing) => log(format!(
+                "ci-wait: label skipped ({AI_REVIEWED_LABEL} missing in this repo, PR #{number})"
+            )),
+            Err(e) => log(format!(
+                "ci-wait: label failed ({AI_REVIEWED_LABEL}, PR #{number}): {e}"
+            )),
+        },
+        Err(e) => log(format!(
+            "ci-wait: label skipped (PR #{number} file list unreadable: {e})"
+        )),
     }
 }
 
@@ -3826,6 +3885,138 @@ mod tests {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
         }
+    }
+
+    // --- 0096: ai-reviewed label from a machine review verdict ---
+
+    fn label_state(verdict: Option<&str>, oid: Option<&str>) -> RunState {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        run_with_driver(&r, Some("0010".into()), WorkflowDriver::Adapter).unwrap();
+        let mut st = load_run_state(&r).unwrap();
+        st.review = verdict.map(|v| crate::state::ReviewWatchState {
+            verdict: Some(v.into()),
+            reviewed_oid: oid.map(String::from),
+            ..Default::default()
+        });
+        st
+    }
+
+    /// Runs the helper and returns `(label_calls, pr_files_calls, ensure_label_calls, status.md)`.
+    fn run_label(
+        verdict: Option<&str>,
+        reviewed: Option<&str>,
+        tip: Option<&str>,
+        files: Result<Vec<String>>,
+        label: Result<LabelOutcome>,
+    ) -> (Vec<(u64, String)>, usize, usize, String) {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let st = label_state(verdict, reviewed);
+        let scripted = Arc::new(ScriptedBackend::new());
+        scripted.push_files(files);
+        scripted.push_label(label);
+        let rec_b = RecordingBackend::wrap(scripted.clone());
+        maybe_apply_ai_reviewed(&r, &st, dir.path(), &rec_b, 7, tip);
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap_or_default();
+        (
+            scripted.label_calls(),
+            rec_b.counts.pr_files_n(),
+            rec_b.counts.ensure_label_n(),
+            log,
+        )
+    }
+
+    fn wf() -> Result<Vec<String>> {
+        Ok(vec![".github/workflows/ci.yml".into(), "src/a.rs".into()])
+    }
+
+    #[test]
+    fn label_applied_on_pass_and_pass_with_lows_for_mandatory_class() {
+        for v in ["PASS", "PASS_WITH_LOWS"] {
+            let (calls, _, _, log) = run_label(
+                Some(v),
+                Some("abc"),
+                Some("abc"),
+                wf(),
+                Ok(LabelOutcome::Applied),
+            );
+            assert_eq!(calls, vec![(7, "ai-reviewed".to_string())], "{v}");
+            assert!(log.contains("label applied ai-reviewed #7"), "{log}");
+        }
+    }
+
+    #[test]
+    fn no_label_call_for_other_verdicts_or_tip_mismatch() {
+        for v in [Some("FAIL"), Some("DEGRADED_PUBLISH"), None] {
+            let (calls, files_n, label_n, _) =
+                run_label(v, Some("abc"), Some("abc"), wf(), Ok(LabelOutcome::Applied));
+            assert!(calls.is_empty() && files_n == 0 && label_n == 0, "{v:?}");
+        }
+        for (reviewed, tip) in [
+            (Some("abc"), Some("def")),
+            (None, Some("abc")),
+            (Some("abc"), None),
+        ] {
+            let (calls, files_n, label_n, log) =
+                run_label(Some("PASS"), reviewed, tip, wf(), Ok(LabelOutcome::Applied));
+            assert!(calls.is_empty() && files_n == 0 && label_n == 0);
+            assert!(log.contains("label skipped (verdict tip"), "{log}");
+        }
+    }
+
+    #[test]
+    fn non_mandatory_files_make_no_label_call() {
+        let (calls, files_n, label_n, _) = run_label(
+            Some("PASS"),
+            Some("abc"),
+            Some("abc"),
+            Ok(vec!["src/a.rs".into(), "Cargo.lock".into()]),
+            Ok(LabelOutcome::Applied),
+        );
+        assert!(calls.is_empty());
+        assert_eq!((files_n, label_n), (1, 0));
+    }
+
+    #[test]
+    fn label_problems_are_logged_and_never_raise() {
+        fn boom<T>() -> Result<T> {
+            Err(CoordinatorError::Message("HTTP 403".into()))
+        }
+        let (_, _, _, log) = run_label(Some("PASS"), Some("abc"), Some("abc"), wf(), boom());
+        assert!(log.contains("label failed") && log.contains("403"), "{log}");
+        let (_, _, _, log) = run_label(
+            Some("PASS"),
+            Some("abc"),
+            Some("abc"),
+            boom(),
+            Ok(LabelOutcome::Applied),
+        );
+        assert!(log.contains("file list unreadable"), "{log}");
+        let (_, _, _, log) = run_label(
+            Some("PASS"),
+            Some("abc"),
+            Some("abc"),
+            wf(),
+            Ok(LabelOutcome::LabelMissing),
+        );
+        assert!(
+            log.contains("ai-reviewed missing in this repo, PR #7"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn already_present_label_logs_nothing() {
+        let (calls, _, _, log) = run_label(
+            Some("PASS"),
+            Some("abc"),
+            Some("abc"),
+            wf(),
+            Ok(LabelOutcome::AlreadyPresent),
+        );
+        assert_eq!(calls.len(), 1);
+        assert!(!log.contains("label"), "{log}");
     }
 
     const EMPTY_LEG_EVENT: &str = "ci-wait: empty implement leg \u{2014} branch 'track/0001-x' has no commits ahead of origin/main";
