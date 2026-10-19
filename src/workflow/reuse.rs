@@ -762,6 +762,27 @@ mod tests {
     fn binding_or_skill_change_refuses_the_slot() {
         let _lock = test_env_lock();
         let prev = std::env::var_os(ENV_COORDINATOR_AGY_BIN);
+        // `slot_matches` resolves the live binding from the machine config, so without
+        // isolation this test reads the developer's real `config.json`. A host that pins
+        // `plan_reviewer_agy.model` makes the null-model case below fail, while CI (which
+        // has no config) passes on the same commit. Point the machine home at a temp dir so
+        // the bindings are the compiled defaults wherever the suite runs.
+        let home = tempdir().unwrap();
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var(crate::config::ENV_COORDINATOR_HOME, v),
+                        None => std::env::remove_var(crate::config::ENV_COORDINATOR_HOME),
+                    }
+                }
+            }
+        }
+        let _restore_home = RestoreHome(std::env::var_os(crate::config::ENV_COORDINATOR_HOME));
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
         let dir = tempdir().unwrap();
         let r = matching_fixture(dir.path(), "0083");
         assert!(slot_matches(&r, "0083", REVIEW_SLUG_AGY));
