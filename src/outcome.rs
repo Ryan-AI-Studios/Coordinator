@@ -56,10 +56,12 @@ pub enum FailureClass {
     Timeout,
     CiFailed,
     SkillMissing,
+    /// 0097: a fold kept rewriting the artifacts that review had just passed.
+    ReviewNeverSettles,
 }
 
 impl FailureClass {
-    pub const ALL: [FailureClass; 7] = [
+    pub const ALL: [FailureClass; 8] = [
         Self::Permission,
         Self::ModelExhaustion,
         Self::Difficulty,
@@ -67,6 +69,7 @@ impl FailureClass {
         Self::Timeout,
         Self::CiFailed,
         Self::SkillMissing,
+        Self::ReviewNeverSettles,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -78,6 +81,7 @@ impl FailureClass {
             Self::Timeout => "timeout",
             Self::CiFailed => "ci_failed",
             Self::SkillMissing => "skill_missing",
+            Self::ReviewNeverSettles => "review_never_settles",
         }
     }
 
@@ -90,6 +94,7 @@ impl FailureClass {
             "timeout" => Ok(Self::Timeout),
             "ci_failed" => Ok(Self::CiFailed),
             "skill_missing" => Ok(Self::SkillMissing),
+            "review_never_settles" => Ok(Self::ReviewNeverSettles),
             other => Err(CoordinatorError::Message(format!(
                 "unknown failure_class: {other}"
             ))),

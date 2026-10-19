@@ -182,21 +182,27 @@ pub fn on_success(
     }
 
     if let Some(next) = successor(&state.phase) {
+        // 0097: a fold may override the successor (see `fold_review_reentry`).
+        let mut next = next;
         if state.phase == graph::PHASE_FOLD && next == graph::PHASE_IMPLEMENT {
             match conductor_md::fold_advance(record, state.track_id.as_deref()) {
-                conductor_md::FoldAdvance::Allow => {
-                    if let Err(e) = crate::checkpoint::ensure_implement_ref(record, state) {
-                        state.status = RunStatus::Stopped;
-                        state.failure_class = None;
-                        state.last_event = e.to_string();
-                        crate::progress_log::append(
-                            record,
-                            "checkpoint-refused",
-                            &state.last_event,
-                        );
-                        return AddressCiFollowUp::Continue;
+                conductor_md::FoldAdvance::Allow => match fold_review_reentry(record, state) {
+                    FoldReentry::None => {
+                        if let Err(e) = crate::checkpoint::ensure_implement_ref(record, state) {
+                            state.status = RunStatus::Stopped;
+                            state.failure_class = None;
+                            state.last_event = e.to_string();
+                            crate::progress_log::append(
+                                record,
+                                "checkpoint-refused",
+                                &state.last_event,
+                            );
+                            return AddressCiFollowUp::Continue;
+                        }
                     }
-                }
+                    FoldReentry::Reenter => next = graph::PHASE_PLAN_REVIEW,
+                    FoldReentry::Exhausted => return AddressCiFollowUp::Continue,
+                },
                 conductor_md::FoldAdvance::Withhold { status_clean } => {
                     state.status = RunStatus::Stopped;
                     state.failure_class = None;
@@ -310,6 +316,79 @@ fn stop_address_ci(state: &mut RunState, message: &str) {
     state.phase_started_at = None;
     state.pause_started_at = None;
     state.last_event = message.to_string();
+}
+
+/// 0097 — max consecutive `fold -> plan-review` re-entries in one run.
+const MAX_FOLD_REVIEW_REENTRIES: u32 = 2;
+const FOLD_REENTRY_KIND: &str = "fold-reentry";
+const REVIEW_NEVER_SETTLES_KIND: &str = "review-never-settles";
+
+enum FoldReentry {
+    /// Nothing changed, or there is no receipt to compare against: advance as before.
+    None,
+    /// The fold rewrote a reviewed artifact; the successor must become `plan-review`.
+    Reenter,
+    /// The cap is spent; `state` is already stopped with `review_never_settles`.
+    Exhausted,
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..8).unwrap_or(sha)
+}
+
+/// 0097 — did this fold rewrite an artifact the last review receipt covers?
+///
+/// Compares the on-disk `spec.md`/`plan.md` hashes with the ones `plan-review` recorded in
+/// `reuse.json`. Without those reviews a fold that changes them hands `implement` artifacts
+/// nobody has read, and a spec that requires fresh reviews of the current pair can never be
+/// satisfied — every fold invalidates the reviews that preceded it, and the graph had no
+/// `fold -> plan-review` edge. A missing receipt means there is nothing to compare against,
+/// so the historical `fold -> implement` behaviour is kept rather than inventing a re-review.
+///
+/// Bounded by [`MAX_FOLD_REVIEW_REENTRIES`]: a fold that always rewrites stops the run with
+/// [`FailureClass::ReviewNeverSettles`] instead of spinning.
+fn fold_review_reentry(record: &ProjectRecord, state: &mut RunState) -> FoldReentry {
+    let Some(track) = state.track_id.as_deref() else {
+        return FoldReentry::None;
+    };
+    let Some(dir) = graph::resolve_track_dir(record, track) else {
+        return FoldReentry::None;
+    };
+    let Some((spec_now, plan_now)) = reuse::current_artifact_pair(&dir) else {
+        return FoldReentry::None;
+    };
+    let Some((spec_rev, plan_rev)) = reuse::reviewed_artifact_pair(record, track) else {
+        return FoldReentry::None;
+    };
+    if spec_now == spec_rev && plan_now == plan_rev {
+        // Settled: a later rewrite in this run starts a fresh count.
+        state.fold_review_reentries = 0;
+        return FoldReentry::None;
+    }
+    if state.fold_review_reentries >= MAX_FOLD_REVIEW_REENTRIES {
+        state.status = RunStatus::Stopped;
+        state.failure_class = Some(FailureClass::ReviewNeverSettles);
+        state.last_event = format!(
+            "workflow: review never settles — artifacts rewritten {} times; spec {} plan {} \
+             (reviewed spec {} plan {})",
+            MAX_FOLD_REVIEW_REENTRIES,
+            short_sha(&spec_now),
+            short_sha(&plan_now),
+            short_sha(&spec_rev),
+            short_sha(&plan_rev)
+        );
+        crate::progress_log::append(record, REVIEW_NEVER_SETTLES_KIND, &state.last_event);
+        return FoldReentry::Exhausted;
+    }
+    state.fold_review_reentries = state.fold_review_reentries.saturating_add(1);
+    let message = format!(
+        "advance fold -> plan-review (artifacts changed: spec {} plan {})",
+        short_sha(&spec_now),
+        short_sha(&plan_now)
+    );
+    state.last_event = message.clone();
+    crate::progress_log::append(record, FOLD_REENTRY_KIND, &message);
+    FoldReentry::Reenter
 }
 
 fn advance_event(from: &str, next: &str, paused: bool) -> String {
@@ -2572,5 +2651,114 @@ mod tests {
         let view = write_and_apply(&r, o).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         assert_eq!(view.phase, crate::state::STUB_PHASE_COMPLETED);
+    }
+
+    // --- 0097: fold -> plan-review re-entry ---------------------------------------------
+
+    fn sha_hex_test(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Write a track dir whose `reuse.json` covers exactly `spec`/`plan`.
+    fn receipt_for(dir: &std::path::Path, spec: &[u8], plan: &[u8]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("spec.md"), spec).unwrap();
+        std::fs::write(dir.join("plan.md"), plan).unwrap();
+        let spec_sha = sha_hex_test(spec);
+        let plan_sha = sha_hex_test(plan);
+        let body = format!(
+            "{{\"version\":1,\"track_id\":\"0097\",\"spec_sha256\":\"{spec_sha}\",\
+             \"plan_sha256\":\"{plan_sha}\",\"skill_sha256\":\"{spec_sha}\",\"slots\":{{}}}}"
+        );
+        std::fs::write(dir.join("reuse.json"), body).unwrap();
+    }
+
+    fn track_dir_0097(ws: &std::path::Path) -> std::path::PathBuf {
+        let dir = ws.join("conductor").join("0097-Test");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn fold_reentry_is_none_when_artifacts_match_the_receipt() {
+        let ws = tempdir().unwrap();
+        let record = rec(ws.path());
+        let dir = track_dir_0097(ws.path());
+        receipt_for(&dir, b"spec", b"plan");
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0097".into());
+        assert!(matches!(
+            fold_review_reentry(&record, &mut state),
+            FoldReentry::None
+        ));
+        assert_eq!(state.fold_review_reentries, 0);
+    }
+
+    #[test]
+    fn fold_reentry_reenters_when_the_fold_rewrote_the_spec() {
+        let ws = tempdir().unwrap();
+        let record = rec(ws.path());
+        let dir = track_dir_0097(ws.path());
+        receipt_for(&dir, b"spec", b"plan");
+        std::fs::write(dir.join("spec.md"), b"rewritten spec").unwrap();
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0097".into());
+        assert!(matches!(
+            fold_review_reentry(&record, &mut state),
+            FoldReentry::Reenter
+        ));
+        assert_eq!(state.fold_review_reentries, 1);
+        assert!(
+            state.last_event.contains("advance fold -> plan-review"),
+            "{}",
+            state.last_event
+        );
+        assert!(
+            state.last_event.contains("artifacts changed"),
+            "{}",
+            state.last_event
+        );
+    }
+
+    #[test]
+    fn fold_reentry_is_none_without_a_receipt() {
+        let ws = tempdir().unwrap();
+        let record = rec(ws.path());
+        let dir = track_dir_0097(ws.path());
+        std::fs::write(dir.join("spec.md"), b"spec").unwrap();
+        std::fs::write(dir.join("plan.md"), b"plan").unwrap();
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0097".into());
+        assert!(
+            matches!(fold_review_reentry(&record, &mut state), FoldReentry::None),
+            "a track with no receipt keeps the historical fold -> implement behaviour"
+        );
+    }
+
+    #[test]
+    fn fold_reentry_stops_with_review_never_settles_at_the_cap() {
+        let ws = tempdir().unwrap();
+        let record = rec(ws.path());
+        let dir = track_dir_0097(ws.path());
+        receipt_for(&dir, b"spec", b"plan");
+        std::fs::write(dir.join("plan.md"), b"rewritten plan").unwrap();
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0097".into());
+        state.status = RunStatus::Running;
+        state.fold_review_reentries = MAX_FOLD_REVIEW_REENTRIES;
+        assert!(matches!(
+            fold_review_reentry(&record, &mut state),
+            FoldReentry::Exhausted
+        ));
+        assert_eq!(state.status, RunStatus::Stopped);
+        assert_eq!(state.failure_class, Some(FailureClass::ReviewNeverSettles));
+        assert!(
+            state.last_event.contains("review never settles"),
+            "{}",
+            state.last_event
+        );
     }
 }

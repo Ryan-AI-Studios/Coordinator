@@ -278,6 +278,25 @@ fn shared_hashes(record: &ProjectRecord, track_dir: &Path) -> Option<SharedHashe
     Some(SharedHashes { spec, plan, skill })
 }
 
+/// 0097: current `spec.md`/`plan.md` content hashes for a track directory.
+pub fn current_artifact_pair(track_dir: &Path) -> Option<(String, String)> {
+    Some((
+        hash_file(&track_dir.join("spec.md"))?,
+        hash_file(&track_dir.join("plan.md"))?,
+    ))
+}
+
+/// 0097: the `spec.md`/`plan.md` hashes the last `plan-review` receipt covers. `None` when
+/// there is no readable receipt — a fold with nothing to compare against keeps the old
+/// behaviour rather than inventing a re-review.
+pub fn reviewed_artifact_pair(record: &ProjectRecord, track_id: &str) -> Option<(String, String)> {
+    let dir = crate::workflow::graph::resolve_track_dir(record, track_id)?;
+    match load_receipt(&dir) {
+        LoadedReceipt::Ready(r) => Some((r.spec_sha256, r.plan_sha256)),
+        _ => None,
+    }
+}
+
 fn shared_match(record: &ProjectRecord, track_dir: &Path, receipt: &Receipt) -> bool {
     match shared_hashes(record, track_dir) {
         Some(h) => {
