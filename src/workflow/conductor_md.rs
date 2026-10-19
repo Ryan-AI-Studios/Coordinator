@@ -235,6 +235,31 @@ pub fn is_terminal(status_raw: &str) -> bool {
     is_completed(status_raw) || is_absorbed(status_raw) || is_cancelled(status_raw)
 }
 
+/// A downgrade that carries a stated reason is a decision, not lost bookkeeping.
+///
+/// `Proposed` and `Blocked` are written two ways. Bare - as a marker that the next tick should
+/// pick the row up again (0089: a plan left a row `Proposed` so it would be re-planned). Or with a
+/// reason, when the phase is deliberately not advancing it (0098: "Proposed - spec section 7
+/// prerequisites remain open"). Replaying the bare marker back to `Ready` is the intended safety
+/// net; replaying a reasoned one overrides the decision the phase just made, and the next tick
+/// starts work the plan says must not start. Keep this narrow: it only speaks about rows whose
+/// status names `Proposed` or `Blocked`.
+pub fn is_reasoned_downgrade(status_raw: &str) -> bool {
+    let lower = status_raw.to_ascii_lowercase();
+    let Some((word, at)) = ["proposed", "blocked"]
+        .iter()
+        .filter_map(|w| lower.find(w).map(|p| (*w, p)))
+        .min_by_key(|(_, p)| *p)
+    else {
+        return false;
+    };
+    lower[at + word.len()..]
+        .trim_matches(|c: char| c.is_whitespace() || c == '*' || c == '`')
+        .trim_start_matches(['-', ':', '=', '.'])
+        .chars()
+        .any(|c| c.is_ascii_alphanumeric())
+}
+
 /// Best-effort `{conductor_dir}/conductor.md` rows. Missing / unreadable → `None`.
 pub fn load_track_rows(record: &ProjectRecord) -> Option<Vec<TrackRow>> {
     let path = crate::layout::resolve(record)
@@ -537,7 +562,11 @@ pub fn restore_ready_rows(
         };
         let was_ready = is_eligible_ready_in(prev, aliases);
         let now_ready = is_eligible_ready_in(&row.status_raw, aliases);
-        if was_ready && !now_ready && !is_terminal(&row.status_raw) {
+        if was_ready
+            && !now_ready
+            && !is_terminal(&row.status_raw)
+            && !is_reasoned_downgrade(&row.status_raw)
+        {
             downgraded.push((row.id.clone(), prev.clone()));
         }
     }
