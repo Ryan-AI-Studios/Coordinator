@@ -94,6 +94,11 @@ pub struct RunState {
     /// Monotonic epoch; incremented each successful `run` into Running.
     #[serde(default)]
     pub run_epoch: u64,
+    /// 0097: consecutive `fold -> plan-review` re-entries this run (capped). A fold that
+    /// rewrites a reviewed artifact must be re-reviewed, but a fold that always rewrites
+    /// must not spin: the run stops with `review_never_settles` at the cap.
+    #[serde(default)]
+    pub fold_review_reentries: u32,
     /// When the current phase clock started (Running entry / fresh run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase_started_at: Option<DateTime<Utc>>,
@@ -294,6 +299,7 @@ impl RunState {
             updated_at: Utc::now(),
             last_event: "idle: no run".into(),
             run_epoch: 0,
+            fold_review_reentries: 0,
             phase_started_at: None,
             total_paused_ms: 0,
             pause_started_at: None,

@@ -25,6 +25,9 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
         FailureClass::SkillMissing => {
             "Create the missing skill file or set skill_aliases; do not blind-retry."
         }
+        FailureClass::ReviewNeverSettles => {
+            "Do not blind-retry: the fold keeps rewriting the artifacts the last review passed. Read the fold's changes and re-review the amended pair, or stop the fold rewriting spec/plan."
+        }
     }
 }
 
