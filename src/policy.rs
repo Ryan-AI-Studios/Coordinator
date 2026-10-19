@@ -573,21 +573,73 @@ pub fn git_changed_paths(cwd: &Path, base_ref: &str, tip: &str) -> Result<Vec<St
     let verified_text = std::str::from_utf8(&verified.stdout).map_err(|_| {
         CoordinatorError::Message("policy: git rev-parse stdout is not utf-8".into())
     })?;
-    if !verified.status.success() || verified_text.trim().is_empty() {
-        return Err(CoordinatorError::Message(format!(
-            "policy: unreadable checkpoint {base_ref}"
-        )));
-    }
-    let diff = git(cwd, &["diff", "--name-only", base_ref, tip])?;
+    let base = if verified.status.success() && !verified_text.trim().is_empty() {
+        base_ref.to_string()
+    } else {
+        // The per-epoch checkpoint ref can be absent: a resumed run, a pruned ref, or a stepper
+        // restart that bumped the epoch after the phase began. Blocking every publish on that is
+        // a bookkeeping failure wearing a policy violation's clothes - and the automation merges
+        // around the block anyway, which is worse than the block. Fall back to the newest older
+        // checkpoint for the same project. It is an ancestor of the missing ref, so its diff is a
+        // superset of this epoch's changes and the gate still sees every path.
+        match newest_older_checkpoint(cwd, base_ref)? {
+            Some(older) => older,
+            None => {
+                return Err(CoordinatorError::Message(format!(
+                    "policy: unreadable checkpoint {base_ref}"
+                )));
+            }
+        }
+    };
+    let diff = git(cwd, &["diff", "--name-only", &base, tip])?;
     if !diff.status.success() {
         return Err(CoordinatorError::Message(format!(
-            "policy: git diff --name-only {base_ref} {tip}: {}",
+            "policy: git diff --name-only {base} {tip}: {}",
             diff.stderr.trim()
         )));
     }
     let text = String::from_utf8(diff.stdout)
         .map_err(|_| CoordinatorError::Message("policy: git diff stdout is not utf-8".into()))?;
     Ok(normalize_paths(&text))
+}
+
+/// Newest `refs/coordinator/checkpoints/{project}/{n}` with `n` below the requested epoch.
+///
+/// Only consulted when the exact epoch ref is missing. `None` when the base is not of that shape
+/// or no older checkpoint exists, so the caller keeps its block rather than guessing a base.
+fn newest_older_checkpoint(cwd: &Path, base_ref: &str) -> Result<Option<String>> {
+    let Some((prefix, epoch_text)) = base_ref.rsplit_once('/') else {
+        return Ok(None);
+    };
+    let Ok(epoch) = epoch_text.parse::<u64>() else {
+        return Ok(None);
+    };
+    let spec = format!("{prefix}/");
+    let listing = git(cwd, &["for-each-ref", "--format=%(refname)", &spec])?;
+    if !listing.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&listing.stdout);
+    let mut best: Option<(u64, String)> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((p, n)) = line.rsplit_once('/') else {
+            continue;
+        };
+        if p != prefix {
+            continue;
+        }
+        let Ok(n) = n.parse::<u64>() else {
+            continue;
+        };
+        if n >= epoch {
+            continue;
+        }
+        if best.as_ref().map(|(b, _)| n > *b).unwrap_or(true) {
+            best = Some((n, line.to_string()));
+        }
+    }
+    Ok(best.map(|(_, r)| r))
 }
 
 fn normalize_paths(text: &str) -> Vec<String> {
@@ -955,6 +1007,56 @@ mod tests {
         git(dir.path(), &["commit", "-m", "seed"]);
         let err = git_changed_paths(dir.path(), "refs/coordinator/checkpoints/missing/1", "HEAD")
             .unwrap_err();
+        assert!(err.to_string().contains("unreadable checkpoint"), "{err}");
+    }
+
+    /// 0552: ci-wait blocked with "policy: block dependency-manifest: unreadable" because the
+    /// epoch's checkpoint ref was absent, and the stepper merged the PR anyway - the gate blocked
+    /// and the merge happened outside it. An older checkpoint for the same project is an ancestor
+    /// of the missing one, so its diff still shows every path this epoch changed.
+    #[test]
+    fn missing_epoch_checkpoint_falls_back_to_the_newest_older_one() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "policy@example.com"]);
+        git(dir.path(), &["config", "user.name", "policy"]);
+        std::fs::write(dir.path().join("README.md"), b"seed\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "seed"]);
+        let seed = git_stdout(dir.path(), &["rev-parse", "HEAD"]);
+        git(
+            dir.path(),
+            &["update-ref", "refs/coordinator/checkpoints/p/1", &seed],
+        );
+        std::fs::write(dir.path().join("Cargo.toml"), b"[package]\nname = \"x\"\n").unwrap();
+        git(dir.path(), &["add", "Cargo.toml"]);
+        git(dir.path(), &["commit", "-m", "manifest"]);
+        let paths = git_changed_paths(dir.path(), "refs/coordinator/checkpoints/p/2", "HEAD")
+            .expect("an older checkpoint supplies the base");
+        assert!(
+            paths.iter().any(|p| p == "Cargo.toml"),
+            "the fallback must still see the manifest: {paths:?}"
+        );
+    }
+
+    /// The fallback only ever looks *backwards*. A ref for a later epoch is not evidence of what
+    /// this run changed, so it must not be used and the block must stand.
+    #[test]
+    fn newer_only_checkpoint_still_blocks() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "policy@example.com"]);
+        git(dir.path(), &["config", "user.name", "policy"]);
+        std::fs::write(dir.path().join("README.md"), b"seed\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "seed"]);
+        let seed = git_stdout(dir.path(), &["rev-parse", "HEAD"]);
+        git(
+            dir.path(),
+            &["update-ref", "refs/coordinator/checkpoints/p/9", &seed],
+        );
+        let err =
+            git_changed_paths(dir.path(), "refs/coordinator/checkpoints/p/2", "HEAD").unwrap_err();
         assert!(err.to_string().contains("unreadable checkpoint"), "{err}");
     }
 
