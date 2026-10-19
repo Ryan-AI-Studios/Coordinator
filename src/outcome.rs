@@ -58,10 +58,13 @@ pub enum FailureClass {
     SkillMissing,
     /// 0097: a fold kept rewriting the artifacts that review had just passed.
     ReviewNeverSettles,
+    /// A leg reported success, but the artifacts say the phase did not actually
+    /// complete: no `plan.md`, or a review artifact still asking for a re-plan.
+    Gate,
 }
 
 impl FailureClass {
-    pub const ALL: [FailureClass; 8] = [
+    pub const ALL: [FailureClass; 9] = [
         Self::Permission,
         Self::ModelExhaustion,
         Self::Difficulty,
@@ -70,6 +73,7 @@ impl FailureClass {
         Self::CiFailed,
         Self::SkillMissing,
         Self::ReviewNeverSettles,
+        Self::Gate,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -82,6 +86,7 @@ impl FailureClass {
             Self::CiFailed => "ci_failed",
             Self::SkillMissing => "skill_missing",
             Self::ReviewNeverSettles => "review_never_settles",
+            Self::Gate => "gate",
         }
     }
 
@@ -95,6 +100,7 @@ impl FailureClass {
             "ci_failed" => Ok(Self::CiFailed),
             "skill_missing" => Ok(Self::SkillMissing),
             "review_never_settles" => Ok(Self::ReviewNeverSettles),
+            "gate" => Ok(Self::Gate),
             other => Err(CoordinatorError::Message(format!(
                 "unknown failure_class: {other}"
             ))),

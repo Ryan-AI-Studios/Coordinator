@@ -185,6 +185,14 @@ pub fn on_success(
         // 0097: a fold may override the successor (see `fold_review_reentry`).
         let mut next = next;
         if state.phase == graph::PHASE_FOLD && next == graph::PHASE_IMPLEMENT {
+            // The leg's `success` is not evidence. Check the artifacts before implementing.
+            if let Some(message) = fold_artifact_gate(record, state) {
+                state.status = RunStatus::Stopped;
+                state.failure_class = Some(FailureClass::Gate);
+                state.last_event = message.clone();
+                crate::progress_log::append(record, FOLD_GATE_KIND, &message);
+                return AddressCiFollowUp::Continue;
+            }
             match conductor_md::fold_advance(record, state.track_id.as_deref()) {
                 conductor_md::FoldAdvance::Allow => match fold_review_reentry(record, state) {
                     FoldReentry::None => {
@@ -347,6 +355,75 @@ fn short_sha(sha: &str) -> &str {
 ///
 /// Bounded by [`MAX_FOLD_REVIEW_REENTRIES`]: a fold that always rewrites stops the run with
 /// [`FailureClass::ReviewNeverSettles`] instead of spinning.
+const FOLD_GATE_KIND: &str = "fold-gate";
+
+/// Fold gate: never advance to `implement` on artifacts that say the plan is not ready.
+///
+/// A phase leg self-reports `success`; the conductor must not treat that as evidence when
+/// the artifacts say otherwise. Observed on 0553 (2026-10-19): `plan.md` was absent and
+/// both review artifacts still said `## Verdict: Needs re-plan`, the fold returned
+/// `success`, the conductor advanced, implement wrote nothing, and the run was recorded as
+/// `harness_crash` - the wrong diagnosis for a gate failure. Checking here makes the
+/// failure land on the phase that actually failed, and stops the track before it spends
+/// a leg on nothing.
+fn fold_artifact_gate(record: &ProjectRecord, state: &RunState) -> Option<String> {
+    let track = state
+        .track_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let dir = graph::resolve_track_dir(record, track)?;
+    let plan_ok = std::fs::read_to_string(dir.join("plan.md")).is_ok_and(|t| !t.trim().is_empty());
+    if !plan_ok {
+        return Some(format!(
+            "workflow: fold gate - {track} reached implement with no usable plan.md              (the leg reported success)"
+        ));
+    }
+    let mut offenders: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if !lower.contains("review") || !lower.ends_with(".md") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if review_asks_for_replan(&text) {
+                offenders.push(name.to_string());
+            }
+        }
+    }
+    offenders.sort();
+    if offenders.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "workflow: fold gate - {track} reached implement while review still asked for a          re-plan: {}",
+        offenders.join(", ")
+    ))
+}
+
+/// Does this review artifact's verdict ask for a re-plan?
+fn review_asks_for_replan(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        let body = trimmed.trim_start_matches('#').trim();
+        let Some(rest) = body.strip_prefix("Verdict:") else {
+            return false;
+        };
+        let rest = rest.trim().to_ascii_lowercase();
+        rest.contains("needs re-plan") || rest.contains("needs replan")
+    })
+}
+
 fn fold_review_reentry(record: &ProjectRecord, state: &mut RunState) -> FoldReentry {
     let Some(track) = state.track_id.as_deref() else {
         return FoldReentry::None;
@@ -2680,6 +2757,56 @@ mod tests {
         let dir = ws.join("conductor").join("0097-Test");
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn gate_state(record: &ProjectRecord) -> RunState {
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0097".into());
+        state
+    }
+
+    #[test]
+    fn fold_gate_blocks_when_plan_is_missing() {
+        let ws = tempdir().unwrap();
+        let record = rec(ws.path());
+        let dir = track_dir_0097(ws.path());
+        std::fs::write(dir.join("spec.md"), b"spec").unwrap();
+        let state = gate_state(&record);
+        let message = fold_artifact_gate(&record, &state).expect("gate must fire");
+        assert!(message.contains("no usable plan.md"), "{message}");
+    }
+
+    #[test]
+    fn fold_gate_blocks_on_a_needs_re_plan_verdict() {
+        let ws = tempdir().unwrap();
+        let record = rec(ws.path());
+        let dir = track_dir_0097(ws.path());
+        std::fs::write(dir.join("plan.md"), b"a real plan").unwrap();
+        std::fs::write(
+            dir.join("agy-review.md"),
+            b"## Verdict: Needs re-plan\n\nfindings\n",
+        )
+        .unwrap();
+        let state = gate_state(&record);
+        let message = fold_artifact_gate(&record, &state).expect("gate must fire");
+        assert!(message.contains("agy-review.md"), "{message}");
+        assert!(message.contains("re-plan"), "{message}");
+    }
+
+    #[test]
+    fn fold_gate_allows_a_plan_with_passing_verdicts() {
+        let ws = tempdir().unwrap();
+        let record = rec(ws.path());
+        let dir = track_dir_0097(ws.path());
+        std::fs::write(dir.join("plan.md"), b"a real plan").unwrap();
+        std::fs::write(dir.join("agy-review.md"), b"## Verdict: PASS\n").unwrap();
+        std::fs::write(
+            dir.join("opencode-review.md"),
+            b"## Verdict: Ready after fixes\n",
+        )
+        .unwrap();
+        let state = gate_state(&record);
+        assert!(fold_artifact_gate(&record, &state).is_none());
     }
 
     #[test]

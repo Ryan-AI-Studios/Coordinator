@@ -28,6 +28,9 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
         FailureClass::ReviewNeverSettles => {
             "Do not blind-retry: the fold keeps rewriting the artifacts the last review passed. Read the fold's changes and re-review the amended pair, or stop the fold rewriting spec/plan."
         }
+        FailureClass::Gate => {
+            "Do not re-drive the track: it reached the fold without a usable plan.md, or with a review still asking for a re-plan. Write or re-review the artifacts, and resolve any owner decision the leg was waiting on."
+        }
     }
 }
 

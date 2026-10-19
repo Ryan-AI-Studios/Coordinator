@@ -1338,7 +1338,13 @@ pub fn overlay_file_status(record: &ProjectRecord, id: &str) -> Option<String> {
 #[cfg(test)]
 pub fn write_ready_fixture(ws: &std::path::Path, id: &str) -> std::io::Result<()> {
     let cond = ws.join("conductor");
-    std::fs::create_dir_all(cond.join(format!("{id}-Fixture")))?;
+    let track = cond.join(format!("{id}-Fixture"));
+    std::fs::create_dir_all(&track)?;
+    // A Ready row means spec/plan already exist. The fold gate refuses to advance to
+    // implement without a usable plan.md, so the fixture has to carry one or it models a
+    // state the real registry never produces.
+    std::fs::write(track.join("spec.md"), b"fixture spec\n")?;
+    std::fs::write(track.join("plan.md"), b"fixture plan\n")?;
     let md = format!(
         "| Track | Execution path | Status | Summary |\n\
          | --- | --- | --- | --- |\n\
