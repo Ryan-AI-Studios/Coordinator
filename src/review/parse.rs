@@ -382,7 +382,10 @@ fn line_has_blocking_severity(line: &str) -> bool {
             return true;
         }
     }
-    false
+    // A plain bullet — `- P2. missing case`, no table cell, no bold, no `Severity:` label —
+    // reached none of the checks above, so its severity was invisible.
+    let bare = line.trim_start_matches(['-', '*', '+', ' ', '\t']);
+    is_blocking_severity_token(bare)
 }
 
 fn split_severity_label(line: &str) -> Option<&str> {
@@ -414,10 +417,18 @@ fn is_blocking_severity_token(raw: &str) -> bool {
         .trim()
         .trim_matches(|c: char| c == '*' || c == '`' || c == '"' || c == '\'')
         .to_ascii_lowercase();
-    matches!(
-        t.as_str(),
-        "p0" | "p1" | "p2" | "critical" | "high" | "medium"
-    )
+    if matches!(t.as_str(), "critical" | "high" | "medium") {
+        return true;
+    }
+    // A real finding is written `**P2 — wrong prefix handling**`, `P2: …` or `P2.`, not as a
+    // bare `P2`. Requiring the whole cell to equal the token missed every annotated finding,
+    // so `findings_block` saw a FAIL with nothing blocking in it and downgraded it to
+    // publish — a reviewer FAIL silently clearing its own gate. Match the leading token.
+    let head = t
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+    matches!(head, "p0" | "p1" | "p2")
 }
 
 #[cfg(test)]
@@ -703,5 +714,56 @@ None at P0–P2 against the DoD-1–5 implementation itself.
         assert!(is_gate2_finding(line));
         assert!(!is_publish_only_fail(&text));
         assert_eq!(parse_report(&text, ""), ParsedVerdict::GateFail);
+    }
+
+    /// A finding is normally written with prose after its severity. Requiring the whole
+    /// cell to equal the token let a FAIL with only annotated findings read as "lows only"
+    /// and publish — the reviewer clearing its own gate.
+    #[test]
+    fn annotated_severity_tokens_are_blocking() {
+        for line in [
+            "- **P1 — wrong prefix handling**",
+            "- **P2 — trailing chatter accepted**",
+            "| P2 | isError not set on parse failure |",
+            "Severity: P2 (high)",
+            "P2. missing #[should_panic] case",
+            "P2: wrong prefix",
+            "*p1* — unparseable",
+            "**critical** — data loss",
+            "**high**",
+            "**medium**",
+        ] {
+            assert!(
+                line_has_blocking_severity(line),
+                "expected blocking severity in: {line}"
+            );
+        }
+    }
+
+    /// P3 is a low: it must stay non-blocking, or every nit becomes a gate failure.
+    #[test]
+    fn low_severity_tokens_are_not_blocking() {
+        for line in [
+            "- **P3 — naming nit**",
+            "| P3 | cosmetic |",
+            "P3. typo",
+            "**P3**",
+            "P4 out of range",
+            "- **note** — not a severity",
+        ] {
+            assert!(
+                !line_has_blocking_severity(line),
+                "expected NO blocking severity in: {line}"
+            );
+        }
+    }
+
+    /// The end-to-end consequence: a FAIL whose only blocking finding carries prose must
+    /// still gate.
+    #[test]
+    fn fail_with_only_annotated_p2_findings_is_a_gate_fail() {
+        let text =
+            "## Verdict: FAIL\n\n## Findings\n\n- **P2 — isError not set on a parse failure**\n";
+        assert_eq!(parse_report(text, ""), ParsedVerdict::GateFail);
     }
 }
