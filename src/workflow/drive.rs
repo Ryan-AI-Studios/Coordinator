@@ -2122,6 +2122,50 @@ mod tests {
         assert!(log.contains("0090"), "{log}");
     }
 
+    /// 0098: the fold wrote `Proposed - spec section 7 prerequisites remain open`, and the advance
+    /// step replayed the pre-run `Ready` two seconds later. Implement then ran against unmet
+    /// prerequisites, correctly wrote nothing, and was scored `harness_crash` - three times.
+    /// A reasoned downgrade is a decision the phase just made, not lost bookkeeping.
+    #[test]
+    fn reasoned_proposed_downgrade_is_not_restored() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_registry(
+            dir.path(),
+            &linked_row(
+                "0090",
+                "**Proposed - spec section 7 prerequisites remain open**",
+            ),
+        );
+        seed_snapshot(&record, "0090", READY_CELL);
+        let ready = restore_ready_rows_after_phase(&record);
+        let text =
+            std::fs::read_to_string(dir.path().join("conductor").join("conductor.md")).unwrap();
+        assert!(
+            text.contains("prerequisites remain open"),
+            "the reason must survive the advance step: {text}"
+        );
+        assert!(
+            ready.restored.is_empty(),
+            "a reasoned downgrade must not be replayed to Ready, restored {:?}",
+            ready.restored
+        );
+    }
+
+    /// The narrow counterpart: a bare `Proposed` is still the 0089 "re-plan me" marker and must
+    /// keep being restored. If this ever fails, the fix above has widened too far.
+    #[test]
+    fn bare_proposed_still_restores() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_registry(dir.path(), &linked_row("0090", "**Proposed**"));
+        seed_snapshot(&record, "0090", READY_CELL);
+        let ready = restore_ready_rows_after_phase(&record);
+        assert_eq!(ready.restored, vec!["0090".to_string()]);
+    }
+
     #[test]
     fn fold_consume_survives_apply_and_completed_survives_implement() {
         let _home = IsolatedHome::enter();
