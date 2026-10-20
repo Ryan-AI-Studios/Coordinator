@@ -184,6 +184,21 @@ pub fn on_success(
     if let Some(next) = successor(&state.phase) {
         // 0097: a fold may override the successor (see `fold_review_reentry`).
         let mut next = next;
+        // 0554: an implement leg that reports success without committing leaves the chain to
+        // fail two phases later (cross-model gate, then the next epoch's checkpoint).
+        let implement_message =
+            if state.phase == graph::PHASE_IMPLEMENT && state.driver == WorkflowDriver::Adapter {
+                implement_artifact_gate(record, state)
+            } else {
+                None
+            };
+        if let Some(message) = implement_message {
+            state.status = RunStatus::Stopped;
+            state.failure_class = Some(FailureClass::Gate);
+            state.last_event = message.clone();
+            crate::progress_log::append(record, IMPLEMENT_GATE_KIND, &message);
+            return AddressCiFollowUp::Continue;
+        }
         if state.phase == graph::PHASE_FOLD && next == graph::PHASE_IMPLEMENT {
             // The leg's `success` is not evidence. Check the artifacts before implementing.
             if let Some(message) = fold_artifact_gate(record, state) {
@@ -935,6 +950,53 @@ pub fn mark_driven(record: &ProjectRecord, phase: &str) -> Result<()> {
         crate::progress_log::append(record, "inject", &format!("track={track} phase={phase}"));
         Ok(())
     })
+}
+
+const IMPLEMENT_GATE_KIND: &str = "implement-gate";
+
+/// Implement gate: the `implement` phase is done only when its work is committed.
+///
+/// `success` from the leg is not evidence. Observed on 0554 (2026-10-20): the leg wrote
+/// 18 files (+1938/-211) and committed nothing, so the cross-model gate failed twice on
+/// "no EXEC commit, worktree dirty", the `address-findings` budget was exhausted, and the
+/// next epoch's fold -> implement checkpoint refused the dirty tree. Every refusal named a
+/// phase other than the one that failed, and the cost was two wasted legs plus a manual
+/// commit on the operator.
+///
+/// Fail-open when git cannot be read (no execution repo, unreadable HEAD): the checkpoint
+/// and `harness::no_change` remain the backstops, matching that guard's posture.
+fn implement_artifact_gate(record: &ProjectRecord, state: &RunState) -> Option<String> {
+    let cwd = crate::checkpoint::require_cwd(record).ok()?;
+    let dirt = crate::checkpoint::committable_dirt(&cwd).ok()?;
+    if !dirt.is_empty() {
+        let shown = dirt.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        let more = dirt.len().saturating_sub(5);
+        let tail = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        return Some(format!(
+            "implement-gate: the implement leg reported success with {} uncommitted path(s): {shown}{tail}; commit the work before the phase can advance",
+            dirt.len()
+        ));
+    }
+    let head = crate::checkpoint::git_ok(&cwd, &["rev-parse", "HEAD"]).ok()?;
+    let head = head.trim().to_string();
+    if head.is_empty() {
+        return None;
+    }
+    let base_ref = crate::checkpoint::ref_name(&record.id, state.run_epoch);
+    let base = crate::checkpoint::git_ok(&cwd, &["rev-parse", "--verify", "--quiet", &base_ref])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if base == head {
+        return Some(format!(
+            "implement-gate: the implement leg reported success but HEAD {head} is still the epoch checkpoint, so the phase produced no commit to review"
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2807,6 +2869,81 @@ mod tests {
         .unwrap();
         let state = gate_state(&record);
         assert!(fold_artifact_gate(&record, &state).is_none());
+    }
+
+    fn impl_git(cwd: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repo whose HEAD is also this epoch's checkpoint ref, i.e. the moment `fold` hands
+    /// over to `implement`.
+    fn implement_fixture(
+        epoch: u64,
+    ) -> (tempfile::TempDir, crate::registry::ProjectRecord, String) {
+        let repo = tempfile::tempdir().unwrap();
+        impl_git(repo.path(), &["init", "-b", "main"]);
+        impl_git(
+            repo.path(),
+            &["config", "user.email", "impl-gate@example.com"],
+        );
+        impl_git(repo.path(), &["config", "user.name", "impl-gate"]);
+        std::fs::write(repo.path().join("README.md"), b"seed\n").unwrap();
+        impl_git(repo.path(), &["add", "."]);
+        impl_git(repo.path(), &["commit", "-m", "seed"]);
+        let mut record = rec(repo.path());
+        record.execution_repo = Some(repo.path().to_path_buf());
+        let ref_name = crate::checkpoint::ref_name(&record.id, epoch);
+        impl_git(repo.path(), &["update-ref", &ref_name, "HEAD"]);
+        (repo, record, ref_name)
+    }
+
+    fn implement_state(record: &crate::registry::ProjectRecord, epoch: u64) -> RunState {
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0554".into());
+        state.run_epoch = epoch;
+        state
+    }
+
+    #[test]
+    fn implement_gate_blocks_when_the_tree_is_dirty() {
+        let (repo, record, _) = implement_fixture(1);
+        std::fs::write(repo.path().join("src_new.rs"), b"fn work() {}\n").unwrap();
+        let state = implement_state(&record, 1);
+        let message = implement_artifact_gate(&record, &state).expect("gate must fire");
+        assert!(message.contains("uncommitted"), "{message}");
+        assert!(message.contains("src_new.rs"), "{message}");
+    }
+
+    #[test]
+    fn implement_gate_blocks_when_nothing_was_committed_since_the_checkpoint() {
+        let (_repo, record, _) = implement_fixture(1);
+        let state = implement_state(&record, 1);
+        let message = implement_artifact_gate(&record, &state).expect("gate must fire");
+        assert!(message.contains("no commit to review"), "{message}");
+    }
+
+    #[test]
+    fn implement_gate_allows_a_clean_committed_tree() {
+        let (repo, record, _) = implement_fixture(1);
+        std::fs::write(repo.path().join("src_new.rs"), b"fn work() {}\n").unwrap();
+        impl_git(repo.path(), &["add", "."]);
+        impl_git(
+            repo.path(),
+            &["commit", "-m", "track(0554): the leg's work"],
+        );
+        let state = implement_state(&record, 1);
+        assert!(implement_artifact_gate(&record, &state).is_none());
     }
 
     #[test]
