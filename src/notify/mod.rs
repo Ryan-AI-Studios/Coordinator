@@ -44,6 +44,9 @@ pub const ENV_COORDINATOR_NOTIFY_FLEET: &str = "COORDINATOR_NOTIFY_FLEET";
 /// JSON `event_type` and `X-Coordinator-Event` value for [`FleetSummaryEvent`].
 pub const EVENT_TYPE_FLEET_SUMMARY: &str = "fleet_summary";
 
+/// JSON `event_type` and `X-Coordinator-Event` value for [`StallEvent`] (0104).
+pub const EVENT_TYPE_STALL: &str = "stall";
+
 /// Minimum gap between serve-loop fleet posts.
 pub const FLEET_SUMMARY_INTERVAL: chrono::Duration = chrono::Duration::seconds(3600);
 
@@ -94,6 +97,85 @@ pub struct FleetSummaryEvent {
     pub written_at: DateTime<Utc>,
     pub projects: Vec<crate::state::StatusView>,
 }
+
+/// Stall page kind. `begin` opens one owner page per `(project, track, epoch)`;
+/// `clear` is its single matching resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallKind {
+    Begin,
+    Clear,
+}
+
+impl StallKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+/// Why a stall page was resolved. Precedence: run_ended → track → phase → progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallClearReason {
+    Progress,
+    Phase,
+    Track,
+    RunEnded,
+}
+
+impl StallClearReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Progress => "progress",
+            Self::Phase => "phase",
+            Self::Track => "track",
+            Self::RunEnded => "run_ended",
+        }
+    }
+}
+
+/// Owner stall page (0104). Not a [`NotifyEvent`]: no `failure_class`, no artifact,
+/// no toast, no retry. `track_id` is omitted when `None`; `stalled_at`/`idle_secs`
+/// appear only on begin, `cleared_at`/`clear_reason` only on clear.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StallEvent {
+    pub event_type: String,
+    pub kind: StallKind,
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_id: Option<String>,
+    /// begin: current phase; clear: the paged phase (stored-key echo).
+    pub phase: String,
+    pub run_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_reason: Option<StallClearReason>,
+    pub last_event: String,
+    pub written_at: DateTime<Utc>,
+}
+
+/// Test-only delivery-mode recorder.
+///
+/// The in-process Hermes test slot delivers both transports synchronously, so a
+/// request count alone cannot prove that `run::stop` used the blocking path. The
+/// recorder is the only non-vacuous seam (mirrors `features::take_feature_warnings`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallDelivery {
+    Detached,
+    Blocking,
+}
+
+#[cfg(test)]
+static RECORDED_STALL_DELIVERIES: std::sync::Mutex<Vec<StallDelivery>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Single notify entry. Never fails the caller (toast/adapter errors isolated).
 pub fn on_hard_failure(record: &ProjectRecord, event: &NotifyEvent) {
@@ -213,6 +295,65 @@ pub fn on_progress(event: &ProgressEvent) {
     if let Err(e) = hermes::HermesAdapter::for_default_stack().notify_progress(event) {
         eprintln!("coordinator: progress hermes failed (non-fatal): {e}");
     }
+}
+
+/// One stderr line + one detached Hermes POST (0104).
+///
+/// Never artifact, never toast, never fails the caller. With an unconfigured or
+/// `NoOp` Hermes the page is still claimed by the caller and only the stderr line
+/// is written (no POST, no retry).
+pub fn on_stall(event: &StallEvent) {
+    record_stall_delivery(StallDelivery::Detached);
+    eprintln!(
+        "coordinator: stall page: {} track={} phase={} epoch={}",
+        event.kind.as_str(),
+        event.track_id.as_deref().unwrap_or("-"),
+        event.phase,
+        event.run_epoch
+    );
+    if let Err(e) = hermes::HermesAdapter::for_default_stack().notify_stall(event) {
+        eprintln!("coordinator: stall page hermes failed (non-fatal): {e}");
+    }
+}
+
+/// One stderr line + one **synchronous** Hermes POST, bounded by `POST_TIMEOUT`
+/// (0104 operator stop only). No thread; a failure is logged and never fails the
+/// caller (at-most-once; no retry).
+pub fn on_stall_blocking(event: &StallEvent) {
+    record_stall_delivery(StallDelivery::Blocking);
+    eprintln!(
+        "coordinator: stall page: {} track={} phase={} epoch={}",
+        event.kind.as_str(),
+        event.track_id.as_deref().unwrap_or("-"),
+        event.phase,
+        event.run_epoch
+    );
+    if let Err(e) = hermes::HermesAdapter::for_default_stack().notify_stall_blocking(event) {
+        eprintln!("coordinator: stall page hermes failed (non-fatal): {e}");
+    }
+}
+
+fn record_stall_delivery(mode: StallDelivery) {
+    #[cfg(test)]
+    {
+        let mut recorded = RECORDED_STALL_DELIVERIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        recorded.push(mode);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = mode;
+    }
+}
+
+/// Drain the delivery-mode recorder (test-only).
+#[cfg(test)]
+pub(crate) fn take_stall_delivery_modes_for_tests() -> Vec<StallDelivery> {
+    let mut recorded = RECORDED_STALL_DELIVERIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *recorded)
 }
 
 #[cfg(test)]

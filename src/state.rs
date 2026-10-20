@@ -153,6 +153,9 @@ pub struct RunState {
     /// Stall recycles this phase (0027). Cap 1. Not cleared by the recycle itself.
     #[serde(default)]
     pub stall_recycles: u32,
+    /// 0104: owner-page ownership for the current/most recent stall key.
+    #[serde(default, skip_serializing_if = "StallPagingState::is_idle")]
+    pub stall_paging: StallPagingState,
     /// Session id being recycled; apply skips fallout from this id only (0027).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aborted_session_id: Option<String>,
@@ -215,6 +218,37 @@ pub struct RunState {
     /// Cleared with `delivery_target`. Never gates a mutation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_target_journal: Option<String>,
+}
+
+/// 0104: owner-page ownership for the current/most recent stall key.
+///
+/// Durable dedupe marker for `(run_epoch, track_id)`. The paging module owns its
+/// lifecycle; `run.rs` never touches it (a fresh epoch must be observable so the
+/// old page can be closed). Omitted from JSON while idle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StallPagingState {
+    /// `run_epoch` whose begin was claimed (written before the POST).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paged_epoch: Option<u64>,
+    /// `track_id` at begin (`None` = no track id). Part of the dedupe key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paged_track: Option<String>,
+    /// Phase at begin. A later phase is a clear, not a re-begin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paged_phase: Option<String>,
+    /// Claim time; also the "progress since the page" watermark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paged_at: Option<DateTime<Utc>>,
+    /// The matching resolution was claimed for this key (at most one).
+    #[serde(default)]
+    pub cleared: bool,
+}
+
+impl StallPagingState {
+    /// No begin has ever been claimed for the current/most recent key.
+    pub fn is_idle(&self) -> bool {
+        self.paged_epoch.is_none()
+    }
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -338,6 +372,7 @@ impl RunState {
             registry_status_before: BTreeMap::new(),
             pause_spans: Vec::new(),
             stall_recycles: 0,
+            stall_paging: StallPagingState::default(),
             aborted_session_id: None,
             acp_stdout_retries: 0,
             plan_review_spawned: Vec::new(),
@@ -1027,5 +1062,53 @@ mod tests {
         let elapsed = state.effective_running_elapsed(Utc::now());
         // ~7s wall-pause; allow clock skew in CI
         assert!(elapsed.as_secs() >= 6 && elapsed.as_secs() <= 8);
+    }
+
+    #[test]
+    fn stall_paging_state_is_additive_and_round_trips() {
+        let mut idle = RunState::idle("p");
+        let idle_json = serde_json::to_string(&idle).unwrap();
+        assert!(
+            !idle_json.contains("stall_paging"),
+            "an idle marker must not add a JSON key"
+        );
+
+        // A legacy file with no key loads as default.
+        let mut legacy: serde_json::Value = serde_json::from_str(&idle_json).unwrap();
+        legacy.as_object_mut().unwrap().remove("stall_paging");
+        let loaded: RunState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(loaded.stall_paging, StallPagingState::default());
+        assert!(loaded.stall_paging.is_idle());
+
+        // A claimed marker round-trips field-for-field.
+        let paged_at = Utc::now();
+        idle.stall_paging = StallPagingState {
+            paged_epoch: Some(7),
+            paged_track: Some("0104".into()),
+            paged_phase: Some("implement".into()),
+            paged_at: Some(paged_at),
+            cleared: true,
+        };
+        let text = serde_json::to_string(&idle).unwrap();
+        assert!(text.contains("stall_paging"));
+        let back: RunState = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.stall_paging, idle.stall_paging);
+        assert_eq!(back, idle);
+        assert!(!back.stall_paging.is_idle());
+
+        // Equality includes the new field.
+        let mut other = idle.clone();
+        other.stall_paging.cleared = false;
+        assert_ne!(other, idle);
+    }
+
+    #[test]
+    fn run_state_idle_has_idle_paging_marker() {
+        let state = RunState::idle("p");
+        assert_eq!(state.stall_paging, StallPagingState::default());
+        assert!(state.stall_paging.is_idle());
+        assert!(state.stall_paging.paged_epoch.is_none());
+        assert!(state.stall_paging.paged_at.is_none());
+        assert!(!state.stall_paging.cleared);
     }
 }

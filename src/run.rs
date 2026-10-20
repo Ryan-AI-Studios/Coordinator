@@ -490,8 +490,15 @@ fn resume_locked(record: &ProjectRecord) -> Result<ResumePrep> {
 }
 
 /// Apply `stop`: Running/Paused → Stopped; already Stopped = successful no-op.
+///
+/// 0104: an operator stop now also closes an open stall page (one `run_ended`
+/// clear). The close runs **after** the run-state lock is released and only on
+/// the `Ok` path; its POST is **synchronous** (bounded by `POST_TIMEOUT`, 5 s) so a
+/// one-shot CLI stop cannot lose it at process exit. A failure is logged and not
+/// retried (at-most-once). Ordinary stops with an idle marker take the lock-free
+/// early return, so no extra lock or delay is taken.
 pub fn stop(record: &ProjectRecord) -> Result<StatusView> {
-    with_run_state_lock(record, || {
+    let result = with_run_state_lock(record, || {
         ensure_state_dir(record)?;
         let mut state = load_run_state(record)?;
         match state.status {
@@ -525,7 +532,12 @@ pub fn stop(record: &ProjectRecord) -> Result<StatusView> {
                 from: other.to_string(),
             }),
         }
-    })
+    })?;
+    // The run-state directory lock is non-reentrant; `reconcile` takes the same
+    // lock, so the close must run here, after the closure returned, never inside
+    // it. Deliberately blocking (round-2 m1): the one-shot CLI exits next.
+    crate::workflow::stall_paging::tick_blocking(record);
+    Ok(result)
 }
 
 /// Read status without mutation.

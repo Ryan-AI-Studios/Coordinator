@@ -217,7 +217,7 @@ fn check_stall_inner(record: &ProjectRecord) -> Result<Option<StatusView>> {
     })
 }
 
-fn should_watch(state: &RunState) -> bool {
+pub(crate) fn should_watch(state: &RunState) -> bool {
     if state.status != RunStatus::Running {
         return false;
     }

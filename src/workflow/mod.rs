@@ -13,6 +13,7 @@ pub mod prompts;
 pub mod reuse;
 pub mod self_check;
 pub mod shipped;
+pub mod stall_paging;
 pub mod timeouts;
 pub mod watchdog;
 
