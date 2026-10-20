@@ -17,6 +17,7 @@ pub mod toast;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::features::{Duty, evaluate_loaded};
 use crate::outcome::FailureClass;
 use crate::registry::ProjectRecord;
 
@@ -137,18 +138,22 @@ pub fn progress_enabled(record: &ProjectRecord) -> bool {
     machine || record.notify_progress
 }
 
-/// Env `off` wins; else env on **or** machine `hermes.fleet_summary`.
-/// No per-project flag. The CLI probe does not consult this.
+/// Feature gate **veto** first (0102), then env `off` wins; else env on **or**
+/// machine `hermes.fleet_summary`. No per-project flag. The CLI probe does not
+/// consult this. One config load per call (live re-read; no caching).
 pub fn fleet_summary_enabled() -> bool {
+    let loaded = crate::config::load_machine_config();
+    let gate = evaluate_loaded(&loaded);
+    if !gate.enabled(Duty::FleetNotify) {
+        return false;
+    }
     if env_flag_off(ENV_COORDINATOR_NOTIFY_FLEET) {
         return false;
     }
     if env_flag_on(ENV_COORDINATOR_NOTIFY_FLEET) {
         return true;
     }
-    crate::config::load_machine_config()
-        .map(|c| c.hermes.fleet_summary)
-        .unwrap_or(false)
+    loaded.map(|c| c.hermes.fleet_summary).unwrap_or(false)
 }
 
 /// `enabled` false is never due. A missing `last_sent` is due. Otherwise due
@@ -1067,53 +1072,72 @@ mod tests {
         assert!(!fleet_summary_due(Some(backward), now, true));
     }
 
+    fn fleet_env_guard() -> crate::config::TestEnvGuard {
+        crate::config::TestEnvGuard::capture(&crate::features::test_feature_env_names())
+    }
+
+    fn probe_env_guard() -> crate::config::TestEnvGuard {
+        let mut names = crate::features::test_feature_env_names();
+        names.push("COORDINATOR_HERMES_URL");
+        names.push("COORDINATOR_HERMES_SECRET");
+        crate::config::TestEnvGuard::capture(&names)
+    }
+
+    /// Write a real machine config at `home` (raw JSON = the load path under test).
+    fn write_machine_config(
+        home: &std::path::Path,
+        fleet_summary: bool,
+        features: serde_json::Value,
+    ) {
+        let body = serde_json::json!({
+            "version": 1,
+            "scan_roots": [],
+            "hermes": {
+                "enabled": true,
+                "webhook_url": "http://127.0.0.1:9/hook",
+                "progress": false,
+                "fleet_summary": fleet_summary,
+            },
+            "features": features,
+        });
+        std::fs::write(home.join("config.json"), body.to_string()).unwrap();
+    }
+
+    fn assert_fleet_gate(enabled: bool, source: crate::features::FeatureSource) {
+        let snapshot = crate::features::resolve_all();
+        let view = &snapshot.duties[Duty::FleetNotify.as_str()];
+        assert_eq!(view.enabled, enabled, "fleet_notify gate");
+        assert_eq!(view.source, source, "fleet_notify source");
+    }
+
     #[test]
     fn fleet_off_beats_machine_flag_and_tick_posts_nothing() {
-        use crate::config::{
-            ENV_COORDINATOR_HOME, HermesNotifyConfig, MACHINE_CONFIG_VERSION, MachineConfig,
-            default_role_bindings, save_machine_config, test_env_lock,
-        };
-        let _guard = test_env_lock();
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
         let home = tempdir().unwrap();
         unsafe {
-            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
             std::env::set_var(ENV_COORDINATOR_NOTIFY_FLEET, "off");
+            std::env::remove_var("COORDINATOR_HERMES");
         }
-        let cfg = MachineConfig {
-            version: MACHINE_CONFIG_VERSION,
-            scan_roots: Vec::new(),
-            role_bindings: default_role_bindings(),
-            phase_timeouts_secs: std::collections::BTreeMap::new(),
-            hermes: HermesNotifyConfig {
-                enabled: true,
-                webhook_url: Some("http://127.0.0.1:9/hook".into()),
-                progress: false,
-                fleet_summary: true,
-            },
-            progress_stall_secs: None,
-            journal_keep: None,
-            state_policies: Vec::new(),
-        };
-        save_machine_config(&cfg).unwrap();
+        write_machine_config(home.path(), true, serde_json::json!({}));
         assert!(!fleet_summary_enabled());
         let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
         let mut last = None;
         fleet_tick(&mut last, Utc::now());
         assert!(last.is_none());
         assert!(sink.take().is_empty());
-        unsafe {
-            std::env::remove_var(ENV_COORDINATOR_NOTIFY_FLEET);
-            std::env::remove_var(ENV_COORDINATOR_HOME);
-        }
     }
 
     #[test]
     fn fleet_tick_due_posts_one_header_then_waits() {
-        use crate::config::{ENV_COORDINATOR_HOME, test_env_lock};
-        let _guard = test_env_lock();
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
         let home = tempdir().unwrap();
         unsafe {
-            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
             std::env::set_var(ENV_COORDINATOR_NOTIFY_FLEET, "1");
             std::env::remove_var("COORDINATOR_HERMES");
         }
@@ -1136,9 +1160,161 @@ mod tests {
         assert!(!text.contains("s3cret-fleet"));
         fleet_tick(&mut last, now);
         assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn fleet_tick_honours_live_feature_edit_on_next_tick() {
+        use crate::features::FeatureSource;
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
         unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
             std::env::remove_var(ENV_COORDINATOR_NOTIFY_FLEET);
-            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var("COORDINATOR_HERMES");
+        }
+        let t0 = Utc::now();
+        let later = t0 + chrono::Duration::hours(2);
+        write_machine_config(home.path(), true, serde_json::json!({"fleet_notify": true}));
+        let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
+        let mut last = None;
+
+        fleet_tick(&mut last, t0);
+        assert_eq!(sink.take().len(), 1, "tick N posts while the gate is on");
+        assert_eq!(last, Some(t0));
+        assert_fleet_gate(true, FeatureSource::Config);
+
+        write_machine_config(
+            home.path(),
+            true,
+            serde_json::json!({"fleet_notify": false}),
+        );
+        fleet_tick(&mut last, later);
+        assert!(sink.take().is_empty(), "tick N+1 honours the config edit");
+        assert_eq!(last, Some(t0), "a gated-off tick does not stamp last_sent");
+        assert_fleet_gate(false, FeatureSource::Config);
+
+        write_machine_config(home.path(), true, serde_json::json!({"fleet_notify": true}));
+        fleet_tick(&mut last, later);
+        assert_eq!(sink.take().len(), 1, "tick N+2 posts again");
+        assert_fleet_gate(true, FeatureSource::Config);
+    }
+
+    #[test]
+    fn fleet_feature_off_is_a_noop_even_when_hermes_flag_on() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY_FLEET);
+            std::env::remove_var("COORDINATOR_HERMES");
+        }
+        write_machine_config(
+            home.path(),
+            true,
+            serde_json::json!({"fleet_notify": false}),
+        );
+        assert!(!fleet_summary_enabled());
+        let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
+        let mut last = None;
+        fleet_tick(&mut last, Utc::now());
+        assert!(last.is_none());
+        assert!(sink.take().is_empty());
+        assert!(
+            toast::take_recorded_toasts().is_empty(),
+            "no toast side effect"
+        );
+    }
+
+    #[test]
+    fn legacy_env_on_cannot_bypass_feature_gate() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_COORDINATOR_NOTIFY_FLEET, "1");
+            std::env::remove_var("COORDINATOR_HERMES");
+        }
+        write_machine_config(
+            home.path(),
+            true,
+            serde_json::json!({"fleet_notify": false}),
+        );
+        assert!(
+            !fleet_summary_enabled(),
+            "the gate is a veto above the legacy env-on arm"
+        );
+        let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
+        let mut last = None;
+        fleet_tick(&mut last, Utc::now());
+        assert!(last.is_none());
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn malformed_features_table_keeps_fleet_dark_and_logs_one_line() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY_FLEET);
+            std::env::remove_var("COORDINATOR_HERMES");
+        }
+        write_machine_config(
+            home.path(),
+            true,
+            serde_json::json!({"fleet_notify": "yes"}),
+        );
+        let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
+        let now = Utc::now();
+        let mut last = None;
+        fleet_tick(&mut last, now);
+        fleet_tick(&mut last, now + chrono::Duration::hours(2));
+        assert!(last.is_none());
+        assert!(sink.take().is_empty());
+        assert_eq!(
+            crate::features::take_feature_warnings().len(),
+            1,
+            "two ticks, one line"
+        );
+    }
+
+    #[test]
+    fn manual_fleet_summary_probe_is_not_gated() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = probe_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
+        // A bound-then-dropped loopback port so the connect is refused at once.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::remove_var("COORDINATOR_HERMES");
+            std::env::set_var(
+                "COORDINATOR_HERMES_URL",
+                format!("http://127.0.0.1:{port}/hook"),
+            );
+            std::env::set_var("COORDINATOR_HERMES_SECRET", "dummy-secret");
+        }
+        write_machine_config(
+            home.path(),
+            true,
+            serde_json::json!({"fleet_notify": false}),
+        );
+        assert!(!fleet_summary_enabled(), "gate off");
+        let event = build_fleet_summary_event(Utc::now()).unwrap();
+        match hermes::probe_fleet(&event) {
+            hermes::ProbeOutcome::Failed(_) => {}
+            other => panic!("manual probe must attempt the POST, got {other:?}"),
         }
     }
 

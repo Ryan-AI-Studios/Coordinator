@@ -55,7 +55,7 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 |-------|-------------------|----------|
 | Machine home (registry) | `%LOCALAPPDATA%\coordinator\` | `COORDINATOR_HOME` |
 | Registry file | `{home}/registry.json` | — |
-| Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`, `phase_timeouts_secs`, `hermes`) | — |
+| Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`, `phase_timeouts_secs`, `hermes`, `features`) | — |
 | Serve lease | `{home}/serve.json` | written after a successful `serve` bind; deleted on graceful shutdown |
 | Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
 | Active Phase Outcome | `{state_dir}/outcomes/current.json` | same state-dir rules |
@@ -388,6 +388,69 @@ Prefer a **second Hermes route** so a failure prompt does not render `{from_phas
 Operator may point `webhook_url` at either route (one URL in Coordinator). Missing template keys stay literal `{key}` per Hermes. Do not ship Hermes config from this repo. The operator poll cron is unchanged.
 
 `COORDINATOR_NOTIFY=off` is the CI / headless default path. `cargo test` never requires a visible toast (recording adapter).
+
+### Machine feature gates (0102)
+
+Every automation duty has one machine-level kill switch. The switches are **default on** and are a
+**veto**, never an enabler: when a duty is on, its own opt-in still decides (for the fleet summary,
+`hermes.fleet_summary` must also be true). A default install therefore behaves exactly as before.
+
+```json
+{
+  "version": 1,
+  "features": {
+    "auto_start": true,
+    "stall_paging": true,
+    "fleet_notify": true,
+    "self_update": true,
+    "self_reap": true
+  }
+}
+```
+
+| Key | Duty | Env override | Wired today |
+|-----|------|--------------|-------------|
+| `auto_start` | ticker starts the next Ready track | `COORDINATOR_FEATURE_AUTO_START` | reserved (0103) |
+| `stall_paging` | route a detected stall to the owner | `COORDINATOR_FEATURE_STALL_PAGING` | reserved (0104) |
+| `fleet_notify` | serve-loop fleet summary (`notify::fleet_tick`) | `COORDINATOR_FEATURE_FLEET_NOTIFY` | **yes** |
+| `self_update` | build-and-swap the installed binary | `COORDINATOR_FEATURE_SELF_UPDATE` | reserved (0108) |
+| `self_reap` | reap stale harness holders | `COORDINATOR_FEATURE_SELF_REAP` | reserved (0107) |
+
+- **Precedence:** env > machine config > default (on).
+- **Tokens:** on `1|true|on|yes`, off `0|false|off|no` — trimmed, ASCII case-insensitive. An
+  **unknown or empty** token fails that duty **closed** (off, source `env`, one stderr line).
+  Legacy `COORDINATOR_NOTIFY_*` token semantics are **unchanged** (exact untrimmed `off` /
+  `1|true|on`); only `COORDINATOR_FEATURE_*` trims and accepts `yes|no`.
+- **Live re-read:** every tick and every status call re-reads `config.json` and the env. Edit the
+  file and the next tick honours it; no restart.
+- **Effective source:** `status --project <uuid>` renders `features.<duty>` as
+  `{ "enabled": bool, "source": "default" | "config" | "env", "error"?: string }`. The gate and the
+  status surface read the same snapshot.
+- **Fail-closed matrix** (all five duties off, source `config`, one line per condition per process):
+
+  | Condition | Result |
+  |-----------|--------|
+  | `features` absent / `null` / `{}` | all five **on**, source `default` |
+  | known key `true` / `false` | that duty follows config, source `config` |
+  | valid env token | env wins, source `env` |
+  | unrecognised/empty env token | that duty **off**, source `env`, `error` set |
+  | `features` not an object (`"nope"`, `[]`, `42`) | all five off, source `config` |
+  | any value not a JSON boolean (`"yes"`, `1`, `null`) | all five off, source `config` |
+  | `config.json` unreadable / invalid JSON / bad version | all five off, source `config` |
+  | key not in the five | all five off, source `config`; keys listed in `unknown_keys` |
+
+  A malformed table never fails the whole machine config: `role_bindings`, `hermes`, and timeouts
+  keep working. The malformed value is preserved (semantically) on the next
+  `save_machine_config`, so a save cannot silently re-enable duties. An env `on` token cannot
+  rescue a broken/unreadable config.
+- **Combined condition:** a table with both an unknown key and a non-boolean value takes the
+  invalid/type path — `unknown_keys` stays empty and the diagnostic names the bad value. Both
+  paths fail closed.
+- **Reserved keys:** `auto_start` (0103), `stall_paging` (0104), `self_reap` (0107), and
+  `self_update` (0108) are reserved now; those duties ship in later tracks and are not wired here.
+- **Veto semantics:** `fleet_notify` **and** `hermes.fleet_summary` are both required for a
+  serve-loop post. `COORDINATOR_NOTIFY_FLEET=1` cannot bypass the gate. The explicit one-shot
+  `notify fleet-summary` probe is **not** gated.
 
 There are **no skip slots**. `cross-model-review` is a real one-shot gate (track 0011). `ci-wait` is a real phase (track 0010). 0010 still treats predecessor success as the Review Gate — filling this slot makes that hook honest.
 

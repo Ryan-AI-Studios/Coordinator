@@ -305,6 +305,107 @@ pub struct HermesNotifyConfig {
     pub fleet_summary: bool,
 }
 
+/// Machine `features` table (track 0102).
+///
+/// Permissive on purpose: a malformed table must not fail `MachineConfig` load —
+/// one bad duty value would otherwise break every command. Validation
+/// (fail-closed: all duties off) lives in [`crate::features::evaluate_with`].
+/// Missing / `null` / `{}` are the valid default (all duties on).
+///
+/// A malformed table is captured (`invalid`) **and** preserved
+/// (`raw_invalid`, the whole features value) so a later `save_machine_config`
+/// cannot silently re-enable duties. Preservation is semantic (reparse
+/// equality), not byte identity: object key order normalizes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeatureTable {
+    duties: BTreeMap<String, bool>,
+    invalid: Option<String>,
+    raw_invalid: Option<serde_json::Value>,
+}
+
+impl FeatureTable {
+    /// Build a table from validated duty booleans (tests / future writers).
+    pub fn from_duties(duties: BTreeMap<String, bool>) -> Self {
+        Self {
+            duties,
+            invalid: None,
+            raw_invalid: None,
+        }
+    }
+
+    /// Valid duty booleans (never set while `invalid` is).
+    pub fn duties(&self) -> &BTreeMap<String, bool> {
+        &self.duties
+    }
+
+    /// Diagnostic for a malformed/type-invalid table.
+    pub fn invalid(&self) -> Option<&str> {
+        self.invalid.as_deref()
+    }
+
+    /// One duty value, when the table is valid and the key is present.
+    pub fn get(&self, key: &str) -> Option<bool> {
+        self.duties.get(key).copied()
+    }
+
+    /// True only when there is nothing to persist (no duties, no malformed value).
+    pub fn is_empty(&self) -> bool {
+        self.duties.is_empty() && self.invalid.is_none() && self.raw_invalid.is_none()
+    }
+
+    fn from_value(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::default(),
+            serde_json::Value::Object(map) => {
+                if let Some((key, _)) = map.iter().find(|(_, v)| v.as_bool().is_none()) {
+                    let invalid = format!("features.{key} must be true or false");
+                    return Self {
+                        duties: BTreeMap::new(),
+                        invalid: Some(invalid),
+                        raw_invalid: Some(serde_json::Value::Object(map)),
+                    };
+                }
+                let duties = map
+                    .into_iter()
+                    .filter_map(|(key, value)| value.as_bool().map(|flag| (key, flag)))
+                    .collect();
+                Self {
+                    duties,
+                    invalid: None,
+                    raw_invalid: None,
+                }
+            }
+            other => Self {
+                duties: BTreeMap::new(),
+                invalid: Some("features must be an object".into()),
+                raw_invalid: Some(other),
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FeatureTable {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self::from_value(value))
+    }
+}
+
+impl Serialize for FeatureTable {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.raw_invalid {
+            Some(raw) => raw.serialize(serializer),
+            None => self.duties.serialize(serializer),
+        }
+    }
+}
+
 /// Machine-level prefs (`{COORDINATOR_HOME}/config.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MachineConfig {
@@ -319,6 +420,11 @@ pub struct MachineConfig {
     /// Hermes notify adapter. Missing key → disabled defaults (no version bump).
     #[serde(default)]
     pub hermes: HermesNotifyConfig,
+    /// Machine `features` table (0102). Missing → empty (all duties default on).
+    /// Values are validated by `features::evaluate`, not by `MachineConfig` load,
+    /// so one bad duty value cannot fail the whole config.
+    #[serde(default, skip_serializing_if = "FeatureTable::is_empty")]
+    pub features: FeatureTable,
     /// Adapter progress stall interval (seconds). Missing → 600. `0` disables. No version bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_stall_secs: Option<u64>,
@@ -338,6 +444,7 @@ impl Default for MachineConfig {
             role_bindings: default_role_bindings(),
             phase_timeouts_secs: BTreeMap::new(),
             hermes: HermesNotifyConfig::default(),
+            features: FeatureTable::default(),
             progress_stall_secs: None,
             journal_keep: None,
             state_policies: Vec::new(),
@@ -443,7 +550,7 @@ pub fn resolve_scan_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `COORDINATOR_NOTIFY`, `COORDINATOR_HERMES`, `COORDINATOR_HERMES_URL`,
 /// `COORDINATOR_HERMES_SECRET`, `COORDINATOR_HERMES_LIVE`,
 /// `COORDINATOR_NOTIFY_PROGRESS`, `COORDINATOR_NOTIFY_FLEET`, `.env` via `load_dotenv_path`,
-/// `COORDINATOR_PROGRESS_STALL_SECS`, `COORDINATOR_JOURNAL`,
+/// `COORDINATOR_FEATURE_*` (0102), `COORDINATOR_PROGRESS_STALL_SECS`, `COORDINATOR_JOURNAL`,
 /// `COORDINATOR_CANCEL_WAIT_SECS`, `COORDINATOR_AGY_BIN`,
 /// `COORDINATOR_OPENCODE_BIN`, `COORDINATOR_GROK_BIN`,
 /// `COORDINATOR_WORKTREE`, or `COORDINATOR_WORKTREE_REAP_SECS` must
@@ -455,6 +562,41 @@ pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let m = LOCK.get_or_init(|| Mutex::new(()));
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Test-only RAII restore for env vars a test mutates.
+///
+/// Capture **before** writing; `Drop` restores the previous value (or removes
+/// the var), including on panic — unlike a trailing `remove_var`. Used by the
+/// 0102 feature/fleet/status fixtures so ambient `COORDINATOR_*` state cannot
+/// false-pass a test or leak into the next one.
+#[cfg(test)]
+pub struct TestEnvGuard {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+impl TestEnvGuard {
+    pub fn capture(names: &[&'static str]) -> Self {
+        Self {
+            saved: names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..) {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +666,7 @@ mod tests {
             role_bindings: default_role_bindings(),
             phase_timeouts_secs: BTreeMap::new(),
             hermes: HermesNotifyConfig::default(),
+            features: FeatureTable::default(),
             progress_stall_secs: None,
             journal_keep: None,
             state_policies: Vec::new(),
@@ -721,6 +864,7 @@ mod tests {
                 progress: false,
                 fleet_summary: false,
             },
+            features: FeatureTable::default(),
             progress_stall_secs: None,
             journal_keep: None,
             state_policies: Vec::new(),

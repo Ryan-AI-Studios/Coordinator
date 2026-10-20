@@ -443,25 +443,29 @@ pub fn project_scan(
     Ok((candidates, added))
 }
 
-fn attach_ticker(mut view: StatusView) -> StatusView {
+fn attach_operator_view(mut view: StatusView) -> StatusView {
     view.ticker = Some(watch::ticker_view());
+    view.features = Some(crate::features::resolve_all());
     view
 }
 
 /// Resolve project selector then return status view.
 pub fn status(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
-    Ok(attach_ticker(run::status(&rec)?))
+    Ok(attach_operator_view(run::status(&rec)?))
 }
 
-/// Status for all projects (aggregate). One health probe; ticker cloned onto every view.
+/// Status for all projects (aggregate). One health probe and one feature
+/// snapshot; both cloned onto every view so status and fleet agree.
 pub fn status_all() -> Result<Vec<StatusView>> {
     let reg = load_registry()?;
     let ticker = watch::ticker_view();
+    let features = crate::features::resolve_all();
     let mut out = Vec::with_capacity(reg.projects.len());
     for rec in reg.list() {
         let mut view = run::status(rec)?;
         view.ticker = Some(ticker.clone());
+        view.features = Some(features.clone());
         out.push(view);
     }
     Ok(out)
@@ -846,7 +850,7 @@ pub fn cmd_run_cli(
     }
     let view = cmd_run(project, track, driver, opts.skip_preflight, true)?;
     if opts.detach {
-        return Ok(attach_ticker(view));
+        return Ok(attach_operator_view(view));
     }
     if let Some(port) = watch::listening_port(opts.probe) {
         eprintln!("serve owns the ticker on 127.0.0.1:{port}; not waiting");
@@ -855,13 +859,16 @@ pub fn cmd_run_cli(
             owner: "serve".into(),
             port: Some(port),
         });
+        // 0102: attach the snapshot directly — `attach_operator_view` would
+        // overwrite the probe-specific ticker with `ServeProbe::Auto`.
+        view.features = Some(crate::features::resolve_all());
         return Ok(view);
     }
     let rec = load_registry()?
         .find_by_id(&view.project_id)
         .cloned()
         .ok_or_else(|| CoordinatorError::ProjectNotFound(view.project_id.clone()))?;
-    Ok(attach_ticker(watch::wait_for_outcome(
+    Ok(attach_operator_view(watch::wait_for_outcome(
         &rec,
         opts.timeout_secs,
     )?))
@@ -1164,6 +1171,37 @@ mod tests {
         }
     }
 
+    /// 0102 fixture guard: machine home, legacy fleet/Hermes env, every duty gate,
+    /// and the adapter poll/timeout knobs (restored on drop, panic-safe).
+    fn feature_env_guard() -> crate::config::TestEnvGuard {
+        let mut names = crate::features::test_feature_env_names();
+        names.push(ENV_OUTCOME_POLL_MS);
+        names.push(ENV_PHASE_TIMEOUT_SECS);
+        names.push(ENV_STUB_PHASE_TIMEOUT_SECS);
+        crate::config::TestEnvGuard::capture(&names)
+    }
+
+    fn write_feature_config(home: &std::path::Path, features: serde_json::Value) {
+        let body = serde_json::json!({
+            "version": 1,
+            "scan_roots": [],
+            "features": features,
+        });
+        std::fs::write(home.join("config.json"), body.to_string()).unwrap();
+    }
+
+    fn duties_match(
+        view: &StatusView,
+        duty: crate::features::Duty,
+        enabled: bool,
+        source: crate::features::FeatureSource,
+    ) {
+        let features = view.features.as_ref().expect("features attached");
+        let gate = &features.duties[duty.as_str()];
+        assert_eq!(gate.enabled, enabled, "{} enabled", duty.as_str());
+        assert_eq!(gate.source, source, "{} source", duty.as_str());
+    }
+
     fn spawn_health_once(body: &str) -> u16 {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1187,6 +1225,7 @@ mod tests {
     #[test]
     fn cmd_run_cli_stub_ticks_to_idle() {
         let _guard = test_env_lock();
+        let _env = feature_env_guard();
         unsafe {
             std::env::set_var(ENV_OUTCOME_POLL_MS, "10");
             std::env::set_var(ENV_PHASE_TIMEOUT_SECS, "30");
@@ -1206,17 +1245,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.status, RunStatus::Idle);
-        unsafe {
-            std::env::remove_var(ENV_OUTCOME_POLL_MS);
-            std::env::remove_var(ENV_PHASE_TIMEOUT_SECS);
-        }
-        clear_home();
+        // `wait_for_outcome` return carries the snapshot too (0102 DoD-2).
+        let features = view.features.as_ref().expect("features on wait return");
+        assert_eq!(features.duties.len(), 5);
     }
 
     #[test]
     fn cmd_run_cli_detach_stays_running_at_plan() {
         let _guard = test_env_lock();
-        let (_home, _proj, rec) = add_isolated_project();
+        let _env = feature_env_guard();
+        let (home, _proj, rec) = add_isolated_project();
+        write_feature_config(home.path(), serde_json::json!({"fleet_notify": false}));
         let view = cmd_run_cli(
             Some(&rec.id),
             Some("0020".into()),
@@ -1231,7 +1270,14 @@ mod tests {
         .unwrap();
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
-        clear_home();
+        let features = view.features.as_ref().expect("features on detach return");
+        assert_eq!(features.duties.len(), 5);
+        duties_match(
+            &view,
+            crate::features::Duty::FleetNotify,
+            false,
+            crate::features::FeatureSource::Config,
+        );
     }
 
     #[test]
@@ -1299,7 +1345,9 @@ mod tests {
     #[test]
     fn cmd_run_cli_serve_owns_skips_wait() {
         let _guard = test_env_lock();
-        let (_home, _proj, rec) = add_isolated_project();
+        let _env = feature_env_guard();
+        let (home, _proj, rec) = add_isolated_project();
+        write_feature_config(home.path(), serde_json::json!({"fleet_notify": true}));
         let port = spawn_health_once(r#"{"ok":true,"service":"coordinator"}"#);
         let view = cmd_run_cli(
             Some(&rec.id),
@@ -1316,10 +1364,17 @@ mod tests {
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
         assert!(artifact::existing_path(&rec).is_none());
-        let ticker = view.ticker.expect("ticker");
+        let ticker = view.ticker.as_ref().expect("ticker");
         assert_eq!(ticker.owner, "serve");
+        // Attaching through `attach_operator_view` would probe `ServeProbe::Auto`
+        // and clobber this assert; omitting features would fail the next one.
         assert_eq!(ticker.port, Some(port));
-        clear_home();
+        duties_match(
+            &view,
+            crate::features::Duty::FleetNotify,
+            true,
+            crate::features::FeatureSource::Config,
+        );
     }
 
     #[test]
@@ -1510,17 +1565,163 @@ mod tests {
     }
 
     #[test]
-    fn run_status_and_from_record_omit_ticker() {
+    fn run_status_and_from_record_omit_ticker_and_features() {
         let _guard = test_env_lock();
+        let _env = feature_env_guard();
         let (_home, _proj, rec) = add_isolated_project();
         let view = run::status(&rec).unwrap();
         assert!(view.ticker.is_none());
+        assert!(view.features.is_none(), "poll path omits features (0102)");
         let json = serde_json::to_value(&view).unwrap();
         assert!(
             !json.as_object().unwrap().contains_key("ticker"),
             "poll-path status must omit ticker"
         );
-        clear_home();
+        assert!(
+            !json.as_object().unwrap().contains_key("features"),
+            "poll-path status must omit features"
+        );
+    }
+
+    #[test]
+    fn api_status_renders_each_duty_state_and_source() {
+        let _guard = test_env_lock();
+        let _env = feature_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let (home, _proj, rec) = add_isolated_project();
+
+        let view = status(Some(&rec.id), false).unwrap();
+        for duty in crate::features::Duty::ALL {
+            duties_match(&view, duty, true, crate::features::FeatureSource::Default);
+        }
+
+        write_feature_config(home.path(), serde_json::json!({"fleet_notify": false}));
+        let view = status(Some(&rec.id), false).unwrap();
+        duties_match(
+            &view,
+            crate::features::Duty::FleetNotify,
+            false,
+            crate::features::FeatureSource::Config,
+        );
+        duties_match(
+            &view,
+            crate::features::Duty::AutoStart,
+            true,
+            crate::features::FeatureSource::Default,
+        );
+
+        unsafe {
+            std::env::set_var(crate::features::Duty::StallPaging.env_var(), "off");
+        }
+        let view = status(Some(&rec.id), false).unwrap();
+        duties_match(
+            &view,
+            crate::features::Duty::StallPaging,
+            false,
+            crate::features::FeatureSource::Env,
+        );
+
+        write_feature_config(home.path(), serde_json::json!({"fleet_notify": "yes"}));
+        let view = status(Some(&rec.id), false).unwrap();
+        let features = view.features.as_ref().expect("features");
+        assert!(
+            features.unknown_keys.is_empty(),
+            "the type-invalid path does not enumerate keys"
+        );
+        for duty in crate::features::Duty::ALL {
+            let gate = &features.duties[duty.as_str()];
+            assert!(!gate.enabled, "{} fail-closed", duty.as_str());
+            assert_eq!(gate.source, crate::features::FeatureSource::Config);
+            assert!(gate.error.is_some());
+        }
+    }
+
+    #[test]
+    fn api_status_feature_view_flips_with_live_edits() {
+        let _guard = test_env_lock();
+        let _env = feature_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let (home, _proj, rec) = add_isolated_project();
+
+        for enabled in [true, false, true] {
+            write_feature_config(home.path(), serde_json::json!({"fleet_notify": enabled}));
+            let view = status(Some(&rec.id), false).unwrap();
+            duties_match(
+                &view,
+                crate::features::Duty::FleetNotify,
+                enabled,
+                crate::features::FeatureSource::Config,
+            );
+            // The gate reads the same snapshot the status surface renders.
+            assert_eq!(
+                crate::features::resolve_all().enabled(crate::features::Duty::FleetNotify),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn status_json_has_the_five_stable_duty_keys() {
+        let _guard = test_env_lock();
+        let _env = feature_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let (_home, _proj, rec) = add_isolated_project();
+        let view = status(Some(&rec.id), false).unwrap();
+        let json = serde_json::to_value(&view).unwrap();
+        let features = json["features"].as_object().expect("features object");
+        let mut keys: Vec<&str> = features.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "auto_start",
+                "fleet_notify",
+                "self_reap",
+                "self_update",
+                "stall_paging"
+            ]
+        );
+        assert!(!features.contains_key("unknown_keys"));
+    }
+
+    #[test]
+    fn status_all_clones_one_feature_snapshot() {
+        let _guard = test_env_lock();
+        let _env = feature_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let (_home, _proj, rec) = add_isolated_project();
+        let proj2 = tempfile::tempdir().unwrap();
+        let rec2 = project_add(proj2.path(), ProjectAddOptions::default()).unwrap();
+        assert_ne!(rec.id, rec2.id);
+        let all = status_all().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].features.is_some());
+        assert_eq!(all[0].features, all[1].features);
+    }
+
+    #[test]
+    fn unknown_keys_are_visible_and_fail_closed_in_status() {
+        let _guard = test_env_lock();
+        let _env = feature_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let (home, _proj, rec) = add_isolated_project();
+        write_feature_config(
+            home.path(),
+            serde_json::json!({"auto_strat": true, "fleet_notify": false}),
+        );
+        let view = status(Some(&rec.id), false).unwrap();
+        let features = view.features.as_ref().expect("features");
+        assert_eq!(features.unknown_keys, vec!["auto_strat".to_string()]);
+        for duty in crate::features::Duty::ALL {
+            let gate = &features.duties[duty.as_str()];
+            assert!(
+                !gate.enabled,
+                "{} fail-closed on an unknown key",
+                duty.as_str()
+            );
+            assert_eq!(gate.source, crate::features::FeatureSource::Config);
+            assert!(gate.error.is_some());
+        }
     }
 
     #[test]

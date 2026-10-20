@@ -887,8 +887,8 @@ fn parse_headers(head: &[u8]) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use crate::config::{
-        ENV_COORDINATOR_HOME, HermesNotifyConfig, MACHINE_CONFIG_VERSION, MachineConfig,
-        default_role_bindings, save_machine_config, test_env_lock,
+        ENV_COORDINATOR_HOME, FeatureTable, HermesNotifyConfig, MACHINE_CONFIG_VERSION,
+        MachineConfig, default_role_bindings, save_machine_config, test_env_lock,
     };
     use crate::outcome::FailureClass;
     use chrono::Utc;
@@ -932,6 +932,7 @@ mod tests {
                 progress: false,
                 fleet_summary: false,
             },
+            features: FeatureTable::default(),
             progress_stall_secs: None,
             journal_keep: None,
             state_policies: Vec::new(),
