@@ -2212,6 +2212,11 @@ mod tests {
         );
 
         write_registry(ws.path(), &linked_row("0090", COMPLETED_CELL));
+        // A real adapter implement leg commits its work: `implement-gate` refuses a tree that
+        // still matches the epoch checkpoint, so the fixture has to model the commit.
+        std::fs::write(repo.path().join("implemented.txt"), b"work\n").unwrap();
+        git_ok(repo.path(), &["add", "."]);
+        git_ok(repo.path(), &["commit", "-m", "track(0090): work"]);
         let view = crate::outcome::write_and_apply(
             &record,
             crate::outcome::PhaseOutcome::success(

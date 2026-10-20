@@ -228,7 +228,7 @@ fn delete_ref(record: &ProjectRecord, cwd: &Path, name: &str) {
     }
 }
 
-fn require_cwd(record: &ProjectRecord) -> Result<PathBuf> {
+pub(crate) fn require_cwd(record: &ProjectRecord) -> Result<PathBuf> {
     match git_cwd(record) {
         Some(cwd) => Ok(cwd),
         None => Err(CoordinatorError::Message(
@@ -282,7 +282,7 @@ fn git(cwd: &Path, args: &[&str]) -> Result<GitOut> {
     })
 }
 
-fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
     let shown = args.join(" ");
     let out = git(cwd, args)?;
     if !out.ok {
@@ -298,7 +298,7 @@ fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
 ///
 /// `git diff HEAD` is the worktree. `git diff --cached HEAD` is the index.
 /// A line-ending phantom is absent from both, so it is not committable.
-fn committable_dirt(cwd: &Path) -> Result<Vec<String>> {
+pub(crate) fn committable_dirt(cwd: &Path) -> Result<Vec<String>> {
     let worktree = git_ok(cwd, &["diff", "-z", "--name-only", "HEAD"])?;
     let index = git_ok(cwd, &["diff", "-z", "--cached", "--name-only", "HEAD"])?;
     let untracked = git_ok(cwd, &["ls-files", "-z", "--others", "--exclude-standard"])?;
