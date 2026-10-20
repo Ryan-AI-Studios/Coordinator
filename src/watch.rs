@@ -817,7 +817,10 @@ mod tests {
             "inject must not apply before the prompt returns"
         );
         assert!(
-            elapsed < Duration::from_millis(800),
+            // The mock prompt hangs for 2 s, so blocking would cost the full 2 s. A 1500 ms
+            // ceiling still proves non-blocking while tolerating scheduler noise on a loaded
+            // CI runner (observed 822 ms against the old 800 ms bound).
+            elapsed < Duration::from_millis(1500),
             "poll_once must not block on session/prompt; elapsed={elapsed:?}"
         );
         let st = crate::state::load_run_state(&r).unwrap();
