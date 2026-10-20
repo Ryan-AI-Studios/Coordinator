@@ -3,6 +3,8 @@
 //! Phase completion and timeouts are driven by the Phase Outcome apply path
 //! ([`crate::outcome`]) and poll/wait ([`crate::watch`]).
 
+use std::path::PathBuf;
+
 use crate::error::{CoordinatorError, Result};
 use crate::outcome::clear_active_outcome_file;
 use crate::registry::ProjectRecord;
@@ -41,6 +43,7 @@ struct RunProbeCtx {
     number: u64,
     head_sha: String,
     effective_track: String,
+    resume_repo: Option<PathBuf>,
 }
 
 enum RunPrep {
@@ -74,7 +77,11 @@ pub(crate) fn run_with_origin(
     match prep {
         RunPrep::Done(view) => Ok(*view),
         RunPrep::NeedsProbe(ctx) => {
-            let answer = crate::workflow::reuse::probe_resume(record, ctx.number);
+            let answer = crate::workflow::reuse::probe_resume(
+                record,
+                ctx.number,
+                ctx.resume_repo.as_deref(),
+            );
             with_run_state_lock(record, || finish_probed_run(record, &ctx, &answer))
         }
     }
@@ -112,6 +119,7 @@ fn prepare_run_locked(
                     number,
                     head_sha,
                     head_ref: _,
+                    repo,
                 } => {
                     let effective_track = effective.unwrap_or_default();
                     Ok(RunPrep::NeedsProbe(RunProbeCtx {
@@ -124,6 +132,7 @@ fn prepare_run_locked(
                         number,
                         head_sha,
                         effective_track,
+                        resume_repo: repo,
                     }))
                 }
                 crate::workflow::reuse::ResumeChoice::Plan {
@@ -218,6 +227,8 @@ fn begin_fresh_run(
     state.parked_next = None;
     state.last_applied_outcome_hash = None;
     state.ci = None;
+    state.delivery_target = None;
+    state.gate_target_journal = None;
     state.review = None;
     state.stalled_at = None;
     state.pause_spans.clear();
@@ -247,6 +258,21 @@ fn begin_fresh_run(
             ..Default::default()
         });
         state.last_event = format!("run: started {WORKFLOW_ID} resume ci-wait pr {number}");
+        // G2: freeze a ci-wait resume's provenance from tick 0. A planning-only target is
+        // stored too, so the first gate takes its explicit refusal arm. A resolution error
+        // leaves `None` and journals; the first ci-wait gate emits the typed Permission.
+        match crate::workflow::execution_repo::resolve_track_target(
+            record,
+            state,
+            workflow::graph::PHASE_CI_WAIT,
+        ) {
+            Ok(target) => state.delivery_target = Some(target),
+            Err(err) => crate::progress_log::append(
+                record,
+                "reuse",
+                &format!("reuse: ci-wait target unresolved — {err}"),
+            ),
+        }
     }
     state.updated_at = chrono::Utc::now();
     clear_active_outcome_file(record);
@@ -363,7 +389,8 @@ pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
     match prep {
         ResumePrep::Done(view) => Ok(*view),
         ResumePrep::Probe(probe) => {
-            let answer = crate::workflow::reuse::probe_resume(record, probe.number);
+            let answer =
+                crate::workflow::reuse::probe_resume(record, probe.number, probe.repo.as_deref());
             with_run_state_lock(record, || {
                 crate::workflow::commit_probed_successor(record, &probe, &answer)
             })
@@ -544,6 +571,94 @@ mod tests {
         let log = std::fs::read_to_string(dir.path().join("status.md")).unwrap();
         assert!(log.contains("start  track=0004"));
         assert!(log.contains("stop  track=0004"));
+    }
+
+    fn fresh_ci_fixture(cell: &str) -> (tempfile::TempDir, tempfile::TempDir, ProjectRecord) {
+        let ws = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(repo.path().join("f.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let conductor = ws.path().join("conductor");
+        std::fs::create_dir_all(conductor.join("0101-Example")).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0101-Example](0101-Example/spec.md) | {cell} | **Ready - not started** | s |\n"
+            ),
+        )
+        .unwrap();
+        let mut r = rec(ws.path());
+        r.execution_repo = Some(repo.path().to_path_buf());
+        (ws, repo, r)
+    }
+
+    #[test]
+    fn ci_wait_resume_seeds_the_delivery_target() {
+        let (ws, repo, r) = fresh_ci_fixture("`not-a-target`");
+        std::fs::write(
+            ws.path().join("conductor").join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0101-Example](0101-Example/spec.md) | `{}` | **Ready - not started** | s |\n",
+                repo.path().display()
+            ),
+        )
+        .unwrap();
+        let mut state = RunState::idle(&r.id);
+        let view = begin_fresh_run(
+            &r,
+            &mut state,
+            FreshRun {
+                track_arg: Some("0101".into()),
+                driver: WorkflowDriver::Adapter,
+                picked: false,
+                archive_slugs: Vec::new(),
+                journal_unreadable: false,
+                ci_wait: Some((7, "abc".into())),
+            },
+        )
+        .unwrap();
+        assert_eq!(view.phase, crate::workflow::graph::PHASE_CI_WAIT);
+        let saved = load_run_state(&r).unwrap();
+        assert!(saved.delivery_target.as_ref().is_some_and(|target| {
+            crate::workflow::execution_repo::paths_same(&target.declared_path, repo.path())
+        }));
+    }
+
+    #[test]
+    fn ci_wait_resume_unresolved_keeps_none_and_journals() {
+        let (_ws, _repo, r) = fresh_ci_fixture("`not-a-target`");
+        let mut state = RunState::idle(&r.id);
+        begin_fresh_run(
+            &r,
+            &mut state,
+            FreshRun {
+                track_arg: Some("0101".into()),
+                driver: WorkflowDriver::Adapter,
+                picked: false,
+                archive_slugs: Vec::new(),
+                journal_unreadable: false,
+                ci_wait: Some((7, "abc".into())),
+            },
+        )
+        .unwrap();
+        let saved = load_run_state(&r).unwrap();
+        assert!(saved.delivery_target.is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap_or_default();
+        assert!(log.contains("reuse: ci-wait target unresolved"), "{log}");
     }
 
     #[test]

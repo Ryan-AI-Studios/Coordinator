@@ -605,6 +605,7 @@ async fn apply_turn_checked(
                                 injected_phase,
                                 pr.stop_reason.as_deref(),
                                 &pr.text,
+                                prepared.and_then(|p| p.target()),
                             )? {
                                 return Ok(HarnessPromptView {
                                     text: Some(pr.text),

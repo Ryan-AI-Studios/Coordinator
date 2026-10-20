@@ -627,6 +627,7 @@ mod tests {
             layout_profile: LayoutProfile::Nested,
             execution_repo: None,
             conductor_dir: None,
+            delivery_target: None,
             harness: None,
             workflow: None,
             failure_artifact,

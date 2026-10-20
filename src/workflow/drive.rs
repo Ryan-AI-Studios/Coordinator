@@ -14,7 +14,7 @@ use super::graph::{
     resolve_track_dir, review_slugs, role_phase,
 };
 use super::prompts;
-use super::{WorkflowDriver, mark_driven};
+use super::{WorkflowDriver, mark_driven_with_target};
 
 /// Idempotent drive step. No-op when Stopped / Idle / leftover stub.
 ///
@@ -162,7 +162,15 @@ static TEST_SLOW_INJECT: std::sync::Mutex<Option<std::time::Duration>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-static TEST_CAPTURE_PROMPTS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+thread_local! {
+    /// Per-test capture slot. A process-global mutex let one guard drop clear another
+    /// test's armed slot (0101 §3.7); prompt capture happens synchronously on the
+    /// arming thread before any adapter thread spawns.
+    static TEST_CAPTURE_PROMPTS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_CAPTURE_PREPARED: std::cell::RefCell<Option<Vec<crate::workflow::execution_repo::PreparedInjection>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Arm a one-shot capture of adapter prompts. No harness process is started.
 #[cfg(test)]
@@ -170,46 +178,52 @@ pub(crate) struct CapturePromptGuard;
 
 #[cfg(test)]
 pub(crate) fn arm_capture_prompts() -> CapturePromptGuard {
-    *TEST_CAPTURE_PROMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+    TEST_CAPTURE_PROMPTS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    TEST_CAPTURE_PREPARED.with(|c| *c.borrow_mut() = Some(Vec::new()));
     CapturePromptGuard
 }
 
 #[cfg(test)]
 pub(crate) fn captured_prompts() -> Vec<String> {
-    TEST_CAPTURE_PROMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-        .unwrap_or_default()
+    TEST_CAPTURE_PROMPTS.with(|c| c.borrow().clone().unwrap_or_default())
+}
+
+/// Prepared injections captured by the same seam, proving the route and its ACP root.
+#[cfg(test)]
+pub(crate) fn captured_prepared() -> Vec<crate::workflow::execution_repo::PreparedInjection> {
+    TEST_CAPTURE_PREPARED.with(|c| c.borrow().clone().unwrap_or_default())
 }
 
 #[cfg(test)]
 impl Drop for CapturePromptGuard {
     fn drop(&mut self) {
-        *TEST_CAPTURE_PROMPTS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
+        TEST_CAPTURE_PROMPTS.with(|c| *c.borrow_mut() = None);
+        TEST_CAPTURE_PREPARED.with(|c| *c.borrow_mut() = None);
     }
 }
 
 #[cfg(test)]
 fn capture_slot_armed() -> bool {
-    TEST_CAPTURE_PROMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .is_some()
+    TEST_CAPTURE_PROMPTS.with(|c| c.borrow().is_some())
 }
 
 #[cfg(test)]
 fn push_captured_prompt(prompt: &str) {
-    if let Some(buf) = TEST_CAPTURE_PROMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_mut()
-    {
-        buf.push(prompt.to_string());
+    TEST_CAPTURE_PROMPTS.with(|c| {
+        if let Some(buf) = c.borrow_mut().as_mut() {
+            buf.push(prompt.to_string());
+        }
+    });
+}
+
+#[cfg(test)]
+fn push_captured_prepared(prepared: Option<&crate::workflow::execution_repo::PreparedInjection>) {
+    if let Some(prepared) = prepared {
+        TEST_CAPTURE_PREPARED.with(|c| {
+            if let Some(buf) = c.borrow_mut().as_mut() {
+                buf.push(prepared.clone());
+            }
+        });
     }
 }
 
@@ -288,6 +302,30 @@ fn drive_adapter(
     };
     let prepared_target = prepared.as_ref().and_then(|p| p.target());
 
+    // 0101: compare against the frozen delivery target before any prompt. A row edit that
+    // moved the target after the checkpoint stops the phase with Permission and zero prompts.
+    if let (Some(stored), Some(current)) = (state.delivery_target.as_ref(), prepared_target)
+        && stored.project_id == current.project_id
+        && stored.run_epoch == current.run_epoch
+        && stored.track_id == current.track_id
+        && super::execution_repo::uses_delivery_target(&stored.phase)
+        && super::execution_repo::uses_delivery_target(&current.phase)
+        && !super::execution_repo::same_delivery_repo(stored, current)
+    {
+        let track = state.track_id.as_deref().unwrap_or("<id>");
+        return fail_phase(
+            record,
+            state,
+            FailureClass::Permission,
+            format!(
+                "execution target changed after checkpoint: {} -> {}; stop and re-run --track {track}",
+                stored.declared_path.display(),
+                current.declared_path.display()
+            ),
+            OutcomeSource::Adapter,
+        );
+    }
+
     // Test seam: capture the continuation prompt without resolving a harness binary.
     #[cfg(test)]
     if continuing && capture_slot_armed() {
@@ -303,6 +341,7 @@ fn drive_adapter(
             inject_sid.as_deref(),
             false,
         );
+        push_captured_prepared(prepared.as_ref());
         push_captured_prompt(&prompt);
         return Ok(None);
     }
@@ -398,7 +437,7 @@ fn drive_adapter(
             None => return Ok(None),
         }
     } else {
-        mark_driven(record, &state.phase)?;
+        mark_driven_with_target(record, &state.phase, prepared_target)?;
         snapshot_registry_before_phase(record, &state.phase)?;
         prompts::phase_prompt_with_target(
             record,
@@ -422,6 +461,7 @@ fn drive_adapter(
     #[cfg(test)]
     {
         if capture_slot_armed() {
+            push_captured_prepared(prepared.as_ref());
             push_captured_prompt(&prompt);
             return Ok(None);
         }
@@ -1209,6 +1249,22 @@ mod tests {
         )
         .unwrap();
         product
+    }
+
+    /// Compare the prompt's resolved target by path identity, not raw display text:
+    /// Windows tempdirs can be short (`RUNNER~1`) while the resolver canonicalizes to
+    /// the long form (`runneradmin`).
+    fn assert_prompt_names_execution_repo(prompt: &str, expected: &std::path::Path) {
+        let line = prompt
+            .lines()
+            .find(|line| line.starts_with("Execution repo: "))
+            .unwrap_or_else(|| panic!("prompt has no Execution repo line:\n{prompt}"));
+        let actual = line.trim_start_matches("Execution repo: ").trim();
+        assert!(
+            crate::workflow::execution_repo::paths_same(std::path::Path::new(actual), expected),
+            "Execution repo line {actual:?} does not name {}",
+            expected.display()
+        );
     }
 
     fn plan_state(record: &ProjectRecord, phase: &str, track: &str) -> crate::state::RunState {
@@ -2118,8 +2174,9 @@ mod tests {
 
     #[test]
     fn manual_prompt_policy_unchanged() {
-        // Manual CLI/HTTP turns and address-ci stay outside target resolution.
-        assert!(!crate::workflow::execution_repo::prepares_target(
+        // 0101: address-ci is now a prepared phase (prompt + ACP target root). Raw CLI
+        // and HTTP prompts remain outside target resolution and install no root.
+        assert!(crate::workflow::execution_repo::prepares_target(
             "address-ci"
         ));
         assert!(crate::workflow::execution_repo::prepares_target(
@@ -2128,6 +2185,7 @@ mod tests {
         assert!(crate::workflow::execution_repo::prepares_target(
             "address-findings"
         ));
+        assert!(!crate::workflow::execution_repo::prepares_target("plan"));
     }
 
     #[test]
@@ -2217,17 +2275,93 @@ mod tests {
     }
 
     #[test]
-    fn address_ci_remains_prompt_only() {
+    fn capture_prompts_are_thread_local() {
+        let _guard = arm_capture_prompts();
+        std::thread::spawn(|| {
+            let other = arm_capture_prompts();
+            assert!(captured_prompts().is_empty());
+            drop(other);
+        })
+        .join()
+        .unwrap();
+        assert!(
+            capture_slot_armed(),
+            "another thread must not clear this slot"
+        );
+    }
+
+    #[test]
+    fn target_change_between_checkpoint_and_inject_stops_before_prompt() {
         let _home = IsolatedHome::enter();
         write_implementor_binding(&_home);
         let dir = tempdir().unwrap();
-        let r = rec(dir.path());
-        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        let product = implementation_target(dir.path(), "0071");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let out = crate::git_command::command()
+            .args(["init", "-b", "main"])
+            .current_dir(&other)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(product.clone());
+        run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.last_driven_phase = None;
+            state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+                &r,
+                "0071",
+                state.run_epoch,
+                crate::workflow::graph::PHASE_IMPLEMENT,
+                &other,
+            ));
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        let view = tick(&r).unwrap().expect("permission");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert!(
+            view.last_event
+                .contains("execution target changed after checkpoint"),
+            "{}",
+            view.last_event
+        );
+        assert!(super::captured_prompts().is_empty(), "zero prompts");
+    }
+
+    #[test]
+    fn address_ci_uses_the_prepared_target_route() {
+        let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
+        let dir = tempdir().unwrap();
+        let product = implementation_target(dir.path(), "0071");
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(product.clone());
+        r.ci_fix_routing = true;
+        run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
         crate::state::with_run_state_lock(&r, || {
             let mut state = load_run_state(&r)?;
             state.phase = crate::workflow::graph::PHASE_ADDRESS_CI.into();
             state.driver = WorkflowDriver::Adapter;
             state.last_driven_phase = None;
+            state.ci_fix_request = Some(crate::state::CiFixRequest {
+                pr_number: 71,
+                from_sha: "abc111".into(),
+                checks: Vec::new(),
+            });
+            state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+                &r,
+                "0071",
+                state.run_epoch,
+                crate::workflow::graph::PHASE_ADDRESS_CI,
+                &product,
+            ));
+            crate::workflow::execution_repo::assert_fixture_has_delivery_target(&state);
             crate::state::save_run_state(&r, &state)
         })
         .unwrap();
@@ -2236,14 +2370,114 @@ mod tests {
         let prompts = super::captured_prompts();
         assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert!(prompts[0].contains("address-ci"), "{}", prompts[0]);
+        assert_prompt_names_execution_repo(&prompts[0], &product);
+        let prepared = super::captured_prepared();
+        assert_eq!(prepared.len(), 1, "{prepared:?}");
+        let target = prepared[0].target().expect("prepared target");
         assert!(
-            load_run_state(&r).unwrap().failure_class.is_none(),
-            "address-ci must not resolve a track target"
+            crate::workflow::execution_repo::paths_same(&target.prompt_path, &product),
+            "ACP target root must be the delivery repo: {}",
+            target.prompt_path.display()
+        );
+        let saved = load_run_state(&r).unwrap();
+        assert!(saved.failure_class.is_none());
+        assert!(
+            saved
+                .delivery_target
+                .as_ref()
+                .is_some_and(|t| t.phase == crate::workflow::graph::PHASE_ADDRESS_CI)
         );
     }
 
     #[test]
-    fn address_ci_injects_one_prompt_and_does_not_merge() {
+    fn address_ci_resolution_failure_is_permission_without_prompt() {
+        let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_ADDRESS_CI.into();
+            state.driver = WorkflowDriver::Adapter;
+            state.last_driven_phase = None;
+            state.delivery_target = None;
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        assert!(super::captured_prompts().is_empty(), "zero prompts");
+        let saved = load_run_state(&r).unwrap();
+        assert_eq!(saved.failure_class, Some(FailureClass::Permission));
+        assert!(
+            saved.last_event.contains("leg repo unresolved:"),
+            "{}",
+            saved.last_event
+        );
+    }
+
+    #[test]
+    fn address_ci_prompt_names_the_target() {
+        let dir = tempdir().unwrap();
+        let product = implementation_target(dir.path(), "0071");
+        let r = rec(dir.path());
+        let target = crate::workflow::execution_repo::seeded_delivery_target(
+            &r,
+            "0071",
+            1,
+            crate::workflow::graph::PHASE_ADDRESS_CI,
+            &product,
+        );
+        let prompt = crate::workflow::prompts::phase_prompt_with_target(
+            &r,
+            crate::workflow::graph::PHASE_ADDRESS_CI,
+            Some("0071"),
+            Some(&target),
+        );
+        assert_prompt_names_execution_repo(&prompt, &product);
+    }
+
+    #[test]
+    fn address_ci_installs_the_target_root() {
+        let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
+        let dir = tempdir().unwrap();
+        let product = implementation_target(dir.path(), "0071");
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(product.clone());
+        run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_ADDRESS_CI.into();
+            state.last_driven_phase = None;
+            state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+                &r,
+                "0071",
+                state.run_epoch,
+                crate::workflow::graph::PHASE_ADDRESS_CI,
+                &product,
+            ));
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        let prepared = super::captured_prepared();
+        assert_eq!(prepared.len(), 1, "{prepared:?}");
+        assert!(
+            prepared[0]
+                .target()
+                .is_some_and(|t| crate::workflow::execution_repo::paths_same(
+                    &t.prompt_path,
+                    &product
+                )),
+            "the prepared route must install the target root"
+        );
+    }
+
+    #[test]
+    fn address_ci_injects_one_target_aware_prompt_and_does_not_merge() {
         let _home = IsolatedHome::enter();
         let prev_poll = std::env::var_os(crate::config::ENV_COORDINATOR_CI_POLL_MS);
         let prev_notify = std::env::var_os(crate::notify::ENV_COORDINATOR_NOTIFY);
@@ -2288,8 +2522,9 @@ mod tests {
             b.get_mut(ROLE_IMPLEMENTOR).unwrap().command = implementor.to_string_lossy().into();
         });
         let dir = tempdir().unwrap();
+        let product = implementation_target(dir.path(), "0071");
         let mut r = rec(dir.path());
-        r.execution_repo = Some(dir.path().to_path_buf());
+        r.execution_repo = Some(product.clone());
         r.ci_fix_routing = true;
         run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
         crate::state::with_run_state_lock(&r, || {
@@ -2343,9 +2578,22 @@ mod tests {
         assert!(prompt.contains("gh pr create"), "{prompt}");
         assert!(prompt.contains("gh pr merge"), "{prompt}");
         assert!(!prompt.contains("self-check:"), "{prompt}");
+        assert_prompt_names_execution_repo(prompt, &product);
+        let prepared = super::captured_prepared();
+        assert_eq!(prepared.len(), 1, "{prepared:?}");
+        assert!(
+            prepared[0]
+                .target()
+                .is_some_and(|t| crate::workflow::execution_repo::paths_same(
+                    &t.prompt_path,
+                    &product
+                )),
+            "prepared prompt must install the target root"
+        );
         tick(&r).unwrap();
         assert_eq!(super::captured_prompts().len(), 1);
         let saved = load_run_state(&r).unwrap();
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&saved);
         assert_eq!(saved.address_findings_attempts, 0);
         assert_eq!(saved.ci_fix_attempts, 1);
         assert_eq!(

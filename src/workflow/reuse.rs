@@ -4,6 +4,10 @@
 //! review-track skill, both slot bindings, and both review files still match
 //! `reuse.json`, and `gh pr view` still shows that receipt PR on this track's
 //! branch. The probe runs outside the run-state lock.
+//!
+//! 0101: `PrReceipt` records the delivery repo. The resume probe uses that repo when it still
+//! exists, else the current gate target, else the documented legacy primary. A receipt repo
+//! that disagrees with the resolved gate target falls through to plan instead of resuming.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{ENV_COORDINATOR_AGY_BIN, ENV_COORDINATOR_OPENCODE_BIN, RoleBinding};
 use crate::error::{CoordinatorError, Result};
 use crate::registry::ProjectRecord;
-use crate::state::RunStatus;
+use crate::state::{RunStatus, load_run_state};
 
 use super::graph::{
     REVIEW_SLUG_OPENCODE, ROLE_REVIEWER_AGY, ROLE_REVIEWER_OPENCODE, resolve_track_dir,
@@ -43,6 +47,8 @@ pub struct ReuseProbe {
     pub number: u64,
     pub head_sha: String,
     pub head_ref: String,
+    /// 0101: receipt repo for the `gh pr view` cwd.
+    pub repo: Option<PathBuf>,
 }
 
 /// What a fresh start should do before any `gh` call.
@@ -56,6 +62,7 @@ pub enum ResumeChoice {
         number: u64,
         head_sha: String,
         head_ref: String,
+        repo: Option<PathBuf>,
     },
 }
 
@@ -94,6 +101,9 @@ struct PrReceipt {
     number: u64,
     head_sha: String,
     head_ref: String,
+    /// 0101: the delivery repo the PR was opened/published in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repo: Option<PathBuf>,
 }
 
 struct SharedHashes {
@@ -105,7 +115,7 @@ struct SharedHashes {
 enum LoadedReceipt {
     Missing,
     Unreadable,
-    Ready(Receipt),
+    Ready(Box<Receipt>),
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -409,7 +419,9 @@ fn load_receipt(track_dir: &Path) -> LoadedReceipt {
         Err(_) => return LoadedReceipt::Unreadable,
     };
     match serde_json::from_slice::<Receipt>(&bytes) {
-        Ok(receipt) if receipt.version == RECEIPT_VERSION => LoadedReceipt::Ready(receipt),
+        Ok(receipt) if receipt.version == RECEIPT_VERSION => {
+            LoadedReceipt::Ready(Box::new(receipt))
+        }
         _ => LoadedReceipt::Unreadable,
     }
 }
@@ -447,7 +459,7 @@ pub fn decide_resume(record: &ProjectRecord, track_id: Option<&str>) -> ResumeCh
             };
         }
         LoadedReceipt::Unreadable => return plan(true),
-        LoadedReceipt::Ready(receipt) => receipt,
+        LoadedReceipt::Ready(receipt) => *receipt,
     };
     if !shared_match(record, &track_dir, &receipt) {
         return plan(false);
@@ -467,10 +479,28 @@ pub fn decide_resume(record: &ProjectRecord, track_id: Option<&str>) -> ResumeCh
         && let Some(pr) = receipt.pr.as_ref()
         && !pr.head_sha.is_empty()
     {
+        // 0101: a recorded repo that still resolves to a different gate target must not
+        // resume; fall through to plan so the leg is replayed.
+        if let Some(repo) = pr.repo.as_ref()
+            && repo.is_dir()
+            && let Ok(mut state) = load_run_state(record)
+        {
+            state.track_id = Some(track_id.to_string());
+            state.phase = crate::workflow::graph::PHASE_CI_WAIT.into();
+            if let Ok(target) = crate::workflow::execution_repo::resolve_track_target(
+                record,
+                &state,
+                crate::workflow::graph::PHASE_CI_WAIT,
+            ) && !crate::workflow::execution_repo::same_git_repository(repo, &target.sample_path)
+            {
+                return plan(false);
+            }
+        }
         return ResumeChoice::Probe {
             number: pr.number,
             head_sha: pr.head_sha.clone(),
             head_ref: pr.head_ref.clone(),
+            repo: pr.repo.clone(),
         };
     }
     ResumeChoice::Plan {
@@ -533,6 +563,7 @@ pub fn note_pr(
     number: u64,
     head_sha: &str,
     head_ref: &str,
+    repo: Option<&Path>,
 ) {
     let Some(track_dir) = resolve_track_dir(record, track_id) else {
         return;
@@ -550,10 +581,16 @@ pub fn note_pr(
     if receipt.version != RECEIPT_VERSION {
         return;
     }
+    let repo_same = match (receipt.pr.as_ref().and_then(|pr| pr.repo.as_deref()), repo) {
+        (None, None) => true,
+        (Some(a), Some(b)) => crate::workflow::execution_repo::paths_same(a, b),
+        _ => false,
+    };
     if let Some(pr) = receipt.pr.as_ref()
         && pr.number == number
         && pr.head_sha == head_sha
         && pr.head_ref == head_ref
+        && repo_same
     {
         return;
     }
@@ -568,15 +605,18 @@ pub fn note_pr(
         number,
         head_sha: head_sha.to_string(),
         head_ref: head_ref.to_string(),
+        repo: repo.map(Path::to_path_buf),
     });
     let _ = write_receipt(&path, &receipt);
 }
 
-/// `persist_target` hook. HeadSha and a pull request with no head oid do not write.
+/// `persist_target` / `try_auto_publish` hook. HeadSha and a pull request with no head
+/// oid do not write. `repo` is the delivery repo the PR was published in.
 pub fn note_ci_target(
     record: &ProjectRecord,
     track_id: &str,
     target: &crate::ci::backend::CiTarget,
+    repo: Option<&Path>,
 ) {
     let crate::ci::backend::CiTarget::PullRequest {
         number,
@@ -587,7 +627,7 @@ pub fn note_ci_target(
     else {
         return;
     };
-    note_pr(record, track_id, *number, oid, head_ref);
+    note_pr(record, track_id, *number, oid, head_ref, repo);
 }
 
 /// Byte-copy `prior/{epoch}-{slug}-review.md`. Identical bytes count as archived.
@@ -657,10 +697,28 @@ pub fn install_test_probe(probe: ResumeTestProbe) -> TestProbeGuard {
 
 /// Live `gh pr view` outside tests. An unset test probe returns an error so
 /// default `cargo test` never reaches the network and resume falls through to `plan`.
-pub fn probe_resume(record: &ProjectRecord, number: u64) -> Result<Option<ResumePr>> {
+/// Receipt repo first (when it still exists), then the current gate target, then the
+/// documented legacy primary. `None` means no probe is possible.
+pub(crate) fn resume_probe_cwd(record: &ProjectRecord, repo: Option<&Path>) -> Option<PathBuf> {
+    repo.filter(|path| path.is_dir())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let state = load_run_state(record).ok()?;
+            crate::workflow::execution_repo::gate_target(record, &state)
+                .ok()
+                .map(|gate| gate.execution.sample_path)
+        })
+        .or_else(|| crate::worktree::product_git_cwd(record))
+}
+
+pub fn probe_resume(
+    record: &ProjectRecord,
+    number: u64,
+    repo: Option<&Path>,
+) -> Result<Option<ResumePr>> {
     #[cfg(test)]
     {
-        let _ = record;
+        let _ = (record, repo);
         let installed = TEST_PROBE.with(|cell| cell.borrow().clone());
         match installed {
             Some(probe) => probe(number),
@@ -671,7 +729,7 @@ pub fn probe_resume(record: &ProjectRecord, number: u64) -> Result<Option<Resume
     }
     #[cfg(not(test))]
     {
-        let Some(cwd) = crate::worktree::product_git_cwd(record) else {
+        let Some(cwd) = resume_probe_cwd(record, repo) else {
             return Err(CoordinatorError::Message("no execution repo".into()));
         };
         let head = crate::ci::gh::pr_view_resume(&cwd, number)?;
@@ -688,6 +746,7 @@ mod tests {
     use super::*;
     use crate::ci::backend::{CiTarget, MergeStateStatus};
     use crate::config::test_env_lock;
+    use crate::state::RunState;
     use crate::workflow::graph::REVIEW_SLUG_AGY;
     use chrono::Utc;
     use std::collections::BTreeMap;
@@ -970,7 +1029,7 @@ mod tests {
     fn note_pr_attaches_when_hashes_match() {
         let f = matching_fixture("0083");
         let r = f.record();
-        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch", None);
         let v: serde_json::Value = serde_json::from_slice(
             &std::fs::read(track_dir_of(f.root(), "0083").join("reuse.json")).unwrap(),
         )
@@ -985,9 +1044,9 @@ mod tests {
     fn note_pr_strips_pr_when_inputs_mismatch() {
         let f = matching_fixture("0083");
         let r = f.record();
-        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch", None);
         std::fs::write(track_dir_of(f.root(), "0083").join("spec.md"), b"spec-v2").unwrap();
-        note_pr(r, "0083", 81, "def456", "track/0083-Relaunch");
+        note_pr(r, "0083", 81, "def456", "track/0083-Relaunch", None);
         let v: serde_json::Value = serde_json::from_slice(
             &std::fs::read(track_dir_of(f.root(), "0083").join("reuse.json")).unwrap(),
         )
@@ -1001,7 +1060,7 @@ mod tests {
     fn note_pr_no_op_when_pr_already_matching() {
         let f = matching_fixture("0083");
         let r = f.record();
-        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch", None);
         let path = track_dir_of(f.root(), "0083").join("reuse.json");
         let before = std::fs::read(&path).unwrap();
         std::fs::write(
@@ -1009,16 +1068,96 @@ mod tests {
             b"spec-later",
         )
         .unwrap();
-        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch", None);
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn resume_probe_uses_the_recorded_repo() {
+        let f = matching_fixture("0083");
+        let recorded = tempdir().unwrap();
+        assert_eq!(
+            resume_probe_cwd(f.record(), Some(recorded.path())).as_deref(),
+            Some(recorded.path())
+        );
+    }
+
+    #[test]
+    fn legacy_receipt_without_repo_falls_back() {
+        let f = matching_fixture("0083");
+        let r = f.record();
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch", None);
+        match decide_resume(r, Some("0083")) {
+            ResumeChoice::Probe { repo, .. } => assert!(repo.is_none()),
+            other => panic!("legacy receipt must still probe: {other:?}"),
+        }
+        // The gate target is the next fallback when the receipt has no repo.
+        let repo = tempdir().unwrap();
+        let mut state = RunState::idle(&r.id);
+        state.phase = crate::workflow::graph::PHASE_CI_WAIT.into();
+        state.track_id = Some("0083".into());
+        state.run_epoch = 1;
+        state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            r,
+            "0083",
+            1,
+            crate::workflow::graph::PHASE_CI_WAIT,
+            repo.path(),
+        ));
+        crate::state::ensure_state_dir(r).unwrap();
+        crate::state::save_run_state(r, &state).unwrap();
+        let resolved = resume_probe_cwd(r, None).expect("gate target fallback");
+        assert!(
+            crate::workflow::execution_repo::paths_same(&resolved, repo.path()),
+            "{} != {}",
+            resolved.display(),
+            repo.path().display()
+        );
+    }
+
+    #[test]
+    fn receipt_repo_mismatch_does_not_resume() {
+        let f = matching_fixture("0083");
+        let mut r = f.record().clone();
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        note_pr(
+            &r,
+            "0083",
+            80,
+            "abc123",
+            "track/0083-Relaunch",
+            Some(first.path()),
+        );
+        let conductor = r.path.join("conductor");
+        std::fs::create_dir_all(&conductor).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0083-Example](0083-Example/spec.md) | `{}` | **Ready - not started** | s |\n",
+                second.path().display()
+            ),
+        )
+        .unwrap();
+        r.execution_repo = Some(second.path().to_path_buf());
+        let mut state = RunState::idle(&r.id);
+        state.phase = crate::workflow::graph::PHASE_CI_WAIT.into();
+        state.track_id = Some("0083".into());
+        state.run_epoch = 1;
+        crate::state::ensure_state_dir(&r).unwrap();
+        crate::state::save_run_state(&r, &state).unwrap();
+        assert!(matches!(
+            decide_resume(&r, Some("0083")),
+            ResumeChoice::Plan { .. }
+        ));
     }
 
     #[test]
     fn head_sha_target_does_not_note_pr() {
         let f = matching_fixture("0083");
         let r = f.record();
-        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch", None);
         let path = track_dir_of(f.root(), "0083").join("reuse.json");
         let before = std::fs::read(&path).unwrap();
         note_ci_target(
@@ -1027,6 +1166,7 @@ mod tests {
             &CiTarget::HeadSha {
                 sha: "deadbeef".into(),
             },
+            None,
         );
         note_ci_target(
             r,
@@ -1041,6 +1181,7 @@ mod tests {
                 head_ref: "track/0083-Relaunch".into(),
                 title: String::new(),
             },
+            None,
         );
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after);

@@ -3,6 +3,11 @@
 //! The ref is `refs/coordinator/checkpoints/{project_id}/{epoch}`. Create runs
 //! only from the fold → implement edge. Restore is operator-only. Reap helpers
 //! do not take [`with_run_state_lock`].
+//!
+//! 0101: create, restore and reap act on the track delivery target, not on
+//! `product_git_cwd`. A non-adapter run (stub / file_wait) has no delivery target and
+//! keeps the legacy primary/epoch path. A sibling ref is never reaped outside
+//! `refs/coordinator/checkpoints/<project>/`.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +16,11 @@ use crate::registry::ProjectRecord;
 use crate::state::{
     RunState, RunStatus, StatusView, load_run_state, save_run_state, with_run_state_lock,
 };
+use crate::workflow::WorkflowDriver;
+use crate::workflow::execution_repo::{
+    ResolvedExecution, resolve_track_target, uses_delivery_target,
+};
+use crate::workflow::graph::PHASE_IMPLEMENT;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const DIRT_PATH_CAP: usize = 20;
@@ -23,7 +33,40 @@ pub(crate) fn ref_name(project_id: &str, epoch: u64) -> String {
 ///
 /// Does not take the run-state lock. On failure the caller keeps phase `fold`.
 pub(crate) fn ensure_implement_ref(record: &ProjectRecord, state: &mut RunState) -> Result<()> {
-    let cwd = require_cwd(record)?;
+    // Only an adapter leg is a delivery leg. Stub / file_wait keep the legacy path and
+    // store no target.
+    let target = if state.driver == WorkflowDriver::Adapter {
+        let track = state.track_id.as_deref().unwrap_or("<id>");
+        let target = resolve_track_target(record, state, PHASE_IMPLEMENT).map_err(|e| {
+            CoordinatorError::Message(format!(
+                "{e}; declare one execution target, then `coordinator failure resolve` and \
+                 `coordinator run --track {track}`"
+            ))
+        })?;
+        Some(target)
+    } else {
+        None
+    };
+    if let Some(target) = &target {
+        state.delivery_target = Some(target.clone());
+        state.gate_target_journal = None;
+        if target.planning_only {
+            // No product delivery: skip the ref. The implement gate also skips.
+            crate::progress_log::append(
+                record,
+                "checkpoint",
+                &format!(
+                    "checkpoint: skipped planning-only target {}",
+                    target.declared_path.display()
+                ),
+            );
+            return Ok(());
+        }
+    }
+    let cwd = match &target {
+        Some(target) => target.sample_path.clone(),
+        None => require_cwd(record)?,
+    };
     let sha = git_ok(&cwd, &["rev-parse", "HEAD"])?;
     let sha = sha.trim();
     if sha.is_empty() {
@@ -73,14 +116,49 @@ fn restore_locked(record: &ProjectRecord, discard: bool) -> Result<StatusView> {
     if let Some(msg) = persist_blocks(record)? {
         return refuse(record, &msg);
     }
-    let cwd = match require_cwd(record) {
-        Ok(cwd) => cwd,
-        Err(e) => return refuse(record, &e.to_string()),
+    // Prefer the frozen target; otherwise re-resolve the current delivery phase, or the
+    // fold -> implement edge for a non-delivery phase. A non-adapter run keeps legacy.
+    let target: Option<ResolvedExecution> = if state.driver == WorkflowDriver::Adapter {
+        let stored = state.delivery_target.as_ref().filter(|target| {
+            target.project_id == record.id
+                && target.run_epoch == state.run_epoch
+                && state.track_id.as_deref() == Some(target.track_id.as_str())
+        });
+        if let Some(stored) = stored {
+            Some(stored.clone())
+        } else {
+            let phase = if uses_delivery_target(&state.phase) {
+                state.phase.clone()
+            } else {
+                PHASE_IMPLEMENT.to_string()
+            };
+            match resolve_track_target(record, &state, &phase) {
+                Ok(target) => Some(target),
+                Err(e) => return refuse(record, &e.to_string()),
+            }
+        }
+    } else {
+        None
+    };
+    let cwd = match &target {
+        Some(target) => target.sample_path.clone(),
+        None => match require_cwd(record) {
+            Ok(cwd) => cwd,
+            Err(e) => return refuse(record, &e.to_string()),
+        },
     };
     let name = ref_name(&record.id, state.run_epoch);
     let sha = match git(&cwd, &["rev-parse", "--verify", "--quiet", &name]) {
         Ok(out) if out.ok && !out.stdout.trim().is_empty() => out.stdout.trim().to_string(),
-        Ok(_) => return refuse(record, "restore refused: no checkpoint for this epoch"),
+        Ok(_) => {
+            return refuse(
+                record,
+                &format!(
+                    "restore refused: no checkpoint for this epoch in {}",
+                    cwd.display()
+                ),
+            );
+        }
         Err(e) => return refuse(record, &e.to_string()),
     };
     if !discard {
@@ -172,27 +250,73 @@ pub(crate) fn reap_abandoned(record: &ProjectRecord, next_epoch: u64) -> Result<
 }
 
 fn reap(record: &ProjectRecord, drop_epoch: impl Fn(Option<u64>) -> bool) -> Result<()> {
-    let Some(cwd) = git_cwd(record) else {
-        return Ok(());
-    };
-    let refs = match list_refs(&cwd, &record.id) {
-        Ok(refs) => refs,
-        Err(e) => {
-            crate::progress_log::append(record, "checkpoint-reap", &e.to_string());
-            return Ok(());
+    // Candidates: the stored delivery target, the current primary/epoch, and every
+    // registered binding. Each is deduped by `paths_same`; one repo's failure is journalled
+    // and never fails the advance.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(state) = load_run_state(record)
+        && let Some(target) = state.delivery_target
+    {
+        candidates.push(target.sample_path);
+    }
+    if let Some(cwd) = git_cwd(record) {
+        candidates.push(cwd);
+    }
+    for binding in record.execution_repos.values() {
+        if let Some(top) = git_toplevel(binding) {
+            candidates.push(top);
+        } else if binding.is_dir() {
+            candidates.push(binding.clone());
         }
-    };
+    }
+    let mut deduped: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if !deduped
+            .iter()
+            .any(|existing| crate::workflow::execution_repo::paths_same(existing, &candidate))
+        {
+            deduped.push(candidate);
+        }
+    }
     let prefix = format!("refs/coordinator/checkpoints/{}/", record.id);
-    for name in refs {
-        if !name.starts_with(&prefix) {
-            continue;
-        }
-        let epoch = name.rsplit('/').next().and_then(|s| s.parse().ok());
-        if drop_epoch(epoch) {
-            delete_ref(record, &cwd, &name);
+    for cwd in deduped {
+        let refs = match list_refs(&cwd, &record.id) {
+            Ok(refs) => refs,
+            Err(e) => {
+                crate::progress_log::append(
+                    record,
+                    "checkpoint-reap",
+                    &format!("{} ({})", e, cwd.display()),
+                );
+                continue;
+            }
+        };
+        for name in refs {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let epoch = name.rsplit('/').next().and_then(|s| s.parse().ok());
+            if drop_epoch(epoch) {
+                delete_ref(record, &cwd, &name);
+            }
         }
     }
     Ok(())
+}
+
+fn git_toplevel(path: &Path) -> Option<PathBuf> {
+    let out = git(path, &["rev-parse", "--show-toplevel"]).ok()?;
+    if !out.ok {
+        return None;
+    }
+    let text = out.stdout.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(text);
+    dunce::canonicalize(&path)
+        .ok()
+        .map(|p| PathBuf::from(dunce::simplified(&p)))
 }
 
 fn list_refs(cwd: &Path, project_id: &str) -> Result<Vec<String>> {
@@ -228,6 +352,8 @@ fn delete_ref(record: &ProjectRecord, cwd: &Path, name: &str) {
     }
 }
 
+/// Legacy primary/epoch checkout. Gates must not use this for delivery routing; it is
+/// kept for non-adapter restore and for the documented legacy cleanup fallback.
 pub(crate) fn require_cwd(record: &ProjectRecord) -> Result<PathBuf> {
     match git_cwd(record) {
         Some(cwd) => Ok(cwd),
@@ -694,6 +820,64 @@ mod tests {
         assert!(view.failure_class.is_none());
         assert!(view.last_event.contains("checkpoint: no execution repo"));
         assert!(crate::notify::artifact::existing_path(&rec).is_none());
+    }
+
+    #[test]
+    fn planning_only_target_skips_the_checkpoint_ref() {
+        let (primary, sibling, ws, _state, rec) = sibling_fixture();
+        std::fs::write(
+            ws.path().join("conductor").join("conductor.md"),
+            "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0001-One](0001-One/spec.md) | `.` | **Ready — not started** | ok |\n",
+        )
+        .unwrap();
+        save_adapter_phase(&rec, RunStatus::Running, PHASE_FOLD, 1);
+        let mut state = load_run_state(&rec).unwrap();
+        ensure_implement_ref(&rec, &mut state).unwrap();
+        assert!(
+            state
+                .delivery_target
+                .as_ref()
+                .is_some_and(|target| target.planning_only)
+        );
+        let name = ref_name(&rec.id, 1);
+        for repo in [primary.path(), sibling.path(), ws.path()] {
+            assert!(
+                !git(repo, &["rev-parse", "--verify", "--quiet", &name])
+                    .unwrap()
+                    .ok
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_resolution_failure_is_permission() {
+        let (repo, _sibling, ws, _state, rec) = sibling_fixture();
+        let track = ws.path().join("conductor").join("0001-One");
+        std::fs::write(track.join("spec.md"), "# spec\n").unwrap();
+        std::fs::write(track.join("plan.md"), "# plan\n").unwrap();
+        std::fs::write(
+            ws.path().join("conductor").join("conductor.md"),
+            "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0001-One](0001-One/spec.md) | `not-a-target` | **Ready — not started** | ok |\n",
+        )
+        .unwrap();
+        save_adapter_phase(&rec, RunStatus::Running, PHASE_FOLD, 1);
+        let view = fold_success(&rec, 1);
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(
+            view.failure_class,
+            Some(crate::outcome::FailureClass::Permission)
+        );
+        assert!(
+            view.last_event.contains("leg repo unresolved:"),
+            "{}",
+            view.last_event
+        );
+        let name = ref_name(&rec.id, 1);
+        assert!(
+            !git(repo.path(), &["rev-parse", "--verify", "--quiet", &name])
+                .unwrap()
+                .ok
+        );
     }
 
     #[test]
@@ -1239,6 +1423,178 @@ mod tests {
                 CoordinatorError::InvalidTransition { action: "run", .. }
             ),
             "{again}"
+        );
+    }
+
+    /// Primary + registered sibling, execution row naming the sibling, adapter state.
+    fn sibling_fixture() -> (TempDir, TempDir, TempDir, TempDir, ProjectRecord) {
+        let primary = init_repo();
+        let sibling = init_repo();
+        let ws = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut rec = record(
+            ws.path().to_path_buf(),
+            Some(primary.path().to_path_buf()),
+            Some(state.path().to_path_buf()),
+            false,
+        );
+        rec.execution_repos
+            .insert("sibling".into(), sibling.path().to_path_buf());
+        let cond = ws.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0001-One")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0001-One](0001-One/spec.md) | `{}` | **Ready — not started** | ok |\n",
+                sibling.path().display()
+            ),
+        )
+        .unwrap();
+        (primary, sibling, ws, state, rec)
+    }
+
+    fn save_adapter_phase(rec: &ProjectRecord, status: RunStatus, phase: &str, epoch: u64) {
+        ensure_state_dir(rec).unwrap();
+        let mut state = RunState::idle(&rec.id);
+        state.status = status;
+        state.phase = phase.into();
+        state.run_epoch = epoch;
+        state.workflow = Some(crate::workflow::WORKFLOW_ID.into());
+        state.driver = WorkflowDriver::Adapter;
+        state.track_id = Some("0001".into());
+        save_run_state(rec, &state).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_ref_is_created_in_the_sibling_target() {
+        let (primary, sibling, _ws, _state, rec) = sibling_fixture();
+        save_adapter_phase(&rec, RunStatus::Running, PHASE_FOLD, 1);
+        let mut state = load_run_state(&rec).unwrap();
+        ensure_implement_ref(&rec, &mut state).unwrap();
+        let name = ref_name(&rec.id, 1);
+        assert_eq!(
+            git_stdout(sibling.path(), &["rev-parse", &name]),
+            head(sibling.path())
+        );
+        let primary_ref =
+            git(primary.path(), &["rev-parse", "--verify", "--quiet", &name]).unwrap();
+        assert!(!primary_ref.ok);
+        let target = state.delivery_target.expect("target stored");
+        assert!(crate::workflow::execution_repo::paths_same(
+            &target.declared_path,
+            sibling.path()
+        ));
+    }
+
+    #[test]
+    fn restore_uses_the_checkpoint_repo() {
+        let (primary, sibling, _ws, _state, rec) = sibling_fixture();
+        save_adapter_phase(&rec, RunStatus::Running, PHASE_FOLD, 1);
+        let mut state = load_run_state(&rec).unwrap();
+        ensure_implement_ref(&rec, &mut state).unwrap();
+        save_run_state(&rec, &state).unwrap();
+        let base = head(sibling.path());
+        std::fs::write(sibling.path().join("README.md"), b"delivered\n").unwrap();
+        git_cmd(sibling.path(), &["commit", "-am", "delivered"]);
+        let primary_head = head(primary.path());
+        let mut stopped = state;
+        stopped.status = RunStatus::Stopped;
+        stopped.phase = PHASE_IMPLEMENT.into();
+        save_run_state(&rec, &stopped).unwrap();
+        restore(&rec, false).unwrap();
+        assert_eq!(head(sibling.path()), base);
+        assert_eq!(head(primary.path()), primary_head);
+    }
+
+    #[test]
+    fn restore_refuses_after_the_target_moved() {
+        let (primary, sibling, _ws, _state, rec) = sibling_fixture();
+        let mut state = RunState::idle(&rec.id);
+        state.status = RunStatus::Stopped;
+        state.phase = PHASE_IMPLEMENT.into();
+        state.run_epoch = 1;
+        state.track_id = Some("0001".into());
+        state.driver = WorkflowDriver::Adapter;
+        state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            &rec,
+            "0001",
+            1,
+            PHASE_IMPLEMENT,
+            sibling.path(),
+        ));
+        ensure_state_dir(&rec).unwrap();
+        save_run_state(&rec, &state).unwrap();
+        // The primary holds a ref, but the frozen target (sibling) does not. Restore must
+        // refuse in the frozen repo rather than rewind the newly declared one.
+        let name = ref_name(&rec.id, 1);
+        git_cmd(primary.path(), &["update-ref", &name, "HEAD"]);
+        let primary_head = head(primary.path());
+        let cond = rec.path.join("conductor");
+        std::fs::write(
+            cond.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0001-One](0001-One/spec.md) | `{}` | **Ready — not started** | ok |\n",
+                primary.path().display()
+            ),
+        )
+        .unwrap();
+        let err = restore(&rec, true).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("no checkpoint for this epoch in"), "{err}");
+        let named = message
+            .rsplit(" in ")
+            .next()
+            .map(Path::new)
+            .expect("repo in message");
+        assert!(
+            crate::workflow::execution_repo::paths_same(named, sibling.path()),
+            "restore must name the frozen repo, not the re-resolved one: {err}"
+        );
+        assert_eq!(head(primary.path()), primary_head);
+    }
+
+    #[test]
+    fn epoch_checkpoint_ref_is_visible_from_the_primary() {
+        let repo = init_repo();
+        let ws = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let rec = record(
+            ws.path().to_path_buf(),
+            Some(repo.path().to_path_buf()),
+            Some(state.path().to_path_buf()),
+            true,
+        );
+        crate::worktree::prepare_epoch(&rec, 1).unwrap();
+        let epoch = crate::worktree::epoch_dir(&rec, 1).unwrap();
+        let name = ref_name(&rec.id, 1);
+        let sha = head(&epoch);
+        git_cmd(&epoch, &["update-ref", &name, &sha]);
+        assert_eq!(git_stdout(repo.path(), &["rev-parse", &name]), sha);
+    }
+
+    #[test]
+    fn reap_clears_refs_in_every_registered_repo() {
+        let (primary, sibling, _ws, _state, rec) = sibling_fixture();
+        let name = ref_name(&rec.id, 1);
+        git_cmd(primary.path(), &["update-ref", &name, "HEAD"]);
+        git_cmd(sibling.path(), &["update-ref", &name, "HEAD"]);
+        reap_completed(&rec).unwrap();
+        for repo in [primary.path(), sibling.path()] {
+            let out = git(repo, &["rev-parse", "--verify", "--quiet", &name]).unwrap();
+            assert!(!out.ok, "ref survived in {}", repo.display());
+        }
+    }
+
+    #[test]
+    fn reap_never_touches_an_unknown_repo() {
+        let (_primary, _sibling, _ws, _state, rec) = sibling_fixture();
+        let unknown = init_repo();
+        let name = ref_name(&rec.id, 1);
+        git_cmd(unknown.path(), &["update-ref", &name, "HEAD"]);
+        reap_completed(&rec).unwrap();
+        assert_eq!(
+            git_stdout(unknown.path(), &["rev-parse", &name]),
+            head(unknown.path())
         );
     }
 

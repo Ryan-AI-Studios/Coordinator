@@ -140,6 +140,12 @@ pub struct TrackTargetView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub planning_only: bool,
+    /// 0101: the target is the primary or a registered execution binding.
+    #[serde(default)]
+    pub registered: bool,
+    /// 0101: publish/PR/merge/label are permitted for this target.
+    #[serde(default)]
+    pub publishable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -313,15 +319,21 @@ pub fn project_show_with_track(
                 &state,
                 crate::workflow::graph::PHASE_IMPLEMENT,
             ) {
-                Ok(target) => TrackTargetView {
-                    track: track.to_string(),
-                    declared_path: Some(target.declared_path),
-                    prompt_path: Some(target.prompt_path),
-                    sample_path: Some(target.sample_path),
-                    source: Some(target.source.to_string()),
-                    planning_only: target.planning_only,
-                    error: None,
-                },
+                Ok(target) => {
+                    let registered =
+                        crate::workflow::execution_repo::registered_execution_target(&rec, &target);
+                    TrackTargetView {
+                        track: track.to_string(),
+                        declared_path: Some(target.declared_path),
+                        prompt_path: Some(target.prompt_path),
+                        sample_path: Some(target.sample_path),
+                        source: Some(target.source.to_string()),
+                        planning_only: target.planning_only,
+                        registered,
+                        publishable: registered && !target.planning_only,
+                        error: None,
+                    }
+                }
                 Err(err) => TrackTargetView {
                     track: track.to_string(),
                     declared_path: None,
@@ -329,6 +341,8 @@ pub fn project_show_with_track(
                     sample_path: None,
                     source: None,
                     planning_only: false,
+                    registered: false,
+                    publishable: false,
                     error: Some(err.to_string()),
                 },
             };
@@ -980,10 +994,42 @@ pub fn cmd_policy_set(
 /// `policy approve`. Stores nothing when the fingerprint cannot be read.
 pub fn cmd_policy_approve(project: Option<&str>, name: &str, infer_cwd: bool) -> Result<String> {
     let record = resolve_selected(project, infer_cwd)?;
-    let cwd = crate::worktree::product_git_cwd(&record)
-        .ok_or_else(|| CoordinatorError::Message("policy approve: no execution repo".into()))?;
+    // 0101: approve the same repo as the ci-wait policy gate. A non-delivery phase is a
+    // typed error, not a primary fallback. Prefer the ci-wait latch and require agreement.
+    let snapshot = crate::state::load_run_state(&record)?;
+    let gate = crate::workflow::execution_repo::gate_target(&record, &snapshot)
+        .map_err(|err| CoordinatorError::Message(format!("policy approve: {err}")))?;
+    if gate.execution.planning_only {
+        return Err(CoordinatorError::Message(format!(
+            "policy approve: planning-only target {} has no product policy diff",
+            gate.execution.declared_path.display()
+        )));
+    }
+    let mut cwd = gate.execution.sample_path.clone();
+    if let Some(latched) = snapshot.ci.as_ref().and_then(|ci| ci.target_repo.as_ref()) {
+        if !crate::workflow::execution_repo::paths_same(latched, &cwd) {
+            return Err(CoordinatorError::Message(format!(
+                "policy approve: delivery target changed from {} to {} since the ci-wait latch",
+                latched.display(),
+                cwd.display()
+            )));
+        }
+        cwd = latched.clone();
+    }
     crate::state::with_run_state_lock(&record, || {
         let mut state = crate::state::load_run_state(&record)?;
+        let current = crate::workflow::execution_repo::gate_target(&record, &state)
+            .map_err(|err| CoordinatorError::Message(format!("policy approve: {err}")))?;
+        if current.execution.project_id != snapshot.project_id
+            || current.execution.run_epoch != snapshot.run_epoch
+            || current.execution.track_id != gate.execution.track_id
+            || !crate::workflow::execution_repo::paths_same(&current.execution.sample_path, &cwd)
+        {
+            return Err(CoordinatorError::Message(
+                "policy approve: delivery target changed while approving; retry after the run settles"
+                    .into(),
+            ));
+        }
         let fingerprint = crate::policy::approve(&record, &mut state, &cwd, name)?;
         crate::state::save_run_state(&record, &state)?;
         Ok(fingerprint)
@@ -1019,7 +1065,7 @@ mod tests {
         ENV_COORDINATOR_HOME, ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, test_env_lock,
     };
     use crate::notify::artifact;
-    use crate::state::RunStatus;
+    use crate::state::{RunState, RunStatus};
     use crate::workflow::ENV_PHASE_TIMEOUT_SECS;
     use tempfile::tempdir;
 
@@ -2479,6 +2525,152 @@ mod tests {
         assert!(log.contains(crate::notify::START_CLEAR_DETAIL));
         assert!(!log.contains(crate::notify::SETTLED_DETAIL));
         let _ = proj;
+        clear_home();
+    }
+
+    fn api_git(cwd: &std::path::Path, args: &[&str]) -> String {
+        let out = crate::git_command::command()
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn api_repo(root: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(root).unwrap();
+        api_git(root, &["init", "-b", "main"]);
+        std::fs::write(root.join("f.txt"), "base\n").unwrap();
+        api_git(root, &["add", "."]);
+        api_git(root, &["commit", "-m", "base"]);
+        root.to_path_buf()
+    }
+
+    fn write_api_row(root: &std::path::Path, track: &str, target: &std::path::Path) {
+        let conductor = root.join("conductor");
+        std::fs::create_dir_all(conductor.join(format!("{track}-Example"))).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [{track}-Example]({track}-Example/spec.md) | `{}` | **Ready - not started** | s |\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn register_primary_and_sibling(
+        rec: &ProjectRecord,
+        primary: &std::path::Path,
+        sibling: &std::path::Path,
+    ) {
+        let mut reg = load_registry().unwrap();
+        let row = reg.projects.iter_mut().find(|p| p.id == rec.id).unwrap();
+        row.execution_repo = Some(primary.to_path_buf());
+        row.execution_repos
+            .insert("sibling".into(), sibling.to_path_buf());
+        save_registry(&reg).unwrap();
+    }
+
+    fn save_delivery_state(rec: &ProjectRecord, track: &str, target: &std::path::Path) -> RunState {
+        crate::state::ensure_state_dir(rec).unwrap();
+        let mut state = RunState::idle(&rec.id);
+        state.status = RunStatus::Running;
+        state.phase = crate::workflow::graph::PHASE_CI_WAIT.into();
+        state.track_id = Some(track.into());
+        state.run_epoch = 1;
+        state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            rec,
+            track,
+            1,
+            crate::workflow::graph::PHASE_CI_WAIT,
+            target,
+        ));
+        state.ci = Some(crate::state::CiWatchState {
+            target_repo: Some(target.to_path_buf()),
+            ..Default::default()
+        });
+        crate::state::save_run_state(rec, &state).unwrap();
+        state
+    }
+
+    #[test]
+    fn policy_approve_reads_the_gate_repo() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        let primary = api_repo(&proj.path().join("primary"));
+        let sibling = api_repo(&proj.path().join("sibling"));
+        register_primary_and_sibling(&rec, &primary, &sibling);
+        write_api_row(proj.path(), "0010", &sibling);
+        save_delivery_state(&rec, "0010", &sibling);
+        // A checkpoint base in both repos; only the target adds a dependency manifest.
+        for repo in [&primary, &sibling] {
+            api_git(
+                repo,
+                &[
+                    "update-ref",
+                    &crate::checkpoint::ref_name(&rec.id, 1),
+                    "HEAD",
+                ],
+            );
+        }
+        std::fs::write(sibling.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        api_git(&sibling, &["add", "Cargo.toml"]);
+        api_git(&sibling, &["commit", "-m", "dependency"]);
+        let got = cmd_policy_approve(Some(&rec.id), "dependency-manifest", false).unwrap();
+        let mut expected_state = RunState::idle(&rec.id);
+        expected_state.track_id = Some("0010".into());
+        expected_state.run_epoch = 1;
+        let expected = crate::policy::approve(
+            &load_registry()
+                .unwrap()
+                .projects
+                .into_iter()
+                .find(|p| p.id == rec.id)
+                .unwrap(),
+            &mut expected_state,
+            &sibling,
+            "dependency-manifest",
+        )
+        .unwrap();
+        assert_eq!(got, expected);
+        let saved = crate::state::load_run_state(&rec).unwrap();
+        assert!(
+            saved
+                .policy_approvals
+                .iter()
+                .any(|a| a.name == "dependency-manifest")
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn project_show_reports_publish_ownership() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        let primary = api_repo(&proj.path().join("primary"));
+        let sibling = api_repo(&proj.path().join("sibling"));
+        let outside = api_repo(&proj.path().join("outside"));
+        register_primary_and_sibling(&rec, &primary, &sibling);
+        write_api_row(proj.path(), "0010", &sibling);
+        let view = project_show_with_track(Some(&rec.id), Some("0010"), false).unwrap();
+        let target = view.resolved_track.expect("preview");
+        assert!(target.registered);
+        assert!(target.publishable);
+        write_api_row(proj.path(), "0010", &outside);
+        let view = project_show_with_track(Some(&rec.id), Some("0010"), false).unwrap();
+        let target = view.resolved_track.expect("preview");
+        assert!(!target.registered);
+        assert!(!target.publishable);
         clear_home();
     }
 }

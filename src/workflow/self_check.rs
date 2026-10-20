@@ -3,6 +3,10 @@
 //! Opt-in, report-only, and only for `implement` and `address-findings`.
 //! A yielded step does not write a phase outcome and does not move the phase clock.
 //! `note_progress` is not called from classify or from the self-check log.
+//!
+//! 0101: `measure` fingerprints the turn's frozen delivery target (`sample_path`), not the
+//! primary/epoch checkout. No target or a planning-only target yields no fingerprint and no
+//! `DIFF_UNREADABLE`, so `Plateau` cannot be reported for that leg (disclosed capability limit).
 
 use chrono::Utc;
 
@@ -231,6 +235,7 @@ pub fn hold_continue(
     injected_phase: &str,
     stop_reason: Option<&str>,
     text: &str,
+    target: Option<&crate::workflow::execution_repo::ResolvedExecution>,
 ) -> Result<bool> {
     let preview = load_run_state(record)?;
     if decide(record, &preview, injected_phase, stop_reason, text) != Decide::ContinueStep {
@@ -244,7 +249,7 @@ pub fn hold_continue(
         let Some(Line::Continue { finding, action }) = parse_line(text) else {
             return Ok(false);
         };
-        let cost = measure(record, &state);
+        let cost = measure(record, &state, target);
         let prev = state.self_check.clone().unwrap_or_default();
         let repairs_in_a_row = if action == Action::Repair {
             prev.repairs_in_a_row.saturating_add(1)
@@ -338,13 +343,20 @@ fn classify(
     }
 }
 
-fn measure(record: &ProjectRecord, state: &RunState) -> StepCost {
-    let (diff_fp, diff_unreadable) = match crate::worktree::product_git_cwd(record) {
-        Some(cwd) => match diff_fingerprint(&cwd) {
+fn measure(
+    record: &ProjectRecord,
+    state: &RunState,
+    target: Option<&crate::workflow::execution_repo::ResolvedExecution>,
+) -> StepCost {
+    // The passed target is the turn's frozen delivery target. No target (planning-only or
+    // legacy) means no fingerprint: `Plateau` can never fire for that leg. A present
+    // target whose Git read fails stays `diff_unreadable` (the existing DIFF_UNREADABLE).
+    let (diff_fp, diff_unreadable) = match target {
+        Some(target) if !target.planning_only => match diff_fingerprint(&target.sample_path) {
             Ok(fp) => (Some(fp), false),
             Err(()) => (None, true),
         },
-        None => (None, false),
+        _ => (None, false),
     };
     let (tools_ms, lines) = journal_tail(record, state);
     let start = state
@@ -847,11 +859,19 @@ mod tests {
             "{\"dur_ms\":10,\"ok\":true}\n{\"dur_ms\":25,\"ok\":true}\n",
         )
         .unwrap();
+        let target = crate::workflow::execution_repo::seeded_delivery_target(
+            &rec,
+            "0070",
+            state.run_epoch,
+            PHASE_IMPLEMENT,
+            bad_git.path(),
+        );
         let held = hold_continue(
             &rec,
             PHASE_IMPLEMENT,
             Some("end_turn"),
             "self-check: continue finding=F11 action=repair",
+            Some(&target),
         )
         .unwrap();
         assert!(held);
@@ -875,5 +895,79 @@ mod tests {
         unsafe {
             std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
         }
+    }
+
+    fn dirty_repo(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(dir.path().join("a.txt"), b"base\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        std::fs::write(dir.path().join(name), b"work\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn self_check_fingerprint_samples_the_target() {
+        let primary = dirty_repo("a.txt");
+        let target_repo = dirty_repo("b.txt");
+        let mut rec = sample(true);
+        rec.execution_repo = Some(primary.path().to_path_buf());
+        let mut state = running(PHASE_IMPLEMENT);
+        state.track_id = Some("0070".into());
+        state.run_epoch = 1;
+        let target = crate::workflow::execution_repo::seeded_delivery_target(
+            &rec,
+            "0070",
+            1,
+            PHASE_IMPLEMENT,
+            target_repo.path(),
+        );
+        let cost = measure(&rec, &state, Some(&target));
+        assert_eq!(
+            cost.diff_fp,
+            diff_fingerprint(target_repo.path()).ok(),
+            "fingerprint must sample the target repo"
+        );
+        assert_ne!(cost.diff_fp, diff_fingerprint(primary.path()).ok());
+        assert!(!cost.diff_unreadable);
+    }
+
+    #[test]
+    fn self_check_without_target_skips_fingerprint() {
+        let repo = dirty_repo("work.rs");
+        let mut rec = sample(true);
+        rec.execution_repo = Some(repo.path().to_path_buf());
+        let mut state = running(PHASE_IMPLEMENT);
+        state.track_id = Some("0070".into());
+        state.run_epoch = 1;
+        let cost = measure(&rec, &state, None);
+        assert!(cost.diff_fp.is_none());
+        assert!(!cost.diff_unreadable);
+        let planning = crate::workflow::execution_repo::seeded_delivery_target(
+            &rec,
+            "0070",
+            1,
+            PHASE_IMPLEMENT,
+            repo.path(),
+        );
+        let mut planning = planning;
+        planning.planning_only = true;
+        let cost = measure(&rec, &state, Some(&planning));
+        assert!(cost.diff_fp.is_none());
+        assert!(!cost.diff_unreadable);
     }
 }

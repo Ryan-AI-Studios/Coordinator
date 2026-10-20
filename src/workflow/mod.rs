@@ -213,9 +213,7 @@ pub fn on_success(
                 conductor_md::FoldAdvance::Allow => match fold_review_reentry(record, state) {
                     FoldReentry::None => {
                         if let Err(e) = crate::checkpoint::ensure_implement_ref(record, state) {
-                            state.status = RunStatus::Stopped;
-                            state.failure_class = None;
-                            state.last_event = e.to_string();
+                            apply_checkpoint_refusal(state, &e);
                             crate::progress_log::append(
                                 record,
                                 "checkpoint-refused",
@@ -248,9 +246,7 @@ pub fn on_success(
                                 &state.last_event,
                             );
                             if let Err(e) = crate::checkpoint::ensure_implement_ref(record, state) {
-                                state.status = RunStatus::Stopped;
-                                state.failure_class = None;
-                                state.last_event = e.to_string();
+                                apply_checkpoint_refusal(state, &e);
                                 crate::progress_log::append(
                                     record,
                                     "checkpoint-refused",
@@ -332,6 +328,21 @@ pub fn on_success(
         state.last_event = "workflow: graph complete".into();
     }
     AddressCiFollowUp::Continue
+}
+
+/// A delivery-phase resolution error is `permission` (spec §3.3/§3.5); a legacy
+/// checkpoint failure (dirty tree, unreadable Git) keeps the historical `fold` refusal.
+fn apply_checkpoint_refusal(state: &mut RunState, error: &CoordinatorError) {
+    state.status = RunStatus::Stopped;
+    let message = error.to_string();
+    state.failure_class = if state.driver == WorkflowDriver::Adapter
+        && message.starts_with(execution_repo::RESOLUTION_PREFIX)
+    {
+        Some(FailureClass::Permission)
+    } else {
+        None
+    };
+    state.last_event = message;
 }
 
 fn stop_address_ci(state: &mut RunState, message: &str) {
@@ -624,6 +635,7 @@ fn start_or_park(
             number,
             head_sha,
             head_ref,
+            repo,
         } => {
             // Keep the phase marked driven so a tick during `gh` does not inject advance again.
             state.last_driven_phase = Some(graph::PHASE_ADVANCE.into());
@@ -636,6 +648,7 @@ fn start_or_park(
                 number,
                 head_sha,
                 head_ref,
+                repo,
             })
         }
         reuse::ResumeChoice::Plan {
@@ -858,6 +871,8 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.last_applied_outcome_hash = None;
     state.ci = None;
     state.review = None;
+    state.delivery_target = None;
+    state.gate_target_journal = None;
     state.stalled_at = None;
     state.address_findings_attempts = 0;
     state.ci_fix_attempts = 0;
@@ -918,6 +933,15 @@ pub fn commit_probed_successor(
             "run: started {WORKFLOW_ID} resume ci-wait pr {}",
             probe.number
         );
+        // G2 (second resume path): freeze ci-wait provenance from tick 0.
+        match execution_repo::resolve_track_target(record, &state, graph::PHASE_CI_WAIT) {
+            Ok(target) => state.delivery_target = Some(target),
+            Err(err) => crate::progress_log::append(
+                record,
+                "reuse",
+                &format!("reuse: ci-wait target unresolved — {err}"),
+            ),
+        }
     }
     crate::outcome::clear_active_outcome_file(record);
     drive::clear_plan_review_artifacts(
@@ -942,9 +966,36 @@ pub fn commit_probed_successor(
 }
 
 pub fn mark_driven(record: &ProjectRecord, phase: &str) -> Result<()> {
+    mark_driven_with_target(record, phase, None)
+}
+
+/// Persist `last_driven_phase` and, when a delivery target was prepared, the frozen
+/// `delivery_target` in the same locked write. A stale tick (a newer epoch/phase/track
+/// or another project) writes nothing and journals the skip.
+pub fn mark_driven_with_target(
+    record: &ProjectRecord,
+    phase: &str,
+    target: Option<&execution_repo::ResolvedExecution>,
+) -> Result<()> {
     with_run_state_lock(record, || {
         let mut state = load_run_state(record)?;
+        if let Some(target) = target
+            && (state.project_id != target.project_id
+                || state.run_epoch != target.run_epoch
+                || state.phase != target.phase
+                || state.track_id.as_deref() != Some(target.track_id.as_str()))
+        {
+            crate::progress_log::append(
+                record,
+                "inject",
+                &format!("inject: stale target skipped phase={phase}"),
+            );
+            return Ok(());
+        }
         state.last_driven_phase = Some(phase.into());
+        if let Some(target) = target {
+            state.delivery_target = Some(target.clone());
+        }
         state.updated_at = chrono::Utc::now();
         save_run_state(record, &state)?;
         let track = state.track_id.as_deref().unwrap_or("-");
@@ -966,8 +1017,25 @@ const IMPLEMENT_GATE_KIND: &str = "implement-gate";
 ///
 /// Fail-open when git cannot be read (no execution repo, unreadable HEAD): the checkpoint
 /// and `harness::no_change` remain the backstops, matching that guard's posture.
-fn implement_artifact_gate(record: &ProjectRecord, state: &RunState) -> Option<String> {
-    let cwd = crate::checkpoint::require_cwd(record).ok()?;
+fn implement_artifact_gate(record: &ProjectRecord, state: &mut RunState) -> Option<String> {
+    // Frozen first; otherwise re-resolve the fold -> implement edge; otherwise keep the
+    // existing fail-open `None` posture. A planning-only target has no product delivery.
+    let gate = match execution_repo::gate_target(record, state) {
+        Ok(gate) => gate,
+        Err(_) => {
+            let target =
+                execution_repo::resolve_track_target(record, state, graph::PHASE_IMPLEMENT).ok()?;
+            execution_repo::GateTarget {
+                registered: execution_repo::registered_execution_target(record, &target),
+                execution: target,
+                provenance: execution_repo::TargetProvenance::ReResolved,
+            }
+        }
+    };
+    if gate.execution.planning_only {
+        return None;
+    }
+    let cwd = gate.execution.sample_path.clone();
     let dirt = crate::checkpoint::committable_dirt(&cwd).ok()?;
     if !dirt.is_empty() {
         let shown = dirt.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
@@ -992,12 +1060,16 @@ fn implement_artifact_gate(record: &ProjectRecord, state: &RunState) -> Option<S
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())?;
-    if base == head {
-        return Some(format!(
+    let message = if base == head {
+        Some(format!(
             "implement-gate: the implement leg reported success but HEAD {head} is still the epoch checkpoint, so the phase produced no commit to review"
-        ));
-    }
-    None
+        ))
+    } else {
+        None
+    };
+    // Journal only once the repository reads succeeded; the memo rides the caller's save.
+    execution_repo::journal_gate_target(record, state, &gate);
+    message
 }
 
 #[cfg(test)]
@@ -1169,7 +1241,7 @@ mod tests {
         let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
-        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug", None);
         let _probe = install_open("track/0083-Slug");
         let view = run::run(&r, Some("0083".into())).unwrap();
         assert_eq!(view.phase, graph::PHASE_CI_WAIT);
@@ -1184,7 +1256,7 @@ mod tests {
         let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
-        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug", None);
         let _probe = reuse::install_test_probe(std::sync::Arc::new(|_| {
             Err(crate::error::CoordinatorError::Message(
                 "gh auth required".into(),
@@ -1206,7 +1278,7 @@ mod tests {
         let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
-        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug", None);
         let _probe = reuse::install_test_probe(std::sync::Arc::new(|_| {
             Ok(Some(reuse::ResumePr {
                 state: "CLOSED".into(),
@@ -1223,7 +1295,7 @@ mod tests {
         let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
-        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug", None);
         let _probe = install_open("track/0084-Other");
         let view = run::run(&r, Some("0083".into())).unwrap();
         assert_eq!(view.phase, graph::PHASE_PLAN);
@@ -1234,7 +1306,7 @@ mod tests {
         let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
-        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083", None);
         let _probe = install_open("track/0083");
         let view = run::run(&r, Some("0083".into())).unwrap();
         assert_eq!(view.phase, graph::PHASE_CI_WAIT);
@@ -1263,7 +1335,7 @@ mod tests {
         let _restore = RestoreStateDir(prev);
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
-        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug", None);
         let lock = crate::state::resolve_state_dir(&r)
             .unwrap()
             .join(".run-state.lock");
@@ -1292,7 +1364,7 @@ mod tests {
         let _env = test_env_lock();
         let dir = tempdir().unwrap();
         let r = seed_matching_receipt(dir.path(), "0083");
-        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug");
+        reuse::note_pr(&r, "0083", 80, REUSE_SHA, "track/0083-Slug", None);
         let _probe = install_open("track/0083-Slug");
         let view = run::run(&r, Some("0083".into())).unwrap();
         assert_eq!(view.phase, graph::PHASE_CI_WAIT);
@@ -2913,15 +2985,36 @@ mod tests {
         let mut state = RunState::idle(&record.id);
         state.track_id = Some("0554".into());
         state.run_epoch = epoch;
+        state.phase = graph::PHASE_IMPLEMENT.into();
+        let repo = record
+            .execution_repo
+            .as_deref()
+            .unwrap_or(record.path.as_path());
+        state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            record,
+            "0554",
+            epoch,
+            graph::PHASE_IMPLEMENT,
+            repo,
+        ));
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&state);
         state
+    }
+
+    #[test]
+    fn implement_gate_fixtures_seed_the_delivery_target() {
+        let (_repo, record, _) = implement_fixture(1);
+        let state = implement_state(&record, 1);
+        assert!(state.delivery_target.is_some());
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&state);
     }
 
     #[test]
     fn implement_gate_blocks_when_the_tree_is_dirty() {
         let (repo, record, _) = implement_fixture(1);
         std::fs::write(repo.path().join("src_new.rs"), b"fn work() {}\n").unwrap();
-        let state = implement_state(&record, 1);
-        let message = implement_artifact_gate(&record, &state).expect("gate must fire");
+        let mut state = implement_state(&record, 1);
+        let message = implement_artifact_gate(&record, &mut state).expect("gate must fire");
         assert!(message.contains("uncommitted"), "{message}");
         assert!(message.contains("src_new.rs"), "{message}");
     }
@@ -2929,9 +3022,134 @@ mod tests {
     #[test]
     fn implement_gate_blocks_when_nothing_was_committed_since_the_checkpoint() {
         let (_repo, record, _) = implement_fixture(1);
-        let state = implement_state(&record, 1);
-        let message = implement_artifact_gate(&record, &state).expect("gate must fire");
+        let mut state = implement_state(&record, 1);
+        let message = implement_artifact_gate(&record, &mut state).expect("gate must fire");
         assert!(message.contains("no commit to review"), "{message}");
+    }
+
+    fn implement_sibling_state(
+        epoch: u64,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::registry::ProjectRecord,
+        RunState,
+    ) {
+        let primary = tempfile::tempdir().unwrap();
+        impl_git(primary.path(), &["init", "-b", "main"]);
+        impl_git(
+            primary.path(),
+            &["config", "user.email", "impl-gate@example.com"],
+        );
+        impl_git(primary.path(), &["config", "user.name", "impl-gate"]);
+        std::fs::write(primary.path().join("README.md"), b"seed\n").unwrap();
+        impl_git(primary.path(), &["add", "."]);
+        impl_git(primary.path(), &["commit", "-m", "seed"]);
+        let sibling = tempfile::tempdir().unwrap();
+        impl_git(sibling.path(), &["init", "-b", "main"]);
+        impl_git(
+            sibling.path(),
+            &["config", "user.email", "impl-gate@example.com"],
+        );
+        impl_git(sibling.path(), &["config", "user.name", "impl-gate"]);
+        std::fs::write(sibling.path().join("README.md"), b"seed\n").unwrap();
+        impl_git(sibling.path(), &["add", "."]);
+        impl_git(sibling.path(), &["commit", "-m", "seed"]);
+        let mut record = rec(primary.path());
+        record.execution_repo = Some(primary.path().to_path_buf());
+        let ref_name = crate::checkpoint::ref_name(&record.id, epoch);
+        impl_git(sibling.path(), &["update-ref", &ref_name, "HEAD"]);
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0554".into());
+        state.run_epoch = epoch;
+        state.phase = graph::PHASE_IMPLEMENT.into();
+        state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            &record,
+            "0554",
+            epoch,
+            graph::PHASE_IMPLEMENT,
+            sibling.path(),
+        ));
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&state);
+        (primary, sibling, record, state)
+    }
+
+    #[test]
+    fn implement_gate_measures_the_target_head() {
+        let (primary, sibling, record, mut state) = implement_sibling_state(1);
+        std::fs::write(primary.path().join("primary-only.txt"), b"not the target\n").unwrap();
+        std::fs::write(sibling.path().join("src_new.rs"), b"fn work() {}\n").unwrap();
+        impl_git(sibling.path(), &["add", "."]);
+        impl_git(
+            sibling.path(),
+            &["commit", "-m", "track(0554): the leg's work"],
+        );
+        assert!(
+            implement_artifact_gate(&record, &mut state).is_none(),
+            "the primary's dirt must not fail a sibling-target leg"
+        );
+    }
+
+    #[test]
+    fn implement_gate_still_fails_an_uncommitted_sibling_leg() {
+        let (_primary, sibling, record, mut state) = implement_sibling_state(1);
+        std::fs::write(sibling.path().join("src_new.rs"), b"fn work() {}\n").unwrap();
+        let message = implement_artifact_gate(&record, &mut state).expect("gate must fire");
+        assert!(message.contains("uncommitted"), "{message}");
+        assert!(message.contains("src_new.rs"), "{message}");
+    }
+
+    #[test]
+    fn planning_only_target_skips_the_implement_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = rec(dir.path());
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0101".into());
+        state.run_epoch = 1;
+        state.phase = graph::PHASE_IMPLEMENT.into();
+        let mut target = crate::workflow::execution_repo::seeded_delivery_target(
+            &record,
+            "0101",
+            1,
+            graph::PHASE_IMPLEMENT,
+            dir.path(),
+        );
+        target.planning_only = true;
+        state.delivery_target = Some(target);
+        assert!(implement_artifact_gate(&record, &mut state).is_none());
+    }
+
+    #[test]
+    fn two_repo_b_only_commit_is_delivered_and_graded() {
+        let (primary, sibling, record, mut state) = implement_sibling_state(1);
+        let base = impl_git(
+            sibling.path(),
+            &["rev-parse", &crate::checkpoint::ref_name(&record.id, 1)],
+        );
+        // A-only work does not satisfy the B leg.
+        std::fs::write(primary.path().join("a-only.rs"), b"fn a() {}\n").unwrap();
+        impl_git(primary.path(), &["add", "."]);
+        impl_git(primary.path(), &["commit", "-m", "a only"]);
+        let message = implement_artifact_gate(&record, &mut state).expect("B leg empty");
+        assert!(message.contains("no commit to review"), "{message}");
+        // A B-only commit is delivered and graded in B.
+        std::fs::write(sibling.path().join("b-only.rs"), b"fn b() {}\n").unwrap();
+        impl_git(sibling.path(), &["add", "."]);
+        impl_git(sibling.path(), &["commit", "-m", "track(0554): b only"]);
+        assert!(implement_artifact_gate(&record, &mut state).is_none());
+        state.phase = graph::PHASE_ADDRESS_CI.into();
+        if let Some(target) = state.delivery_target.as_mut() {
+            target.phase = graph::PHASE_ADDRESS_CI.into();
+        }
+        state.ci_fix_request = Some(crate::state::CiFixRequest {
+            pr_number: 71,
+            from_sha: base,
+            checks: Vec::new(),
+        });
+        assert_eq!(
+            crate::ci::fix::classify_diff(&record, &state),
+            crate::ci::fix::DiffClass::Changed
+        );
     }
 
     #[test]
@@ -2943,8 +3161,8 @@ mod tests {
             repo.path(),
             &["commit", "-m", "track(0554): the leg's work"],
         );
-        let state = implement_state(&record, 1);
-        assert!(implement_artifact_gate(&record, &state).is_none());
+        let mut state = implement_state(&record, 1);
+        assert!(implement_artifact_gate(&record, &mut state).is_none());
     }
 
     #[test]

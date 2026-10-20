@@ -199,6 +199,16 @@ pub struct RunState {
     /// Payload for the current `address-ci` inject (0071). Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_fix_request: Option<CiFixRequest>,
+    /// 0101: the frozen delivery target of the most recent delivery leg.
+    ///
+    /// Written at checkpoint/inject, compared before overwrite, and cleared on a fresh
+    /// epoch. A legacy file loads with `None`; gates then re-resolve and validate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_target: Option<crate::workflow::execution_repo::ResolvedExecution>,
+    /// 0101: one persisted memo for the bounded `gate-target:` journal line.
+    /// Cleared with `delivery_target`. Never gates a mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_target_journal: Option<String>,
 }
 
 /// One completed pause interval (start inclusive, end exclusive-ish).
@@ -270,6 +280,10 @@ pub struct CiWatchState {
     /// HEAD the merge-tip counter is counting. Absent on old files and after `Opened`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_tip_transient_sha: Option<String>,
+    /// 0101: the delivery repo latched on the first ci-wait tick. Never rewritten to
+    /// follow a later row edit; publish authority only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_repo: Option<PathBuf>,
 }
 
 /// One failing check from the judged slice handed to `address-ci` (0071).
@@ -332,6 +346,8 @@ impl RunState {
             self_check: None,
             ci_fix_attempts: 0,
             ci_fix_request: None,
+            delivery_target: None,
+            gate_target_journal: None,
         }
     }
 
@@ -386,6 +402,9 @@ pub struct StatusView {
     /// Resolved conductor directory.
     #[serde(default)]
     pub conductor_dir: Option<PathBuf>,
+    /// 0101: the frozen delivery target copied from `RunState` (no I/O).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_target: Option<crate::workflow::execution_repo::ResolvedExecution>,
     /// Additive harness summary (`harness.grok`) when a session exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<crate::harness::HarnessStatusBundle>,
@@ -510,6 +529,7 @@ impl StatusView {
             layout_profile: record.layout_profile,
             execution_repo: paths.execution_repo,
             conductor_dir: Some(paths.conductor_dir),
+            delivery_target: state.delivery_target.clone(),
             harness: crate::harness::status_bundle_sync(record),
             workflow: Some(WorkflowView {
                 id: state.workflow.clone(),
