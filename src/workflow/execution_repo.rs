@@ -565,6 +565,10 @@ pub fn journal_gate_target(
 
 /// Journal through the run-state lock for gates that do not already hold it.
 pub fn note_gate_target(record: &ProjectRecord, gate: &GateTarget) -> crate::error::Result<()> {
+    // Frozen targets never journal; skip the lock and state read on every poll tick.
+    if gate.provenance == TargetProvenance::Frozen {
+        return Ok(());
+    }
     with_run_state_lock(record, || {
         let mut state = crate::state::load_run_state(record)?;
         if journal_gate_target(record, &mut state, gate) {
@@ -826,6 +830,15 @@ fn is_planning_only(record: &ProjectRecord, candidate: &Path) -> bool {
         }
     }
     true
+}
+
+/// Repository identity for a receipt/epoch comparison. Two linked worktrees of the same
+/// repository share a Git common dir; otherwise fall back to path equality.
+pub(crate) fn same_git_repository(a: &Path, b: &Path) -> bool {
+    match (git_common_dir(a), git_common_dir(b)) {
+        (Some(a), Some(b)) => paths_same(&a, &b),
+        _ => paths_same(a, b),
+    }
 }
 
 pub(crate) fn paths_same(a: &Path, b: &Path) -> bool {

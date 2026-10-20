@@ -103,7 +103,11 @@ pub fn drive_with(
                 record,
                 state,
                 FailureClass::Permission,
-                format!("cross-model: {err}"),
+                format!(
+                    "cross-model: {err}; repair conductor.md or spec metadata, then failure \
+                     resolve and run --track {}",
+                    state.track_id.as_deref().unwrap_or("<id>")
+                ),
             );
         }
     };

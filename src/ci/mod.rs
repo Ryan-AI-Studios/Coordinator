@@ -141,7 +141,11 @@ pub fn drive_with(
                 record,
                 state,
                 FailureClass::Permission,
-                format!("ci-wait: {err}"),
+                format!(
+                    "ci-wait: {err}; repair conductor.md or spec metadata, then failure resolve \
+                     and run --track {}",
+                    state.track_id.as_deref().unwrap_or("<id>")
+                ),
             );
         }
     };
@@ -207,10 +211,12 @@ pub fn drive_with(
             if let MutationGate::Stop(view) = release_for_mutation(record, state, &head_gate)? {
                 return Ok(view.map(|view| *view));
             }
+            // On the first tick the latch is absent; compare the fresh target with this
+            // tick's gate target as well, closing the None/None window before mutating.
             let publish_target = match crate::workflow::execution_repo::mutation_target(
                 record,
                 state,
-                latched.as_deref(),
+                latched.as_deref().or(Some(cwd.as_path())),
             ) {
                 Ok(target) => target,
                 Err(refusal) => {

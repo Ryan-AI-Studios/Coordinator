@@ -491,7 +491,7 @@ pub fn decide_resume(record: &ProjectRecord, track_id: Option<&str>) -> ResumeCh
                 record,
                 &state,
                 crate::workflow::graph::PHASE_CI_WAIT,
-            ) && !crate::workflow::execution_repo::paths_same(repo, &target.sample_path)
+            ) && !crate::workflow::execution_repo::same_git_repository(repo, &target.sample_path)
             {
                 return plan(false);
             }
