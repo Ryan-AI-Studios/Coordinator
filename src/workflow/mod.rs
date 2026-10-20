@@ -1121,7 +1121,10 @@ mod tests {
         for _ in 0..MAX_FOLD_REVIEW_REENTRIES {
             c = fold_counter_step(c, true);
         }
-        assert!(c >= MAX_FOLD_REVIEW_REENTRIES, "repeated pair must trip the cap: {c}");
+        assert!(
+            c >= MAX_FOLD_REVIEW_REENTRIES,
+            "repeated pair must trip the cap: {c}"
+        );
     }
 
     #[test]
@@ -3273,6 +3276,7 @@ mod tests {
         state.track_id = Some("0097".into());
         state.status = RunStatus::Running;
         state.fold_review_reentries = MAX_FOLD_REVIEW_REENTRIES;
+        state.fold_last_pair = crate::workflow::reuse::current_artifact_pair(&dir);
         assert!(matches!(
             fold_review_reentry(&record, &mut state),
             FoldReentry::Exhausted
