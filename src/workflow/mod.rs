@@ -213,9 +213,7 @@ pub fn on_success(
                 conductor_md::FoldAdvance::Allow => match fold_review_reentry(record, state) {
                     FoldReentry::None => {
                         if let Err(e) = crate::checkpoint::ensure_implement_ref(record, state) {
-                            state.status = RunStatus::Stopped;
-                            state.failure_class = None;
-                            state.last_event = e.to_string();
+                            apply_checkpoint_refusal(state, &e);
                             crate::progress_log::append(
                                 record,
                                 "checkpoint-refused",
@@ -248,9 +246,7 @@ pub fn on_success(
                                 &state.last_event,
                             );
                             if let Err(e) = crate::checkpoint::ensure_implement_ref(record, state) {
-                                state.status = RunStatus::Stopped;
-                                state.failure_class = None;
-                                state.last_event = e.to_string();
+                                apply_checkpoint_refusal(state, &e);
                                 crate::progress_log::append(
                                     record,
                                     "checkpoint-refused",
@@ -332,6 +328,21 @@ pub fn on_success(
         state.last_event = "workflow: graph complete".into();
     }
     AddressCiFollowUp::Continue
+}
+
+/// A delivery-phase resolution error is `permission` (spec §3.3/§3.5); a legacy
+/// checkpoint failure (dirty tree, unreadable Git) keeps the historical `fold` refusal.
+fn apply_checkpoint_refusal(state: &mut RunState, error: &CoordinatorError) {
+    state.status = RunStatus::Stopped;
+    let message = error.to_string();
+    state.failure_class = if state.driver == WorkflowDriver::Adapter
+        && message.starts_with(execution_repo::RESOLUTION_PREFIX)
+    {
+        Some(FailureClass::Permission)
+    } else {
+        None
+    };
+    state.last_event = message;
 }
 
 fn stop_address_ci(state: &mut RunState, message: &str) {

@@ -823,6 +823,37 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_resolution_failure_is_permission() {
+        let (repo, _sibling, ws, _state, rec) = sibling_fixture();
+        let track = ws.path().join("conductor").join("0001-One");
+        std::fs::write(track.join("spec.md"), "# spec\n").unwrap();
+        std::fs::write(track.join("plan.md"), "# plan\n").unwrap();
+        std::fs::write(
+            ws.path().join("conductor").join("conductor.md"),
+            "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0001-One](0001-One/spec.md) | `not-a-target` | **Ready — not started** | ok |\n",
+        )
+        .unwrap();
+        save_adapter_phase(&rec, RunStatus::Running, PHASE_FOLD, 1);
+        let view = fold_success(&rec, 1);
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(
+            view.failure_class,
+            Some(crate::outcome::FailureClass::Permission)
+        );
+        assert!(
+            view.last_event.contains("leg repo unresolved:"),
+            "{}",
+            view.last_event
+        );
+        let name = ref_name(&rec.id, 1);
+        assert!(
+            !git(repo.path(), &["rev-parse", "--verify", "--quiet", &name])
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[test]
     fn address_findings_and_implement_tick_do_not_move_ref() {
         let (repo, _ws, _state, rec) = fixture(false);
         save_phase(&rec, RunStatus::Running, PHASE_FOLD, 5);
