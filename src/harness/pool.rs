@@ -1792,7 +1792,7 @@ async fn holder_rpc(addr: &str, req: &HoldRequest) -> Result<HoldResponse> {
 fn hold_view(resp: HoldResponse) -> Result<HarnessPromptView> {
     // If the holder already applied a failure outcome, return the structured
     // view (same as the in-process path) instead of dropping it as a hard error.
-    if !resp.ok && resp.applied != Some(true) {
+    if !resp.ok && resp.applied != Some(true) && resp.skipped != Some(true) {
         return Err(CoordinatorError::Message(
             resp.error.unwrap_or_else(|| "holder request failed".into()),
         ));
@@ -5383,6 +5383,18 @@ Loop\r\n",
         }
     }
 
+    fn holder_shared(rec: &ProjectRecord, session: GrokSession) -> std::sync::Arc<HolderShared> {
+        let snapshot = session_status(&session);
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        std::sync::Arc::new(HolderShared {
+            session: tokio::sync::Mutex::new(session),
+            prompt_gate: tokio::sync::Mutex::new(()),
+            rec: rec.clone(),
+            snapshot: std::sync::Mutex::new(snapshot),
+            shutdown_tx,
+        })
+    }
+
     fn prepared_fixture() -> (tempfile::TempDir, ProjectRecord, PreparedInjection) {
         let dir = tempdir().unwrap();
         let product = dir.path().join("product");
@@ -5678,10 +5690,6 @@ Loop\r\n",
             "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0099-Example](0099-Example/spec.md) | `not-a-target or key` | **Ready - not started** | s |\n",
         )
         .unwrap();
-        assert_eq!(
-            validate_prepared(&rec, &prepared).unwrap_err(),
-            "unresolved"
-        );
         let session = GrokSession::start_mock(
             rec.path.clone(),
             crate::harness::grok::mock_handshake_ok("sess-res-fail"),
@@ -5689,9 +5697,114 @@ Loop\r\n",
         )
         .await
         .unwrap();
-        let before = session.mock_written().unwrap_or_default().len();
-        // Nothing in the failure path sends a prompt.
-        assert_eq!(session.mock_written().unwrap_or_default().len(), before);
+        let shared = holder_shared(&rec, session);
+        let (resp, _) = handle_prepared_prompt(&rec, &shared, "work".into(), prepared)
+            .await
+            .unwrap();
+        assert_eq!(resp.skipped, Some(true));
+        assert_eq!(resp.applied, Some(false));
+        let session = shared.session.lock().await;
+        assert!(session.turn_roots().is_empty());
+        // Only the handshake was written; no session/prompt request exists.
+        let written = session.mock_written().unwrap_or_default();
+        assert!(
+            !written.iter().any(|line| line.contains("session/prompt")),
+            "{written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn holder_prepared_route_captures_and_verdicts() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        let target = prepared.target().unwrap().clone();
+        let mut lines = crate::harness::grok::mock_handshake_ok("sess-holder-prepared");
+        lines.push(crate::harness::grok::rpc_result(
+            4,
+            serde_json::json!({ "stopReason": "end_turn" }),
+        ));
+        let session =
+            GrokSession::start_mock(target.prompt_path.clone(), lines, Duration::from_secs(2))
+                .await
+                .unwrap();
+        let shared = holder_shared(&rec, session);
+        let (resp, _) = handle_prepared_prompt(&rec, &shared, "work".into(), prepared)
+            .await
+            .unwrap();
+        assert_eq!(resp.applied, Some(true));
+        assert_eq!(resp.failure_class, Some(FailureClass::HarnessCrash));
+        let baseline = crate::state::resolve_state_dir(&rec)
+            .unwrap()
+            .join("leg-baseline.json");
+        assert!(baseline.is_file());
+        let session = shared.session.lock().await;
+        assert!(
+            session.turn_roots().is_empty(),
+            "roots cleared after the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn holder_manual_prompt_leaves_baseline_and_journal_untouched() {
+        let (_dir, rec, _prepared) = prepared_fixture();
+        let target = crate::workflow::execution_repo::resolve_track_target(
+            &rec,
+            &crate::state::load_run_state(&rec).unwrap(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+        )
+        .unwrap();
+        let baseline = crate::state::resolve_state_dir(&rec)
+            .unwrap()
+            .join("leg-baseline.json");
+        std::fs::write(&baseline, b"sentinel").unwrap();
+        let before = std::fs::read(&baseline).unwrap();
+        let mut lines = crate::harness::grok::mock_handshake_ok("sess-holder-manual");
+        lines.push(crate::harness::grok::rpc_result(
+            4,
+            serde_json::json!({ "stopReason": "end_turn" }),
+        ));
+        let session =
+            GrokSession::start_mock(target.prompt_path.clone(), lines, Duration::from_secs(2))
+                .await
+                .unwrap();
+        let shared = holder_shared(&rec, session);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_shared = shared.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_hold_conn(stream, server_shared).await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let request = serde_json::to_string(&HoldRequest::Prompt {
+            text: "manual operator work".into(),
+        })
+        .unwrap();
+        client
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: HoldResponse = serde_json::from_str(&line).unwrap();
+        assert!(response.ok, "{response:?}");
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        assert_eq!(
+            std::fs::read(&baseline).unwrap(),
+            before,
+            "baseline untouched"
+        );
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap_or_default();
+        assert!(!log.contains("sample-skip"), "{log}");
+        let session = shared.session.lock().await;
+        assert!(
+            session
+                .mock_written()
+                .unwrap_or_default()
+                .iter()
+                .any(|line| line.contains("session/prompt")),
+            "the manual prompt still reaches the harness"
+        );
         assert!(session.turn_roots().is_empty());
     }
 
@@ -5699,11 +5812,6 @@ Loop\r\n",
     async fn stale_snapshot_installs_no_target_root() {
         let (_dir, rec, prepared) = prepared_fixture();
         bump_epoch(&rec);
-        // Validation runs before the holder/session lock and before any root install.
-        assert_eq!(
-            validate_prepared(&rec, &prepared).unwrap_err(),
-            "stale-injection"
-        );
         let session = GrokSession::start_mock(
             rec.path.clone(),
             crate::harness::grok::mock_handshake_ok("sess-stale-root"),
@@ -5711,7 +5819,21 @@ Loop\r\n",
         )
         .await
         .unwrap();
+        let shared = holder_shared(&rec, session);
+        let (resp, _) = handle_prepared_prompt(&rec, &shared, "work".into(), prepared)
+            .await
+            .unwrap();
+        assert_eq!(resp.skipped, Some(true));
+        assert_eq!(resp.applied, Some(false));
+        let session = shared.session.lock().await;
         assert!(session.turn_roots().is_empty());
+        assert!(
+            !session
+                .mock_written()
+                .unwrap_or_default()
+                .iter()
+                .any(|line| line.contains("session/prompt"))
+        );
     }
 
     #[test]
@@ -6078,7 +6200,7 @@ Loop\r\n",
     #[tokio::test]
     async fn rejected_prepared_opcode_or_closed_response_never_retries_prompt() {
         use tokio::io::AsyncReadExt;
-        let (_dir, _rec, prepared) = prepared_fixture();
+        let (_dir, rec, prepared) = prepared_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6090,27 +6212,24 @@ Loop\r\n",
             let _ = stream.read(&mut buf).await;
             // Close without a response: uncertain delivery after send.
         });
-        let err = holder_rpc(
-            &addr.to_string(),
-            &HoldRequest::PreparedPrompt {
-                text: "work".into(),
-                prepared: Box::new(prepared),
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            {
-                let text = err.to_string();
-                text.contains("holder") || text.contains("closed") || text.contains("connect")
-            },
-            "unexpected transport error: {err}"
-        );
+        let view = send_prepared_rpc(&rec, "work".into(), prepared, &addr.to_string())
+            .await
+            .unwrap();
+        assert!(view.applied, "one identity-checked failure is applied");
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        let error = view.error.unwrap_or_default();
+        assert!(error.contains("transport failed after send"), "{error}");
+        assert!(error.contains("no automatic retry"), "{error}");
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
         assert_eq!(
             accepted.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "no resend"
         );
+        if let Ok(Some(handle)) = load_persist(&rec) {
+            assert!(!handle.alive, "the holder is refused for reuse");
+        }
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(state.status, RunStatus::Stopped);
     }
 }

@@ -2053,6 +2053,69 @@ mod tests {
             1,
             "no continuation claimed"
         );
+        let artifact = crate::notify::artifact::read(&r)
+            .unwrap()
+            .expect("Permission artifact");
+        assert!(
+            artifact.body.contains("Declare one execution target"),
+            "{}",
+            artifact.body
+        );
+        assert!(
+            artifact.body.contains("repair conductor.md"),
+            "{}",
+            artifact.body
+        );
+        assert!(
+            artifact.body.contains("coordinator failure resolve"),
+            "{}",
+            artifact.body
+        );
+        assert!(
+            artifact.body.contains("coordinator run --track 0070"),
+            "{}",
+            artifact.body
+        );
+    }
+
+    #[test]
+    fn inprocess_resolution_failure_prevents_inject() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.driver = WorkflowDriver::Adapter;
+            state.last_driven_phase = None;
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        assert!(
+            super::captured_prompts().is_empty(),
+            "zero prepared prompts"
+        );
+        assert_eq!(
+            load_run_state(&r).unwrap().failure_class,
+            Some(FailureClass::Permission)
+        );
+    }
+
+    #[test]
+    fn manual_prompt_policy_unchanged() {
+        // Manual CLI/HTTP turns and address-ci stay outside target resolution.
+        assert!(!crate::workflow::execution_repo::prepares_target(
+            "address-ci"
+        ));
+        assert!(crate::workflow::execution_repo::prepares_target(
+            "implement"
+        ));
+        assert!(crate::workflow::execution_repo::prepares_target(
+            "address-findings"
+        ));
     }
 
     #[test]
@@ -2139,7 +2202,6 @@ mod tests {
         let b_after = load_run_state(&b).unwrap();
         assert_eq!(b_before.phase, b_after.phase);
         assert_eq!(b_after.failure_class, None);
-        assert!(super::captured_prompts().is_empty());
     }
 
     #[test]

@@ -919,7 +919,8 @@ pub fn write_and_apply_prepared(
     prepared: &PreparedInjection,
 ) -> Result<ApplyIdentity> {
     outcome.validate()?;
-    save_current_outcome(record, &outcome)?;
+    // Prepared turns apply synchronously. Do not persist an active outcome before
+    // the locked identity check: a stale turn must leave no replayable file.
     match apply_prepared(record, outcome, prepared) {
         Ok(ApplyIdentity::Stale(reason)) => {
             clear_active_outcome_file(record);
