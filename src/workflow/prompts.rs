@@ -378,7 +378,7 @@ fn implement_branch_line(track_id: Option<&str>) -> String {
     }
 }
 
-/// Injected into Grok-bound phases (plan / fold / implement / advance).
+/// Injected into Grok-bound phases (plan / fold / implement / address-findings / address-ci / advance).
 pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>) -> String {
     phase_prompt_with_target(record, phase, track_id, None)
 }
@@ -492,7 +492,30 @@ pub fn phase_prompt_with_target(
         }
         _ => "Unknown phase; end the turn.\n".into(),
     };
-    format!("Coordinator phase `{phase}` for track `{track}`.\n{layout}{body}")
+    let blocked = if super::block::phase_allowed(phase) && phase != PHASE_ADDRESS_CI {
+        blocked_clause(phase)
+    } else {
+        String::new()
+    };
+    format!("Coordinator phase `{phase}` for track `{track}`.\n{layout}{body}{blocked}")
+}
+
+/// Terminal block contract shared by the six prompt bodies.
+///
+/// A blocked turn is terminal: the phase stops, the project holds, and no
+/// self-check / `next_track:` successor is applied. Successful turns keep their
+/// existing control-line contract.
+pub(crate) fn blocked_clause(phase: &str) -> String {
+    format!(
+        "If you cannot complete this phase, end the reply with exactly one last line \
+         `Blocked: <reason>` (or `{phase} blocked: <reason>`). \
+         The reason must be a real, bounded explanation on the same line (at most 512 \
+         characters, no control characters and no `<...>` placeholder). \
+         Do not write a self-check line or a `next_track:` line on a blocked turn. \
+         Coordinator stops the phase, writes one Failure Artifact and holds the project \
+         until the operator resolves the prerequisite with `failure resolve` and starts \
+         a new `run --track`. A block overrides partial or committed work and never advances.\n"
+    )
 }
 
 const ADDRESS_CI_CONTEXT_CAP: usize = 4096;
@@ -541,9 +564,10 @@ fn address_ci_body(record: &ProjectRecord) -> String {
          Failing required checks:\n",
         crate::workflow::graph::CI_FIX_CAP
     );
-    let room = ADDRESS_CI_CONTEXT_CAP.saturating_sub(head.chars().count());
+    let room = ADDRESS_CI_CONTEXT_CAP
+        .saturating_sub(head.chars().count() + blocked_clause(PHASE_ADDRESS_CI).chars().count());
     let checks = truncate_scalars(&checks, room);
-    let body = format!("{head}{checks}");
+    let body = format!("{head}{}{checks}", blocked_clause(PHASE_ADDRESS_CI));
     truncate_scalars(&body, ADDRESS_CI_CONTEXT_CAP)
 }
 
@@ -1688,5 +1712,46 @@ mod tests {
             None,
             "id must not contain spaces"
         );
+    }
+
+    #[test]
+    fn every_phase_prompt_requires_a_terminal_block_with_the_canonical_phase() {
+        let rec = nested_record();
+        for phase in [
+            crate::workflow::graph::PHASE_PLAN,
+            crate::workflow::graph::PHASE_FOLD,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            crate::workflow::graph::PHASE_ADDRESS_FINDINGS,
+            crate::workflow::graph::PHASE_ADDRESS_CI,
+            crate::workflow::graph::PHASE_ADVANCE,
+        ] {
+            let text = phase_prompt(&rec, phase, Some("0098"));
+            assert!(text.contains("Blocked: <reason>"), "{phase}: {text}");
+            assert!(
+                text.contains(&format!("`{phase} blocked: <reason>`")),
+                "{phase} must render the canonical phase: {text}"
+            );
+            assert!(
+                text.contains("Do not write a self-check line or a `next_track:` line"),
+                "{phase}: {text}"
+            );
+            assert!(
+                !text.contains("<phase> blocked:"),
+                "{phase} must not leave a literal placeholder"
+            );
+            assert!(
+                text.chars().count() <= 8192,
+                "{phase} prompt unexpectedly large"
+            );
+        }
+    }
+
+    #[test]
+    fn address_ci_block_clause_fits_the_capped_body() {
+        let rec = nested_record();
+        let text = phase_prompt(&rec, crate::workflow::graph::PHASE_ADDRESS_CI, Some("0098"));
+        assert!(text.chars().count() <= 4096 + 512, "capped body");
+        assert!(text.contains("Blocked: <reason>"));
+        assert!(text.contains("`address-ci blocked: <reason>`"));
     }
 }

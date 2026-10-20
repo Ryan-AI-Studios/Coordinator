@@ -30,7 +30,7 @@ const REPORT_PLATEAU: &str = "self-check: non-convergence plateau";
 const DIFF_UNREADABLE: &str = "self-check: diff unreadable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Action {
+pub(crate) enum Action {
     Progress,
     Repair,
     Blocked,
@@ -56,7 +56,7 @@ impl Action {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Line {
+pub(crate) enum Line {
     Continue { finding: String, action: Action },
     Done,
 }
@@ -113,7 +113,10 @@ pub fn phase_clause(record: &ProjectRecord) -> String {
     "When a step can resume, end the reply with a last line \
      `self-check: continue finding=<token> action=<progress|repair|blocked>` \
      (`finding` is `none` or a short token; `action` is `progress`, `repair`, or `blocked`).\n\
-     Finish the phase with a last line `self-check: done`.\n"
+     Finish the phase with a last line `self-check: done`.\n\
+     If a prerequisite prevents the phase from completing, end instead with a last line \
+     `Blocked: <reason>` and no self-check line. \
+     Coordinator stops the phase and holds the project until `failure resolve`.\n"
         .to_string()
 }
 
@@ -146,7 +149,10 @@ pub fn continuation_prompt_with_target(
          {target_line}\
          The last line of your reply must be \
          `self-check: continue finding=<token> action=<progress|repair|blocked>` \
-         or `self-check: done`.\n",
+         or `self-check: done`.\n\
+         If a prerequisite prevents completion, end instead with a last line \
+         `Blocked: <reason>` (or `{phase} blocked: <reason>`) and no self-check line. \
+         Coordinator stops the phase and holds the project until `failure resolve`.\n",
         max = SELF_CHECK_MAX_STEPS,
     )
 }
@@ -292,7 +298,7 @@ fn phase_allowed(phase: &str) -> bool {
     phase == PHASE_IMPLEMENT || phase == PHASE_ADDRESS_FINDINGS
 }
 
-fn parse_line(text: &str) -> Option<Line> {
+pub(crate) fn parse_line(text: &str) -> Option<Line> {
     let last = text.lines().map(str::trim).rfind(|line| !line.is_empty())?;
     let rest = last.strip_prefix("self-check:")?.trim();
     if rest == "done" {
@@ -969,5 +975,30 @@ mod tests {
         let cost = measure(&rec, &state, Some(&planning));
         assert!(cost.diff_fp.is_none());
         assert!(!cost.diff_unreadable);
+    }
+
+    #[test]
+    fn block_contract_is_in_the_clause_and_both_continuation_routes() {
+        let rec = sample(true);
+        let clause = phase_clause(&rec);
+        assert!(clause.contains("Blocked: <reason>"));
+        assert!(clause.contains("no self-check line"));
+        let first = continuation_prompt(PHASE_IMPLEMENT, "0098", 2, "self-check: done");
+        assert!(first.contains("Blocked: <reason>"));
+        assert!(first.contains("`implement blocked: <reason>`"));
+        let second = continuation_prompt_with_target(
+            PHASE_ADDRESS_FINDINGS,
+            "0098",
+            2,
+            "self-check: done",
+            None,
+        );
+        assert!(second.contains("Blocked: <reason>"));
+        assert!(second.contains("`address-findings blocked: <reason>`"));
+        // The shared parser accepts the shipped grammar and rejects an invalid tail.
+        assert!(parse_line("self-check: done").is_some());
+        assert!(parse_line("self-check: continue finding=f1 action=blocked").is_some());
+        assert!(parse_line("self-check: continue").is_none());
+        assert!(parse_line("next_track: 0112").is_none());
     }
 }

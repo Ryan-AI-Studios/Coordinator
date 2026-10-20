@@ -74,6 +74,8 @@ pub fn settle_failure(
 pub struct ArtifactMeta {
     pub track_id: Option<String>,
     pub run_epoch: Option<u64>,
+    /// Failure class as written on the artifact (`blocked` holds the run).
+    pub failure_class: Option<String>,
 }
 
 /// Scan markdown bullets. `"null"`, absent, or a non-integer epoch → `None`.
@@ -90,6 +92,11 @@ pub fn parse_metadata(body: &str) -> ArtifactMeta {
             let v = rest.trim();
             if let Ok(n) = v.parse::<u64>() {
                 meta.run_epoch = Some(n);
+            }
+        } else if let Some(rest) = line.strip_prefix("- failure_class:") {
+            let v = rest.trim();
+            if !v.is_empty() && v != "null" {
+                meta.failure_class = Some(v.to_string());
             }
         }
     }
@@ -216,11 +223,20 @@ fn render(event: &NotifyEvent) -> String {
     let last_event = event.last_event.as_str();
     let message = truncate_message(event.message.as_deref().unwrap_or("(none)"));
     let action = recommended_action(event.failure_class);
+    // 0098: class-aware preamble. Empty for every pre-existing class, so their
+    // artifact bytes are unchanged.
+    let blocked_preamble = if event.failure_class == crate::outcome::FailureClass::Blocked {
+        "The leg declared a terminal prerequisite block. No blocked repair was attempted; the project is held until `failure resolve` and a new `run --track`.\n\
+         \n"
+    } else {
+        ""
+    };
     format!(
         "# Coordinator failure\n\
          \n\
          Recommended action is **advisory**. This file means automatic recovery has stopped. An ACP stdout close or a transport drop restarts the session only before this file is written (bounded). Nothing else auto-retries.\n\
          \n\
+         {blocked_preamble}\
          - project_id: {project}\n\
          - track_id: {track}\n\
          - phase: {phase}\n\
@@ -385,6 +401,36 @@ mod tests {
             Some(SUPERSEDED_MISMATCH)
         );
         assert_eq!(compute_superseded(None, Some("0038"), 2, false), None);
+    }
+
+    #[test]
+    fn blocked_artifact_has_a_class_aware_preamble_and_recovery() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        crate::state::ensure_state_dir(&r).unwrap();
+        let event = NotifyEvent {
+            project_id: r.id.clone(),
+            track_id: Some("0098".into()),
+            phase: "plan".into(),
+            failure_class: FailureClass::Blocked,
+            message: Some("prerequisite missing".into()),
+            last_event: "outcome: failure class=blocked".into(),
+            artifact_path: path(&r).unwrap(),
+            written_at: Utc::now(),
+            run_epoch: 2,
+        };
+        let p = write(&r, &event).unwrap();
+        let body = std::fs::read_to_string(p).unwrap();
+        assert!(body.contains("terminal prerequisite block"));
+        assert!(body.contains("No blocked repair was attempted"));
+        assert!(body.contains(
+            "Resolve the prerequisite the leg named, then `coordinator failure resolve`"
+        ));
+        assert!(body.contains("- failure_class: blocked"));
+        assert_eq!(
+            parse_metadata(&body).failure_class.as_deref(),
+            Some("blocked")
+        );
     }
 
     #[test]

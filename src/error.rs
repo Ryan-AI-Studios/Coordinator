@@ -32,6 +32,14 @@ pub enum CoordinatorError {
     /// Adapter `run` / `doctor` required harness missing or logged out (exit 1, HTTP 409).
     #[error("{}", report.preflight_message())]
     Preflight { report: Box<DoctorReport> },
+
+    /// 0098: a Blocked failure holds the whole project. Only `failure resolve` releases it.
+    #[error(
+        "project is blocked at track {track} (conductor row: {row_status}); \
+         resolve the prerequisite, then `coordinator failure resolve` and start a new \
+         `coordinator run --track {track}`"
+    )]
+    BlockedHold { track: String, row_status: String },
 }
 
 impl CoordinatorError {
@@ -42,7 +50,7 @@ impl CoordinatorError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::WaitBudgetExpired => 2,
-            Self::InvalidTransition { .. } => 2,
+            Self::InvalidTransition { .. } | Self::BlockedHold { .. } => 2,
             Self::ProjectNotFound(_) => 3,
             Self::NonLoopbackBind(_) => 4,
             Self::Message(_) | Self::Io(_) | Self::Json(_) | Self::Preflight { .. } => 1,
@@ -53,7 +61,9 @@ impl CoordinatorError {
     pub fn http_status(&self) -> u16 {
         match self {
             Self::WaitBudgetExpired => 408,
-            Self::InvalidTransition { .. } | Self::Preflight { .. } => 409,
+            Self::InvalidTransition { .. } | Self::Preflight { .. } | Self::BlockedHold { .. } => {
+                409
+            }
             Self::ProjectNotFound(_) => 404,
             Self::NonLoopbackBind(_) => 400,
             Self::Message(_) => 400,

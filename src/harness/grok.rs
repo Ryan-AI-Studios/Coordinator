@@ -3439,4 +3439,41 @@ mod live_tests {
             &session.fs_allowed_roots()
         ));
     }
+
+    #[test]
+    fn collect_update_characterizes_message_boundaries_and_ignores_tools() {
+        let mut out = String::new();
+        for chunk in ["alpha", "beta"] {
+            let msg: serde_json::Value =
+                serde_json::from_str(&session_update_chunk(chunk)).unwrap();
+            collect_update(&msg, &mut out);
+        }
+        assert_eq!(out, "alphabeta", "two messages glue with no separator");
+
+        let mut with_newline = String::new();
+        for chunk in ["alpha\n", "beta"] {
+            let msg: serde_json::Value =
+                serde_json::from_str(&session_update_chunk(chunk)).unwrap();
+            collect_update(&msg, &mut with_newline);
+        }
+        assert_eq!(with_newline, "alpha\nbeta");
+
+        // Whole-message and tool updates never contribute text: a block declared in
+        // them is missed (documented channel limit, not an ACP change in 0098).
+        for msg in [
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "update": {
+                    "sessionUpdate": "agent_message",
+                    "content": [{ "type": "text", "text": "Blocked: missed" }]
+                }}
+            }),
+            serde_json::from_str::<serde_json::Value>(&session_update_tool_call("read")).unwrap(),
+        ] {
+            let mut ignored = String::new();
+            collect_update(&msg, &mut ignored);
+            assert!(ignored.is_empty(), "{msg}");
+        }
+    }
 }

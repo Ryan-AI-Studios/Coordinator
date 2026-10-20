@@ -1197,4 +1197,39 @@ mod tests {
             "https://example.test/pr/1"
         );
     }
+
+    #[test]
+    fn blocked_failure_notifies_once_without_success_or_progress_and_dedupes() {
+        use crate::config::test_env_lock;
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY);
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY_PROGRESS);
+        }
+        toast::clear_recorded_toasts();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_stub(&r, Some("0098".into())).unwrap();
+        let outcome = PhaseOutcome::failure(
+            STUB_PHASE_ACTIVE,
+            FailureClass::Blocked,
+            OutcomeSource::Test,
+            Some("prerequisite".into()),
+            None,
+        );
+        let view = crate::outcome::apply(&r, outcome.clone()).unwrap();
+        assert_eq!(view.failure_class, Some(FailureClass::Blocked));
+        let toasts = toast::take_recorded_toasts();
+        assert_eq!(toasts.len(), 1, "exactly one captured failure notification");
+        assert_eq!(toasts[0].failure_class, FailureClass::Blocked);
+
+        // Identical re-apply is idempotent: no second toast or progress event.
+        crate::outcome::apply(&r, outcome).unwrap();
+        assert!(toast::take_recorded_toasts().is_empty(), "dedupe");
+        assert!(
+            !std::fs::read_to_string(crate::progress_log::path(&r))
+                .unwrap_or_default()
+                .contains("kind=progress")
+        );
+    }
 }

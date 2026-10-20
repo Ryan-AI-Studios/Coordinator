@@ -950,10 +950,22 @@ fn note_for(card: &ProjectCard) -> Option<(&'static str, String)> {
             "note warn",
             "Pause (not Stop): finish current phase, hold next phase/track until Resume. Sessions remain for attach.".into(),
         )),
-        CardState::HardFailure => Some((
-            "note err",
-            "Hard failure. See Failure Artifact. Stop is not a failure class and does not write FAILURE.md.".into(),
-        )),
+        CardState::HardFailure => {
+            if card.view.failure_class == Some(crate::outcome::FailureClass::Blocked) {
+                Some((
+                    "note err",
+                    "Blocked: the run is held pending `failure resolve`. Run / Start next \
+                     Ready is refused; resolve the prerequisite, then start a new \
+                     `run --track`."
+                        .into(),
+                ))
+            } else {
+                Some((
+                    "note err",
+                    "Hard failure. See Failure Artifact. Stop is not a failure class and does not write FAILURE.md.".into(),
+                ))
+            }
+        }
         CardState::TokenIdleCi => {
             let summary = card
                 .view
@@ -1101,5 +1113,56 @@ mod tests {
         assert_eq!(cls, "note warn");
         assert!(text.starts_with("recycle:"));
         assert_ne!(card.card_state, CardState::HardFailure);
+    }
+
+    #[test]
+    fn blocked_card_shows_the_hold_note_and_no_new_action() {
+        use crate::registry::ProjectRecord;
+        use crate::state::{RunState, RunStatus};
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: Utc::now(),
+        };
+        let mut state = RunState::idle(&rec.id);
+        state.status = RunStatus::Stopped;
+        state.phase = crate::workflow::graph::PHASE_PLAN.into();
+        state.track_id = Some("0098".into());
+        state.failure_class = Some(crate::outcome::FailureClass::Blocked);
+        let view = crate::state::StatusView::from_record(&rec, &state);
+        let card = ProjectCard {
+            view: view.clone(),
+            card_state: CardState::HardFailure,
+            sessions: Vec::new(),
+        };
+        let (cls, text) = note_for(&card).expect("blocked note");
+        assert_eq!(cls, "note err");
+        assert!(text.contains("Blocked"), "{text}");
+        assert!(text.contains("failure resolve"), "{text}");
+        assert_eq!(
+            card_primary_action(&view),
+            CardPrimaryAction::Run,
+            "no new UI action; the existing Run button is refused by the hold"
+        );
     }
 }

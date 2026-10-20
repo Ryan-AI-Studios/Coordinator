@@ -31,6 +31,9 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
         FailureClass::Gate => {
             "Do not re-drive the track: it reached the fold without a usable plan.md, or with a review still asking for a re-plan. Write or re-review the artifacts, and resolve any owner decision the leg was waiting on."
         }
+        FailureClass::Blocked => {
+            "Resolve the prerequisite the leg named, then `coordinator failure resolve` and start a new `coordinator run --track <id>`. No blocked repair was attempted, and the block never advances."
+        }
     }
 }
 

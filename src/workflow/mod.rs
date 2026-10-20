@@ -1,5 +1,6 @@
 //! Built-in canonical conductor-track workflow (`canonical_v1`).
 
+pub mod block;
 pub mod bundle;
 pub mod conductor_md;
 pub mod decision;
@@ -603,6 +604,10 @@ fn journal_advance_override(record: &ProjectRecord, planner_id: Option<&str>, ca
 }
 
 fn finish_advance(record: &ProjectRecord, state: &mut RunState) -> Option<reuse::ReuseProbe> {
+    // 0098: a Blocked hold keeps the held track and phase; advance does nothing.
+    if state.failure_class == Some(FailureClass::Blocked) {
+        return None;
+    }
     let _ = crate::checkpoint::reap_completed(record);
     if let Some(id) = state
         .track_id
@@ -706,6 +711,10 @@ fn start_or_park(
 }
 
 fn apply_backlog_clear(record: &ProjectRecord, state: &mut RunState) {
+    // 0098: backlog clear must preserve a Blocked hold and its artifact.
+    if state.failure_class == Some(FailureClass::Blocked) {
+        return;
+    }
     let _ = crate::checkpoint::reap_completed(record);
     state.status = RunStatus::Idle;
     state.next_track = None;
@@ -855,6 +864,10 @@ fn truncate_event_msg(msg: &str) -> String {
 
 /// Stay Running/Paused at `address-findings`; archive live reports; clear review.
 pub fn on_gate_retry(record: &ProjectRecord, state: &mut RunState, outcome: &PhaseOutcome) {
+    // 0098: a Blocked hold is never released or mutated by a gate retry.
+    if state.failure_class == Some(FailureClass::Blocked) {
+        return;
+    }
     state.address_findings_attempts = state.address_findings_attempts.saturating_add(1);
     let n = state.address_findings_attempts;
     archive_gate_reports(record, state, n);
@@ -878,6 +891,10 @@ pub fn on_gate_retry(record: &ProjectRecord, state: &mut RunState, outcome: &Pha
 }
 
 pub fn auto_start(state: &mut RunState, track_id: &str) {
+    // 0098: never release a Blocked hold or mutate the held state.
+    if state.failure_class == Some(FailureClass::Blocked) {
+        return;
+    }
     state.run_epoch = state.run_epoch.saturating_add(1);
     state.track_id = Some(track_id.to_string());
     state.next_track = None;
@@ -1195,6 +1212,52 @@ mod tests {
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn blocked_hold_helpers_cannot_release_or_mutate_the_held_state() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let mut state = crate::state::RunState::idle(&r.id);
+        state.status = crate::state::RunStatus::Stopped;
+        state.track_id = Some("0098".into());
+        state.phase = graph::PHASE_ADVANCE.into();
+        state.run_epoch = 3;
+        state.failure_class = Some(FailureClass::Blocked);
+        state.last_event = "outcome: failure class=blocked".into();
+        state.phase_started_at = Some(chrono::Utc::now());
+        let snap = state.clone();
+
+        auto_start(&mut state, "0100");
+        assert_eq!(state.run_epoch, snap.run_epoch);
+        assert_eq!(state.track_id, snap.track_id);
+        assert_eq!(state.failure_class, snap.failure_class);
+        assert_eq!(state.last_event, snap.last_event);
+
+        let outcome = crate::outcome::PhaseOutcome::failure(
+            graph::PHASE_CROSS_MODEL,
+            FailureClass::Difficulty,
+            OutcomeSource::Test,
+            Some("gate".into()),
+            None,
+        );
+        on_gate_retry(&r, &mut state, &outcome);
+        assert_eq!(state.failure_class, snap.failure_class);
+        assert_eq!(state.phase, snap.phase);
+        assert_eq!(
+            state.address_findings_attempts,
+            snap.address_findings_attempts
+        );
+
+        assert!(finish_advance(&r, &mut state).is_none());
+        assert_eq!(state.track_id, snap.track_id);
+        assert_eq!(state.failure_class, snap.failure_class);
+
+        apply_backlog_clear(&r, &mut state);
+        assert_eq!(state.status, snap.status);
+        assert_eq!(state.failure_class, snap.failure_class);
+        assert_eq!(state.last_event, snap.last_event);
+        assert_eq!(state.next_track, snap.next_track);
     }
 
     fn walk_until<F>(r: &crate::registry::ProjectRecord, mut pred: F) -> StatusView

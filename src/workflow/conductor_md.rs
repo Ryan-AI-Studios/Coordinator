@@ -319,6 +319,16 @@ pub fn failure_superseded(
     body: Option<&str>,
 ) -> Option<String> {
     let meta = body.map(crate::notify::artifact::parse_metadata);
+    // 0098: a Blocked failure is not superseded by a Completed conductor row. Only
+    // `failure resolve` releases the hold.
+    if state.failure_class == Some(crate::outcome::FailureClass::Blocked)
+        || meta
+            .as_ref()
+            .and_then(|m| m.failure_class.as_deref())
+            .is_some_and(|class| class == "blocked")
+    {
+        return None;
+    }
     let key = meta
         .as_ref()
         .and_then(|m| m.track_id.as_deref())
