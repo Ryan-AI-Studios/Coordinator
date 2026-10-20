@@ -410,7 +410,7 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 
 | Key | Duty | Env override | Wired today |
 |-----|------|--------------|-------------|
-| `auto_start` | ticker starts the next Ready track | `COORDINATOR_FEATURE_AUTO_START` | reserved (0103) |
+| `auto_start` | ticker starts the next Ready track | `COORDINATOR_FEATURE_AUTO_START` | **yes (0103)** |
 | `stall_paging` | route a detected stall to the owner | `COORDINATOR_FEATURE_STALL_PAGING` | reserved (0104) |
 | `fleet_notify` | serve-loop fleet summary (`notify::fleet_tick`) | `COORDINATOR_FEATURE_FLEET_NOTIFY` | **yes** |
 | `self_update` | build-and-swap the installed binary | `COORDINATOR_FEATURE_SELF_UPDATE` | reserved (0108) |
@@ -446,11 +446,45 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 - **Combined condition:** a table with both an unknown key and a non-boolean value takes the
   invalid/type path — `unknown_keys` stays empty and the diagnostic names the bad value. Both
   paths fail closed.
-- **Reserved keys:** `auto_start` (0103), `stall_paging` (0104), `self_reap` (0107), and
-  `self_update` (0108) are reserved now; those duties ship in later tracks and are not wired here.
+- **Reserved keys:** `stall_paging` (0104), `self_reap` (0107), and `self_update` (0108) are
+  reserved now; those duties ship in later tracks and are not wired here.
 - **Veto semantics:** `fleet_notify` **and** `hermes.fleet_summary` are both required for a
   serve-loop post. `COORDINATOR_NOTIFY_FLEET=1` cannot bypass the gate. The explicit one-shot
   `notify fleet-summary` probe is **not** gated.
+
+### Ticker auto-start (0103)
+
+`serve` starts the next exact `Ready — not started` row for a project whose `auto_start` is `full`
+when the machine gate `features.auto_start` is on. **One attempt per project per tick**, after the
+existing settle sweep; polling, reap and fleet order are unchanged.
+
+- **Policies.** `full` starts; `hitl` reports and waits (`status` / fleet already show
+  `auto_start: "hitl"`); `never` never starts. The ticker is deliberately **stricter** than a manual
+  `run` that omits `--track` — that path still picks for `hitl` (unchanged).
+- **Canonical launch.** The start calls the same `run` path: 0098 blocked hold, adapter preflight,
+  omit-pick with the merged-PR probe, sticky overlay, and the normal state transition. There is no
+  second start path.
+- **Nothing to start is silent.** No eligible Ready row (empty backlog, all Completed/`nostart`/
+  HITL/merged) writes nothing: no `failure_class`, no `last_event` churn. A **missing or unparseable
+  `conductor.md`**, or a Ready row without its track directory, is a **recorded setup failure**
+  (`harness_crash`, deduped like any other) — a `full` project with no conductor registry is
+  misconfigured, not idle. A transient read `Io` skips the tick without writing.
+- **Durable failure, no retry loop.** A launch failure persists the existing `failure_class` +
+  capped `last_event` (visible in `status` / fleet), is **not** retried while it is present (also
+  across a `serve` restart), and writes no `FAILURE.md` and no toast. Recovery is explicit:
+  `coordinator failure resolve`, or the failed track's conductor row becoming Completed (settle
+  sweep). There is no backoff, retry counter, or automatic re-arm.
+- **Live gate re-read.** Edit `config.json` (`"features": {"auto_start": false}`) or set
+  `COORDINATOR_FEATURE_AUTO_START=off`; the next tick honours it, no restart. The gate is a veto:
+  `full` is still required.
+- **Mid-tick policy flip.** `project set --auto-start hitl|never` between the tick snapshot and the
+  launch can still start **once in that tick** under the new policy (bounded, no corruption); a
+  `never` flip that `run` sees maps to a skip, never a failure. The next tick waits.
+- **Controlled pilot.** Start `coordinator serve` with one project and its external launcher paused
+  **by the owner**; watch `status --project <uuid>` for `Running`, `track_id`, `run_epoch` +1 and the
+  workspace `status.md` `start  track=…` line, then a second tick with the epoch unchanged. Retiring
+  the launcher scripts is owner action; Coordinator never edits, pauses, or deletes them.
+- **No schema change.** `status --project` already shows `auto_start` and `features.auto_start`.
 
 There are **no skip slots**. `cross-model-review` is a real one-shot gate (track 0011). `ci-wait` is a real phase (track 0010). 0010 still treats predecessor success as the Review Gate — filling this slot makes that hook honest.
 

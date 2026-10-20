@@ -1127,6 +1127,19 @@ fn empty_ready_pick_error(record: &ProjectRecord) -> String {
     }
 }
 
+/// True only when a pick error means "no eligible Ready row exists" — an empty backlog.
+///
+/// A missing `conductor.md` is NOT benign: for a `full` project it is a misconfigured
+/// workspace/layout, and it must record like an unparseable table. Additive classifier for
+/// 0103 — it must not change pick behaviour.
+pub fn ready_pick_miss_is_benign(err: &crate::error::CoordinatorError) -> bool {
+    let crate::error::CoordinatorError::Message(msg) = err else {
+        return false;
+    };
+    msg.starts_with("no Ready — not started track")
+        || msg.starts_with("no eligible Ready track (aliases: ")
+}
+
 /// Read `{conductor_dir}/conductor.md` and return the first eligible Ready id
 /// whose track directory exists.
 pub fn pick_next_ready(record: &ProjectRecord) -> Result<String> {
@@ -3079,5 +3092,99 @@ mod tests {
             "status cell was {}",
             rows[0].status_raw
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_0103 {
+    use super::*;
+    use crate::registry::ProjectRecord;
+    use tempfile::tempdir;
+
+    fn rec(path: &std::path::Path) -> ProjectRecord {
+        ProjectRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            path: path.to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn write_conductor(ws: &std::path::Path, row: &str) {
+        let cond = ws.join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        let md = format!(
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             {row}\n"
+        );
+        std::fs::write(cond.join("conductor.md"), md).unwrap();
+    }
+
+    #[test]
+    fn ready_pick_miss_classification() {
+        // (1) Missing conductor.md is a setup failure, not an empty backlog.
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let err = pick_next_ready(&r).unwrap_err();
+        assert!(err.to_string().contains("no conductor.md at"), "{err}");
+        assert!(!ready_pick_miss_is_benign(&err));
+
+        // (2) Only a Completed row is a benign empty backlog.
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        write_conductor(dir.path(), "| 0029-Done | `.` | **Completed** | shipped |");
+        let err = pick_next_ready(&r).unwrap_err();
+        assert!(
+            err.to_string().contains("no Ready — not started track"),
+            "{err}"
+        );
+        assert!(ready_pick_miss_is_benign(&err));
+
+        // (3) Custom aliases with no match take the alias error branch.
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path());
+        r.ready_aliases = vec!["Ready - full plan @ 0020".into()];
+        write_conductor(dir.path(), "| 0029-Done | `.` | **Completed** | shipped |");
+        let err = pick_next_ready(&r).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no eligible Ready track (aliases: "),
+            "{err}"
+        );
+        assert!(ready_pick_miss_is_benign(&err));
+
+        // (4) A Ready row without its conductor directory is a recorded setup failure.
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        write_conductor(
+            dir.path(),
+            "| 0021-Missing | `.` | **Ready — not started** | fixture |",
+        );
+        let err = pick_next_ready(&r).unwrap_err();
+        assert!(
+            err.to_string().contains("no matching conductor directory"),
+            "{err}"
+        );
+        assert!(!ready_pick_miss_is_benign(&err));
+
+        // (5) An Io read error is never benign by construction.
+        let io = crate::error::CoordinatorError::Io(std::io::Error::other("share"));
+        assert!(!ready_pick_miss_is_benign(&io));
     }
 }
