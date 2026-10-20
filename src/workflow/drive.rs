@@ -1162,6 +1162,15 @@ mod tests {
         }
     }
 
+    fn write_implementor_binding(home: &IsolatedHome) {
+        let bin = dummy(home._home.path(), "impl-0099.exe");
+        home.write_bindings(|b| {
+            if let Some(slot) = b.get_mut(ROLE_IMPLEMENTOR) {
+                slot.command = bin.to_string_lossy().into();
+            }
+        });
+    }
+
     /// Real temp Git target plus a conductor row, for fixtures that actually tick
     /// the adapter into implement/address-findings (0099 §3.1b).
     fn implementation_target(root: &std::path::Path, track: &str) -> std::path::PathBuf {
@@ -1997,6 +2006,7 @@ mod tests {
     #[test]
     fn initial_implement_capture_uses_prepared_target() {
         let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
         let dir = tempdir().unwrap();
         let mut r = rec(dir.path());
         let product = implementation_target(dir.path(), "0070");
@@ -2025,6 +2035,7 @@ mod tests {
     #[test]
     fn invalid_target_before_capture_claims_no_continuation() {
         let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         // No conductor.md row exists for this track.
@@ -2081,6 +2092,7 @@ mod tests {
     #[test]
     fn inprocess_resolution_failure_prevents_inject() {
         let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
@@ -2207,6 +2219,7 @@ mod tests {
     #[test]
     fn address_ci_remains_prompt_only() {
         let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();

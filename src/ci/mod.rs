@@ -7,7 +7,7 @@ pub mod backend;
 pub mod fix;
 pub mod gh;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -1435,7 +1435,7 @@ pub(crate) fn with_primary_target_diagnostic(
     state: &crate::state::RunState,
     event: String,
 ) -> String {
-    let inspected = crate::worktree::product_git_cwd(record);
+    let inspected = canonical_for_diagnostic(crate::worktree::product_git_cwd(record));
     let declared =
         crate::workflow::execution_repo::resolve_track_target(record, state, &state.phase);
     match (inspected, declared) {
@@ -1464,9 +1464,17 @@ pub(crate) fn with_primary_target_diagnostic(
     }
 }
 
+fn canonical_for_diagnostic(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.map(|path| {
+        dunce::canonicalize(&path)
+            .map(|p| PathBuf::from(dunce::simplified(&p)))
+            .unwrap_or(path)
+    })
+}
+
 /// Compact last_event suffix: preserve the review-verdict tail inside the 200-char cap.
 fn compact_primary_target_note(record: &ProjectRecord, state: &crate::state::RunState) -> String {
-    let inspected = crate::worktree::product_git_cwd(record);
+    let inspected = canonical_for_diagnostic(crate::worktree::product_git_cwd(record));
     let declared =
         crate::workflow::execution_repo::resolve_track_target(record, state, &state.phase);
     match (inspected, declared) {
@@ -4133,6 +4141,8 @@ mod tests {
             ),
         )
         .unwrap();
+        let primary = PathBuf::from(dunce::simplified(&dunce::canonicalize(&primary).unwrap()));
+        let declared = PathBuf::from(dunce::simplified(&dunce::canonicalize(&declared).unwrap()));
         let mut r = rec(dir.path(), true);
         r.execution_repo = Some(primary.clone());
         r.conductor_dir = Some(conductor);

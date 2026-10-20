@@ -504,6 +504,11 @@ pub(crate) fn paths_same(a: &Path, b: &Path) -> bool {
             .trim_end_matches('\\')
             .to_ascii_lowercase()
     };
+    // Windows CI temp paths may be 8.3 short names on one side and long names
+    // on the other. Compare canonical forms when both exist.
+    if let (Ok(a), Ok(b)) = (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        return norm(&a) == norm(&b);
+    }
     norm(a) == norm(b)
 }
 
