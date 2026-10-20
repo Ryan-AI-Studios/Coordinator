@@ -1107,7 +1107,13 @@ mod tests {
         ));
         crate::state::ensure_state_dir(r).unwrap();
         crate::state::save_run_state(r, &state).unwrap();
-        assert_eq!(resume_probe_cwd(r, None).as_deref(), Some(repo.path()));
+        let resolved = resume_probe_cwd(r, None).expect("gate target fallback");
+        assert!(
+            crate::workflow::execution_repo::paths_same(&resolved, repo.path()),
+            "{} != {}",
+            resolved.display(),
+            repo.path().display()
+        );
     }
 
     #[test]

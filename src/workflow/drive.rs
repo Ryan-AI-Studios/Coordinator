@@ -1251,6 +1251,22 @@ mod tests {
         product
     }
 
+    /// Compare the prompt's resolved target by path identity, not raw display text:
+    /// Windows tempdirs can be short (`RUNNER~1`) while the resolver canonicalizes to
+    /// the long form (`runneradmin`).
+    fn assert_prompt_names_execution_repo(prompt: &str, expected: &std::path::Path) {
+        let line = prompt
+            .lines()
+            .find(|line| line.starts_with("Execution repo: "))
+            .unwrap_or_else(|| panic!("prompt has no Execution repo line:\n{prompt}"));
+        let actual = line.trim_start_matches("Execution repo: ").trim();
+        assert!(
+            crate::workflow::execution_repo::paths_same(std::path::Path::new(actual), expected),
+            "Execution repo line {actual:?} does not name {}",
+            expected.display()
+        );
+    }
+
     fn plan_state(record: &ProjectRecord, phase: &str, track: &str) -> crate::state::RunState {
         let mut state = crate::state::RunState::idle(&record.id);
         state.phase = phase.into();
@@ -2354,11 +2370,7 @@ mod tests {
         let prompts = super::captured_prompts();
         assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert!(prompts[0].contains("address-ci"), "{}", prompts[0]);
-        assert!(
-            prompts[0].contains(&format!("Execution repo: {}", product.display())),
-            "{}",
-            prompts[0]
-        );
+        assert_prompt_names_execution_repo(&prompts[0], &product);
         let prepared = super::captured_prepared();
         assert_eq!(prepared.len(), 1, "{prepared:?}");
         let target = prepared[0].target().expect("prepared target");
@@ -2423,10 +2435,7 @@ mod tests {
             Some("0071"),
             Some(&target),
         );
-        assert!(
-            prompt.contains(&format!("Execution repo: {}", product.display())),
-            "{prompt}"
-        );
+        assert_prompt_names_execution_repo(&prompt, &product);
     }
 
     #[test]
@@ -2569,10 +2578,7 @@ mod tests {
         assert!(prompt.contains("gh pr create"), "{prompt}");
         assert!(prompt.contains("gh pr merge"), "{prompt}");
         assert!(!prompt.contains("self-check:"), "{prompt}");
-        assert!(
-            prompt.contains(&format!("Execution repo: {}", product.display())),
-            "{prompt}"
-        );
+        assert_prompt_names_execution_repo(prompt, &product);
         let prepared = super::captured_prepared();
         assert_eq!(prepared.len(), 1, "{prepared:?}");
         assert!(
