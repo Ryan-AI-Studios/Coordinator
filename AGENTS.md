@@ -62,8 +62,8 @@ Precedence is env > config > default; `status --project` renders each duty's `en
 An unreadable config, a malformed/type-invalid table, or an unknown duty key fails **all** duties
 closed (source `config`) with one stderr line per condition per process; an unknown env token fails
 that duty closed. Env cannot rescue a broken table. Live re-read every tick — no restart.
-`fleet_notify` (0102) and `auto_start` (0103) are wired; `stall_paging` / `self_update` / `self_reap`
-remain reserved for 0104/0108/0107.
+`fleet_notify` (0102), `auto_start` (0103) and `stall_paging` (0104) are wired; `self_update` (0108)
+and `self_reap` (0107) remain reserved.
 
 ## Code style
 

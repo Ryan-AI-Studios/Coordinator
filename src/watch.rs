@@ -18,7 +18,19 @@ use crate::state::{RunStatus, StatusView, load_run_state, save_run_state, with_r
 /// Returns `Some(view)` when an outcome was applied this tick, or when the
 /// progress watchdog first fires / clears a stall. `None` otherwise.
 /// Never panics on unreadable/partial JSON (skips file apply for this tick).
+///
+/// 0104: reconciles the owner stall-page marker **before and after** the body, so
+/// every return path leaves durable paging state consistent (a phase advance or
+/// stop inside the tick cannot strand an open page). Paging is a side effect only:
+/// the return value and errors are unchanged. Normal polls deliver detached.
 pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
+    crate::workflow::stall_paging::tick(record);
+    let result = poll_once_inner(record);
+    crate::workflow::stall_paging::tick(record);
+    result
+}
+
+fn poll_once_inner(record: &ProjectRecord) -> Result<Option<StatusView>> {
     // 0) Drive the canonical graph (inject / stub / named drives / join).
     //    `cross-model-review` and `ci-wait` still tick while Paused (finish current phase).
     match crate::workflow::tick(record) {
@@ -93,6 +105,9 @@ pub fn poll_once(record: &ProjectRecord) -> Result<Option<StatusView>> {
     // 3) Progress watchdog — surface only. Never fails the poll (torn sidecar = skip).
     match crate::workflow::watchdog::check_stall(record) {
         Ok(Some(view)) => {
+            // 0104: claim the begin before the 0027 recycle clears `stalled_at` in
+            // this same tick. Load-bearing, not scope creep.
+            crate::workflow::stall_paging::tick(record);
             if let Some(stamped) = crate::harness::abort::maybe_stamp_and_abort_stall(record) {
                 return Ok(Some(stamped));
             }

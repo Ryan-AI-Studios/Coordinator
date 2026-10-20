@@ -411,7 +411,7 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 | Key | Duty | Env override | Wired today |
 |-----|------|--------------|-------------|
 | `auto_start` | ticker starts the next Ready track | `COORDINATOR_FEATURE_AUTO_START` | **yes (0103)** |
-| `stall_paging` | route a detected stall to the owner | `COORDINATOR_FEATURE_STALL_PAGING` | reserved (0104) |
+| `stall_paging` | route a detected stall to the owner | `COORDINATOR_FEATURE_STALL_PAGING` | **yes (0104)** |
 | `fleet_notify` | serve-loop fleet summary (`notify::fleet_tick`) | `COORDINATOR_FEATURE_FLEET_NOTIFY` | **yes** |
 | `self_update` | build-and-swap the installed binary | `COORDINATOR_FEATURE_SELF_UPDATE` | reserved (0108) |
 | `self_reap` | reap stale harness holders | `COORDINATOR_FEATURE_SELF_REAP` | reserved (0107) |
@@ -446,8 +446,8 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 - **Combined condition:** a table with both an unknown key and a non-boolean value takes the
   invalid/type path — `unknown_keys` stays empty and the diagnostic names the bad value. Both
   paths fail closed.
-- **Reserved keys:** `stall_paging` (0104), `self_reap` (0107), and `self_update` (0108) are
-  reserved now; those duties ship in later tracks and are not wired here.
+- **Reserved keys:** `self_reap` (0107) and `self_update` (0108) are reserved now; those duties
+  ship in later tracks and are not wired here.
 - **Veto semantics:** `fleet_notify` **and** `hermes.fleet_summary` are both required for a
   serve-loop post. `COORDINATOR_NOTIFY_FLEET=1` cannot bypass the gate. The explicit one-shot
   `notify fleet-summary` probe is **not** gated.
@@ -485,6 +485,67 @@ existing settle sweep; polling, reap and fleet order are unchanged.
   workspace `status.md` `start  track=…` line, then a second tick with the epoch unchanged. Retiring
   the launcher scripts is owner action; Coordinator never edits, pauses, or deletes them.
 - **No schema change.** `status --project` already shows `auto_start` and `features.auto_start`.
+
+### Stall paging (0104)
+
+The product's own progress watchdog now pages the owner instead of leaving the detection to external
+cron shepherds. One `begin` and one matching `clear` per `(project, track, run_epoch)`, behind the
+0102 `features.stall_paging` gate.
+
+- **Gate.** `features.stall_paging` (default on) is read **live** at every begin decision; env
+  `COORDINATOR_FEATURE_STALL_PAGING` wins. It is a **veto only for new pages**: a page that was
+  already claimed is still closed when the stall resolves, even if the gate was turned off in the
+  meantime. Malformed/unreadable config fails closed for new pages.
+- **Signal.** The same `harness-progress.json` `last_progress_at` the watchdog already uses;
+  `tool_in_flight = true` (a client-visible ACP tool / TerminalHub child) produces **zero** pages
+  even though `check_stall` may surface `watchdog: stall`. A cargo/rustc build is not a stall. Journal
+  lines, mtimes and pids are never read.
+- **Hook.** `poll_once` reconciles before and after the tick, and the watchdog's first-stall arm
+  claims the begin **before** the 0027 recycle clears `stalled_at`. A recycle is not a resolution: the
+  page stays open until a heartbeat, a phase advance, a track change, or Idle/Stopped/new epoch.
+- **Event.** A dedicated `event_type: "stall"` on the existing Hermes webhook, header
+  `X-Coordinator-Event: stall`, deterministic `X-Request-ID`
+  `{project}:{epoch}:stall:{begin|clear}:{track-or--}:{phase}`. Begin carries `stalled_at` +
+  `idle_secs`; clear carries `cleared_at` + `clear_reason`
+  (`progress` | `phase` | `track` | `run_ended`). `track_id` is omitted when absent; there is no
+  `failure_class`, artifact path or message field.
+
+  ```json
+  {
+    "event_type": "stall",
+    "kind": "begin",
+    "project_id": "8e94ce6a-…",
+    "track_id": "0104-StallDetectionViaNotify",
+    "phase": "implement",
+    "run_epoch": 3,
+    "stalled_at": "2026-10-20T20:01:02Z",
+    "idle_secs": 612,
+    "last_event": "watchdog: stall — no harness progress for 612s",
+    "written_at": "2026-10-20T20:01:03Z"
+  }
+  ```
+
+  A Hermes route example matching the event: `events: ["stall"]` with `{kind}`, `{track_id}`,
+  `{phase}`, `{idle_secs}` available for the message template.
+- **At most once.** The durable `RunState.stall_paging` marker (additive, omitted while idle) is
+  written **before** the POST and keyed by epoch + track. A second stall in the same key does not
+  re-page and produces no premature clear; a fresh `run_epoch` pages again; a run that never paged
+  emits no clear. A crash between the claim and the POST loses that event (no retry, no outbox); the
+  deterministic request id would let a future outbox retry safely.
+- **Operator stop.** `stop` (CLI, HTTP `/v1/stop`, Status Surface) also closes an open page. The
+  `run_ended` clear is delivered **synchronously** after `run::stop` releases the run-state lock, so
+  it completes before the one-shot CLI exits; it is bounded by the shared 5 s `POST_TIMEOUT`, and a
+  failure is logged and not retried. Ordinary polls keep the detached delivery.
+- **Delivery requires a resolved Hermes transport.** With an unconfigured or `NoOp` Hermes
+  (`hermes.enabled`/`COORDINATOR_HERMES_URL` + `COORDINATOR_HERMES_SECRET`, never
+  `COORDINATOR_HERMES=off`) the page/clear is still **claimed** and exactly one stderr line is
+  written — no POST, no retry, no fallback. Hermes must be configured for delivery. This path does
+  **not** require `hermes.progress` or `COORDINATOR_NOTIFY_PROGRESS` (0033/0105 own those).
+- **No toast, no `FAILURE.md`, no `failure_class`, no retry.** One stderr line per claimed event is
+  the only local trace; `last_event` is never overwritten by paging.
+- **Known residual.** A run ended by a direct `outcome write` (CLI/HTTP) on a serve-owned project is
+  outside `poll_once`; the next tick that observes it closes the page, and if no tick ever runs the
+  page stays open. This is a documented residual, not a second hook.
 
 There are **no skip slots**. `cross-model-review` is a real one-shot gate (track 0011). `ci-wait` is a real phase (track 0010). 0010 still treats predecessor success as the Review Gate — filling this slot makes that hook honest.
 

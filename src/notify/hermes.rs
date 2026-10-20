@@ -15,7 +15,7 @@ use crate::config::{HermesNotifyConfig, load_machine_config};
 use crate::error::{CoordinatorError, Result};
 use crate::notify::{
     EVENT_TYPE_FLEET_SUMMARY, EVENT_TYPE_PROGRESS, FleetSummaryEvent, NotifyAdapter, NotifyEvent,
-    ProgressEvent,
+    ProgressEvent, StallEvent,
 };
 
 /// Force-disable even if machine config is enabled.
@@ -34,6 +34,7 @@ const HEADER_REQUEST_ID: &str = "X-Request-ID";
 const HEADER_EVENT: &str = "X-Coordinator-Event";
 const EVENT_HARD_FAILURE: &str = "hard_failure";
 const EVENT_PROGRESS: &str = "progress";
+const EVENT_STALL: &str = "stall";
 const POST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why Hermes did not POST.
@@ -187,6 +188,17 @@ impl HermesAdapter {
         }
     }
 
+    /// Blocking stall POST (0104 operator stop only). No thread; bounded by
+    /// [`POST_TIMEOUT`] in `post_prepared`.
+    pub fn notify_stall_blocking(&self, event: &StallEvent) -> Result<u16> {
+        match &self.kind {
+            HermesKind::NoOp => Ok(0),
+            HermesKind::Http { url, secret } => post_stall_http(url, secret, event),
+            #[cfg(test)]
+            HermesKind::Test(inst) => deliver_stall_test(inst, event).map(|()| 200),
+        }
+    }
+
     /// Blocking fleet POST (CLI `notify fleet-summary`).
     pub fn notify_fleet_blocking(&self, event: &FleetSummaryEvent) -> Result<u16> {
         match &self.kind {
@@ -244,6 +256,32 @@ impl HermesAdapter {
             }
             #[cfg(test)]
             HermesKind::Test(inst) => deliver_progress_test(inst, event),
+        }
+    }
+
+    /// Detached stall POST (0104 normal polls / in-tick clears). Errors never fail
+    /// the caller. The operator-stop clear uses [`Self::notify_stall_blocking`].
+    pub fn notify_stall(&self, event: &StallEvent) -> Result<()> {
+        match &self.kind {
+            HermesKind::NoOp => Ok(()),
+            HermesKind::Http { url, secret } => {
+                let url = url.clone();
+                let secret = secret.clone();
+                let event = event.clone();
+                let _ = std::thread::Builder::new()
+                    .name("coordinator-hermes-stall".into())
+                    .spawn(move || match post_stall_http(&url, &secret, &event) {
+                        Ok(status) => {
+                            eprintln!("coordinator: hermes stall delivered HTTP {status}");
+                        }
+                        Err(e) => {
+                            eprintln!("coordinator: hermes stall failed (non-fatal): {e}");
+                        }
+                    });
+                Ok(())
+            }
+            #[cfg(test)]
+            HermesKind::Test(inst) => deliver_stall_test(inst, event),
         }
     }
 }
@@ -333,6 +371,19 @@ pub fn progress_request_id(event: &ProgressEvent) -> String {
 /// Hermes one-hour cache still deliver.
 pub fn fleet_request_id(event: &FleetSummaryEvent) -> String {
     format!("fleet_summary:{}", event.written_at.timestamp_millis())
+}
+
+/// Stall idempotency key (0104). Deterministic by construction: one begin and one
+/// clear per `(project, track, run_epoch)`; `kind` separates them. No millis suffix.
+pub fn stall_request_id(event: &StallEvent) -> String {
+    format!(
+        "{}:{}:stall:{}:{}:{}",
+        event.project_id,
+        event.run_epoch,
+        event.kind.as_str(),
+        event.track_id.as_deref().unwrap_or("-"),
+        event.phase
+    )
 }
 
 /// Resolve config + env. Does not POST.
@@ -586,6 +637,16 @@ impl PreparedPost {
         )
     }
 
+    fn stall(url: &str, secret: &str, event: &StallEvent) -> Result<Self> {
+        Self::signed(
+            url,
+            secret,
+            EVENT_STALL,
+            stall_request_id(event),
+            serde_json::to_vec(event)?,
+        )
+    }
+
     #[cfg(test)]
     fn captured(&self) -> CapturedRequest {
         CapturedRequest {
@@ -614,6 +675,10 @@ fn post_progress_http(url: &str, secret: &str, event: &ProgressEvent) -> Result<
 
 fn post_fleet_http(url: &str, secret: &str, event: &FleetSummaryEvent) -> Result<u16> {
     post_prepared(PreparedPost::fleet(url, secret, event)?)
+}
+
+fn post_stall_http(url: &str, secret: &str, event: &StallEvent) -> Result<u16> {
+    post_prepared(PreparedPost::stall(url, secret, event)?)
 }
 
 fn post_prepared(prepared: PreparedPost) -> Result<u16> {
@@ -661,6 +726,11 @@ fn deliver_progress_test(inst: &TestInstall, event: &ProgressEvent) -> Result<()
 #[cfg(test)]
 fn deliver_fleet_test(inst: &TestInstall, event: &FleetSummaryEvent) -> Result<()> {
     deliver_prepared(inst, PreparedPost::fleet(&inst.url, &inst.secret, event)?)
+}
+
+#[cfg(test)]
+fn deliver_stall_test(inst: &TestInstall, event: &StallEvent) -> Result<()> {
+    deliver_prepared(inst, PreparedPost::stall(&inst.url, &inst.secret, event)?)
 }
 
 #[cfg(test)]
@@ -1323,5 +1393,127 @@ mod tests {
             header(req, HEADER_SIGNATURE_V2).unwrap(),
             sign_v2("s3cret-fleet", ts, &req.body)
         );
+    }
+
+    fn stall_event(kind: crate::notify::StallKind) -> StallEvent {
+        use crate::notify::{EVENT_TYPE_STALL, StallClearReason, StallKind};
+        let written_at = chrono::DateTime::from_timestamp_millis(1_778_000_000_123).unwrap();
+        StallEvent {
+            event_type: EVENT_TYPE_STALL.into(),
+            kind,
+            project_id: "proj".into(),
+            track_id: Some("0104".into()),
+            phase: "implement".into(),
+            run_epoch: 3,
+            stalled_at: match kind {
+                StallKind::Begin => Some(written_at),
+                StallKind::Clear => None,
+            },
+            idle_secs: match kind {
+                StallKind::Begin => Some(612),
+                StallKind::Clear => None,
+            },
+            cleared_at: match kind {
+                StallKind::Begin => None,
+                StallKind::Clear => Some(written_at),
+            },
+            clear_reason: match kind {
+                StallKind::Begin => None,
+                StallKind::Clear => Some(StallClearReason::Progress),
+            },
+            last_event: "watchdog: stall — no harness progress for 612s".into(),
+            written_at,
+        }
+    }
+
+    #[test]
+    fn stall_request_id_is_deterministic_and_kind_scoped() {
+        use crate::notify::StallKind;
+        let begin = stall_event(StallKind::Begin);
+        let clear = stall_event(StallKind::Clear);
+        assert_eq!(stall_request_id(&begin), stall_request_id(&begin.clone()));
+        assert_eq!(
+            stall_request_id(&begin),
+            "proj:3:stall:begin:0104:implement"
+        );
+        assert_eq!(
+            stall_request_id(&clear),
+            "proj:3:stall:clear:0104:implement"
+        );
+        assert!(stall_request_id(&begin).contains(":stall:begin:"));
+        assert!(stall_request_id(&clear).contains(":stall:clear:"));
+        assert_ne!(stall_request_id(&begin), stall_request_id(&clear));
+
+        let mut other_epoch = begin.clone();
+        other_epoch.run_epoch = 4;
+        assert_ne!(stall_request_id(&begin), stall_request_id(&other_epoch));
+
+        let mut other_track = begin.clone();
+        other_track.track_id = Some("0105".into());
+        assert_ne!(stall_request_id(&begin), stall_request_id(&other_track));
+
+        let mut no_track = begin.clone();
+        no_track.track_id = None;
+        assert_eq!(
+            stall_request_id(&no_track),
+            "proj:3:stall:begin:-:implement"
+        );
+    }
+
+    #[test]
+    fn stall_recorded_post_uses_stall_header_and_body() {
+        use crate::notify::StallKind;
+        let _guard = test_env_lock();
+        let _home = isolated_home();
+        let recording =
+            install_recording("http://127.0.0.1:8644/webhooks/coordinator-stall", "s3cret");
+        let event = stall_event(StallKind::Begin);
+        HermesAdapter::for_default_stack()
+            .notify_stall_blocking(&event)
+            .unwrap();
+        let captured = recording.take();
+        assert_eq!(captured.len(), 1);
+        let request = &captured[0];
+        assert_eq!(
+            request.url,
+            "http://127.0.0.1:8644/webhooks/coordinator-stall"
+        );
+        assert_eq!(header(request, HEADER_EVENT).unwrap(), EVENT_STALL);
+        assert_eq!(
+            header(request, HEADER_REQUEST_ID).unwrap(),
+            stall_request_id(&event)
+        );
+        let parsed: StallEvent = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(parsed, event);
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["event_type"], "stall");
+        assert_eq!(body["kind"], "begin");
+
+        let ts: u64 = header(request, HEADER_TIMESTAMP).unwrap().parse().unwrap();
+        assert_eq!(
+            header(request, HEADER_SIGNATURE_V2).unwrap(),
+            sign_v2("s3cret", ts, &request.body)
+        );
+    }
+
+    #[test]
+    fn stall_event_json_has_no_failure_fields() {
+        use crate::notify::StallKind;
+        for kind in [StallKind::Begin, StallKind::Clear] {
+            let body = serde_json::to_value(stall_event(kind)).unwrap();
+            for key in [
+                "failure_class",
+                "artifact_path",
+                "from_phase",
+                "to_phase",
+                "message",
+            ] {
+                assert!(
+                    body.get(key).is_none(),
+                    "{kind:?} body must not carry {key}"
+                );
+            }
+            assert_eq!(body["event_type"], "stall");
+        }
     }
 }

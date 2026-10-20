@@ -51,6 +51,7 @@
 //! Opt-in same-epoch `address-ci` when the ci-wait gate fails this run's owned PR (cap 2, off by default): track **0071** (slice unified in **0079**).
 //! Machine feature gates for automation duties (default on; env > config > default; fail closed): track **0102**.
 //! Ticker auto-start for `auto_start: full` behind the 0102 gate (one attempt per project per tick): track **0103**.
+//! One owner stall page + one matching resolution per `(project, track, epoch)` behind the 0102 gate: track **0104**.
 
 pub mod api;
 pub mod checkpoint;
