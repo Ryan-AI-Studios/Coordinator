@@ -15,6 +15,22 @@ use crate::state::{
     RunState, RunStatus, STUB_PHASE_COMPLETED, STUB_PHASE_FAILED, StatusView, ensure_state_dir,
     load_run_state, resolve_state_dir, save_run_state, with_run_state_lock,
 };
+use crate::workflow::execution_repo::PreparedInjection;
+
+/// Result of a prepared-turn apply. A stale identity is a structured skip, not an error.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum ApplyIdentity {
+    Applied(StatusView),
+    Stale(String),
+}
+
+/// Typed disposition consumed by the outcome poller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyDisposition {
+    Applicable,
+    Stale(String),
+}
 
 /// Cap for free-text message when copied into `last_event`.
 pub const LAST_EVENT_MESSAGE_CAP: usize = 200;
@@ -380,11 +396,46 @@ struct ApplyCommit {
 ///
 /// Hard-failure notify runs **after** both locks drop (track 0009).
 pub fn apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView> {
+    match apply_impl(record, outcome, None)? {
+        ApplyIdentity::Applied(view) => Ok(view),
+        ApplyIdentity::Stale(reason) => Err(CoordinatorError::Message(reason)),
+    }
+}
+
+/// Apply an outcome only if the injected prepared identity is still current.
+///
+/// The identity is rechecked under the existing apply lock and the run-state lock,
+/// so the check/write race cannot apply this turn to a newer run.
+pub fn apply_prepared(
+    record: &ProjectRecord,
+    outcome: PhaseOutcome,
+    prepared: &PreparedInjection,
+) -> Result<ApplyIdentity> {
+    apply_impl(record, outcome, Some(prepared))
+}
+
+fn apply_impl(
+    record: &ProjectRecord,
+    outcome: PhaseOutcome,
+    prepared: Option<&PreparedInjection>,
+) -> Result<ApplyIdentity> {
+    outcome.validate()?;
     let mut commit = {
         let _guard = apply_lock()
             .lock()
             .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;
-        with_run_state_lock(record, || apply_locked(record, outcome))?
+        with_run_state_lock(record, || {
+            if let Some(prepared) = prepared {
+                let state = load_run_state(record)?;
+                if state.status != RunStatus::Running || !prepared.matches_state(&state) {
+                    return Ok(None);
+                }
+            }
+            apply_locked(record, outcome).map(Some)
+        })?
+    };
+    let Some(mut commit) = commit.take() else {
+        return Ok(ApplyIdentity::Stale("stale-injection".into()));
     };
     if let Some(probe) = commit.reuse_probe.take() {
         let answer = crate::workflow::reuse::probe_resume(record, probe.number);
@@ -419,7 +470,40 @@ pub fn apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView
     }
     fire_pending_notify(record, &commit);
     crate::worktree::release_if_idle(record, &commit.view);
-    Ok(refresh_failure_artifact(record, commit.view))
+    Ok(ApplyIdentity::Applied(refresh_failure_artifact(
+        record,
+        commit.view,
+    )))
+}
+
+/// Typed pre-check used by [`poll_try_apply`] so message classification is no longer
+/// the only stale-state detector.
+pub fn outcome_disposition(
+    record: &ProjectRecord,
+    outcome: &PhaseOutcome,
+) -> Result<ApplyDisposition> {
+    let base = load_run_state(record)?;
+    if base.status != RunStatus::Running && base.status != RunStatus::Paused {
+        return Ok(ApplyDisposition::Stale(format!(
+            "cannot apply outcome while status is {}",
+            base.status
+        )));
+    }
+    if outcome.phase != base.phase {
+        return Ok(ApplyDisposition::Stale(format!(
+            "outcome phase {} does not match current phase {}",
+            outcome.phase, base.phase
+        )));
+    }
+    if let Some(epoch) = outcome.run_epoch
+        && epoch != base.run_epoch
+    {
+        return Ok(ApplyDisposition::Stale(format!(
+            "outcome run_epoch {epoch} does not match state run_epoch {}",
+            base.run_epoch
+        )));
+    }
+    Ok(ApplyDisposition::Applicable)
 }
 
 fn fire_pending_notify(record: &ProjectRecord, commit: &ApplyCommit) {
@@ -797,6 +881,14 @@ fn best_effort_history(record: &ProjectRecord, outcome: &PhaseOutcome) {
 /// Returns `Ok(Some(view))` when state transitioned or idempotent re-apply;
 /// `Ok(None)` when nothing actionable; never panics on share/parse issues (caller loads softly).
 pub fn poll_try_apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<Option<StatusView>> {
+    if let ApplyDisposition::Stale(_) = outcome_disposition(record, &outcome)? {
+        if let Ok(current) = outcome_current_path(record)
+            && current.exists()
+        {
+            let _ = std::fs::remove_file(&current);
+        }
+        return Ok(None);
+    }
     match apply(record, outcome) {
         Ok(view) => Ok(Some(view)),
         Err(e) => {
@@ -821,6 +913,22 @@ pub fn poll_try_apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<O
 /// Write + apply from CLI/HTTP builders (drops `current.json` then applies).
 ///
 /// If apply rejects, the active file is removed so a later `run` cannot replay it.
+pub fn write_and_apply_prepared(
+    record: &ProjectRecord,
+    outcome: PhaseOutcome,
+    prepared: &PreparedInjection,
+) -> Result<ApplyIdentity> {
+    outcome.validate()?;
+    save_current_outcome(record, &outcome)?;
+    match apply_prepared(record, outcome, prepared) {
+        Ok(ApplyIdentity::Stale(reason)) => {
+            clear_active_outcome_file(record);
+            Ok(ApplyIdentity::Stale(reason))
+        }
+        other => other,
+    }
+}
+
 pub fn write_and_apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView> {
     outcome.validate()?;
     save_current_outcome(record, &outcome)?;

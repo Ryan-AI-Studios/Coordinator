@@ -122,6 +122,26 @@ pub struct ProjectShowView {
     pub hint: Option<String>,
     /// Effective `{secs, source}` for every canonical phase.
     pub phase_timeouts: BTreeMap<String, PhaseTimeoutView>,
+    /// Read-only track execution-target preview (`project show --track <id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_track: Option<TrackTargetView>,
+}
+
+/// Read-only resolved-target preview. No run state mutation and no prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackTargetView {
+    pub track: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub planning_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// POST /v1/restore body. `discard` defaults false. Not added onto [`ProjectRefBody`].
@@ -235,6 +255,15 @@ pub fn project_list() -> Result<Vec<ProjectRecord>> {
 
 /// `project show` — raw + resolved + nested null hint.
 pub fn project_show(project: Option<&str>, infer_cwd: bool) -> Result<ProjectShowView> {
+    project_show_with_track(project, None, infer_cwd)
+}
+
+/// `project show --track <id>`: adds a read-only resolved-target preview.
+pub fn project_show_with_track(
+    project: Option<&str>,
+    track: Option<&str>,
+    infer_cwd: bool,
+) -> Result<ProjectShowView> {
     let rec = resolve_selected(project, infer_cwd)?;
     let resolved = layout::resolve(&rec);
     let hint = if rec.layout_profile == LayoutProfile::Nested && rec.execution_repo.is_none() {
@@ -273,11 +302,46 @@ pub fn project_show(project: Option<&str>, infer_cwd: bool) -> Result<ProjectSho
             .to_string(),
         },
     );
+    let resolved_track = match track {
+        None => None,
+        Some(track) => {
+            let mut state = crate::state::load_run_state(&rec)?;
+            state.track_id = Some(track.to_string());
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            let view = match crate::workflow::execution_repo::resolve_track_target(
+                &rec,
+                &state,
+                crate::workflow::graph::PHASE_IMPLEMENT,
+            ) {
+                Ok(target) => TrackTargetView {
+                    track: track.to_string(),
+                    declared_path: Some(target.declared_path),
+                    prompt_path: Some(target.prompt_path),
+                    sample_path: Some(target.sample_path),
+                    source: Some(target.source.to_string()),
+                    planning_only: target.planning_only,
+                    error: None,
+                },
+                Err(err) => TrackTargetView {
+                    track: track.to_string(),
+                    declared_path: None,
+                    prompt_path: None,
+                    sample_path: None,
+                    source: None,
+                    planning_only: false,
+                    error: Some(err.to_string()),
+                },
+            };
+            Some(view)
+        }
+    };
+
     Ok(ProjectShowView {
         project: rec,
         resolved,
         hint,
         phase_timeouts,
+        resolved_track,
     })
 }
 
@@ -2121,6 +2185,39 @@ mod tests {
             run_epoch: epoch,
         };
         artifact::write(rec, &event).unwrap();
+    }
+
+    #[test]
+    fn project_show_previews_resolved_target_and_reason() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        let conductor = proj.path().join("conductor");
+        std::fs::create_dir_all(conductor.join("0091-Preview")).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0091-Preview](0091-Preview/spec.md) | `.` | **Ready - not started** | preview |\n",
+        )
+        .unwrap();
+
+        let view = project_show_with_track(Some(&rec.id), Some("0091-Preview"), false).unwrap();
+        let target = view.resolved_track.expect("track preview");
+        assert!(target.error.is_none(), "{target:?}");
+        assert_eq!(target.track, "0091-Preview");
+        assert_eq!(target.source.as_deref(), Some("row_execution"));
+        assert!(target.declared_path.is_some());
+        assert!(target.prompt_path.is_some());
+        assert!(target.sample_path.is_some());
+
+        let missing = project_show_with_track(Some(&rec.id), Some("0404-Missing"), false).unwrap();
+        let target = missing.resolved_track.expect("track preview");
+        assert!(
+            target
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(crate::workflow::execution_repo::RESOLUTION_PREFIX)),
+            "{target:?}"
+        );
+        clear_home();
     }
 
     #[test]

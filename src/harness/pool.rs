@@ -20,12 +20,15 @@ use crate::harness::{grok_cwd, resolve_grok_binary};
 
 /// Child-only model pin for the detached holder (never `set_var` on the parent).
 pub(crate) const ENV_GROK_MODEL: &str = "COORDINATOR_GROK_MODEL";
+use crate::harness::no_change::{self, CaptureStatus, VerdictOutcome};
 use crate::outcome::{
-    FailureClass, LAST_EVENT_MESSAGE_CAP, OutcomeSource, PhaseOutcome, write_and_apply,
+    ApplyIdentity, FailureClass, LAST_EVENT_MESSAGE_CAP, OutcomeSource, PhaseOutcome,
+    write_and_apply, write_and_apply_prepared,
 };
 use crate::persist::atomic_write_json;
 use crate::registry::ProjectRecord;
 use crate::state::{RunStatus, StatusView, ensure_state_dir, load_run_state, resolve_state_dir};
+use crate::workflow::execution_repo::{PreparedInjection, ResolvedExecution};
 
 /// In-process pool (tests / `insert_test_session`). CLI and HTTP start use a detached holder.
 static POOL: OnceLock<tokio::sync::Mutex<SessionPool>> = OnceLock::new();
@@ -199,7 +202,14 @@ impl PersistedGrokHandle {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum HoldRequest {
     Ping,
-    Prompt { text: String },
+    Prompt {
+        text: String,
+    },
+    /// Adapter-only prepared turn: frozen target identity plus prompt.
+    PreparedPrompt {
+        text: String,
+        prepared: Box<PreparedInjection>,
+    },
     Compact,
     Status,
     Shutdown,
@@ -225,7 +235,13 @@ struct HoldResponse {
     skipped: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failure_class: Option<FailureClass>,
+    /// Prepared-prompt protocol the holder understands. Absent on old holders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_protocol: Option<u32>,
 }
+
+/// Current prepared-prompt capability advertised in `Ping`.
+pub const PREPARED_PROTOCOL_VERSION: u32 = 1;
 
 pub fn persist_path(record: &ProjectRecord) -> Result<PathBuf> {
     Ok(resolve_state_dir(record)?.join("harness-grok.json"))
@@ -398,7 +414,64 @@ async fn apply_turn(
     injected_phase: &str,
     spawn: SpawnTally,
 ) -> Result<HarnessPromptView> {
-    apply_turn_checked(record, turn, harness, injected_phase, spawn, None).await
+    apply_turn_checked(record, turn, harness, injected_phase, spawn, None, None).await
+}
+
+fn commit_prepared(
+    record: &ProjectRecord,
+    outcome: PhaseOutcome,
+    prepared: Option<&PreparedInjection>,
+) -> Result<ApplyIdentity> {
+    match prepared {
+        Some(prepared) => write_and_apply_prepared(record, outcome, prepared),
+        None => write_and_apply(record, outcome).map(ApplyIdentity::Applied),
+    }
+}
+
+fn apply_outcome(
+    record: &ProjectRecord,
+    outcome: PhaseOutcome,
+    prepared: Option<&PreparedInjection>,
+    harness: GrokHarnessStatus,
+) -> Result<std::result::Result<StatusView, HarnessPromptView>> {
+    match commit_prepared(record, outcome, prepared)? {
+        ApplyIdentity::Applied(view) => Ok(Ok(view)),
+        ApplyIdentity::Stale(reason) => {
+            let prepared = prepared.expect("stale identity requires a prepared injection");
+            Ok(Err(prepared_skipped_view(
+                record, harness, prepared, &reason,
+            )))
+        }
+    }
+}
+
+fn prepared_skipped_view(
+    record: &ProjectRecord,
+    harness: GrokHarnessStatus,
+    prepared: &PreparedInjection,
+    reason: &str,
+) -> HarnessPromptView {
+    journal_sample_skip(record, prepared.target(), reason);
+    HarnessPromptView {
+        text: None,
+        stop_reason: None,
+        applied: false,
+        skipped: Some(true),
+        error: None,
+        failure_class: None,
+        status: None,
+        harness: Some(harness),
+    }
+}
+
+fn journal_sample_skip(record: &ProjectRecord, target: Option<&ResolvedExecution>, reason: &str) {
+    let track = target.map(|t| t.track_id.as_str()).unwrap_or("(none)");
+    let source = target.map(|t| t.source.as_str()).unwrap_or("none");
+    crate::progress_log::append(
+        record,
+        "sample-skip",
+        &format!("leg sample skipped: track={track} source={source} reason={reason}"),
+    );
 }
 
 /// `no_change` is the unchanged-tree verdict (0095) computed beside the prompt, where the session
@@ -410,9 +483,22 @@ async fn apply_turn_checked(
     injected_phase: &str,
     spawn: SpawnTally,
     no_change: Option<String>,
+    prepared: Option<&PreparedInjection>,
 ) -> Result<HarnessPromptView> {
     let state = load_run_state(record)?;
     let drifted = state.phase != injected_phase;
+    // Outcomes are stamped with the injected epoch, never a newly loaded one.
+    let injected_epoch = prepared.map(|p| p.run_epoch).unwrap_or(state.run_epoch);
+    if let Some(prepared) = prepared
+        && (state.status != RunStatus::Running || !prepared.matches_state(&state))
+    {
+        return Ok(prepared_skipped_view(
+            record,
+            harness,
+            prepared,
+            "stale-injection",
+        ));
+    }
     match turn {
         Ok(pr) => {
             let mut applied = false;
@@ -433,9 +519,12 @@ async fn apply_turn_checked(
                         FailureClass::HarnessCrash,
                         OutcomeSource::Adapter,
                         Some(msg.clone()),
-                        Some(state.run_epoch),
+                        Some(injected_epoch),
                     );
-                    status = Some(write_and_apply(record, outcome)?);
+                    match apply_outcome(record, outcome, prepared, harness.clone())? {
+                        Ok(view) => status = Some(view),
+                        Err(skip_view) => return Ok(skip_view),
+                    }
                     applied = true;
                     error = Some(msg);
                     failure_class = Some(FailureClass::HarnessCrash);
@@ -466,7 +555,7 @@ async fn apply_turn_checked(
                                 class,
                                 OutcomeSource::Adapter,
                                 Some(err),
-                                Some(state.run_epoch),
+                                Some(injected_epoch),
                             )
                         }
                         None => {
@@ -496,7 +585,7 @@ async fn apply_turn_checked(
                                         FailureClass::HarnessCrash,
                                         OutcomeSource::Adapter,
                                         Some(m),
-                                        Some(state.run_epoch),
+                                        Some(injected_epoch),
                                     )
                                 }
                                 None => PhaseOutcome::success(
@@ -504,12 +593,15 @@ async fn apply_turn_checked(
                                     OutcomeSource::Adapter,
                                     msg,
                                     next,
-                                    Some(state.run_epoch),
+                                    Some(injected_epoch),
                                 ),
                             }
                         }
                     };
-                    status = Some(write_and_apply(record, outcome)?);
+                    match apply_outcome(record, outcome, prepared, harness.clone())? {
+                        Ok(view) => status = Some(view),
+                        Err(skip_view) => return Ok(skip_view),
+                    }
                     applied = true;
                 }
             }
@@ -575,9 +667,14 @@ async fn apply_turn_checked(
                             FailureClass::HarnessCrash,
                             OutcomeSource::Adapter,
                             Some(message.clone()),
-                            Some(state.run_epoch),
+                            Some(injected_epoch),
                         );
-                        let status = Some(write_and_apply(record, outcome)?);
+                        let status = Some(
+                            match apply_outcome(record, outcome, prepared, harness.clone())? {
+                                Ok(view) => view,
+                                Err(skip_view) => return Ok(skip_view),
+                            },
+                        );
                         return Ok(HarnessPromptView {
                             text: None,
                             stop_reason: None,
@@ -626,9 +723,14 @@ async fn apply_turn_checked(
                             FailureClass::HarnessCrash,
                             OutcomeSource::Adapter,
                             Some(message.clone()),
-                            Some(state.run_epoch),
+                            Some(injected_epoch),
                         );
-                        let status = Some(write_and_apply(record, outcome)?);
+                        let status = Some(
+                            match apply_outcome(record, outcome, prepared, harness.clone())? {
+                                Ok(view) => view,
+                                Err(skip_view) => return Ok(skip_view),
+                            },
+                        );
                         return Ok(HarnessPromptView {
                             text: None,
                             stop_reason: None,
@@ -648,9 +750,14 @@ async fn apply_turn_checked(
                 class,
                 OutcomeSource::Adapter,
                 Some(raw.clone()),
-                Some(state.run_epoch),
+                Some(injected_epoch),
             );
-            let status = Some(write_and_apply(record, outcome)?);
+            let status = Some(
+                match apply_outcome(record, outcome, prepared, harness.clone())? {
+                    Ok(view) => view,
+                    Err(skip_view) => return Ok(skip_view),
+                },
+            );
             Ok(HarnessPromptView {
                 text: None,
                 stop_reason: None,
@@ -1194,6 +1301,166 @@ fn snapshot_status(shared: &HolderShared) -> GrokHarnessStatus {
         .unwrap_or_else(|_| GrokHarnessStatus::missing())
 }
 
+/// Revalidate the frozen identity and re-resolve the target against the *same*
+/// injected state. A resolution failure or a different target is a structured skip.
+fn validate_prepared(
+    record: &ProjectRecord,
+    prepared: &PreparedInjection,
+) -> std::result::Result<(), String> {
+    let state = load_run_state(record).map_err(|e| e.to_string())?;
+    if state.status != RunStatus::Running {
+        return Err("stale-injection".into());
+    }
+    if !prepared.matches_state(&state) {
+        return Err("stale-injection".into());
+    }
+    let Some(target) = prepared.target() else {
+        return Err("unresolved".into());
+    };
+    match crate::workflow::execution_repo::resolve_track_target(record, &state, &state.phase) {
+        Ok(now) if now.same_identity(target) => Ok(()),
+        Ok(_) => Err("target-changed".into()),
+        Err(_) => Err("unresolved".into()),
+    }
+}
+
+fn prepared_skip_response(shared: &HolderShared, reason: &str) -> (HoldResponse, bool) {
+    let _ = reason;
+    (
+        HoldResponse {
+            ok: true,
+            error: None,
+            text: None,
+            stop_reason: None,
+            status: None,
+            harness: Some(snapshot_status(shared)),
+            applied: Some(false),
+            skipped: Some(true),
+            failure_class: None,
+            prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
+        },
+        false,
+    )
+}
+
+async fn handle_prepared_prompt(
+    record: &ProjectRecord,
+    shared: &std::sync::Arc<HolderShared>,
+    text: String,
+    prepared: PreparedInjection,
+) -> Result<(HoldResponse, bool)> {
+    if let Err(reason) = validate_prepared(record, &prepared) {
+        journal_sample_skip(record, prepared.target(), &reason);
+        return Ok(prepared_skip_response(shared, &reason));
+    }
+    let _gate = match shared.prompt_gate.try_lock() {
+        Ok(gate) => gate,
+        Err(_) => {
+            // Gate contention is a structured skip, never a HarnessCrash.
+            journal_sample_skip(record, prepared.target(), "prompt-gate-contention");
+            return Ok(prepared_skip_response(shared, "prompt-gate-contention"));
+        }
+    };
+    let state = load_run_state(record)?;
+    let phase = prepared.phase.clone();
+    let Some(target) = prepared.target().cloned() else {
+        journal_sample_skip(record, None, "unresolved");
+        return Ok(prepared_skip_response(shared, "unresolved"));
+    };
+    let capture = no_change::note_baseline(record, &state, &phase, &target);
+    if let CaptureStatus::Skipped(reason) = &capture {
+        journal_sample_skip(record, Some(&target), reason);
+    }
+    if matches!(capture, CaptureStatus::UntrustedTargetChange) {
+        journal_sample_skip(record, Some(&target), "target-changed");
+        return Ok(prepared_skip_response(shared, "target-changed"));
+    }
+
+    set_prompt_in_flight(record, true);
+    let turn = {
+        let mut session = shared.session.lock().await;
+        // Revalidate immediately before send while the holder session lock is held.
+        if let Err(reason) = validate_prepared(record, &prepared) {
+            session.clear_turn_roots();
+            set_prompt_in_flight(record, false);
+            journal_sample_skip(record, Some(&target), &reason);
+            return Ok(prepared_skip_response(shared, &reason));
+        }
+        session.install_turn_root(&target.prompt_path);
+        if let Ok(mut snap) = shared.snapshot.lock() {
+            *snap = session_status(&session);
+        }
+        crate::workflow::watchdog::note_progress(
+            record,
+            crate::workflow::watchdog::ProgressKind::Inject,
+            Some(&session.session_id),
+            false,
+        );
+        let turn = session
+            .inject_prompt(&text, prompt_timeout_for(record))
+            .await;
+        session.clear_turn_roots();
+        turn
+    };
+    let normal = matches!(&turn, Ok(pr) if !crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()));
+    if normal {
+        set_prompt_in_flight(record, false);
+    } else if let Err(e) = &turn {
+        let msg = e.to_string().to_ascii_lowercase();
+        if msg.contains("timed out") || msg.contains("timeout") {
+            crate::harness::abort::abort_stuck_prompt_sync(
+                record,
+                crate::harness::abort::AbortReason::PromptTimeout,
+            );
+        }
+    }
+    let (tally, verdict) = {
+        let session = shared.session.lock().await;
+        if let Ok(mut snap) = shared.snapshot.lock() {
+            *snap = session_status(&session);
+        }
+        remember_fidelity(record, &session);
+        let verdict = no_change::evaluate_turn(
+            record,
+            &state,
+            &phase,
+            &target,
+            &capture.trust(),
+            &session.adapter,
+            session.last_signal.as_deref(),
+            &session.cwd,
+        );
+        (session.terminal_spawn_tally(), verdict)
+    };
+    let no_change = match verdict {
+        VerdictOutcome::NoChange(message) => Some(message),
+        VerdictOutcome::CwdMisdirected => {
+            journal_sample_skip(record, Some(&target), "cwd-misdirected");
+            None
+        }
+        VerdictOutcome::TargetChanged(reason) => {
+            journal_sample_skip(record, Some(&target), &reason);
+            None
+        }
+        VerdictOutcome::StaleInjection => {
+            journal_sample_skip(record, Some(&target), "stale-injection");
+            None
+        }
+        VerdictOutcome::Clean => None,
+    };
+    let view = apply_turn_checked(
+        record,
+        turn,
+        snapshot_status(shared),
+        &phase,
+        tally,
+        no_change,
+        Some(&prepared),
+    )
+    .await?;
+    Ok((view_to_hold(view), false))
+}
+
 async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared>) -> Result<bool> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -1214,6 +1481,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                 applied: None,
                 skipped: None,
                 failure_class: None,
+                prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
             },
             false,
         ),
@@ -1232,6 +1500,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     applied: None,
                     skipped: None,
                     failure_class: None,
+                    prepared_protocol: None,
                 },
                 false,
             )
@@ -1248,6 +1517,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     applied: None,
                     skipped: None,
                     failure_class: None,
+                    prepared_protocol: None,
                 },
                 false,
             ),
@@ -1263,6 +1533,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                         applied: None,
                         skipped: None,
                         failure_class: None,
+                        prepared_protocol: None,
                     },
                     false,
                 ),
@@ -1280,7 +1551,8 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             Some(&session.session_id),
                             false,
                         );
-                        note_leg_baseline(record, &injected_phase, &session.cwd);
+                        // Legacy Prompt is the manual CLI/HTTP and prompt-only phase seam:
+                        // it never resolves a target, captures a baseline or emits a verdict.
                         session
                             .inject_prompt(&text, prompt_timeout_for(record))
                             .await
@@ -1299,16 +1571,13 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             );
                         }
                     }
-                    let (tally, no_change) = {
+                    let tally = {
                         let session = shared.session.lock().await;
                         if let Ok(mut snap) = shared.snapshot.lock() {
                             *snap = session_status(&session);
                         }
                         remember_fidelity(record, &session);
-                        (
-                            session.terminal_spawn_tally(),
-                            leg_no_change(record, &injected_phase, &turn, &session),
-                        )
+                        session.terminal_spawn_tally()
                     };
                     let view = apply_turn_checked(
                         record,
@@ -1316,13 +1585,17 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                         snapshot_status(&shared),
                         &injected_phase,
                         tally,
-                        no_change,
+                        None,
+                        None,
                     )
                     .await?;
                     (view_to_hold(view), false)
                 }
             },
         },
+        HoldRequest::PreparedPrompt { text, prepared } => {
+            handle_prepared_prompt(record, &shared, text, *prepared).await?
+        }
         HoldRequest::Compact => {
             let session = shared.session.lock().await;
             if !session.supports_compact {
@@ -1337,6 +1610,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                         applied: Some(false),
                         skipped: Some(true),
                         failure_class: None,
+                        prepared_protocol: None,
                     },
                     false,
                 )
@@ -1360,6 +1634,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                                 applied: Some(false),
                                 skipped: None,
                                 failure_class: None,
+                                prepared_protocol: None,
                             },
                             false,
                         )
@@ -1380,6 +1655,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                                 applied: Some(false),
                                 skipped: None,
                                 failure_class: Some(failure_class_for_message(&e.to_string())),
+                                prepared_protocol: None,
                             },
                             false,
                         )
@@ -1405,6 +1681,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     applied: None,
                     skipped: None,
                     failure_class: None,
+                    prepared_protocol: None,
                 },
                 true,
             )
@@ -1442,6 +1719,7 @@ fn view_to_hold(view: HarnessPromptView) -> HoldResponse {
         applied: Some(view.applied),
         skipped: view.skipped,
         failure_class: view.failure_class,
+        prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
     }
 }
 
@@ -1487,17 +1765,71 @@ pub async fn prompt(
     text: String,
     infer_cwd: bool,
 ) -> Result<HarnessPromptView> {
+    prompt_impl(project, text, infer_cwd, None).await
+}
+
+/// Adapter-only prepared entry point. Legacy `prompt` never resolves a target,
+/// captures a baseline or emits a verdict.
+pub async fn prompt_prepared(
+    project: Option<&str>,
+    text: String,
+    infer_cwd: bool,
+    prepared: PreparedInjection,
+) -> Result<HarnessPromptView> {
+    prompt_impl(project, text, infer_cwd, Some(prepared)).await
+}
+
+async fn prompt_impl(
+    project: Option<&str>,
+    text: String,
+    infer_cwd: bool,
+    prepared: Option<PreparedInjection>,
+) -> Result<HarnessPromptView> {
     let rec = resolve_record(project, infer_cwd)?;
     refuse_if_paused(&rec)?;
+    if let Some(prepared) = &prepared
+        && let Err(reason) = validate_prepared(&rec, prepared)
+    {
+        journal_sample_skip(&rec, prepared.target(), &reason);
+        return Ok(prepared_skipped_view(
+            &rec,
+            current_status(&rec).await,
+            prepared,
+            &reason,
+        ));
+    }
     if let Some(h) = load_persist(&rec)?
         && h.alive
         && let Some(addr) = &h.control_addr
         && !global_pool().lock().await.contains(&rec.id)
     {
+        if let Some(prepared) = prepared.clone() {
+            return prompt_prepared_holder(&rec, text, prepared, addr).await;
+        }
         let resp = holder_rpc(addr, &HoldRequest::Prompt { text }).await?;
         return hold_view(resp);
     }
-    let injected_phase = load_run_state(&rec)?.phase;
+
+    let state = load_run_state(&rec)?;
+    let injected_phase = state.phase.clone();
+    let target = prepared.as_ref().and_then(|p| p.target()).cloned();
+    let capture = target
+        .as_ref()
+        .map(|target| no_change::note_baseline(&rec, &state, &injected_phase, target));
+    if let Some(CaptureStatus::Skipped(reason)) = &capture {
+        journal_sample_skip(&rec, target.as_ref(), reason);
+    }
+    if matches!(capture, Some(CaptureStatus::UntrustedTargetChange)) {
+        journal_sample_skip(&rec, target.as_ref(), "target-changed");
+        let prepared = prepared.expect("target change requires a prepared injection");
+        return Ok(prepared_skipped_view(
+            &rec,
+            current_status(&rec).await,
+            &prepared,
+            "target-changed",
+        ));
+    }
+
     set_prompt_in_flight(&rec, true);
     let turn = {
         let mut pool = global_pool().lock().await;
@@ -1506,14 +1838,30 @@ pub async fn prompt(
                 "no Grok session; run `coordinator harness grok start` first".into(),
             )
         })?;
+        if let Some(prepared) = &prepared
+            && let Err(reason) = validate_prepared(&rec, prepared)
+        {
+            set_prompt_in_flight(&rec, false);
+            journal_sample_skip(&rec, target.as_ref(), &reason);
+            return Ok(prepared_skipped_view(
+                &rec,
+                current_status(&rec).await,
+                prepared,
+                &reason,
+            ));
+        }
+        if let Some(target) = &target {
+            session.install_turn_root(&target.prompt_path);
+        }
         crate::workflow::watchdog::note_progress(
             &rec,
             crate::workflow::watchdog::ProgressKind::Inject,
             Some(&session.session_id),
             false,
         );
-        note_leg_baseline(&rec, &injected_phase, &session.cwd);
-        session.inject_prompt(&text, prompt_timeout_for(&rec)).await
+        let turn = session.inject_prompt(&text, prompt_timeout_for(&rec)).await;
+        session.clear_turn_roots();
+        turn
     };
     let normal = matches!(&turn, Ok(pr) if !crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()));
     if normal {
@@ -1538,45 +1886,170 @@ pub async fn prompt(
     let (tally, no_change) = {
         let mut pool = global_pool().lock().await;
         match pool.get_mut(&rec.id) {
-            Some(s) => (
-                s.terminal_spawn_tally(),
-                leg_no_change(&rec, &injected_phase, &turn, s),
-            ),
+            Some(s) => {
+                let no_change = match (&capture, &target) {
+                    (Some(capture), Some(target)) => match no_change::evaluate_turn(
+                        &rec,
+                        &state,
+                        &injected_phase,
+                        target,
+                        &capture.trust(),
+                        &s.adapter,
+                        s.last_signal.as_deref(),
+                        &s.cwd,
+                    ) {
+                        VerdictOutcome::NoChange(message) => Some(message),
+                        VerdictOutcome::CwdMisdirected => {
+                            journal_sample_skip(&rec, Some(target), "cwd-misdirected");
+                            None
+                        }
+                        VerdictOutcome::TargetChanged(reason) => {
+                            journal_sample_skip(&rec, Some(target), &reason);
+                            None
+                        }
+                        VerdictOutcome::StaleInjection => {
+                            journal_sample_skip(&rec, Some(target), "stale-injection");
+                            None
+                        }
+                        VerdictOutcome::Clean => None,
+                    },
+                    _ => None,
+                };
+                (s.terminal_spawn_tally(), no_change)
+            }
             None => (SpawnTally::default(), None),
         }
     };
-    apply_turn_checked(&rec, turn, harness, &injected_phase, tally, no_change).await
-}
-
-/// Sample the leg baseline before a prompt (no-op outside adapter implement legs).
-fn note_leg_baseline(record: &ProjectRecord, phase: &str, cwd: &std::path::Path) {
-    if let Ok(state) = load_run_state(record) {
-        crate::harness::no_change::note_baseline(record, &state, phase, cwd);
-    }
-}
-
-/// Unchanged-tree verdict for a completed, non-cancelled turn (0095).
-fn leg_no_change(
-    record: &ProjectRecord,
-    phase: &str,
-    turn: &std::result::Result<PromptResult, CoordinatorError>,
-    session: &GrokSession,
-) -> Option<String> {
-    let Ok(pr) = turn else {
-        return None;
-    };
-    if crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()) {
-        return None;
-    }
-    let state = load_run_state(record).ok()?;
-    crate::harness::no_change::verdict_after_turn(
-        record,
-        &state,
-        phase,
-        &session.cwd,
-        &session.adapter,
-        session.last_signal.as_deref(),
+    apply_turn_checked(
+        &rec,
+        turn,
+        harness,
+        &injected_phase,
+        tally,
+        no_change,
+        prepared.as_ref(),
     )
+    .await
+}
+
+/// Detached-holder prepared turn. Missing capability recycles the owned holder once;
+/// a post-send transport failure is applied once and never retried.
+async fn prompt_prepared_holder(
+    rec: &ProjectRecord,
+    text: String,
+    prepared: PreparedInjection,
+    addr: &str,
+) -> Result<HarnessPromptView> {
+    let capability = holder_rpc(addr, &HoldRequest::Ping)
+        .await
+        .ok()
+        .and_then(|resp| resp.prepared_protocol)
+        .unwrap_or(0);
+    if capability >= PREPARED_PROTOCOL_VERSION {
+        return send_prepared_rpc(rec, text, prepared, addr).await;
+    }
+
+    // Outside pool/session locks: shut down the owned old holder and respawn with
+    // the current binary. At most one compatibility recycle per dispatch.
+    recycle_without_pool_lock(rec).await?;
+    let binding = crate::harness::roles::resolve_phase_binding(&prepared.phase)
+        .map_err(|e| CoordinatorError::Message(e.to_string()))?;
+    let bin = crate::harness::roles::resolve_phase_binary(&prepared.phase)
+        .map_err(|e| CoordinatorError::Message(e.to_string()))?;
+    let selector = rec.path.to_string_lossy().to_string();
+    crate::harness::start_with_bin(
+        Some(&selector),
+        false,
+        bin,
+        binding.model.clone(),
+        false,
+        &binding.harness,
+    )
+    .await?;
+    let Some(handle) = load_persist(rec)? else {
+        return prepared_failure_after_recycle(rec, prepared, "replacement holder did not start");
+    };
+    let Some(new_addr) = handle.control_addr.as_deref() else {
+        return prepared_failure_after_recycle(rec, prepared, "replacement holder has no address");
+    };
+    let second = holder_rpc(new_addr, &HoldRequest::Ping)
+        .await
+        .ok()
+        .and_then(|resp| resp.prepared_protocol)
+        .unwrap_or(0);
+    if second < PREPARED_PROTOCOL_VERSION {
+        return prepared_failure_after_recycle(
+            rec,
+            prepared,
+            "replacement holder does not support prepared prompts",
+        );
+    }
+    send_prepared_rpc(rec, text, prepared, new_addr).await
+}
+
+async fn send_prepared_rpc(
+    rec: &ProjectRecord,
+    text: String,
+    prepared: PreparedInjection,
+    addr: &str,
+) -> Result<HarnessPromptView> {
+    match holder_rpc(
+        addr,
+        &HoldRequest::PreparedPrompt {
+            text,
+            prepared: Box::new(prepared.clone()),
+        },
+    )
+    .await
+    {
+        Ok(resp) => hold_view(resp),
+        Err(e) => prepared_failure_after_recycle(
+            rec,
+            prepared,
+            &format!("prepared prompt transport failed after send ({e}); no automatic retry"),
+        ),
+    }
+}
+
+/// One explicit HarnessCrash for the injected identity, zero prompts.
+fn prepared_failure_after_recycle(
+    rec: &ProjectRecord,
+    prepared: PreparedInjection,
+    detail: &str,
+) -> Result<HarnessPromptView> {
+    let message = format!(
+        "prepared prompt unavailable: {detail}. Shut down the harness, run \
+         `coordinator failure resolve`, then `coordinator run --track {}`.",
+        prepared.track_id.as_deref().unwrap_or("(none)")
+    );
+    let outcome = PhaseOutcome::failure(
+        prepared.phase.clone(),
+        FailureClass::HarnessCrash,
+        OutcomeSource::Adapter,
+        Some(message.clone()),
+        Some(prepared.run_epoch),
+    );
+    match write_and_apply_prepared(rec, outcome, &prepared)? {
+        ApplyIdentity::Applied(view) => Ok(HarnessPromptView {
+            text: None,
+            stop_reason: None,
+            applied: true,
+            skipped: None,
+            error: Some(message),
+            failure_class: Some(FailureClass::HarnessCrash),
+            status: Some(view),
+            harness: None,
+        }),
+        ApplyIdentity::Stale(reason) => {
+            journal_sample_skip(rec, prepared.target(), &reason);
+            Ok(prepared_skipped_view(
+                rec,
+                GrokHarnessStatus::missing(),
+                &prepared,
+                &reason,
+            ))
+        }
+    }
 }
 
 pub async fn compact(project: Option<&str>, infer_cwd: bool) -> Result<HarnessPromptView> {
@@ -4327,35 +4800,60 @@ Loop\r\n",
         (rec, home, proj)
     }
 
+    fn target_for(
+        rec: &ProjectRecord,
+        st: &crate::state::RunState,
+        phase: &str,
+        path: &std::path::Path,
+    ) -> ResolvedExecution {
+        ResolvedExecution {
+            project_id: rec.id.clone(),
+            run_epoch: st.run_epoch,
+            phase: phase.into(),
+            track_id: st.track_id.clone().unwrap_or_else(|| "0095".into()),
+            declared_path: path.to_path_buf(),
+            prompt_path: path.to_path_buf(),
+            sample_path: path.to_path_buf(),
+            source: crate::workflow::execution_repo::ResolutionSource::ProjectDefault,
+            planning_only: false,
+            late_metadata: Vec::new(),
+        }
+    }
+
     #[test]
     fn leg_verdict_fires_only_when_the_tree_is_exactly_as_the_leg_found_it() {
         let _guard = test_env_lock();
         let (rec, _home, proj) = implement_leg_fixture(crate::workflow::graph::PHASE_IMPLEMENT);
         let st = crate::state::load_run_state(&rec).unwrap();
         let phase = crate::workflow::graph::PHASE_IMPLEMENT;
-        crate::harness::no_change::note_baseline(&rec, &st, phase, proj.path());
+        let target = target_for(&rec, &st, phase, proj.path());
+        let status = crate::harness::no_change::note_baseline(&rec, &st, phase, &target);
         let v = crate::harness::no_change::verdict_after_turn(
             &rec,
             &st,
             phase,
-            proj.path(),
+            &target,
+            &status.trust(),
             "codex",
             Some("approvals auto-allowed"),
+            proj.path(),
         );
         let m = v.expect("unchanged tree must be a verdict");
         assert!(m.starts_with(crate::harness::no_change::NO_CHANGE_PREFIX));
         assert!(m.contains("codex") && m.contains("approvals auto-allowed"));
         // a second turn of the same leg keeps the original baseline
         std::fs::write(proj.path().join("new.txt"), "x\n").unwrap();
-        crate::harness::no_change::note_baseline(&rec, &st, phase, proj.path());
+        let status = crate::harness::no_change::note_baseline(&rec, &st, phase, &target);
         assert!(
             crate::harness::no_change::verdict_after_turn(
                 &rec,
                 &st,
                 phase,
-                proj.path(),
+                &target,
+                &status.trust(),
                 "codex",
-                None
+                None,
+                proj.path()
             )
             .is_none(),
             "a written file is a change"
@@ -4371,40 +4869,56 @@ Loop\r\n",
         let (rec, _home, proj) = implement_leg_fixture(crate::workflow::graph::PHASE_FOLD);
         let mut st = crate::state::load_run_state(&rec).unwrap();
         let fold = crate::workflow::graph::PHASE_FOLD;
-        crate::harness::no_change::note_baseline(&rec, &st, fold, proj.path());
+        let fold_target = target_for(&rec, &st, fold, proj.path());
+        let fold_status = crate::harness::no_change::note_baseline(&rec, &st, fold, &fold_target);
         assert!(
             crate::harness::no_change::verdict_after_turn(
                 &rec,
                 &st,
                 fold,
-                proj.path(),
+                &fold_target,
+                &fold_status.trust(),
                 "codex",
-                None
+                None,
+                proj.path()
             )
             .is_none(),
             "fold is never checked"
         );
         let imp = crate::workflow::graph::PHASE_IMPLEMENT;
+        let target = target_for(&rec, &st, imp, proj.path());
         st.driver = crate::workflow::WorkflowDriver::Stub;
-        crate::harness::no_change::note_baseline(&rec, &st, imp, proj.path());
+        let stub_status = crate::harness::no_change::note_baseline(&rec, &st, imp, &target);
         assert!(
             crate::harness::no_change::verdict_after_turn(
                 &rec,
                 &st,
                 imp,
-                proj.path(),
+                &target,
+                &stub_status.trust(),
                 "codex",
-                None
+                None,
+                proj.path()
             )
             .is_none(),
             "stub driver is never checked"
         );
         st.driver = crate::workflow::WorkflowDriver::Adapter;
-        crate::harness::no_change::note_baseline(&rec, &st, imp, proj.path());
-        let gone = proj.path().join("not-a-repo-dir");
+        let status = crate::harness::no_change::note_baseline(&rec, &st, imp, &target);
+        let mut gone = target.clone();
+        gone.sample_path = proj.path().join("not-a-repo-dir");
         assert!(
-            crate::harness::no_change::verdict_after_turn(&rec, &st, imp, &gone, "codex", None)
-                .is_none(),
+            crate::harness::no_change::verdict_after_turn(
+                &rec,
+                &st,
+                imp,
+                &gone,
+                &status.trust(),
+                "codex",
+                None,
+                proj.path()
+            )
+            .is_none(),
             "unreadable tree must not fire"
         );
         unsafe {
@@ -4429,6 +4943,7 @@ Loop\r\n",
             crate::workflow::graph::PHASE_IMPLEMENT,
             SpawnTally::default(),
             Some(msg.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -4459,6 +4974,7 @@ Loop\r\n",
             harness_stub(),
             crate::workflow::graph::PHASE_IMPLEMENT,
             SpawnTally::default(),
+            None,
             None,
         )
         .await

@@ -114,10 +114,32 @@ pub fn phase_clause(record: &ProjectRecord) -> String {
 }
 
 pub fn continuation_prompt(phase: &str, track: &str, step: u32, previous: &str) -> String {
+    continuation_prompt_with_target(phase, track, step, previous, None)
+}
+
+/// Continuation prompt carrying the same frozen target as the leg's first turn.
+/// It never re-reads the registry or run state to discover a target.
+pub fn continuation_prompt_with_target(
+    phase: &str,
+    track: &str,
+    step: u32,
+    previous: &str,
+    target: Option<&crate::workflow::execution_repo::ResolvedExecution>,
+) -> String {
+    let target_line = target
+        .map(|t| {
+            format!(
+                "Frozen execution target: {} (sample {})\n",
+                t.prompt_path.display(),
+                t.sample_path.display()
+            )
+        })
+        .unwrap_or_default();
     format!(
         "Coordinator self-check step {step} of {max} for phase `{phase}` track `{track}`.\n\
          Previous line: {previous}\n\
          Continue the same phase. About 10 minutes for this step.\n\
+         {target_line}\
          The last line of your reply must be \
          `self-check: continue finding=<token> action=<progress|repair|blocked>` \
          or `self-check: done`.\n",
@@ -143,7 +165,10 @@ pub fn continuation_pending(state: &RunState) -> bool {
 }
 
 /// Clear `pending_inject` and return the continuation prompt. `None` when it is no longer owed.
-pub fn claim_continuation(record: &ProjectRecord) -> Result<Option<String>> {
+pub fn claim_continuation(
+    record: &ProjectRecord,
+    target: Option<&crate::workflow::execution_repo::ResolvedExecution>,
+) -> Result<Option<String>> {
     with_run_state_lock(record, || {
         let mut state = load_run_state(record)?;
         if state.status != RunStatus::Running || !continuation_pending(&state) {
@@ -167,7 +192,7 @@ pub fn claim_continuation(record: &ProjectRecord) -> Result<Option<String>> {
             .clone()
             .unwrap_or_else(|| "(none)".to_string());
         state.updated_at = Utc::now();
-        let prompt = continuation_prompt(&phase, &track, step, &previous);
+        let prompt = continuation_prompt_with_target(&phase, &track, step, &previous, target);
         save_run_state(record, &state)?;
         Ok(Some(prompt))
     })

@@ -73,6 +73,16 @@ pub async fn prompt(
     pool::prompt(project, text, infer_cwd).await
 }
 
+/// Adapter-only prepared turn. Carries the frozen track target into the pool.
+pub async fn prompt_prepared(
+    project: Option<&str>,
+    text: String,
+    infer_cwd: bool,
+    prepared: crate::workflow::execution_repo::PreparedInjection,
+) -> Result<HarnessPromptView> {
+    pool::prompt_prepared(project, text, infer_cwd, prepared).await
+}
+
 pub async fn compact(project: Option<&str>, infer_cwd: bool) -> Result<HarnessPromptView> {
     pool::compact(project, infer_cwd).await
 }

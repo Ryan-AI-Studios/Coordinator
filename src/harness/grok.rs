@@ -217,6 +217,9 @@ pub struct GrokSession {
     pub last_signal: Option<String>,
     /// Last non-empty tool title. An update that omits `title` does not clear it.
     pub last_tool_title: Option<String>,
+    /// Per-turn ACP target roots (prepared implement/address-findings turns only).
+    /// Cleared on every turn exit, cancel/recycle and before manual prompts.
+    turn_roots: Vec<PathBuf>,
 }
 
 /// Cloneable stdin writer so abort can send `session/cancel` without the pool lock.
@@ -403,6 +406,7 @@ impl GrokSession {
             context_usage: None,
             last_signal: None,
             last_tool_title: None,
+            turn_roots: Vec::new(),
         };
         session.terminals.set_adapter(harness);
         session.handshake(timeout, model).await?;
@@ -475,10 +479,27 @@ impl GrokSession {
             context_usage: None,
             last_signal: None,
             last_tool_title: None,
+            turn_roots: Vec::new(),
         };
         session.terminals.set_adapter(harness);
         session.handshake(timeout, None).await?;
         Ok(session)
+    }
+
+    /// Authorize one prepared target root for the next turn only.
+    pub fn install_turn_root(&mut self, root: &Path) {
+        if !self.turn_roots.iter().any(|p| p == root) {
+            self.turn_roots.push(root.to_path_buf());
+        }
+    }
+
+    /// Remove every per-turn root (success, error, cancel, recycle, manual prompt).
+    pub fn clear_turn_roots(&mut self) {
+        self.turn_roots.clear();
+    }
+
+    pub fn turn_roots(&self) -> &[PathBuf] {
+        &self.turn_roots
     }
 
     /// Recorded JSON-RPC request payloads (mock only).
@@ -949,6 +970,7 @@ impl GrokSession {
     /// worktree that lives under the execution-repo prefix.
     fn fs_allowed_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.cwd.clone()];
+        roots.extend(self.turn_roots.iter().cloned());
         if let Some(rec) = &self.progress_record {
             let paths = crate::layout::resolve(rec);
             roots.push(paths.workspace_root);

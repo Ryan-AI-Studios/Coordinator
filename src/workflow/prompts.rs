@@ -23,8 +23,49 @@ Do not run `coordinator outcome write` during this inject.";
 /// repo when that directory exists. Other phases keep the shared execution repo
 /// and add an `Epoch worktree:` line.
 pub(crate) fn layout_block(record: &ProjectRecord, track_id: Option<&str>, phase: &str) -> String {
+    layout_block_with_target(record, track_id, phase, None)
+}
+
+/// Target-aware layout block. When a frozen target is supplied the formatter never
+/// re-reads run state or the registry: it prints the prepared prompt path.
+pub(crate) fn layout_block_with_target(
+    record: &ProjectRecord,
+    track_id: Option<&str>,
+    phase: &str,
+    target: Option<&super::execution_repo::ResolvedExecution>,
+) -> String {
     let paths = crate::layout::resolve(record);
     let epoch = crate::worktree::active_epoch_dir(record);
+    if let Some(target) = target {
+        let execution = target.prompt_path.display().to_string();
+        let epoch_line = if target.source == super::execution_repo::ResolutionSource::RowExecution
+            || !crate::worktree::paths_same(&target.prompt_path, &target.declared_path)
+        {
+            format!("Epoch worktree: {}\n", target.prompt_path.display())
+        } else {
+            String::new()
+        };
+        let workspace = paths.workspace_root.display();
+        let conductor = paths.conductor_dir.display();
+        let state = paths.state_dir.display();
+        let track_hint = track_id
+            .and_then(|id| resolve_track_dir(record, id))
+            .map(|p| format!("Track folder: {}\n", p.display()))
+            .unwrap_or_default();
+        return format!(
+            "Workspace root: {workspace}\n\
+             Execution repo: {execution}\n\
+             Conductor directory: {conductor}\n\
+             State directory: {state}\n\
+             {epoch_line}\
+             {track_hint}\
+             Planning, conductor tracks, ADRs, and deferred.md stay outside the product git. \
+             Never commit them into the execution repo.\n\
+             plan / fold / advance write under the workspace / conductor / track folder, \
+             not inside the execution repo unless the track spec says the execution path is the workspace.\n\
+             implement honors the track spec execution path.\n"
+        );
+    }
     let use_epoch = epoch.is_some()
         && matches!(
             phase,
@@ -340,8 +381,19 @@ fn implement_branch_line(track_id: Option<&str>) -> String {
 
 /// Injected into Grok-bound phases (plan / fold / implement / advance).
 pub fn phase_prompt(record: &ProjectRecord, phase: &str, track_id: Option<&str>) -> String {
+    phase_prompt_with_target(record, phase, track_id, None)
+}
+
+/// Phase prompt with the frozen execution target. Wrappers remain for non-phase
+/// presentation and tests; prepared adapter turns always pass the target.
+pub fn phase_prompt_with_target(
+    record: &ProjectRecord,
+    phase: &str,
+    track_id: Option<&str>,
+    target: Option<&super::execution_repo::ResolvedExecution>,
+) -> String {
     let track = track_id.unwrap_or("(none)");
-    let layout = layout_block(record, track_id, phase);
+    let layout = layout_block_with_target(record, track_id, phase, target);
     let clause = super::self_check::phase_clause(record);
     let body = match phase {
         PHASE_PLAN => plan_prompt_body(record, track_id),

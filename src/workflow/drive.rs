@@ -263,10 +263,30 @@ fn drive_adapter(
         return Ok(None);
     }
 
+    // Resolve the one track execution target before any capture seam, claim_continuation,
+    // mark_driven or watchdog Inject. Production and test capture share this resolution.
+    let prepared = if super::execution_repo::prepares_target(&state.phase) {
+        match super::execution_repo::resolve_track_target(record, state, &state.phase) {
+            Ok(target) => Some(super::execution_repo::PreparedInjection::for_target(target)),
+            Err(err) => {
+                return fail_phase(
+                    record,
+                    state,
+                    FailureClass::Permission,
+                    err.to_string(),
+                    OutcomeSource::Adapter,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let prepared_target = prepared.as_ref().and_then(|p| p.target());
+
     // Test seam: capture the continuation prompt without resolving a harness binary.
     #[cfg(test)]
     if continuing && capture_slot_armed() {
-        let Some(prompt) = super::self_check::claim_continuation(record)? else {
+        let Some(prompt) = super::self_check::claim_continuation(record, prepared_target)? else {
             return Ok(None);
         };
         let inject_sid = crate::harness::status_bundle_sync(record)
@@ -368,14 +388,19 @@ fn drive_adapter(
     });
 
     let prompt = if continuing {
-        match super::self_check::claim_continuation(record)? {
+        match super::self_check::claim_continuation(record, prepared_target)? {
             Some(prompt) => prompt,
             None => return Ok(None),
         }
     } else {
         mark_driven(record, &state.phase)?;
         snapshot_registry_before_phase(record, &state.phase)?;
-        prompts::phase_prompt(record, &state.phase, state.track_id.as_deref())
+        prompts::phase_prompt_with_target(
+            record,
+            &state.phase,
+            state.track_id.as_deref(),
+            prepared_target,
+        )
     };
     // Inject-start heartbeat so a slow ACP start is not an immediate stall.
     // Continuation uses the same kind. Classify and the self-check log do not.
@@ -428,7 +453,13 @@ fn drive_adapter(
                     &harness,
                 )
                 .await?;
-                crate::harness::prompt(Some(&selector), prompt, false).await
+                match prepared {
+                    Some(prepared) => {
+                        crate::harness::prompt_prepared(Some(&selector), prompt, false, prepared)
+                            .await
+                    }
+                    None => crate::harness::prompt(Some(&selector), prompt, false).await,
+                }
             });
             finish_adapter_inject(&rec, result);
         })
@@ -1050,6 +1081,41 @@ mod tests {
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    /// Real temp Git target plus a conductor row, for fixtures that actually tick
+    /// the adapter into implement/address-findings (0099 §3.1b).
+    fn implementation_target(root: &std::path::Path, track: &str) -> std::path::PathBuf {
+        let product = root.join("product");
+        std::fs::create_dir_all(&product).unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(&product)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(product.join("f.txt"), "base\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-m", "base"]);
+
+        let conductor = root.join("conductor");
+        std::fs::create_dir_all(conductor.join(format!("{track}-Example"))).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "# Conductor\n\n| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [{track}-Example]({track}-Example/spec.md) | `{}` | **Ready - not started** | target |\n",
+                product.display()
+            ),
+        )
+        .unwrap();
+        product
     }
 
     fn plan_state(record: &ProjectRecord, phase: &str, track: &str) -> crate::state::RunState {
@@ -1768,6 +1834,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut r = rec(dir.path());
         r.self_continuation = true;
+        r.execution_repo = Some(implementation_target(dir.path(), "0070"));
         run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
         crate::state::with_run_state_lock(&r, || {
             let mut state = load_run_state(&r)?;
