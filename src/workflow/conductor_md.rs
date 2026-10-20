@@ -126,6 +126,8 @@ pub struct TrackRow {
     pub status_raw: String,
     pub summary: String,
     pub nostart: bool,
+    /// Raw execution cell (`Execution`, `Execution path`, `Execution repo`).
+    pub execution: Option<String>,
 }
 
 /// Trim → unwrap wrapping emphasis → strip leading emoji/punct (stop at alnum or
@@ -272,7 +274,7 @@ pub fn load_track_rows(record: &ProjectRecord) -> Option<Vec<TrackRow>> {
     parse_conductor_md(&text).ok()
 }
 
-fn row_matches_track(row: &TrackRow, key: &str) -> bool {
+pub(crate) fn row_matches_track(row: &TrackRow, key: &str) -> bool {
     let slug = if row.slug.is_empty() {
         row.id.clone()
     } else {
@@ -760,6 +762,7 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
             continue;
         };
         let summary_col = headers.iter().position(|h| is_summary_header(h));
+        let execution_col = headers.iter().position(|h| is_execution_header(h));
         let ncols = headers.len();
         for row in table.iter().skip(1) {
             if row.cells.len() != ncols {
@@ -773,12 +776,16 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
             let summary = summary_col
                 .map(|i| row.cells[i].trim().to_string())
                 .unwrap_or_default();
+            let execution = execution_col
+                .map(|i| row.cells[i].trim().to_string())
+                .filter(|cell| !cell.is_empty());
             rows.push(TrackRow {
                 id,
                 slug,
                 status_raw,
                 summary,
                 nostart: row.nostart,
+                execution,
             });
         }
     }
@@ -800,6 +807,19 @@ fn is_status_header(h: &str) -> bool {
 
 fn is_summary_header(h: &str) -> bool {
     h.eq_ignore_ascii_case("summary")
+}
+
+/// Case/punctuation/whitespace-insensitive execution header match.
+fn is_execution_header(h: &str) -> bool {
+    let norm: String = h
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(
+        norm.as_str(),
+        "execution" | "executionpath" | "executionrepo"
+    )
 }
 
 fn unwrap_md_link(cell: &str) -> String {

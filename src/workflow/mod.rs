@@ -5,6 +5,7 @@ pub mod conductor_md;
 pub mod decision;
 pub mod drive;
 pub mod evidence_stamp;
+pub mod execution_repo;
 pub mod graph;
 pub mod plan_review;
 pub mod prompts;

@@ -263,10 +263,35 @@ fn drive_adapter(
         return Ok(None);
     }
 
+    // Resolve the one track execution target before any capture seam, claim_continuation,
+    // mark_driven or watchdog Inject. Production and test capture share this resolution.
+    let prepared = if super::execution_repo::prepares_target(&state.phase) {
+        match super::execution_repo::resolve_track_target(record, state, &state.phase) {
+            Ok(target) => Some(super::execution_repo::PreparedInjection::for_target(target)),
+            Err(err) => {
+                let track = state.track_id.as_deref().unwrap_or("<id>");
+                return fail_phase(
+                    record,
+                    state,
+                    FailureClass::Permission,
+                    format!(
+                        "{err}. Declare one execution target; repair conductor.md or spec \
+                         metadata, then `coordinator failure resolve` and \
+                         `coordinator run --track {track}`."
+                    ),
+                    OutcomeSource::Adapter,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let prepared_target = prepared.as_ref().and_then(|p| p.target());
+
     // Test seam: capture the continuation prompt without resolving a harness binary.
     #[cfg(test)]
     if continuing && capture_slot_armed() {
-        let Some(prompt) = super::self_check::claim_continuation(record)? else {
+        let Some(prompt) = super::self_check::claim_continuation(record, prepared_target)? else {
             return Ok(None);
         };
         let inject_sid = crate::harness::status_bundle_sync(record)
@@ -368,14 +393,19 @@ fn drive_adapter(
     });
 
     let prompt = if continuing {
-        match super::self_check::claim_continuation(record)? {
+        match super::self_check::claim_continuation(record, prepared_target)? {
             Some(prompt) => prompt,
             None => return Ok(None),
         }
     } else {
         mark_driven(record, &state.phase)?;
         snapshot_registry_before_phase(record, &state.phase)?;
-        prompts::phase_prompt(record, &state.phase, state.track_id.as_deref())
+        prompts::phase_prompt_with_target(
+            record,
+            &state.phase,
+            state.track_id.as_deref(),
+            prepared_target,
+        )
     };
     // Inject-start heartbeat so a slow ACP start is not an immediate stall.
     // Continuation uses the same kind. Classify and the self-check log do not.
@@ -410,6 +440,7 @@ fn drive_adapter(
     let rec = record.clone();
     let model = binding.model.clone();
     let harness = binding.harness.clone();
+    let prepared_for_finish = prepared.clone();
     // First tick starts the holder Prompt without blocking poll_once. Later ticks
     // are no-ops (`mark_driven`). The holder / pool apply path writes the outcome.
     std::thread::Builder::new()
@@ -428,9 +459,15 @@ fn drive_adapter(
                     &harness,
                 )
                 .await?;
-                crate::harness::prompt(Some(&selector), prompt, false).await
+                match prepared {
+                    Some(prepared) => {
+                        crate::harness::prompt_prepared(Some(&selector), prompt, false, prepared)
+                            .await
+                    }
+                    None => crate::harness::prompt(Some(&selector), prompt, false).await,
+                }
             });
-            finish_adapter_inject(&rec, result);
+            finish_adapter_inject(&rec, result, prepared_for_finish.as_ref());
         })
         .map_err(|e| {
             CoordinatorError::Message(format!("failed to spawn adapter inject thread: {e}"))
@@ -441,7 +478,12 @@ fn drive_adapter(
 fn finish_adapter_inject(
     record: &ProjectRecord,
     result: Result<crate::harness::HarnessPromptView>,
+    prepared: Option<&crate::workflow::execution_repo::PreparedInjection>,
 ) {
+    let injected_phase = prepared
+        .map(|p| p.phase.clone())
+        .or_else(|| load_run_state(record).ok().map(|s| s.phase))
+        .unwrap_or_default();
     match result {
         Ok(view) => {
             if view.applied || view.skipped == Some(true) {
@@ -449,7 +491,7 @@ fn finish_adapter_inject(
             }
             if let Some(err) = view.error {
                 let class = view.failure_class.unwrap_or(FailureClass::HarnessCrash);
-                apply_adapter_failure(record, class, err);
+                apply_adapter_failure(record, class, err, prepared, &injected_phase);
             }
         }
         Err(e) => {
@@ -459,9 +501,15 @@ fn finish_adapter_inject(
                     crate::harness::abort::StdoutCloseDisposition::Ignore
                     | crate::harness::abort::StdoutCloseDisposition::Retry => {}
                     crate::harness::abort::StdoutCloseDisposition::Fail { message } => {
-                        let phase = load_run_state(record).map(|s| s.phase).unwrap_or_default();
-                        let message = crate::ci::with_green_pr_prefix(record, &phase, message);
-                        apply_adapter_failure(record, FailureClass::HarnessCrash, message);
+                        let message =
+                            crate::ci::with_green_pr_prefix(record, &injected_phase, message);
+                        apply_adapter_failure(
+                            record,
+                            FailureClass::HarnessCrash,
+                            message,
+                            prepared,
+                            &injected_phase,
+                        );
                     }
                 }
             } else if matches!(
@@ -473,26 +521,88 @@ fn finish_adapter_inject(
                     crate::harness::abort::StdoutCloseDisposition::Ignore
                     | crate::harness::abort::StdoutCloseDisposition::Retry => {}
                     crate::harness::abort::StdoutCloseDisposition::Fail { message } => {
-                        let phase = load_run_state(record).map(|s| s.phase).unwrap_or_default();
-                        let message = crate::ci::with_green_pr_prefix(record, &phase, message);
-                        apply_adapter_failure(record, FailureClass::HarnessCrash, message);
+                        let message =
+                            crate::ci::with_green_pr_prefix(record, &injected_phase, message);
+                        apply_adapter_failure(
+                            record,
+                            FailureClass::HarnessCrash,
+                            message,
+                            prepared,
+                            &injected_phase,
+                        );
                     }
                 }
             } else {
-                apply_adapter_failure(record, FailureClass::HarnessCrash, msg);
+                apply_adapter_failure(
+                    record,
+                    FailureClass::HarnessCrash,
+                    msg,
+                    prepared,
+                    &injected_phase,
+                );
             }
         }
     }
 }
 
-fn apply_adapter_failure(record: &ProjectRecord, class: FailureClass, message: String) {
+/// Apply one failure only if the injected identity is still current. Never fails a
+/// newer run; a stale prepared turn is a structured skip.
+fn apply_adapter_failure(
+    record: &ProjectRecord,
+    class: FailureClass,
+    message: String,
+    prepared: Option<&crate::workflow::execution_repo::PreparedInjection>,
+    injected_phase: &str,
+) {
     let Ok(state) = load_run_state(record) else {
         return;
     };
     if state.status != RunStatus::Running {
         return;
     }
+    if let Some(prepared) = prepared {
+        if !prepared.matches_state(&state) {
+            journal_stale_injection(record, prepared);
+            return;
+        }
+        let outcome = PhaseOutcome::failure(
+            prepared.phase.clone(),
+            class,
+            OutcomeSource::Adapter,
+            Some(message),
+            Some(prepared.run_epoch),
+        );
+        match crate::outcome::write_and_apply_prepared(record, outcome, prepared) {
+            Ok(crate::outcome::ApplyIdentity::Applied(_)) => {}
+            Ok(crate::outcome::ApplyIdentity::Stale(_)) => {
+                journal_stale_injection(record, prepared);
+            }
+            Err(_) => {}
+        }
+        return;
+    }
     let _ = fail_phase(record, &state, class, message, OutcomeSource::Adapter);
+    let _ = injected_phase;
+}
+
+fn journal_stale_injection(
+    record: &ProjectRecord,
+    prepared: &crate::workflow::execution_repo::PreparedInjection,
+) {
+    let track = prepared
+        .target()
+        .map(|t| t.track_id.as_str())
+        .or(prepared.track_id.as_deref())
+        .unwrap_or("(none)");
+    let source = prepared
+        .target()
+        .map(|t| t.source.as_str())
+        .unwrap_or("none");
+    crate::progress_log::append(
+        record,
+        "sample-skip",
+        &format!("leg sample skipped: track={track} source={source} reason=stale-injection"),
+    );
 }
 
 fn drive_plan_review(
@@ -1052,6 +1162,55 @@ mod tests {
         }
     }
 
+    fn write_implementor_binding(home: &IsolatedHome) {
+        let bin = dummy(home._home.path(), "impl-0099.exe");
+        home.write_bindings(|b| {
+            if let Some(slot) = b.get_mut(ROLE_IMPLEMENTOR) {
+                slot.command = bin.to_string_lossy().into();
+            }
+        });
+    }
+
+    /// Real temp Git target plus a conductor row, for fixtures that actually tick
+    /// the adapter into implement/address-findings (0099 §3.1b).
+    fn implementation_target(root: &std::path::Path, track: &str) -> std::path::PathBuf {
+        let product = root.join("product");
+        std::fs::create_dir_all(&product).unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(&product)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(product.join("f.txt"), "base\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-m", "base"]);
+        for name in ["implement", "onboarding"] {
+            let skill = product.join(".agents").join("skills").join(name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "skill\n").unwrap();
+        }
+
+        let conductor = root.join("conductor");
+        std::fs::create_dir_all(conductor.join(format!("{track}-Example"))).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "# Conductor\n\n| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [{track}-Example]({track}-Example/spec.md) | `{}` | **Ready - not started** | target |\n",
+                product.display()
+            ),
+        )
+        .unwrap();
+        product
+    }
+
     fn plan_state(record: &ProjectRecord, phase: &str, track: &str) -> crate::state::RunState {
         let mut state = crate::state::RunState::idle(&record.id);
         state.phase = phase.into();
@@ -1330,6 +1489,7 @@ mod tests {
             Err(CoordinatorError::Message(
                 "ACP stdout closed during initialize; child=exited:42; stderr=".into(),
             )),
+            None,
         );
         let s = load_run_state(&r).unwrap();
         assert_eq!(s.status, crate::state::RunStatus::Running);
@@ -1347,6 +1507,41 @@ mod tests {
     }
 
     #[test]
+    fn finish_adapter_inject_stale_identity_does_not_fail_newer_run() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        let state = load_run_state(&r).unwrap();
+        let prepared = crate::workflow::execution_repo::PreparedInjection {
+            project_id: state.project_id.clone(),
+            run_epoch: state.run_epoch,
+            phase: crate::workflow::graph::PHASE_IMPLEMENT.into(),
+            track_id: state.track_id.clone(),
+            target: None,
+        };
+        crate::state::with_run_state_lock(&r, || {
+            let mut next = load_run_state(&r)?;
+            next.run_epoch += 1;
+            next.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            crate::state::save_run_state(&r, &next)
+        })
+        .unwrap();
+        finish_adapter_inject(
+            &r,
+            Err(CoordinatorError::Message(
+                "replacement holder failed".into(),
+            )),
+            Some(&prepared),
+        );
+        let next = load_run_state(&r).unwrap();
+        assert_eq!(next.status, crate::state::RunStatus::Running);
+        assert_eq!(next.failure_class, None);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap_or_default();
+        assert!(log.contains("stale-injection"), "{log}");
+    }
+
+    #[test]
     fn non_prefix_start_error_is_immediate_harness_crash() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
@@ -1356,6 +1551,7 @@ mod tests {
             Err(CoordinatorError::Message(
                 "terminal host probe exit 1 (no usable shell for terminal/create)".into(),
             )),
+            None,
         );
         let s = load_run_state(&r).unwrap();
         assert_eq!(s.status, crate::state::RunStatus::Stopped);
@@ -1382,6 +1578,7 @@ mod tests {
                 std::io::ErrorKind::ConnectionReset,
                 "reset",
             ))),
+            None,
         );
         let s = load_run_state(&r).unwrap();
         assert_eq!(s.status, crate::state::RunStatus::Running);
@@ -1421,6 +1618,7 @@ mod tests {
                 std::io::ErrorKind::ConnectionReset,
                 "reset",
             ))),
+            None,
         );
         let s = load_run_state(&r).unwrap();
         assert_eq!(s.status, crate::state::RunStatus::Stopped);
@@ -1768,6 +1966,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut r = rec(dir.path());
         r.self_continuation = true;
+        r.execution_repo = Some(implementation_target(dir.path(), "0070"));
         run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
         crate::state::with_run_state_lock(&r, || {
             let mut state = load_run_state(&r)?;
@@ -1802,6 +2001,245 @@ mod tests {
         assert!(body.contains("inject"), "{body}");
         tick(&r).unwrap();
         assert_eq!(super::captured_prompts().len(), 1);
+    }
+
+    #[test]
+    fn initial_implement_capture_uses_prepared_target() {
+        let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path());
+        let product = implementation_target(dir.path(), "0070");
+        r.execution_repo = Some(product.clone());
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.driver = WorkflowDriver::Adapter;
+            state.last_driven_phase = None;
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        let prompts = super::captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(
+            prompts[0].contains(&product.display().to_string()),
+            "{}",
+            prompts[0]
+        );
+        assert!(load_run_state(&r).unwrap().failure_class.is_none());
+    }
+
+    #[test]
+    fn invalid_target_before_capture_claims_no_continuation() {
+        let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        // No conductor.md row exists for this track.
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.driver = WorkflowDriver::Adapter;
+            state.last_driven_phase = Some(crate::workflow::graph::PHASE_IMPLEMENT.into());
+            state.self_check = Some(crate::state::SelfCheckState {
+                steps: 1,
+                pending_inject: true,
+                ..crate::state::SelfCheckState::default()
+            });
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        assert!(super::captured_prompts().is_empty());
+        let state = load_run_state(&r).unwrap();
+        assert_eq!(state.status, RunStatus::Stopped);
+        assert_eq!(state.failure_class, Some(FailureClass::Permission));
+        assert_eq!(
+            state.self_check.unwrap().steps,
+            1,
+            "no continuation claimed"
+        );
+        let artifact = crate::notify::artifact::read(&r)
+            .unwrap()
+            .expect("Permission artifact");
+        assert!(
+            artifact.body.contains("Declare one execution target"),
+            "{}",
+            artifact.body
+        );
+        assert!(
+            artifact.body.contains("repair conductor.md"),
+            "{}",
+            artifact.body
+        );
+        assert!(
+            artifact.body.contains("coordinator failure resolve"),
+            "{}",
+            artifact.body
+        );
+        assert!(
+            artifact.body.contains("coordinator run --track 0070"),
+            "{}",
+            artifact.body
+        );
+    }
+
+    #[test]
+    fn inprocess_resolution_failure_prevents_inject() {
+        let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.driver = WorkflowDriver::Adapter;
+            state.last_driven_phase = None;
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        assert!(
+            super::captured_prompts().is_empty(),
+            "zero prepared prompts"
+        );
+        assert_eq!(
+            load_run_state(&r).unwrap().failure_class,
+            Some(FailureClass::Permission)
+        );
+    }
+
+    #[test]
+    fn manual_prompt_policy_unchanged() {
+        // Manual CLI/HTTP turns and address-ci stay outside target resolution.
+        assert!(!crate::workflow::execution_repo::prepares_target(
+            "address-ci"
+        ));
+        assert!(crate::workflow::execution_repo::prepares_target(
+            "implement"
+        ));
+        assert!(crate::workflow::execution_repo::prepares_target(
+            "address-findings"
+        ));
+    }
+
+    #[test]
+    fn prepared_phase_entry_counts_unchanged_on_invalid_target() {
+        for attempts in [1u32, 2] {
+            let _home = IsolatedHome::enter();
+            let dir = tempdir().unwrap();
+            let r = rec(dir.path());
+            run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+            crate::state::with_run_state_lock(&r, || {
+                let mut state = load_run_state(&r)?;
+                state.phase = crate::workflow::graph::PHASE_ADDRESS_FINDINGS.into();
+                state.driver = WorkflowDriver::Adapter;
+                state.last_driven_phase = None;
+                state.address_findings_attempts = attempts;
+                crate::state::save_run_state(&r, &state)
+            })
+            .unwrap();
+            let _capture = super::arm_capture_prompts();
+            tick(&r).unwrap();
+            assert!(super::captured_prompts().is_empty());
+            let state = load_run_state(&r).unwrap();
+            assert_eq!(state.failure_class, Some(FailureClass::Permission));
+            assert_eq!(
+                state.address_findings_attempts, attempts,
+                "invalid target must not refund or increment entry count"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_application_outside_locks() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.driver = WorkflowDriver::Adapter;
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        // Another task holds the global pool lock while the failure applies.
+        let pool_lock = crate::harness::pool::global_pool().lock().await;
+        let owned = r.clone();
+        let apply = tokio::task::spawn_blocking(move || crate::workflow::tick(&owned));
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), apply).await;
+        assert!(
+            done.is_ok(),
+            "failure application must not wait on the pool lock"
+        );
+        drop(pool_lock);
+        let state = load_run_state(&r).unwrap();
+        assert_eq!(state.status, RunStatus::Stopped);
+        assert_eq!(state.failure_class, Some(FailureClass::Permission));
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+    }
+
+    #[test]
+    fn resolution_failure_is_project_local() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let a = rec(dir_a.path());
+        let b = rec(dir_b.path());
+        run_with_driver(&a, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        run_with_driver(&b, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        for rec in [&a, &b] {
+            crate::state::with_run_state_lock(rec, || {
+                let mut state = load_run_state(rec)?;
+                state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+                state.driver = WorkflowDriver::Adapter;
+                state.last_driven_phase = None;
+                crate::state::save_run_state(rec, &state)
+            })
+            .unwrap();
+        }
+        let b_before = load_run_state(&b).unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&a).unwrap();
+        assert_eq!(
+            load_run_state(&a).unwrap().failure_class,
+            Some(FailureClass::Permission)
+        );
+        let b_after = load_run_state(&b).unwrap();
+        assert_eq!(b_before.phase, b_after.phase);
+        assert_eq!(b_after.failure_class, None);
+    }
+
+    #[test]
+    fn address_ci_remains_prompt_only() {
+        let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_ADDRESS_CI.into();
+            state.driver = WorkflowDriver::Adapter;
+            state.last_driven_phase = None;
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        let prompts = super::captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].contains("address-ci"), "{}", prompts[0]);
+        assert!(
+            load_run_state(&r).unwrap().failure_class.is_none(),
+            "address-ci must not resolve a track target"
+        );
     }
 
     #[test]

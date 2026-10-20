@@ -374,6 +374,9 @@ pub enum ProjectCommands {
     Show {
         #[arg(long)]
         project: Option<String>,
+        /// Read-only resolved execution-target preview for this track.
+        #[arg(long)]
+        track: Option<String>,
     },
     /// Update profile / path bindings (workspace path is immutable)
     Set {
@@ -558,8 +561,9 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 let list = api::project_list()?;
                 println!("{}", serde_json::to_string_pretty(&list)?);
             }
-            ProjectCommands::Show { project } => {
-                let view = api::project_show(project.as_deref(), true)?;
+            ProjectCommands::Show { project, track } => {
+                let view =
+                    api::project_show_with_track(project.as_deref(), track.as_deref(), true)?;
                 println!("{}", serde_json::to_string_pretty(&view)?);
             }
             ProjectCommands::Set {

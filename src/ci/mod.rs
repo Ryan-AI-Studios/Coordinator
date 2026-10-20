@@ -7,7 +7,7 @@ pub mod backend;
 pub mod fix;
 pub mod gh;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -1131,6 +1131,12 @@ fn try_auto_publish_target(
             Ok(AutoPublishDrive::Opened(target))
         }
         Ok(AutoPublishResult::EmptyLeg { event }) => {
+            crate::progress_log::append(
+                record,
+                "ci-wait",
+                &with_primary_target_diagnostic(record, state, event.clone()),
+            );
+            let event = format!("{event}{}", compact_primary_target_note(record, state));
             // An empty leg never had a PR. A run that already recorded one (merged probe failed open)
             // keeps the old latched wait rather than failing a delivered track.
             if pr_hint(state).is_some() {
@@ -1419,6 +1425,77 @@ fn lookup_green_open_pr(record: &ProjectRecord) -> Result<Option<u64>> {
         };
         open_pr_is_green(&state, &GhCli, &cwd)
     }
+}
+
+/// Name both repositories when the CI wait inspected the primary checkout while the
+/// track declared a different target. Diagnostic only: prefix, failure class and
+/// routing are unchanged.
+pub(crate) fn with_primary_target_diagnostic(
+    record: &ProjectRecord,
+    state: &crate::state::RunState,
+    event: String,
+) -> String {
+    let inspected = canonical_for_diagnostic(crate::worktree::product_git_cwd(record));
+    let declared =
+        crate::workflow::execution_repo::resolve_track_target(record, state, &state.phase);
+    match (inspected, declared) {
+        (Some(primary), Ok(target)) => {
+            if crate::worktree::paths_same(&primary, &target.declared_path) {
+                format!(
+                    "{event}; inspected primary={} declared target={}",
+                    primary.display(),
+                    target.declared_path.display()
+                )
+            } else {
+                format!(
+                    "{event}; inspected primary={} but declared target={} (downstream routing is primary/epoch until 0101)",
+                    primary.display(),
+                    target.declared_path.display()
+                )
+            }
+        }
+        (Some(primary), Err(err)) => {
+            format!(
+                "{event}; inspected primary={}; target unresolved: {err}",
+                primary.display()
+            )
+        }
+        (None, _) => format!("{event}; inspected primary=(none)"),
+    }
+}
+
+fn canonical_for_diagnostic(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.map(|path| {
+        dunce::canonicalize(&path)
+            .map(|p| PathBuf::from(dunce::simplified(&p)))
+            .unwrap_or(path)
+    })
+}
+
+/// Compact last_event suffix: preserve the review-verdict tail inside the 200-char cap.
+fn compact_primary_target_note(record: &ProjectRecord, state: &crate::state::RunState) -> String {
+    let inspected = canonical_for_diagnostic(crate::worktree::product_git_cwd(record));
+    let declared =
+        crate::workflow::execution_repo::resolve_track_target(record, state, &state.phase);
+    match (inspected, declared) {
+        (Some(primary), Ok(target))
+            if !crate::worktree::paths_same(&primary, &target.declared_path) =>
+        {
+            format!(
+                "; inspected primary={} declared target={}",
+                short_name(&primary),
+                short_name(&target.declared_path)
+            )
+        }
+        (Some(primary), Err(_)) => format!("; inspected primary={}", short_name(&primary)),
+        _ => String::new(),
+    }
+}
+
+fn short_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 pub(crate) fn with_green_pr_prefix(record: &ProjectRecord, phase: &str, message: String) -> String {
@@ -4045,6 +4122,39 @@ mod tests {
             std::env::remove_var(ENV_COORDINATOR_CI_POLL_MS);
             std::env::remove_var(ENV_COORDINATOR_NOTIFY);
         }
+    }
+
+    #[test]
+    fn wrong_primary_ci_diagnostic_names_both_targets() {
+        let dir = tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let declared = dir.path().join("declared");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&declared).unwrap();
+        let conductor = dir.path().join("conductor");
+        std::fs::create_dir_all(conductor.join("0001-x")).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0001-x](0001-x/spec.md) | `{}` | **Ready - not started** | s |\n",
+                declared.display()
+            ),
+        )
+        .unwrap();
+        let primary = PathBuf::from(dunce::simplified(&dunce::canonicalize(&primary).unwrap()));
+        let declared = PathBuf::from(dunce::simplified(&dunce::canonicalize(&declared).unwrap()));
+        let mut r = rec(dir.path(), true);
+        r.execution_repo = Some(primary.clone());
+        r.conductor_dir = Some(conductor);
+        let mut st = crate::state::RunState::idle(&r.id);
+        st.track_id = Some("0001".into());
+        st.phase = graph::PHASE_CI_WAIT.into();
+        let event =
+            with_primary_target_diagnostic(&r, &st, "ci-wait: empty implement leg".to_string());
+        assert!(event.contains("inspected primary="), "{event}");
+        assert!(event.contains(&primary.display().to_string()), "{event}");
+        assert!(event.contains(&declared.display().to_string()), "{event}");
+        assert!(event.contains("downstream routing is primary/epoch until 0101"));
     }
 
     #[test]
