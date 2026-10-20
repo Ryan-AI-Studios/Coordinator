@@ -140,6 +140,12 @@ pub struct TrackTargetView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub planning_only: bool,
+    /// 0101: the target is the primary or a registered execution binding.
+    #[serde(default)]
+    pub registered: bool,
+    /// 0101: publish/PR/merge/label are permitted for this target.
+    #[serde(default)]
+    pub publishable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -313,15 +319,21 @@ pub fn project_show_with_track(
                 &state,
                 crate::workflow::graph::PHASE_IMPLEMENT,
             ) {
-                Ok(target) => TrackTargetView {
-                    track: track.to_string(),
-                    declared_path: Some(target.declared_path),
-                    prompt_path: Some(target.prompt_path),
-                    sample_path: Some(target.sample_path),
-                    source: Some(target.source.to_string()),
-                    planning_only: target.planning_only,
-                    error: None,
-                },
+                Ok(target) => {
+                    let registered =
+                        crate::workflow::execution_repo::registered_execution_target(&rec, &target);
+                    TrackTargetView {
+                        track: track.to_string(),
+                        declared_path: Some(target.declared_path),
+                        prompt_path: Some(target.prompt_path),
+                        sample_path: Some(target.sample_path),
+                        source: Some(target.source.to_string()),
+                        planning_only: target.planning_only,
+                        registered,
+                        publishable: registered && !target.planning_only,
+                        error: None,
+                    }
+                }
                 Err(err) => TrackTargetView {
                     track: track.to_string(),
                     declared_path: None,
@@ -329,6 +341,8 @@ pub fn project_show_with_track(
                     sample_path: None,
                     source: None,
                     planning_only: false,
+                    registered: false,
+                    publishable: false,
                     error: Some(err.to_string()),
                 },
             };
@@ -980,10 +994,42 @@ pub fn cmd_policy_set(
 /// `policy approve`. Stores nothing when the fingerprint cannot be read.
 pub fn cmd_policy_approve(project: Option<&str>, name: &str, infer_cwd: bool) -> Result<String> {
     let record = resolve_selected(project, infer_cwd)?;
-    let cwd = crate::worktree::product_git_cwd(&record)
-        .ok_or_else(|| CoordinatorError::Message("policy approve: no execution repo".into()))?;
+    // 0101: approve the same repo as the ci-wait policy gate. A non-delivery phase is a
+    // typed error, not a primary fallback. Prefer the ci-wait latch and require agreement.
+    let snapshot = crate::state::load_run_state(&record)?;
+    let gate = crate::workflow::execution_repo::gate_target(&record, &snapshot)
+        .map_err(|err| CoordinatorError::Message(format!("policy approve: {err}")))?;
+    if gate.execution.planning_only {
+        return Err(CoordinatorError::Message(format!(
+            "policy approve: planning-only target {} has no product policy diff",
+            gate.execution.declared_path.display()
+        )));
+    }
+    let mut cwd = gate.execution.sample_path.clone();
+    if let Some(latched) = snapshot.ci.as_ref().and_then(|ci| ci.target_repo.as_ref()) {
+        if !crate::workflow::execution_repo::paths_same(latched, &cwd) {
+            return Err(CoordinatorError::Message(format!(
+                "policy approve: delivery target changed from {} to {} since the ci-wait latch",
+                latched.display(),
+                cwd.display()
+            )));
+        }
+        cwd = latched.clone();
+    }
     crate::state::with_run_state_lock(&record, || {
         let mut state = crate::state::load_run_state(&record)?;
+        let current = crate::workflow::execution_repo::gate_target(&record, &state)
+            .map_err(|err| CoordinatorError::Message(format!("policy approve: {err}")))?;
+        if current.execution.project_id != snapshot.project_id
+            || current.execution.run_epoch != snapshot.run_epoch
+            || current.execution.track_id != gate.execution.track_id
+            || !crate::workflow::execution_repo::paths_same(&current.execution.sample_path, &cwd)
+        {
+            return Err(CoordinatorError::Message(
+                "policy approve: delivery target changed while approving; retry after the run settles"
+                    .into(),
+            ));
+        }
         let fingerprint = crate::policy::approve(&record, &mut state, &cwd, name)?;
         crate::state::save_run_state(&record, &state)?;
         Ok(fingerprint)

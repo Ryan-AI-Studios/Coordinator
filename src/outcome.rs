@@ -438,7 +438,8 @@ fn apply_impl(
         return Ok(ApplyIdentity::Stale("stale-injection".into()));
     };
     if let Some(probe) = commit.reuse_probe.take() {
-        let answer = crate::workflow::reuse::probe_resume(record, probe.number);
+        let answer =
+            crate::workflow::reuse::probe_resume(record, probe.number, probe.repo.as_deref());
         let _guard = apply_lock()
             .lock()
             .map_err(|_| CoordinatorError::Message("outcome apply lock poisoned".into()))?;

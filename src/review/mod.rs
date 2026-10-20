@@ -90,14 +90,22 @@ pub fn drive_with(
     backend: &dyn ReviewBackend,
 ) -> Result<Option<StatusView>> {
     let paths = crate::layout::resolve(record);
-    let Some(exec_repo) = crate::worktree::product_git_cwd(record) else {
-        return apply_failure(
-            record,
-            state,
-            FailureClass::Permission,
-            "cross-model: no execution repo".into(),
-        );
+    // 0101: review the track delivery target. Fail-closed resolution is a Permission with
+    // no backend call and no review mutations.
+    let gate = match crate::workflow::execution_repo::gate_target(record, state) {
+        Ok(gate) => gate,
+        Err(err) => {
+            return apply_failure(
+                record,
+                state,
+                FailureClass::Permission,
+                format!("cross-model: {err}"),
+            );
+        }
     };
+    let _ = crate::workflow::execution_repo::note_gate_target(record, &gate);
+    let target = &gate.execution;
+    let exec_repo = target.prompt_path.clone();
 
     let remaining = remaining_budget(record, state);
     if remaining < MIN_TIER_BUDGET {
@@ -207,7 +215,8 @@ pub fn drive_with(
             TierEval::Finished { class, body } => {
                 let degrade = class == TierClass::GateFail
                     && parse::is_publish_only_fail(&body)
-                    && publish_preconditions_ok(track_dir.as_deref(), &exec_repo);
+                    && !target.planning_only
+                    && publish_preconditions_ok(track_dir.as_deref(), &target.sample_path);
                 let (verdict, event) = if degrade {
                     (
                         "DEGRADED_PUBLISH",
@@ -223,7 +232,11 @@ pub fn drive_with(
                         _ => ("FAIL", format!("cross-model: gate failed ({slug})")),
                     }
                 };
-                let reviewed_oid = exec_head_oid(&exec_repo);
+                let reviewed_oid = if target.planning_only {
+                    None
+                } else {
+                    exec_head_oid(&target.sample_path)
+                };
                 persist_review(record, |rv| {
                     rv.active = Some(slug.to_string());
                     rv.verdict = Some(verdict.into());
@@ -471,7 +484,9 @@ fn write_reports(record: &ProjectRecord, state: &RunState, slug: &str, body: &st
     Ok(())
 }
 
-fn publish_preconditions_ok(track_dir: Option<&Path>, exec_repo: &Path) -> bool {
+/// 0080/0101: the publish-only degrade requires real evidence and a committable-clean
+/// target. `committable_dirt` ignores CRLF phantoms (deferred row 148).
+fn publish_preconditions_ok(track_dir: Option<&Path>, sample_path: &Path) -> bool {
     let Some(dir) = track_dir else {
         return false;
     };
@@ -479,19 +494,10 @@ fn publish_preconditions_ok(track_dir: Option<&Path>, exec_repo: &Path) -> bool 
         Ok(s) => !s.trim().is_empty(),
         Err(_) => false,
     };
-    evidence && git_worktree_clean(exec_repo)
-}
-
-fn git_worktree_clean(exec_repo: &Path) -> bool {
-    let out = crate::git_command::command()
-        .args(["status", "--porcelain"])
-        .current_dir(exec_repo)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
-        _ => false,
-    }
+    evidence
+        && crate::checkpoint::committable_dirt(sample_path)
+            .map(|paths| paths.is_empty())
+            .unwrap_or(false)
 }
 
 /// Execution-repo `HEAD` at verdict time; `None` when unreadable (the label then never applies).
@@ -612,11 +618,75 @@ mod tests {
         r
     }
 
+    fn review_git(cwd: &std::path::Path, args: &[&str]) {
+        let out = crate::git_command::command()
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "probe")
+            .env("GIT_AUTHOR_EMAIL", "probe@example.com")
+            .env("GIT_COMMITTER_NAME", "probe")
+            .env("GIT_COMMITTER_EMAIL", "probe@example.com")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Real temp Git repo + conductor row; cross-model re-resolves when no frozen target.
+    fn seed_review_delivery(r: &ProjectRecord, track: &str) -> std::path::PathBuf {
+        let repo = r.execution_repo.clone().unwrap_or_else(|| r.path.clone());
+        std::fs::create_dir_all(&repo).unwrap();
+        if !repo.join(".git").is_dir() {
+            review_git(&repo, &["init", "-b", "main"]);
+            review_git(&repo, &["config", "user.email", "probe@example.com"]);
+            review_git(&repo, &["config", "user.name", "probe"]);
+            if !repo.join("f.txt").is_file() {
+                std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+            }
+            review_git(&repo, &["add", "."]);
+            review_git(&repo, &["commit", "-m", "base"]);
+        }
+        let conductor = r.path.join("conductor");
+        std::fs::create_dir_all(&conductor).unwrap();
+        let path = conductor.join("conductor.md");
+        let row = format!(
+            "| [{track}-Example]({track}-Example/spec.md) | `{}` | **Ready - not started** | fixture |\n",
+            repo.display()
+        );
+        if !path.is_file() {
+            std::fs::write(
+                &path,
+                format!(
+                    "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n{row}"
+                ),
+            )
+            .unwrap();
+        } else {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if !text.contains(&format!("[{track}-Example]")) {
+                std::fs::write(&path, format!("{text}{row}")).unwrap();
+            }
+        }
+        repo
+    }
+
     fn jump_cross_model(r: &ProjectRecord, driver: WorkflowDriver) {
+        let repo = seed_review_delivery(r, "0011");
         run_with_driver(r, Some("0011".into()), driver).unwrap();
         let mut s = load_run_state(r).unwrap();
         s.phase = graph::PHASE_CROSS_MODEL.into();
         s.last_driven_phase = None;
+        s.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            r,
+            "0011",
+            s.run_epoch,
+            graph::PHASE_CROSS_MODEL,
+            &repo,
+        ));
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&s);
         save_run_state(r, &s).unwrap();
     }
 
@@ -1122,17 +1192,27 @@ mod tests {
     }
 
     #[test]
-    fn missing_execution_repo_is_permission() {
+    fn review_resolution_failure_applies_permission_without_spawn() {
         let (_home, _g) = adapter_env();
         let dir = tempdir().unwrap();
+        // Deliberate row-less failure fixture: the guard is not applied here.
         let r = rec_no_exec(dir.path());
-        jump_cross_model(&r, WorkflowDriver::Adapter);
+        run_with_driver(&r, Some("0011".into()), WorkflowDriver::Adapter).unwrap();
+        let mut s = load_run_state(&r).unwrap();
+        s.phase = graph::PHASE_CROSS_MODEL.into();
+        s.last_driven_phase = None;
+        s.delivery_target = None;
+        save_run_state(&r, &s).unwrap();
         let scripted = ScriptedBackend::new().push_ok(pass_text());
         let (_hook, counts) = hook(scripted);
         let view = crate::workflow::tick(&r).unwrap().expect("perm");
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::Permission));
-        assert!(view.last_event.contains("no execution repo"));
+        assert!(
+            view.last_event.contains("leg repo unresolved:"),
+            "{}",
+            view.last_event
+        );
         assert_eq!(counts.n(), 0);
         clear_env();
     }

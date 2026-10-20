@@ -3,6 +3,8 @@
 //! Phase completion and timeouts are driven by the Phase Outcome apply path
 //! ([`crate::outcome`]) and poll/wait ([`crate::watch`]).
 
+use std::path::PathBuf;
+
 use crate::error::{CoordinatorError, Result};
 use crate::outcome::clear_active_outcome_file;
 use crate::registry::ProjectRecord;
@@ -41,6 +43,7 @@ struct RunProbeCtx {
     number: u64,
     head_sha: String,
     effective_track: String,
+    resume_repo: Option<PathBuf>,
 }
 
 enum RunPrep {
@@ -74,7 +77,11 @@ pub(crate) fn run_with_origin(
     match prep {
         RunPrep::Done(view) => Ok(*view),
         RunPrep::NeedsProbe(ctx) => {
-            let answer = crate::workflow::reuse::probe_resume(record, ctx.number);
+            let answer = crate::workflow::reuse::probe_resume(
+                record,
+                ctx.number,
+                ctx.resume_repo.as_deref(),
+            );
             with_run_state_lock(record, || finish_probed_run(record, &ctx, &answer))
         }
     }
@@ -112,6 +119,7 @@ fn prepare_run_locked(
                     number,
                     head_sha,
                     head_ref: _,
+                    repo,
                 } => {
                     let effective_track = effective.unwrap_or_default();
                     Ok(RunPrep::NeedsProbe(RunProbeCtx {
@@ -124,6 +132,7 @@ fn prepare_run_locked(
                         number,
                         head_sha,
                         effective_track,
+                        resume_repo: repo,
                     }))
                 }
                 crate::workflow::reuse::ResumeChoice::Plan {
@@ -218,6 +227,8 @@ fn begin_fresh_run(
     state.parked_next = None;
     state.last_applied_outcome_hash = None;
     state.ci = None;
+    state.delivery_target = None;
+    state.gate_target_journal = None;
     state.review = None;
     state.stalled_at = None;
     state.pause_spans.clear();
@@ -247,6 +258,21 @@ fn begin_fresh_run(
             ..Default::default()
         });
         state.last_event = format!("run: started {WORKFLOW_ID} resume ci-wait pr {number}");
+        // G2: freeze a ci-wait resume's provenance from tick 0. A planning-only target is
+        // stored too, so the first gate takes its explicit refusal arm. A resolution error
+        // leaves `None` and journals; the first ci-wait gate emits the typed Permission.
+        match crate::workflow::execution_repo::resolve_track_target(
+            record,
+            state,
+            workflow::graph::PHASE_CI_WAIT,
+        ) {
+            Ok(target) => state.delivery_target = Some(target),
+            Err(err) => crate::progress_log::append(
+                record,
+                "reuse",
+                &format!("reuse: ci-wait target unresolved — {err}"),
+            ),
+        }
     }
     state.updated_at = chrono::Utc::now();
     clear_active_outcome_file(record);
@@ -363,7 +389,8 @@ pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
     match prep {
         ResumePrep::Done(view) => Ok(*view),
         ResumePrep::Probe(probe) => {
-            let answer = crate::workflow::reuse::probe_resume(record, probe.number);
+            let answer =
+                crate::workflow::reuse::probe_resume(record, probe.number, probe.repo.as_deref());
             with_run_state_lock(record, || {
                 crate::workflow::commit_probed_successor(record, &probe, &answer)
             })

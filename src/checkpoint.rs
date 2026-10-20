@@ -3,6 +3,11 @@
 //! The ref is `refs/coordinator/checkpoints/{project_id}/{epoch}`. Create runs
 //! only from the fold → implement edge. Restore is operator-only. Reap helpers
 //! do not take [`with_run_state_lock`].
+//!
+//! 0101: create, restore and reap act on the track delivery target, not on
+//! `product_git_cwd`. A non-adapter run (stub / file_wait) has no delivery target and
+//! keeps the legacy primary/epoch path. A sibling ref is never reaped outside
+//! `refs/coordinator/checkpoints/<project>/`.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +16,11 @@ use crate::registry::ProjectRecord;
 use crate::state::{
     RunState, RunStatus, StatusView, load_run_state, save_run_state, with_run_state_lock,
 };
+use crate::workflow::WorkflowDriver;
+use crate::workflow::execution_repo::{
+    ResolvedExecution, resolve_track_target, uses_delivery_target,
+};
+use crate::workflow::graph::PHASE_IMPLEMENT;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const DIRT_PATH_CAP: usize = 20;
@@ -23,7 +33,40 @@ pub(crate) fn ref_name(project_id: &str, epoch: u64) -> String {
 ///
 /// Does not take the run-state lock. On failure the caller keeps phase `fold`.
 pub(crate) fn ensure_implement_ref(record: &ProjectRecord, state: &mut RunState) -> Result<()> {
-    let cwd = require_cwd(record)?;
+    // Only an adapter leg is a delivery leg. Stub / file_wait keep the legacy path and
+    // store no target.
+    let target = if state.driver == WorkflowDriver::Adapter {
+        let track = state.track_id.as_deref().unwrap_or("<id>");
+        let target = resolve_track_target(record, state, PHASE_IMPLEMENT).map_err(|e| {
+            CoordinatorError::Message(format!(
+                "{e}; declare one execution target, then `coordinator failure resolve` and \
+                 `coordinator run --track {track}`"
+            ))
+        })?;
+        Some(target)
+    } else {
+        None
+    };
+    if let Some(target) = &target {
+        state.delivery_target = Some(target.clone());
+        state.gate_target_journal = None;
+        if target.planning_only {
+            // No product delivery: skip the ref. The implement gate also skips.
+            crate::progress_log::append(
+                record,
+                "checkpoint",
+                &format!(
+                    "checkpoint: skipped planning-only target {}",
+                    target.declared_path.display()
+                ),
+            );
+            return Ok(());
+        }
+    }
+    let cwd = match &target {
+        Some(target) => target.sample_path.clone(),
+        None => require_cwd(record)?,
+    };
     let sha = git_ok(&cwd, &["rev-parse", "HEAD"])?;
     let sha = sha.trim();
     if sha.is_empty() {
@@ -73,14 +116,49 @@ fn restore_locked(record: &ProjectRecord, discard: bool) -> Result<StatusView> {
     if let Some(msg) = persist_blocks(record)? {
         return refuse(record, &msg);
     }
-    let cwd = match require_cwd(record) {
-        Ok(cwd) => cwd,
-        Err(e) => return refuse(record, &e.to_string()),
+    // Prefer the frozen target; otherwise re-resolve the current delivery phase, or the
+    // fold -> implement edge for a non-delivery phase. A non-adapter run keeps legacy.
+    let target: Option<ResolvedExecution> = if state.driver == WorkflowDriver::Adapter {
+        let stored = state.delivery_target.as_ref().filter(|target| {
+            target.project_id == record.id
+                && target.run_epoch == state.run_epoch
+                && state.track_id.as_deref() == Some(target.track_id.as_str())
+        });
+        if let Some(stored) = stored {
+            Some(stored.clone())
+        } else {
+            let phase = if uses_delivery_target(&state.phase) {
+                state.phase.clone()
+            } else {
+                PHASE_IMPLEMENT.to_string()
+            };
+            match resolve_track_target(record, &state, &phase) {
+                Ok(target) => Some(target),
+                Err(e) => return refuse(record, &e.to_string()),
+            }
+        }
+    } else {
+        None
+    };
+    let cwd = match &target {
+        Some(target) => target.sample_path.clone(),
+        None => match require_cwd(record) {
+            Ok(cwd) => cwd,
+            Err(e) => return refuse(record, &e.to_string()),
+        },
     };
     let name = ref_name(&record.id, state.run_epoch);
     let sha = match git(&cwd, &["rev-parse", "--verify", "--quiet", &name]) {
         Ok(out) if out.ok && !out.stdout.trim().is_empty() => out.stdout.trim().to_string(),
-        Ok(_) => return refuse(record, "restore refused: no checkpoint for this epoch"),
+        Ok(_) => {
+            return refuse(
+                record,
+                &format!(
+                    "restore refused: no checkpoint for this epoch in {}",
+                    cwd.display()
+                ),
+            );
+        }
         Err(e) => return refuse(record, &e.to_string()),
     };
     if !discard {
@@ -172,27 +250,73 @@ pub(crate) fn reap_abandoned(record: &ProjectRecord, next_epoch: u64) -> Result<
 }
 
 fn reap(record: &ProjectRecord, drop_epoch: impl Fn(Option<u64>) -> bool) -> Result<()> {
-    let Some(cwd) = git_cwd(record) else {
-        return Ok(());
-    };
-    let refs = match list_refs(&cwd, &record.id) {
-        Ok(refs) => refs,
-        Err(e) => {
-            crate::progress_log::append(record, "checkpoint-reap", &e.to_string());
-            return Ok(());
+    // Candidates: the stored delivery target, the current primary/epoch, and every
+    // registered binding. Each is deduped by `paths_same`; one repo's failure is journalled
+    // and never fails the advance.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(state) = load_run_state(record)
+        && let Some(target) = state.delivery_target
+    {
+        candidates.push(target.sample_path);
+    }
+    if let Some(cwd) = git_cwd(record) {
+        candidates.push(cwd);
+    }
+    for binding in record.execution_repos.values() {
+        if let Some(top) = git_toplevel(binding) {
+            candidates.push(top);
+        } else if binding.is_dir() {
+            candidates.push(binding.clone());
         }
-    };
+    }
+    let mut deduped: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if !deduped
+            .iter()
+            .any(|existing| crate::workflow::execution_repo::paths_same(existing, &candidate))
+        {
+            deduped.push(candidate);
+        }
+    }
     let prefix = format!("refs/coordinator/checkpoints/{}/", record.id);
-    for name in refs {
-        if !name.starts_with(&prefix) {
-            continue;
-        }
-        let epoch = name.rsplit('/').next().and_then(|s| s.parse().ok());
-        if drop_epoch(epoch) {
-            delete_ref(record, &cwd, &name);
+    for cwd in deduped {
+        let refs = match list_refs(&cwd, &record.id) {
+            Ok(refs) => refs,
+            Err(e) => {
+                crate::progress_log::append(
+                    record,
+                    "checkpoint-reap",
+                    &format!("{} ({})", e, cwd.display()),
+                );
+                continue;
+            }
+        };
+        for name in refs {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let epoch = name.rsplit('/').next().and_then(|s| s.parse().ok());
+            if drop_epoch(epoch) {
+                delete_ref(record, &cwd, &name);
+            }
         }
     }
     Ok(())
+}
+
+fn git_toplevel(path: &Path) -> Option<PathBuf> {
+    let out = git(path, &["rev-parse", "--show-toplevel"]).ok()?;
+    if !out.ok {
+        return None;
+    }
+    let text = out.stdout.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(text);
+    dunce::canonicalize(&path)
+        .ok()
+        .map(|p| PathBuf::from(dunce::simplified(&p)))
 }
 
 fn list_refs(cwd: &Path, project_id: &str) -> Result<Vec<String>> {
@@ -228,6 +352,8 @@ fn delete_ref(record: &ProjectRecord, cwd: &Path, name: &str) {
     }
 }
 
+/// Legacy primary/epoch checkout. Gates must not use this for delivery routing; it is
+/// kept for non-adapter restore and for the documented legacy cleanup fallback.
 pub(crate) fn require_cwd(record: &ProjectRecord) -> Result<PathBuf> {
     match git_cwd(record) {
         Some(cwd) => Ok(cwd),

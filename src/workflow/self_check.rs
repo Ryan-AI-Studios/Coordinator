@@ -231,6 +231,7 @@ pub fn hold_continue(
     injected_phase: &str,
     stop_reason: Option<&str>,
     text: &str,
+    target: Option<&crate::workflow::execution_repo::ResolvedExecution>,
 ) -> Result<bool> {
     let preview = load_run_state(record)?;
     if decide(record, &preview, injected_phase, stop_reason, text) != Decide::ContinueStep {
@@ -244,7 +245,7 @@ pub fn hold_continue(
         let Some(Line::Continue { finding, action }) = parse_line(text) else {
             return Ok(false);
         };
-        let cost = measure(record, &state);
+        let cost = measure(record, &state, target);
         let prev = state.self_check.clone().unwrap_or_default();
         let repairs_in_a_row = if action == Action::Repair {
             prev.repairs_in_a_row.saturating_add(1)
@@ -338,13 +339,20 @@ fn classify(
     }
 }
 
-fn measure(record: &ProjectRecord, state: &RunState) -> StepCost {
-    let (diff_fp, diff_unreadable) = match crate::worktree::product_git_cwd(record) {
-        Some(cwd) => match diff_fingerprint(&cwd) {
+fn measure(
+    record: &ProjectRecord,
+    state: &RunState,
+    target: Option<&crate::workflow::execution_repo::ResolvedExecution>,
+) -> StepCost {
+    // The passed target is the turn's frozen delivery target. No target (planning-only or
+    // legacy) means no fingerprint: `Plateau` can never fire for that leg. A present
+    // target whose Git read fails stays `diff_unreadable` (the existing DIFF_UNREADABLE).
+    let (diff_fp, diff_unreadable) = match target {
+        Some(target) if !target.planning_only => match diff_fingerprint(&target.sample_path) {
             Ok(fp) => (Some(fp), false),
             Err(()) => (None, true),
         },
-        None => (None, false),
+        _ => (None, false),
     };
     let (tools_ms, lines) = journal_tail(record, state);
     let start = state
@@ -847,11 +855,19 @@ mod tests {
             "{\"dur_ms\":10,\"ok\":true}\n{\"dur_ms\":25,\"ok\":true}\n",
         )
         .unwrap();
+        let target = crate::workflow::execution_repo::seeded_delivery_target(
+            &rec,
+            "0070",
+            state.run_epoch,
+            PHASE_IMPLEMENT,
+            bad_git.path(),
+        );
         let held = hold_continue(
             &rec,
             PHASE_IMPLEMENT,
             Some("end_turn"),
             "self-check: continue finding=F11 action=repair",
+            Some(&target),
         )
         .unwrap();
         assert!(held);

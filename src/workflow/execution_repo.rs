@@ -10,22 +10,39 @@
 //! relative value anchors at the record path (so `.` is the workspace, not the primary
 //! product repo). Everything is read-only: resolution never creates a directory,
 //! mutates a layout profile or falls back to the harness session cwd.
+//!
+//! 0101 adds one stable delivery provenance. `gate_target` freezes `RunState.delivery_target`
+//! for local gates and re-resolves only to validate; `mutation_target` always re-resolves
+//! `conductor.md` immediately before a remote mutation and refuses a target that does not
+//! equal both the frozen value and the `ci-wait` latch.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::registry::ProjectRecord;
-use crate::state::RunState;
+use crate::state::{RunState, with_run_state_lock};
 
-use super::graph::{PHASE_ADDRESS_FINDINGS, PHASE_IMPLEMENT, resolve_track_dir};
+use super::graph::{
+    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_CI_WAIT, PHASE_CROSS_MODEL, PHASE_IMPLEMENT,
+    resolve_track_dir,
+};
 
 /// Stable resolution-error prefix (diagnostics and tests key on it).
 pub const RESOLUTION_PREFIX: &str = "leg repo unresolved:";
 
-/// Prepared phases are exactly the adapter phases whose delivery this track samples.
+/// Prepared phases are the adapter phases that receive a prepared prompt/target root.
+/// 0101 adds `address-ci`: its leg is graded where it wrote.
 pub fn prepares_target(phase: &str) -> bool {
-    matches!(phase, PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS)
+    matches!(
+        phase,
+        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS | PHASE_ADDRESS_CI
+    )
+}
+
+/// Phases whose gates may read the frozen delivery target.
+pub fn uses_delivery_target(phase: &str) -> bool {
+    prepares_target(phase) || matches!(phase, PHASE_CROSS_MODEL | PHASE_CI_WAIT)
 }
 
 /// Where the declared target came from.
@@ -282,6 +299,304 @@ pub fn resolve_track_target(
     })
 }
 
+/// Where a gate target came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetProvenance {
+    Frozen,
+    ReResolved,
+}
+
+impl TargetProvenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Frozen => "frozen",
+            Self::ReResolved => "re-resolved",
+        }
+    }
+}
+
+impl std::fmt::Display for TargetProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A validated target for one gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateTarget {
+    pub execution: ResolvedExecution,
+    pub provenance: TargetProvenance,
+    pub registered: bool,
+}
+
+/// Typed refusal for a remote mutation (spec §3.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationRefusal {
+    NotDeliveryPhase(String),
+    Unresolved(RepoResolutionError),
+    PlanningOnly(PathBuf),
+    Unregistered(PathBuf),
+    Changed { from: Option<PathBuf>, to: PathBuf },
+}
+
+impl std::fmt::Display for MutationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotDeliveryPhase(phase) => write!(f, "phase {phase} has no delivery target"),
+            Self::Unresolved(err) => write!(f, "{err}"),
+            Self::PlanningOnly(declared) => write!(
+                f,
+                "planning-only track has no product delivery to publish (target {})",
+                declared.display()
+            ),
+            Self::Unregistered(declared) => write!(
+                f,
+                "target {} is not a registered execution binding; register it (project add/set) \
+                 or declare a registered target",
+                declared.display()
+            ),
+            Self::Changed { from, to } => write!(
+                f,
+                "execution target changed from {} to {} since the ci-wait target was latched",
+                from.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<none>".into()),
+                to.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MutationRefusal {}
+
+/// Compare the repository identity of two targets. Phase is ignored: implement and
+/// address-ci are different phases on the same delivery repo.
+pub fn same_delivery_repo(a: &ResolvedExecution, b: &ResolvedExecution) -> bool {
+    paths_same(&a.declared_path, &b.declared_path)
+        && paths_same(&a.prompt_path, &b.prompt_path)
+        && paths_same(&a.sample_path, &b.sample_path)
+}
+
+/// True when the target is the primary execution repo or lies under a registered
+/// `execution_repos` binding. The binding's Git toplevel also counts.
+pub fn registered_execution_target(record: &ProjectRecord, target: &ResolvedExecution) -> bool {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let paths = crate::layout::resolve(record);
+    if let Some(primary) = paths.execution_repo {
+        roots.push(primary);
+    }
+    if let Some(primary) = &record.execution_repo {
+        roots.push(primary.clone());
+    }
+    roots.extend(record.execution_repos.values().cloned());
+    let declared = &target.declared_path;
+    let sample = &target.sample_path;
+    for root in roots {
+        if paths_same(declared, &root) || path_under(declared, &root) {
+            return true;
+        }
+        let toplevel = git_toplevel(&root).unwrap_or_else(|| root.clone());
+        if paths_same(declared, &toplevel) || path_under(declared, &toplevel) {
+            return true;
+        }
+        if paths_same(sample, &toplevel) || path_under(sample, &toplevel) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The delivery gate target for a read path.
+///
+/// Rule 1: a frozen `delivery_target` with the pinned `(project, epoch, track)` and a
+/// delivery phase is authority as-is. Rule 2: otherwise re-resolve `state.phase` and
+/// validate the full identity. Rule 3: a non-delivery phase is a typed error.
+pub fn gate_target(
+    record: &ProjectRecord,
+    state: &RunState,
+) -> Result<GateTarget, RepoResolutionError> {
+    if !uses_delivery_target(&state.phase) {
+        return Err(RepoResolutionError::new(
+            state.track_id.as_deref(),
+            format!("phase {} has no delivery target", state.phase),
+        ));
+    }
+    if let Some(frozen) = state.delivery_target.as_ref()
+        && frozen.project_id == record.id
+        && frozen.run_epoch == state.run_epoch
+        && state.track_id.as_deref() == Some(frozen.track_id.as_str())
+        && uses_delivery_target(&frozen.phase)
+    {
+        return Ok(GateTarget {
+            registered: registered_execution_target(record, frozen),
+            execution: frozen.clone(),
+            provenance: TargetProvenance::Frozen,
+        });
+    }
+    let target = resolve_track_target(record, state, &state.phase)?;
+    if target.project_id != record.id
+        || target.run_epoch != state.run_epoch
+        || state.track_id.as_deref() != Some(target.track_id.as_str())
+        || target.phase != state.phase
+    {
+        return Err(RepoResolutionError::new(
+            Some(target.track_id.as_str()),
+            "resolved target identity does not match the pinned run state",
+        ));
+    }
+    Ok(GateTarget {
+        registered: registered_execution_target(record, &target),
+        execution: target,
+        provenance: TargetProvenance::ReResolved,
+    })
+}
+
+/// Re-resolve immediately before a remote mutation and require the fresh target to
+/// equal the frozen value (when present) and the `ci-wait` latch (when present).
+///
+/// G1: `delivery_target = None` (legacy state or an 0083 ci-wait resume) is valid; the
+/// fresh target is validated against the latch/registration and never against
+/// `product_git_cwd`.
+pub fn mutation_target(
+    record: &ProjectRecord,
+    state: &RunState,
+    latched: Option<&Path>,
+) -> Result<GateTarget, MutationRefusal> {
+    if !uses_delivery_target(&state.phase) {
+        return Err(MutationRefusal::NotDeliveryPhase(state.phase.clone()));
+    }
+    let fresh =
+        resolve_track_target(record, state, &state.phase).map_err(MutationRefusal::Unresolved)?;
+    if fresh.project_id != record.id
+        || fresh.run_epoch != state.run_epoch
+        || state.track_id.as_deref() != Some(fresh.track_id.as_str())
+        || fresh.phase != state.phase
+    {
+        return Err(MutationRefusal::Unresolved(RepoResolutionError::new(
+            Some(fresh.track_id.as_str()),
+            "resolved target identity does not match the pinned run state",
+        )));
+    }
+    if fresh.planning_only {
+        return Err(MutationRefusal::PlanningOnly(fresh.declared_path));
+    }
+    if !registered_execution_target(record, &fresh) {
+        return Err(MutationRefusal::Unregistered(fresh.declared_path));
+    }
+    if let Some(frozen) = state.delivery_target.as_ref()
+        && !same_delivery_repo(&fresh, frozen)
+    {
+        return Err(MutationRefusal::Changed {
+            from: Some(frozen.declared_path.clone()),
+            to: fresh.declared_path.clone(),
+        });
+    }
+    if let Some(latched) = latched
+        && !paths_same(&fresh.sample_path, latched)
+    {
+        return Err(MutationRefusal::Changed {
+            from: Some(latched.to_path_buf()),
+            to: fresh.declared_path.clone(),
+        });
+    }
+    Ok(GateTarget {
+        registered: true,
+        execution: fresh,
+        provenance: TargetProvenance::ReResolved,
+    })
+}
+
+/// One persisted memo key per `(track, phase, provenance, repo)`.
+pub fn gate_target_journal_key(gate: &GateTarget) -> String {
+    let sample = gate
+        .execution
+        .sample_path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    format!(
+        "{}|{}|{}|{}",
+        gate.execution.track_id, gate.execution.phase, gate.provenance, sample
+    )
+}
+
+/// Journal a gate target once, on first non-frozen use or a repo change. The memo is
+/// persisted by the caller's existing locked write.
+pub fn journal_gate_target(
+    record: &ProjectRecord,
+    state: &mut RunState,
+    gate: &GateTarget,
+) -> bool {
+    let key = gate_target_journal_key(gate);
+    if state.gate_target_journal.as_deref() == Some(key.as_str()) {
+        return false;
+    }
+    crate::progress_log::append(
+        record,
+        "gate-target",
+        &format!(
+            "gate-target: track={} phase={} provenance={} repo={} source={}",
+            gate.execution.track_id,
+            gate.execution.phase,
+            gate.provenance,
+            gate.execution.sample_path.display(),
+            gate.execution.source
+        ),
+    );
+    state.gate_target_journal = Some(key);
+    true
+}
+
+/// Journal through the run-state lock for gates that do not already hold it.
+pub fn note_gate_target(record: &ProjectRecord, gate: &GateTarget) -> crate::error::Result<()> {
+    with_run_state_lock(record, || {
+        let mut state = crate::state::load_run_state(record)?;
+        if journal_gate_target(record, &mut state, gate) {
+            state.updated_at = chrono::Utc::now();
+            crate::state::save_run_state(record, &state)?;
+        }
+        Ok(())
+    })
+}
+
+/// Test constructor for a fixture delivery target. The repo should be a real temp Git
+/// repo when the gate reads HEAD or dirt.
+#[cfg(test)]
+pub(crate) fn seeded_delivery_target(
+    record: &ProjectRecord,
+    track: &str,
+    epoch: u64,
+    phase: &str,
+    repo: &Path,
+) -> ResolvedExecution {
+    let declared = dunce::canonicalize(repo)
+        .map(|p| PathBuf::from(dunce::simplified(&p)))
+        .unwrap_or_else(|_| repo.to_path_buf());
+    let sample = git_toplevel(&declared).unwrap_or_else(|| declared.clone());
+    ResolvedExecution {
+        project_id: record.id.clone(),
+        run_epoch: epoch,
+        phase: phase.into(),
+        track_id: track.into(),
+        declared_path: declared.clone(),
+        prompt_path: declared,
+        sample_path: sample,
+        source: ResolutionSource::RowExecution,
+        planning_only: false,
+        late_metadata: Vec::new(),
+    }
+}
+
+/// Fixture guard (spec §3.7): a delivery-phase fixture must seed `delivery_target`.
+#[cfg(test)]
+pub(crate) fn assert_fixture_has_delivery_target(state: &RunState) {
+    assert!(
+        !uses_delivery_target(&state.phase) || state.delivery_target.is_some(),
+        "fixture state for phase {} has no delivery_target; use seeded_delivery_target",
+        state.phase
+    );
+}
+
 /// The project layout default, made explicit. MultiSibling without an explicit
 /// `execution_repo` is ambiguous when more than one binding exists and must fail
 /// rather than take the BTreeMap-first repo.
@@ -402,7 +717,7 @@ fn prompt_and_sample_paths(
 ) -> Result<(PathBuf, PathBuf), String> {
     let isolation = crate::worktree::isolation_enabled(record)
         .map_err(|e| format!("worktree isolation setting is invalid: {e}"))?;
-    if !isolation || !prepares_target(phase) {
+    if !isolation || !uses_delivery_target(phase) {
         let sample = git_toplevel(declared).unwrap_or_else(|| declared.to_path_buf());
         return Ok((declared.to_path_buf(), sample));
     }
