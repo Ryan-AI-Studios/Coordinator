@@ -2587,6 +2587,7 @@ mod tests {
         tick(&r).unwrap();
         assert_eq!(super::captured_prompts().len(), 1);
         let saved = load_run_state(&r).unwrap();
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&saved);
         assert_eq!(saved.address_findings_attempts, 0);
         assert_eq!(saved.ci_fix_attempts, 1);
         assert_eq!(

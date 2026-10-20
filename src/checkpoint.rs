@@ -823,6 +823,33 @@ mod tests {
     }
 
     #[test]
+    fn planning_only_target_skips_the_checkpoint_ref() {
+        let (primary, sibling, ws, _state, rec) = sibling_fixture();
+        std::fs::write(
+            ws.path().join("conductor").join("conductor.md"),
+            "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0001-One](0001-One/spec.md) | `.` | **Ready — not started** | ok |\n",
+        )
+        .unwrap();
+        save_adapter_phase(&rec, RunStatus::Running, PHASE_FOLD, 1);
+        let mut state = load_run_state(&rec).unwrap();
+        ensure_implement_ref(&rec, &mut state).unwrap();
+        assert!(
+            state
+                .delivery_target
+                .as_ref()
+                .is_some_and(|target| target.planning_only)
+        );
+        let name = ref_name(&rec.id, 1);
+        for repo in [primary.path(), sibling.path(), ws.path()] {
+            assert!(
+                !git(repo, &["rev-parse", "--verify", "--quiet", &name])
+                    .unwrap()
+                    .ok
+            );
+        }
+    }
+
+    #[test]
     fn checkpoint_resolution_failure_is_permission() {
         let (repo, _sibling, ws, _state, rec) = sibling_fixture();
         let track = ws.path().join("conductor").join("0001-One");

@@ -573,6 +573,94 @@ mod tests {
         assert!(log.contains("stop  track=0004"));
     }
 
+    fn fresh_ci_fixture(cell: &str) -> (tempfile::TempDir, tempfile::TempDir, ProjectRecord) {
+        let ws = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(repo.path().join("f.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let conductor = ws.path().join("conductor");
+        std::fs::create_dir_all(conductor.join("0101-Example")).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0101-Example](0101-Example/spec.md) | {cell} | **Ready - not started** | s |\n"
+            ),
+        )
+        .unwrap();
+        let mut r = rec(ws.path());
+        r.execution_repo = Some(repo.path().to_path_buf());
+        (ws, repo, r)
+    }
+
+    #[test]
+    fn ci_wait_resume_seeds_the_delivery_target() {
+        let (ws, repo, r) = fresh_ci_fixture("`not-a-target`");
+        std::fs::write(
+            ws.path().join("conductor").join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0101-Example](0101-Example/spec.md) | `{}` | **Ready - not started** | s |\n",
+                repo.path().display()
+            ),
+        )
+        .unwrap();
+        let mut state = RunState::idle(&r.id);
+        let view = begin_fresh_run(
+            &r,
+            &mut state,
+            FreshRun {
+                track_arg: Some("0101".into()),
+                driver: WorkflowDriver::Adapter,
+                picked: false,
+                archive_slugs: Vec::new(),
+                journal_unreadable: false,
+                ci_wait: Some((7, "abc".into())),
+            },
+        )
+        .unwrap();
+        assert_eq!(view.phase, crate::workflow::graph::PHASE_CI_WAIT);
+        let saved = load_run_state(&r).unwrap();
+        assert!(saved.delivery_target.as_ref().is_some_and(|target| {
+            crate::workflow::execution_repo::paths_same(&target.declared_path, repo.path())
+        }));
+    }
+
+    #[test]
+    fn ci_wait_resume_unresolved_keeps_none_and_journals() {
+        let (_ws, _repo, r) = fresh_ci_fixture("`not-a-target`");
+        let mut state = RunState::idle(&r.id);
+        begin_fresh_run(
+            &r,
+            &mut state,
+            FreshRun {
+                track_arg: Some("0101".into()),
+                driver: WorkflowDriver::Adapter,
+                picked: false,
+                archive_slugs: Vec::new(),
+                journal_unreadable: false,
+                ci_wait: Some((7, "abc".into())),
+            },
+        )
+        .unwrap();
+        let saved = load_run_state(&r).unwrap();
+        assert!(saved.delivery_target.is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap_or_default();
+        assert!(log.contains("reuse: ci-wait target unresolved"), "{log}");
+    }
+
     #[test]
     fn fresh_run_clears_state_gate_and_keeps_durable_policy_state() {
         let dir = tempdir().unwrap();

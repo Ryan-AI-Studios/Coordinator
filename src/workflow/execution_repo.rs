@@ -352,7 +352,7 @@ impl std::fmt::Display for MutationRefusal {
             Self::Unregistered(declared) => write!(
                 f,
                 "target {} is not a registered execution binding; register it (project add/set) \
-                 or declare a registered target",
+                 or declare a registered target, then failure resolve and run --track <id>",
                 declared.display()
             ),
             Self::Changed { from, to } => write!(
@@ -392,14 +392,21 @@ pub fn registered_execution_target(record: &ProjectRecord, target: &ResolvedExec
     let declared = &target.declared_path;
     let sample = &target.sample_path;
     for root in roots {
-        if paths_same(declared, &root) || path_under(declared, &root) {
+        // The common case is an exact binding or a subdirectory of it; avoid spawning
+        // `git rev-parse` on every poll tick unless the direct compare misses.
+        if paths_same(declared, &root)
+            || path_under(declared, &root)
+            || paths_same(sample, &root)
+            || path_under(sample, &root)
+        {
             return true;
         }
         let toplevel = git_toplevel(&root).unwrap_or_else(|| root.clone());
-        if paths_same(declared, &toplevel) || path_under(declared, &toplevel) {
-            return true;
-        }
-        if paths_same(sample, &toplevel) || path_under(sample, &toplevel) {
+        if paths_same(declared, &toplevel)
+            || path_under(declared, &toplevel)
+            || paths_same(sample, &toplevel)
+            || path_under(sample, &toplevel)
+        {
             return true;
         }
     }
@@ -483,13 +490,17 @@ pub fn mutation_target(
     if !registered_execution_target(record, &fresh) {
         return Err(MutationRefusal::Unregistered(fresh.declared_path));
     }
-    if let Some(frozen) = state.delivery_target.as_ref()
-        && !same_delivery_repo(&fresh, frozen)
-    {
-        return Err(MutationRefusal::Changed {
-            from: Some(frozen.declared_path.clone()),
-            to: fresh.declared_path.clone(),
-        });
+    if let Some(frozen) = state.delivery_target.as_ref() {
+        let identity_matches = frozen.project_id == record.id
+            && frozen.run_epoch == state.run_epoch
+            && frozen.track_id == fresh.track_id
+            && uses_delivery_target(&frozen.phase);
+        if !identity_matches || !same_delivery_repo(&fresh, frozen) {
+            return Err(MutationRefusal::Changed {
+                from: Some(frozen.declared_path.clone()),
+                to: fresh.declared_path.clone(),
+            });
+        }
     }
     if let Some(latched) = latched
         && !paths_same(&fresh.sample_path, latched)
@@ -527,6 +538,11 @@ pub fn journal_gate_target(
     state: &mut RunState,
     gate: &GateTarget,
 ) -> bool {
+    // A frozen target is the leg's own recorded provenance: no re-resolution happened and
+    // the repo cannot change, so it never needs a journal line.
+    if gate.provenance == TargetProvenance::Frozen {
+        return false;
+    }
     let key = gate_target_journal_key(gate);
     if state.gate_target_journal.as_deref() == Some(key.as_str()) {
         return false;
@@ -2199,6 +2215,27 @@ mod tests {
             gate_target(&rec, &state).unwrap().provenance,
             TargetProvenance::Frozen
         );
+    }
+
+    #[test]
+    fn gate_target_journal_is_bounded_by_the_memo() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let sibling = product_repo(&dir.path().join("sibling"));
+        let rec = stateful_record(dir.path(), &primary, &sibling);
+        write_row(dir.path(), &sibling);
+        let state = running("0099-Example");
+        let gate = gate_target(&rec, &state).unwrap();
+        let mut journal_state = state.clone();
+        assert!(journal_gate_target(&rec, &mut journal_state, &gate));
+        assert!(!journal_gate_target(&rec, &mut journal_state, &gate));
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap_or_default();
+        assert_eq!(log.matches("gate-target:").count(), 1, "{log}");
+        // A frozen target never journals.
+        let mut frozen_state = state.clone();
+        frozen_state.delivery_target = Some(gate.execution.clone());
+        let frozen = gate_target(&rec, &frozen_state).unwrap();
+        assert!(!journal_gate_target(&rec, &mut frozen_state, &frozen));
     }
 
     #[test]

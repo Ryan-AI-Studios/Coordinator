@@ -180,10 +180,9 @@ pub fn drive_with(
         );
     }
     if latched.is_none() {
-        let latch = cwd.clone();
-        persist_watch(record, None, |ci| {
-            ci.target_repo = Some(latch);
-        })?;
+        // G1: the first latch also freezes the target that the caller is about to mutate
+        // for, in the same locked write; `None`/`None` is not a wildcard afterwards.
+        latch_ci_target(record, &gate.execution)?;
     }
 
     let head_gate = crate::policy::decide(record, state, &cwd, "HEAD");
@@ -219,7 +218,7 @@ pub fn drive_with(
                 }
             };
             let publish_cwd = publish_target.execution.sample_path.clone();
-            match try_auto_publish_target(record, state, backend, &publish_cwd, now, &publish_cwd) {
+            match try_auto_publish_target(record, state, backend, &publish_cwd, now) {
                 Ok(AutoPublishDrive::Opened(t)) => {
                     if let CiTarget::PullRequest { number, .. } = &t {
                         just_opened = Some(*number);
@@ -1144,7 +1143,6 @@ fn try_auto_publish_target(
     backend: &dyn CiBackend,
     cwd: &Path,
     now: chrono::DateTime<Utc>,
-    repo: &Path,
 ) -> Result<AutoPublishDrive> {
     let Some(numeric) = state
         .track_id
@@ -1189,7 +1187,7 @@ fn try_auto_publish_target(
                 CiTarget::HeadSha { .. } => 0,
             };
             if let Some(id) = state.track_id.as_deref() {
-                crate::workflow::reuse::note_ci_target(record, id, &target, Some(repo));
+                crate::workflow::reuse::note_ci_target(record, id, &target, Some(cwd));
             }
             persist_watch(record, Some(&format!("ci-wait: opened #{n}")), |ci| {
                 apply_target(ci, &target);
@@ -1337,6 +1335,25 @@ fn stamp_poll(
     ci.next_interval_ms = Some(interval);
 }
 
+/// Latch the delivery repo and (when absent) the frozen target in one locked write.
+fn latch_ci_target(
+    record: &ProjectRecord,
+    target: &crate::workflow::execution_repo::ResolvedExecution,
+) -> Result<()> {
+    with_run_state_lock(record, || {
+        let mut state = load_run_state(record)?;
+        let mut ci = state.ci.take().unwrap_or_default();
+        ci.target_repo = Some(target.sample_path.clone());
+        if state.delivery_target.is_none() {
+            state.delivery_target = Some(target.clone());
+            state.gate_target_journal = None;
+        }
+        state.ci = Some(ci);
+        state.updated_at = Utc::now();
+        save_run_state(record, &state)
+    })
+}
+
 fn persist_target(record: &ProjectRecord, target: &CiTarget, repo: &Path) -> Result<()> {
     if let Ok(state) = load_run_state(record)
         && let Some(id) = state.track_id.as_deref()
@@ -1392,14 +1409,15 @@ fn apply_mutation_refusal(
     action: &str,
     refusal: &crate::workflow::execution_repo::MutationRefusal,
 ) -> Result<Option<StatusView>> {
+    let track = state.track_id.as_deref().unwrap_or("<id>");
     let message = match refusal {
         crate::workflow::execution_repo::MutationRefusal::PlanningOnly(_) => {
             format!("ci-wait: {refusal}")
         }
-        _ => format!(
-            "ci-wait: {action} refused: {refusal}; stop and re-run --track {}",
-            state.track_id.as_deref().unwrap_or("<id>")
-        ),
+        crate::workflow::execution_repo::MutationRefusal::Unregistered(_) => {
+            format!("ci-wait: {action} refused: {refusal}")
+        }
+        _ => format!("ci-wait: {action} refused: {refusal}; stop and re-run --track {track}"),
     };
     apply_failure(record, state, FailureClass::Permission, message)
 }
@@ -1633,15 +1651,6 @@ fn maybe_apply_ai_reviewed(
     let Some(review) = state.review.as_ref() else {
         return;
     };
-    // A label is a remote mutation: re-resolve and refuse a changed/unregistered target.
-    let latched = state.ci.as_ref().and_then(|ci| ci.target_repo.as_deref());
-    let cwd = match crate::workflow::execution_repo::mutation_target(record, state, latched) {
-        Ok(target) => target.execution.sample_path,
-        Err(refusal) => {
-            log(format!("ci-wait: label skipped ({refusal})"));
-            return;
-        }
-    };
     if !matches!(review.verdict.as_deref(), Some("PASS" | "PASS_WITH_LOWS")) {
         return;
     }
@@ -1657,6 +1666,15 @@ fn maybe_apply_ai_reviewed(
             return;
         }
     }
+    // A label is a remote mutation: re-resolve and refuse a changed/unregistered target.
+    let latched = state.ci.as_ref().and_then(|ci| ci.target_repo.as_deref());
+    let cwd = match crate::workflow::execution_repo::mutation_target(record, state, latched) {
+        Ok(target) => target.execution.sample_path,
+        Err(refusal) => {
+            log(format!("ci-wait: label skipped ({refusal})"));
+            return;
+        }
+    };
     match backend.pr_files(&cwd, number) {
         Ok(files) if crate::policy::mandatory_review_paths(&files).is_empty() => {}
         Ok(_) => match backend.ensure_label(&cwd, number, AI_REVIEWED_LABEL) {
@@ -6330,6 +6348,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_ci_resume_freezes_both_on_first_tick() {
+        let _g = poll_env();
+        let (_dir, r, _primary, sibling) = two_repo_fixture("sibling", false);
+        let mut st = load_run_state(&r).unwrap();
+        st.phase = graph::PHASE_CI_WAIT.into();
+        st.last_driven_phase = None;
+        st.delivery_target = None;
+        st.ci = Some(crate::state::CiWatchState::default());
+        save_run_state(&r, &st).unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(8, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("ci", CheckBucket::Pending)],
+            &[],
+            MergeStateStatus::Clean,
+        )));
+        let (_hook, _backend) = cwd_hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let saved = load_run_state(&r).unwrap();
+        assert!(saved.delivery_target.as_ref().is_some_and(|target| {
+            crate::workflow::execution_repo::paths_same(&target.declared_path, &sibling)
+        }));
+        assert!(
+            saved
+                .ci
+                .as_ref()
+                .and_then(|ci| ci.target_repo.as_ref())
+                .is_some_and(|repo| crate::workflow::execution_repo::paths_same(repo, &sibling))
+        );
+        clear_ci_env();
+    }
+
+    #[test]
     fn ci_gate_fixtures_seed_the_delivery_target() {
         let _g = poll_env();
         let dir = tempdir().unwrap();
@@ -6391,7 +6443,7 @@ mod tests {
         })));
         let backend = RecordingBackend::wrap(std::sync::Arc::new(s));
         let result =
-            try_auto_publish_target(&r, &st, &backend, &repo, Utc::now(), &repo).expect("publish");
+            try_auto_publish_target(&r, &st, &backend, &repo, Utc::now()).expect("publish");
         assert!(matches!(result, AutoPublishDrive::Opened(_)));
         let text = std::fs::read_to_string(
             crate::workflow::graph::resolve_track_dir(&r, "0010")

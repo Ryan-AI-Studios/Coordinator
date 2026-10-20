@@ -871,6 +871,8 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.last_applied_outcome_hash = None;
     state.ci = None;
     state.review = None;
+    state.delivery_target = None;
+    state.gate_target_journal = None;
     state.stalled_at = None;
     state.address_findings_attempts = 0;
     state.ci_fix_attempts = 0;
@@ -931,6 +933,15 @@ pub fn commit_probed_successor(
             "run: started {WORKFLOW_ID} resume ci-wait pr {}",
             probe.number
         );
+        // G2 (second resume path): freeze ci-wait provenance from tick 0.
+        match execution_repo::resolve_track_target(record, &state, graph::PHASE_CI_WAIT) {
+            Ok(target) => state.delivery_target = Some(target),
+            Err(err) => crate::progress_log::append(
+                record,
+                "reuse",
+                &format!("reuse: ci-wait target unresolved — {err}"),
+            ),
+        }
     }
     crate::outcome::clear_active_outcome_file(record);
     drive::clear_plan_review_artifacts(
@@ -3086,6 +3097,26 @@ mod tests {
         let message = implement_artifact_gate(&record, &mut state).expect("gate must fire");
         assert!(message.contains("uncommitted"), "{message}");
         assert!(message.contains("src_new.rs"), "{message}");
+    }
+
+    #[test]
+    fn planning_only_target_skips_the_implement_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = rec(dir.path());
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0101".into());
+        state.run_epoch = 1;
+        state.phase = graph::PHASE_IMPLEMENT.into();
+        let mut target = crate::workflow::execution_repo::seeded_delivery_target(
+            &record,
+            "0101",
+            1,
+            graph::PHASE_IMPLEMENT,
+            dir.path(),
+        );
+        target.planning_only = true;
+        state.delivery_target = Some(target);
+        assert!(implement_artifact_gate(&record, &mut state).is_none());
     }
 
     #[test]
