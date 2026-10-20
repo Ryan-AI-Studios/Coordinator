@@ -444,14 +444,17 @@ fn finish_green(
                 return Ok(view.map(|view| *view));
             }
             let latched = state.ci.as_ref().and_then(|ci| ci.target_repo.as_deref());
-            maybe_apply_ai_reviewed(record, state, backend, *number, head_oid.as_deref());
-            let merge_target =
-                match crate::workflow::execution_repo::mutation_target(record, state, latched) {
-                    Ok(target) => target,
-                    Err(refusal) => {
-                        return apply_mutation_refusal(record, state, "merge", &refusal);
-                    }
-                };
+            maybe_apply_ai_reviewed(record, state, cwd, backend, *number, head_oid.as_deref());
+            let merge_target = match crate::workflow::execution_repo::mutation_target(
+                record,
+                state,
+                latched.or(Some(cwd)),
+            ) {
+                Ok(target) => target,
+                Err(refusal) => {
+                    return apply_mutation_refusal(record, state, "merge", &refusal);
+                }
+            };
             let merge = match backend.squash_merge(
                 &merge_target.execution.sample_path,
                 *number,
@@ -1647,6 +1650,7 @@ const AI_REVIEWED_LABEL: &str = "ai-reviewed";
 fn maybe_apply_ai_reviewed(
     record: &ProjectRecord,
     state: &RunState,
+    cwd: &Path,
     backend: &dyn CiBackend,
     number: u64,
     head_oid: Option<&str>,
@@ -1674,16 +1678,20 @@ fn maybe_apply_ai_reviewed(
     }
     // A label is a remote mutation: re-resolve and refuse a changed/unregistered target.
     let latched = state.ci.as_ref().and_then(|ci| ci.target_repo.as_deref());
-    let cwd = match crate::workflow::execution_repo::mutation_target(record, state, latched) {
+    let label_cwd = match crate::workflow::execution_repo::mutation_target(
+        record,
+        state,
+        latched.or(Some(cwd)),
+    ) {
         Ok(target) => target.execution.sample_path,
         Err(refusal) => {
             log(format!("ci-wait: label skipped ({refusal})"));
             return;
         }
     };
-    match backend.pr_files(&cwd, number) {
+    match backend.pr_files(&label_cwd, number) {
         Ok(files) if crate::policy::mandatory_review_paths(&files).is_empty() => {}
-        Ok(_) => match backend.ensure_label(&cwd, number, AI_REVIEWED_LABEL) {
+        Ok(_) => match backend.ensure_label(&label_cwd, number, AI_REVIEWED_LABEL) {
             Ok(LabelOutcome::Applied) => log(format!(
                 "ci-wait: label applied {AI_REVIEWED_LABEL} #{number}"
             )),
@@ -4223,7 +4231,7 @@ mod tests {
         scripted.push_files(files);
         scripted.push_label(label);
         let rec_b = RecordingBackend::wrap(scripted.clone());
-        maybe_apply_ai_reviewed(&r, &st, &rec_b, 7, tip);
+        maybe_apply_ai_reviewed(&r, &st, _dir.path(), &rec_b, 7, tip);
         let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap_or_default();
         (
             scripted.label_calls(),
