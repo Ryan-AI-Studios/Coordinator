@@ -3157,7 +3157,8 @@ Loop\r\n",
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn cmd tree");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        // cmd.exe plus a grandchild can exceed 20 s on a loaded runner.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut pid = None;
         while std::time::Instant::now() < deadline {
             if let Ok(s) = std::fs::read_to_string(&pidfile)

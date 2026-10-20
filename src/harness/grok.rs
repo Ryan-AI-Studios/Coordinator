@@ -3063,14 +3063,17 @@ while ($null -ne ($line = $reader.ReadLine())) {
         ];
         let mut session = GrokSession::start_with_raw_command(
             dir.path().to_path_buf(),
-            Duration::from_secs(20),
+            Duration::from_secs(60), /* PowerShell peer start-up under a loaded CI runner */
             bin.clone(),
             &prompt_args,
         )
         .await
         .unwrap();
         let err = session
-            .inject_prompt("x", Duration::from_secs(20))
+            .inject_prompt(
+                "x",
+                Duration::from_secs(60), /* PowerShell peer start-up under a loaded CI runner */
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -3089,7 +3092,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
         prompt_args.push("auth".into());
         let auth = GrokSession::start_with_raw_command(
             dir.path().to_path_buf(),
-            Duration::from_secs(20),
+            Duration::from_secs(60), /* PowerShell peer start-up under a loaded CI runner */
             bin,
             &prompt_args,
         )
