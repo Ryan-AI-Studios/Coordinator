@@ -232,12 +232,16 @@ pub fn resolve_track_target(
                 .with_path(cell)
         })?;
         (
-            PathBuf::from(declared),
+            mapped_token_path(record, &declared),
             ResolutionSource::RowExecution,
             Vec::new(),
         )
     } else if let Some(meta) = read_spec_execution_metadata(record, track_id)? {
-        (meta.path, ResolutionSource::SpecMetadata, meta.late)
+        (
+            mapped_token_path(record, &meta.path.to_string_lossy()),
+            ResolutionSource::SpecMetadata,
+            meta.late,
+        )
     } else {
         (
             layout_default(record, track_id)?,
@@ -319,6 +323,15 @@ fn layout_default(record: &ProjectRecord, track_id: &str) -> Result<PathBuf, Rep
             }
         }
     }
+}
+
+/// An exact `execution_repos` key maps to its bound path; anything else is a path.
+fn mapped_token_path(record: &ProjectRecord, token: &str) -> PathBuf {
+    record
+        .execution_repos
+        .get(token)
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(token))
 }
 
 fn canonicalize_existing_dir(anchor: &Path, declared: &Path) -> Result<PathBuf, String> {
@@ -1325,6 +1338,23 @@ mod tests {
                 .declared_path,
             one
         );
+    }
+
+    #[test]
+    fn map_key_resolves_to_the_bound_repo() {
+        let dir = tempdir().unwrap();
+        let hub = dir.path().join("hub");
+        std::fs::create_dir_all(&hub).unwrap();
+        let bound = product_repo(&dir.path().join("bound"));
+        let mut rec = record(&hub, LayoutProfile::MultiSibling);
+        // BTreeMap-first is a different repo; the explicit key must win.
+        rec.execution_repos
+            .insert("aaa-first".into(), product_repo(&dir.path().join("first")));
+        rec.execution_repos.insert("primary".into(), bound.clone());
+        registry(&hub, Some("primary"));
+        let state = running("0099-Example");
+        let got = resolve_track_target(&rec, &state, PHASE_IMPLEMENT).unwrap();
+        assert_eq!(got.declared_path, bound);
     }
 
     #[test]

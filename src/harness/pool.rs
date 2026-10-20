@@ -5380,6 +5380,25 @@ Loop\r\n",
         assert!(log.contains("sample-skip"));
     }
 
+    #[tokio::test]
+    async fn stale_snapshot_installs_no_target_root() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        bump_epoch(&rec);
+        // Validation runs before the holder/session lock and before any root install.
+        assert_eq!(
+            validate_prepared(&rec, &prepared).unwrap_err(),
+            "stale-injection"
+        );
+        let session = GrokSession::start_mock(
+            rec.path.clone(),
+            crate::harness::grok::mock_handshake_ok("sess-stale-root"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(session.turn_roots().is_empty());
+    }
+
     #[test]
     fn old_holder_cannot_drop_prepared_identity() {
         let (_dir, _rec, prepared) = prepared_fixture();
