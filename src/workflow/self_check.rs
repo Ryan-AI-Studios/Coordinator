@@ -3,6 +3,10 @@
 //! Opt-in, report-only, and only for `implement` and `address-findings`.
 //! A yielded step does not write a phase outcome and does not move the phase clock.
 //! `note_progress` is not called from classify or from the self-check log.
+//!
+//! 0101: `measure` fingerprints the turn's frozen delivery target (`sample_path`), not the
+//! primary/epoch checkout. No target or a planning-only target yields no fingerprint and no
+//! `DIFF_UNREADABLE`, so `Plateau` cannot be reported for that leg (disclosed capability limit).
 
 use chrono::Utc;
 
@@ -891,5 +895,79 @@ mod tests {
         unsafe {
             std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
         }
+    }
+
+    fn dirty_repo(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(dir.path().join("a.txt"), b"base\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        std::fs::write(dir.path().join(name), b"work\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn self_check_fingerprint_samples_the_target() {
+        let primary = dirty_repo("a.txt");
+        let target_repo = dirty_repo("b.txt");
+        let mut rec = sample(true);
+        rec.execution_repo = Some(primary.path().to_path_buf());
+        let mut state = running(PHASE_IMPLEMENT);
+        state.track_id = Some("0070".into());
+        state.run_epoch = 1;
+        let target = crate::workflow::execution_repo::seeded_delivery_target(
+            &rec,
+            "0070",
+            1,
+            PHASE_IMPLEMENT,
+            target_repo.path(),
+        );
+        let cost = measure(&rec, &state, Some(&target));
+        assert_eq!(
+            cost.diff_fp,
+            diff_fingerprint(target_repo.path()).ok(),
+            "fingerprint must sample the target repo"
+        );
+        assert_ne!(cost.diff_fp, diff_fingerprint(primary.path()).ok());
+        assert!(!cost.diff_unreadable);
+    }
+
+    #[test]
+    fn self_check_without_target_skips_fingerprint() {
+        let repo = dirty_repo("work.rs");
+        let mut rec = sample(true);
+        rec.execution_repo = Some(repo.path().to_path_buf());
+        let mut state = running(PHASE_IMPLEMENT);
+        state.track_id = Some("0070".into());
+        state.run_epoch = 1;
+        let cost = measure(&rec, &state, None);
+        assert!(cost.diff_fp.is_none());
+        assert!(!cost.diff_unreadable);
+        let planning = crate::workflow::execution_repo::seeded_delivery_target(
+            &rec,
+            "0070",
+            1,
+            PHASE_IMPLEMENT,
+            repo.path(),
+        );
+        let mut planning = planning;
+        planning.planning_only = true;
+        let cost = measure(&rec, &state, Some(&planning));
+        assert!(cost.diff_fp.is_none());
+        assert!(!cost.diff_unreadable);
     }
 }

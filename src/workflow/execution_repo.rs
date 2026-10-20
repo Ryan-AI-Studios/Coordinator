@@ -1994,4 +1994,222 @@ mod tests {
         assert_eq!(got.declared_path, target);
         assert!(!got.planning_only);
     }
+
+    fn write_row(root: &Path, repo: &Path) {
+        let conductor = root.join("conductor");
+        std::fs::create_dir_all(&conductor).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0099-Example](0099-Example/spec.md) | `{}` | **Ready - not started** | s |\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn stateful_record(root: &Path, primary: &Path, sibling: &Path) -> ProjectRecord {
+        let mut rec = record(root, LayoutProfile::Nested);
+        rec.execution_repo = Some(primary.to_path_buf());
+        rec.execution_repos
+            .insert("sibling".into(), sibling.to_path_buf());
+        rec.state_dir = Some(root.join("state"));
+        crate::state::ensure_state_dir(&rec).unwrap();
+        rec
+    }
+
+    #[test]
+    fn uses_delivery_target_phase_table() {
+        for phase in [
+            PHASE_IMPLEMENT,
+            PHASE_ADDRESS_FINDINGS,
+            PHASE_ADDRESS_CI,
+            PHASE_CROSS_MODEL,
+            PHASE_CI_WAIT,
+        ] {
+            assert!(uses_delivery_target(phase), "{phase}");
+        }
+        assert!(prepares_target(PHASE_ADDRESS_CI));
+        for phase in [
+            crate::workflow::graph::PHASE_PLAN,
+            crate::workflow::graph::PHASE_FOLD,
+        ] {
+            assert!(!uses_delivery_target(phase), "{phase}");
+        }
+    }
+
+    #[test]
+    fn registered_predicate_covers_primary_bindings_and_epoch() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let sibling = product_repo(&dir.path().join("sibling"));
+        let mut rec = stateful_record(dir.path(), &primary, &sibling);
+        rec.worktree_isolation = false;
+        let state = running("0099-Example");
+        let primary_target =
+            seeded_delivery_target(&rec, "0099-Example", 1, PHASE_IMPLEMENT, &primary);
+        let sibling_target =
+            seeded_delivery_target(&rec, "0099-Example", 1, PHASE_IMPLEMENT, &sibling);
+        let outside = product_repo(&dir.path().join("outside"));
+        let outside_target =
+            seeded_delivery_target(&rec, "0099-Example", 1, PHASE_IMPLEMENT, &outside);
+        assert!(registered_execution_target(&rec, &primary_target));
+        assert!(registered_execution_target(&rec, &sibling_target));
+        assert!(!registered_execution_target(&rec, &outside_target));
+        let subdir = primary.join("sub");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let subdir_target =
+            seeded_delivery_target(&rec, "0099-Example", 1, PHASE_IMPLEMENT, &subdir);
+        assert!(registered_execution_target(&rec, &subdir_target));
+        let _ = state;
+    }
+
+    #[test]
+    fn delivery_target_is_frozen_for_the_leg() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let sibling = product_repo(&dir.path().join("sibling"));
+        let rec = stateful_record(dir.path(), &primary, &sibling);
+        let mut state = running("0099-Example");
+        let frozen = seeded_delivery_target(&rec, "0099-Example", 1, PHASE_IMPLEMENT, &primary);
+        state.delivery_target = Some(frozen.clone());
+        // The row now names the sibling; a frozen local gate must not re-read it.
+        write_row(dir.path(), &sibling);
+        let gate = gate_target(&rec, &state).unwrap();
+        assert_eq!(gate.provenance, TargetProvenance::Frozen);
+        assert_eq!(gate.execution.declared_path, primary);
+        assert!(gate.registered);
+    }
+
+    #[test]
+    fn legacy_state_without_target_reresolves_and_validates() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let sibling = product_repo(&dir.path().join("sibling"));
+        let rec = stateful_record(dir.path(), &primary, &sibling);
+        write_row(dir.path(), &sibling);
+        let mut state = running("0099-Example");
+        state.delivery_target = None;
+        let gate = gate_target(&rec, &state).unwrap();
+        assert_eq!(gate.provenance, TargetProvenance::ReResolved);
+        assert_eq!(gate.execution.declared_path, sibling);
+        assert_eq!(gate.execution.project_id, rec.id);
+        assert_eq!(gate.execution.run_epoch, state.run_epoch);
+    }
+
+    #[test]
+    fn status_reports_the_delivery_target() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let sibling = product_repo(&dir.path().join("sibling"));
+        let rec = stateful_record(dir.path(), &primary, &sibling);
+        let mut state = running("0099-Example");
+        let target = seeded_delivery_target(&rec, "0099-Example", 1, PHASE_CROSS_MODEL, &sibling);
+        state.phase = PHASE_CROSS_MODEL.into();
+        state.delivery_target = Some(target.clone());
+        let view = crate::state::StatusView::from_record(&rec, &state);
+        assert_eq!(view.delivery_target, Some(target));
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json.get("delivery_target").is_some());
+    }
+
+    #[test]
+    fn stale_target_does_not_mark_the_newer_run() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let sibling = product_repo(&dir.path().join("sibling"));
+        let rec = stateful_record(dir.path(), &primary, &sibling);
+        let mut state = running("0099-Example");
+        state.run_epoch = 2;
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let stale = seeded_delivery_target(&rec, "0099-Example", 1, PHASE_IMPLEMENT, &primary);
+        crate::workflow::mark_driven_with_target(&rec, PHASE_IMPLEMENT, Some(&stale)).unwrap();
+        let saved = crate::state::load_run_state(&rec).unwrap();
+        assert!(saved.last_driven_phase.is_none());
+        assert!(saved.delivery_target.is_none());
+        assert!(
+            std::fs::read_to_string(crate::progress_log::path(&rec))
+                .unwrap_or_default()
+                .contains("stale target skipped")
+        );
+    }
+
+    #[test]
+    fn mutation_target_accepts_the_frozen_and_latched_repo() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let sibling = product_repo(&dir.path().join("sibling"));
+        let rec = stateful_record(dir.path(), &primary, &sibling);
+        write_row(dir.path(), &sibling);
+        let mut state = running("0099-Example");
+        let frozen = seeded_delivery_target(&rec, "0099-Example", 1, PHASE_IMPLEMENT, &sibling);
+        state.delivery_target = Some(frozen);
+        let got = mutation_target(&rec, &state, Some(&sibling)).unwrap();
+        assert_eq!(got.provenance, TargetProvenance::ReResolved);
+        assert!(got.registered);
+    }
+
+    #[test]
+    fn mutation_target_accepts_a_legacy_resume_without_a_frozen_target() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let sibling = product_repo(&dir.path().join("sibling"));
+        let rec = stateful_record(dir.path(), &primary, &sibling);
+        write_row(dir.path(), &sibling);
+        let mut state = running("0099-Example");
+        state.phase = PHASE_CI_WAIT.into();
+        state.delivery_target = None;
+        let got = mutation_target(&rec, &state, Some(&sibling)).unwrap();
+        assert!(got.registered);
+    }
+
+    #[test]
+    fn mutation_target_refuses_a_changed_row() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let sibling = product_repo(&dir.path().join("sibling"));
+        let rec = stateful_record(dir.path(), &primary, &sibling);
+        let mut state = running("0099-Example");
+        let frozen = seeded_delivery_target(&rec, "0099-Example", 1, PHASE_IMPLEMENT, &primary);
+        state.delivery_target = Some(frozen);
+        write_row(dir.path(), &sibling);
+        let err = mutation_target(&rec, &state, Some(&primary)).unwrap_err();
+        assert!(matches!(err, MutationRefusal::Changed { .. }), "{err}");
+    }
+
+    #[test]
+    fn isolation_epoch_is_the_primary_delivery_target() {
+        let dir = tempdir().unwrap();
+        let primary = product_repo(&dir.path().join("primary"));
+        let mut rec = record(dir.path(), LayoutProfile::Nested);
+        rec.execution_repo = Some(primary.clone());
+        rec.worktree_isolation = true;
+        rec.state_dir = Some(dir.path().join("state"));
+        crate::state::ensure_state_dir(&rec).unwrap();
+        registry(dir.path(), Some(&primary.display().to_string()));
+        let mut state = running("0099-Example");
+        state.run_epoch = 1;
+        crate::worktree::prepare_epoch(&rec, 1).unwrap();
+        let epoch = crate::worktree::epoch_dir(&rec, 1).unwrap();
+        let gate = gate_target(&rec, &state).unwrap();
+        assert!(paths_same(&gate.execution.prompt_path, &epoch));
+        assert!(paths_same(&gate.execution.sample_path, &epoch));
+        state.delivery_target = Some(gate.execution.clone());
+        assert_eq!(
+            gate_target(&rec, &state).unwrap().provenance,
+            TargetProvenance::Frozen
+        );
+    }
+
+    #[test]
+    fn same_delivery_repo_ignores_phase() {
+        let dir = tempdir().unwrap();
+        let repo = product_repo(&dir.path().join("repo"));
+        let rec = record(dir.path(), LayoutProfile::Nested);
+        let mut a = seeded_delivery_target(&rec, "0099-Example", 1, PHASE_IMPLEMENT, &repo);
+        let b = seeded_delivery_target(&rec, "0099-Example", 1, PHASE_ADDRESS_CI, &repo);
+        assert!(same_delivery_repo(&a, &b));
+        a.declared_path = dir.path().join("other");
+        assert!(!same_delivery_repo(&a, &b));
+    }
 }

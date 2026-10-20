@@ -4,6 +4,10 @@
 //! review-track skill, both slot bindings, and both review files still match
 //! `reuse.json`, and `gh pr view` still shows that receipt PR on this track's
 //! branch. The probe runs outside the run-state lock.
+//!
+//! 0101: `PrReceipt` records the delivery repo. The resume probe uses that repo when it still
+//! exists, else the current gate target, else the documented legacy primary. A receipt repo
+//! that disagrees with the resolved gate target falls through to plan instead of resuming.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -693,6 +697,20 @@ pub fn install_test_probe(probe: ResumeTestProbe) -> TestProbeGuard {
 
 /// Live `gh pr view` outside tests. An unset test probe returns an error so
 /// default `cargo test` never reaches the network and resume falls through to `plan`.
+/// Receipt repo first (when it still exists), then the current gate target, then the
+/// documented legacy primary. `None` means no probe is possible.
+pub(crate) fn resume_probe_cwd(record: &ProjectRecord, repo: Option<&Path>) -> Option<PathBuf> {
+    repo.filter(|path| path.is_dir())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let state = load_run_state(record).ok()?;
+            crate::workflow::execution_repo::gate_target(record, &state)
+                .ok()
+                .map(|gate| gate.execution.sample_path)
+        })
+        .or_else(|| crate::worktree::product_git_cwd(record))
+}
+
 pub fn probe_resume(
     record: &ProjectRecord,
     number: u64,
@@ -711,19 +729,7 @@ pub fn probe_resume(
     }
     #[cfg(not(test))]
     {
-        // Receipt repo first, then the current gate target, then the documented legacy
-        // primary. An existing receipt repo is persisted evidence from the publish.
-        let cwd = repo
-            .filter(|path| path.is_dir())
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                let state = load_run_state(record).ok()?;
-                crate::workflow::execution_repo::gate_target(record, &state)
-                    .ok()
-                    .map(|gate| gate.execution.sample_path)
-            })
-            .or_else(|| crate::worktree::product_git_cwd(record));
-        let Some(cwd) = cwd else {
+        let Some(cwd) = resume_probe_cwd(record, repo) else {
             return Err(CoordinatorError::Message("no execution repo".into()));
         };
         let head = crate::ci::gh::pr_view_resume(&cwd, number)?;
@@ -740,6 +746,7 @@ mod tests {
     use super::*;
     use crate::ci::backend::{CiTarget, MergeStateStatus};
     use crate::config::test_env_lock;
+    use crate::state::RunState;
     use crate::workflow::graph::REVIEW_SLUG_AGY;
     use chrono::Utc;
     use std::collections::BTreeMap;
@@ -1064,6 +1071,80 @@ mod tests {
         note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch", None);
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn resume_probe_uses_the_recorded_repo() {
+        let f = matching_fixture("0083");
+        let recorded = tempdir().unwrap();
+        assert_eq!(
+            resume_probe_cwd(f.record(), Some(recorded.path())).as_deref(),
+            Some(recorded.path())
+        );
+    }
+
+    #[test]
+    fn legacy_receipt_without_repo_falls_back() {
+        let f = matching_fixture("0083");
+        let r = f.record();
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch", None);
+        match decide_resume(r, Some("0083")) {
+            ResumeChoice::Probe { repo, .. } => assert!(repo.is_none()),
+            other => panic!("legacy receipt must still probe: {other:?}"),
+        }
+        // The gate target is the next fallback when the receipt has no repo.
+        let repo = tempdir().unwrap();
+        let mut state = RunState::idle(&r.id);
+        state.phase = crate::workflow::graph::PHASE_CI_WAIT.into();
+        state.track_id = Some("0083".into());
+        state.run_epoch = 1;
+        state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            r,
+            "0083",
+            1,
+            crate::workflow::graph::PHASE_CI_WAIT,
+            repo.path(),
+        ));
+        crate::state::ensure_state_dir(r).unwrap();
+        crate::state::save_run_state(r, &state).unwrap();
+        assert_eq!(resume_probe_cwd(r, None).as_deref(), Some(repo.path()));
+    }
+
+    #[test]
+    fn receipt_repo_mismatch_does_not_resume() {
+        let f = matching_fixture("0083");
+        let mut r = f.record().clone();
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        note_pr(
+            &r,
+            "0083",
+            80,
+            "abc123",
+            "track/0083-Relaunch",
+            Some(first.path()),
+        );
+        let conductor = r.path.join("conductor");
+        std::fs::create_dir_all(&conductor).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0083-Example](0083-Example/spec.md) | `{}` | **Ready - not started** | s |\n",
+                second.path().display()
+            ),
+        )
+        .unwrap();
+        r.execution_repo = Some(second.path().to_path_buf());
+        let mut state = RunState::idle(&r.id);
+        state.phase = crate::workflow::graph::PHASE_CI_WAIT.into();
+        state.track_id = Some("0083".into());
+        state.run_epoch = 1;
+        crate::state::ensure_state_dir(&r).unwrap();
+        crate::state::save_run_state(&r, &state).unwrap();
+        assert!(matches!(
+            decide_resume(&r, Some("0083")),
+            ResumeChoice::Plan { .. }
+        ));
     }
 
     #[test]

@@ -541,4 +541,84 @@ mod tests {
         assert_eq!(got[0].name, "risk");
         assert_eq!(got[0].bucket, "fail");
     }
+
+    #[test]
+    fn ci_fix_gate_fixtures_seed_the_delivery_target() {
+        let _lock = test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let sha = seed_repo(dir.path());
+        let record = sample(dir.path(), true);
+        arm(&record, &sha);
+        let state = load_run_state(&record).unwrap();
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&state);
+    }
+
+    #[test]
+    fn classify_diff_reads_target_head() {
+        let _lock = test_env_lock();
+        let primary = tempfile::tempdir().unwrap();
+        let _primary_sha = seed_repo(primary.path());
+        let sibling = tempfile::tempdir().unwrap();
+        let sibling_sha = seed_repo(sibling.path());
+        let record = sample(primary.path(), true);
+        run_with_driver(&record, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&record, || {
+            let mut state = load_run_state(&record)?;
+            state.phase = PHASE_ADDRESS_CI.into();
+            state.ci_fix_attempts = 1;
+            state.ci_fix_request = Some(CiFixRequest {
+                pr_number: 71,
+                from_sha: sibling_sha.clone(),
+                checks: Vec::new(),
+            });
+            state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+                &record,
+                "0071",
+                state.run_epoch,
+                PHASE_ADDRESS_CI,
+                sibling.path(),
+            ));
+            save_run_state(&record, &state)
+        })
+        .unwrap();
+        let state = load_run_state(&record).unwrap();
+        assert!(matches!(
+            classify_diff(&record, &state),
+            DiffClass::Empty { .. }
+        ));
+        // A commit in the primary is invisible to the target leg.
+        std::fs::write(primary.path().join("a.rs"), b"fn a() {}\n").unwrap();
+        git(primary.path(), &["add", "a.rs"]);
+        git(
+            primary.path(),
+            &[
+                "-c",
+                "user.email=ci@example.com",
+                "-c",
+                "user.name=ci",
+                "commit",
+                "-m",
+                "primary only",
+            ],
+        );
+        assert!(matches!(
+            classify_diff(&record, &state),
+            DiffClass::Empty { .. }
+        ));
+        std::fs::write(sibling.path().join("b.rs"), b"fn b() {}\n").unwrap();
+        git(sibling.path(), &["add", "b.rs"]);
+        git(
+            sibling.path(),
+            &[
+                "-c",
+                "user.email=ci@example.com",
+                "-c",
+                "user.name=ci",
+                "commit",
+                "-m",
+                "target fix",
+            ],
+        );
+        assert_eq!(classify_diff(&record, &state), DiffClass::Changed);
+    }
 }

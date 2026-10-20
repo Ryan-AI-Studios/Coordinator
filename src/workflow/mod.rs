@@ -3005,6 +3005,111 @@ mod tests {
         assert!(message.contains("no commit to review"), "{message}");
     }
 
+    fn implement_sibling_state(
+        epoch: u64,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::registry::ProjectRecord,
+        RunState,
+    ) {
+        let primary = tempfile::tempdir().unwrap();
+        impl_git(primary.path(), &["init", "-b", "main"]);
+        impl_git(
+            primary.path(),
+            &["config", "user.email", "impl-gate@example.com"],
+        );
+        impl_git(primary.path(), &["config", "user.name", "impl-gate"]);
+        std::fs::write(primary.path().join("README.md"), b"seed\n").unwrap();
+        impl_git(primary.path(), &["add", "."]);
+        impl_git(primary.path(), &["commit", "-m", "seed"]);
+        let sibling = tempfile::tempdir().unwrap();
+        impl_git(sibling.path(), &["init", "-b", "main"]);
+        impl_git(
+            sibling.path(),
+            &["config", "user.email", "impl-gate@example.com"],
+        );
+        impl_git(sibling.path(), &["config", "user.name", "impl-gate"]);
+        std::fs::write(sibling.path().join("README.md"), b"seed\n").unwrap();
+        impl_git(sibling.path(), &["add", "."]);
+        impl_git(sibling.path(), &["commit", "-m", "seed"]);
+        let mut record = rec(primary.path());
+        record.execution_repo = Some(primary.path().to_path_buf());
+        let ref_name = crate::checkpoint::ref_name(&record.id, epoch);
+        impl_git(sibling.path(), &["update-ref", &ref_name, "HEAD"]);
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0554".into());
+        state.run_epoch = epoch;
+        state.phase = graph::PHASE_IMPLEMENT.into();
+        state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            &record,
+            "0554",
+            epoch,
+            graph::PHASE_IMPLEMENT,
+            sibling.path(),
+        ));
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&state);
+        (primary, sibling, record, state)
+    }
+
+    #[test]
+    fn implement_gate_measures_the_target_head() {
+        let (primary, sibling, record, mut state) = implement_sibling_state(1);
+        std::fs::write(primary.path().join("primary-only.txt"), b"not the target\n").unwrap();
+        std::fs::write(sibling.path().join("src_new.rs"), b"fn work() {}\n").unwrap();
+        impl_git(sibling.path(), &["add", "."]);
+        impl_git(
+            sibling.path(),
+            &["commit", "-m", "track(0554): the leg's work"],
+        );
+        assert!(
+            implement_artifact_gate(&record, &mut state).is_none(),
+            "the primary's dirt must not fail a sibling-target leg"
+        );
+    }
+
+    #[test]
+    fn implement_gate_still_fails_an_uncommitted_sibling_leg() {
+        let (_primary, sibling, record, mut state) = implement_sibling_state(1);
+        std::fs::write(sibling.path().join("src_new.rs"), b"fn work() {}\n").unwrap();
+        let message = implement_artifact_gate(&record, &mut state).expect("gate must fire");
+        assert!(message.contains("uncommitted"), "{message}");
+        assert!(message.contains("src_new.rs"), "{message}");
+    }
+
+    #[test]
+    fn two_repo_b_only_commit_is_delivered_and_graded() {
+        let (primary, sibling, record, mut state) = implement_sibling_state(1);
+        let base = impl_git(
+            sibling.path(),
+            &["rev-parse", &crate::checkpoint::ref_name(&record.id, 1)],
+        );
+        // A-only work does not satisfy the B leg.
+        std::fs::write(primary.path().join("a-only.rs"), b"fn a() {}\n").unwrap();
+        impl_git(primary.path(), &["add", "."]);
+        impl_git(primary.path(), &["commit", "-m", "a only"]);
+        let message = implement_artifact_gate(&record, &mut state).expect("B leg empty");
+        assert!(message.contains("no commit to review"), "{message}");
+        // A B-only commit is delivered and graded in B.
+        std::fs::write(sibling.path().join("b-only.rs"), b"fn b() {}\n").unwrap();
+        impl_git(sibling.path(), &["add", "."]);
+        impl_git(sibling.path(), &["commit", "-m", "track(0554): b only"]);
+        assert!(implement_artifact_gate(&record, &mut state).is_none());
+        state.phase = graph::PHASE_ADDRESS_CI.into();
+        if let Some(target) = state.delivery_target.as_mut() {
+            target.phase = graph::PHASE_ADDRESS_CI.into();
+        }
+        state.ci_fix_request = Some(crate::state::CiFixRequest {
+            pr_number: 71,
+            from_sha: base,
+            checks: Vec::new(),
+        });
+        assert_eq!(
+            crate::ci::fix::classify_diff(&record, &state),
+            crate::ci::fix::DiffClass::Changed
+        );
+    }
+
     #[test]
     fn implement_gate_allows_a_clean_committed_tree() {
         let (repo, record, _) = implement_fixture(1);

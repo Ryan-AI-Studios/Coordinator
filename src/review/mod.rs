@@ -2,6 +2,10 @@
 //!
 //! Runs the Role Binding chain Codex → Claude → OpenCode. Never injects a
 //! Grok prompt. Default `cargo test` uses a scripted backend.
+//!
+//! 0101: the reviewer cwd/prompt and `reviewed_oid` use the track delivery target. A
+//! resolution failure is `permission` with no backend call. Publish-only degrade checks
+//! `checkpoint::committable_dirt` in the target; a planning-only target never degrades.
 
 pub mod backend;
 pub mod parse;
@@ -1590,6 +1594,187 @@ mod tests {
         let view = crate::workflow::tick(&r).unwrap().expect("gate2");
         assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
         assert!(!view.last_event.contains("degraded"));
+        clear_env();
+    }
+
+    struct ExecRecorder {
+        exec_repo: std::sync::Mutex<Option<std::path::PathBuf>>,
+        prompt: std::sync::Mutex<Option<String>>,
+        result: ReviewResult,
+    }
+
+    impl ReviewBackend for ExecRecorder {
+        fn run(&self, req: &ReviewRequest) -> Result<ReviewResult> {
+            *self.exec_repo.lock().unwrap() = Some(req.exec_repo.clone());
+            *self.prompt.lock().unwrap() = Some(req.prompt.clone());
+            Ok(self.result.clone())
+        }
+    }
+
+    fn cross_model_state_with_target(
+        r: &ProjectRecord,
+        repo: &std::path::Path,
+    ) -> (RunState, crate::workflow::execution_repo::ResolvedExecution) {
+        run_with_driver(r, Some("0011".into()), WorkflowDriver::Adapter).unwrap();
+        let mut state = load_run_state(r).unwrap();
+        state.phase = graph::PHASE_CROSS_MODEL.into();
+        state.last_driven_phase = None;
+        let target = crate::workflow::execution_repo::seeded_delivery_target(
+            r,
+            "0011",
+            state.run_epoch,
+            graph::PHASE_CROSS_MODEL,
+            repo,
+        );
+        state.delivery_target = Some(target.clone());
+        save_run_state(r, &state).unwrap();
+        (state, target)
+    }
+
+    #[test]
+    fn review_spawns_in_the_target_repo() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let primary = rec_clean_exec(&dir.path().join("primary"), false);
+        let sibling = rec_clean_exec(&dir.path().join("sibling"), true);
+        let mut r = sibling.clone();
+        r.execution_repo = primary.execution_repo.clone();
+        let (state, target) =
+            cross_model_state_with_target(&r, sibling.execution_repo.as_ref().unwrap());
+        let recorder = ExecRecorder {
+            exec_repo: std::sync::Mutex::new(None),
+            prompt: std::sync::Mutex::new(None),
+            result: pass_text(),
+        };
+        let view = drive_with(&r, &state, &recorder).unwrap().expect("pass");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        let spawned = recorder.exec_repo.lock().unwrap().clone().unwrap();
+        assert!(crate::workflow::execution_repo::paths_same(
+            &spawned,
+            &target.prompt_path
+        ));
+        let prompt = recorder.prompt.lock().unwrap().clone().unwrap();
+        assert!(
+            prompt.contains(&format!(
+                "Product / execution repo (cwd): {}",
+                target.prompt_path.display()
+            )),
+            "{prompt}"
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn reviewed_oid_is_the_target_head() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let exec = dir.path().join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(exec.clone());
+        init_clean_git(&exec);
+        std::fs::create_dir_all(dir.path().join("conductor").join("0011-Example")).unwrap();
+        write_evidence(dir.path());
+        let (state, target) = cross_model_state_with_target(&r, &exec);
+        let head = exec_head_oid(&target.sample_path).expect("target HEAD");
+        let scripted = ScriptedBackend::new().push_ok(pass_text());
+        let (_hook, _counts) = hook(scripted);
+        let _ = crate::workflow::tick(&r).unwrap().expect("pass");
+        let saved = load_run_state(&r).unwrap();
+        assert_eq!(
+            saved.review.as_ref().and_then(|rv| rv.reviewed_oid.clone()),
+            Some(head)
+        );
+        let _ = state;
+        clear_env();
+    }
+
+    #[test]
+    fn publish_only_degrade_uses_the_committable_predicate() {
+        let dir = tempdir().unwrap();
+        let track = dir.path().join("conductor").join("0011-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join("evidence.md"), "evidence\n").unwrap();
+        let exec = dir.path().join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        init_clean_git(&exec);
+        let dirt = crate::checkpoint::committable_dirt(&exec).unwrap();
+        assert!(dirt.is_empty(), "dirt={dirt:?}");
+        assert!(publish_preconditions_ok(Some(&track), &exec));
+        std::fs::write(exec.join("untracked.rs"), b"x\n").unwrap();
+        assert!(!publish_preconditions_ok(Some(&track), &exec));
+        std::fs::write(exec.join(".gitignore"), b"untracked.rs\n").unwrap();
+        run_git(&exec, &["add", ".gitignore"]);
+        run_git(
+            &exec,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "ignore"],
+        );
+        assert!(publish_preconditions_ok(Some(&track), &exec));
+    }
+
+    #[test]
+    fn planning_only_review_cannot_degrade_publish() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let mut state = load_run_state(&r).unwrap();
+        let mut target = state.delivery_target.clone().expect("target");
+        target.planning_only = true;
+        state.delivery_target = Some(target);
+        save_run_state(&r, &state).unwrap();
+        let scripted = ScriptedBackend::new().push_ok(publish_fail_body());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("fail");
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(!view.last_event.contains("degraded"), "{}", view.last_event);
+        assert!(
+            view.last_event.contains("gate failed"),
+            "phase={} event={}",
+            view.phase,
+            view.last_event
+        );
+        assert_eq!(counts.n(), 1);
+        clear_env();
+    }
+
+    #[test]
+    fn review_prompt_names_the_target_repo() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let exec = dir.path().join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(exec.clone());
+        init_clean_git(&exec);
+        std::fs::create_dir_all(dir.path().join("conductor").join("0011-Example")).unwrap();
+        write_evidence(dir.path());
+        let (state, target) = cross_model_state_with_target(&r, &exec);
+        let recorder = ExecRecorder {
+            exec_repo: std::sync::Mutex::new(None),
+            prompt: std::sync::Mutex::new(None),
+            result: pass_text(),
+        };
+        let _ = drive_with(&r, &state, &recorder).unwrap().expect("pass");
+        let prompt = recorder.prompt.lock().unwrap().clone().unwrap();
+        assert!(
+            prompt.contains(&format!(
+                "Product / execution repo (cwd): {}",
+                target.prompt_path.display()
+            )),
+            "{prompt}"
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn review_gate_fixtures_seed_the_delivery_target() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let state = load_run_state(&r).unwrap();
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&state);
         clear_env();
     }
 

@@ -2,6 +2,13 @@
 //!
 //! Polls a [`CiBackend`] on an adaptive interval. Never injects a harness prompt.
 //! `tick` must not sleep and must not spawn `gh` on every 500ms wake.
+//!
+//! 0101: every poll, policy decision, publish, merge and label acts in the track delivery
+//! target (`gate_target`), not `product_git_cwd`. The first tick latches
+//! `CiWatchState.target_repo`; a later resolution that changes repo stops with `permission`.
+//! `mutation_target` re-resolves once immediately before each remote mutation and refuses a
+//! target outside the registered bindings, a planning-only target, or any value that differs
+//! from the frozen target/latch.
 
 pub mod backend;
 pub mod fix;
@@ -5880,5 +5887,524 @@ mod tests {
         assert!(crate::notify::artifact::existing_path(&r).is_none());
         assert_eq!(counts.checks_n(), 0);
         assert_eq!(counts.merge_n(), 0);
+    }
+
+    // --- 0101: delivery-target routing and publish ownership ---
+
+    fn init_ci_repo(dir: &std::path::Path) {
+        git_ok(dir, &["init", "-b", "main"]);
+        git_ok(dir, &["config", "user.email", "probe@example.com"]);
+        git_ok(dir, &["config", "user.name", "probe"]);
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        git_ok(dir, &["add", "f.txt"]);
+        git_ok(dir, &["commit", "-m", "base"]);
+    }
+
+    /// Two registered repos, a conductor row naming `target`, and an adapter ci-wait state.
+    fn two_repo_fixture(
+        target: &str,
+        with_state: bool,
+    ) -> (
+        tempfile::TempDir,
+        ProjectRecord,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let dir = tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let sibling = dir.path().join("sibling");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        init_ci_repo(&primary);
+        init_ci_repo(&sibling);
+        let mut r = rec(dir.path(), true);
+        r.execution_repo = Some(primary.clone());
+        r.execution_repos.insert("sibling".into(), sibling.clone());
+        let conductor = dir.path().join("conductor");
+        std::fs::create_dir_all(&conductor).unwrap();
+        let cell = match target {
+            "sibling" => format!("`{}`", sibling.display()),
+            "primary" => format!("`{}`", primary.display()),
+            "workspace" => ".".to_string(),
+            other => format!("`{other}`"),
+        };
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0010-Example](0010-Example/spec.md) | {cell} | **Ready - not started** | fixture |\n"
+            ),
+        )
+        .unwrap();
+        run_with_driver(&r, Some("0010".into()), WorkflowDriver::Adapter).unwrap();
+        if with_state {
+            let target_path = match target {
+                "sibling" => Some(sibling.clone()),
+                "primary" => Some(primary.clone()),
+                "workspace" => None,
+                other => Some(std::path::PathBuf::from(other)),
+            };
+            let mut st = load_run_state(&r).unwrap();
+            st.phase = graph::PHASE_CI_WAIT.into();
+            st.last_driven_phase = None;
+            if let Some(repo) = target_path {
+                st.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+                    &r,
+                    "0010",
+                    st.run_epoch,
+                    graph::PHASE_CI_WAIT,
+                    &repo,
+                ));
+                let mut ci = st.ci.take().unwrap_or_default();
+                ci.target_repo = Some(repo);
+                st.ci = Some(ci);
+                crate::workflow::execution_repo::assert_fixture_has_delivery_target(&st);
+            }
+            save_run_state(&r, &st).unwrap();
+        }
+        (dir, r, primary, sibling)
+    }
+
+    struct CwdBackend {
+        inner: ScriptedBackend,
+        resolves: std::sync::Mutex<Vec<std::path::PathBuf>>,
+        publishes: std::sync::Mutex<Vec<std::path::PathBuf>>,
+        merges: std::sync::Mutex<Vec<std::path::PathBuf>>,
+        labels: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    }
+
+    impl CwdBackend {
+        fn new(inner: ScriptedBackend) -> Self {
+            Self {
+                inner,
+                resolves: std::sync::Mutex::new(Vec::new()),
+                publishes: std::sync::Mutex::new(Vec::new()),
+                merges: std::sync::Mutex::new(Vec::new()),
+                labels: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CiBackend for CwdBackend {
+        fn resolve_pr(
+            &self,
+            cwd: &Path,
+            hint: Option<&PrHint>,
+            track_id: Option<&str>,
+        ) -> Result<Option<CiTarget>> {
+            self.resolves.lock().unwrap().push(cwd.to_path_buf());
+            self.inner.resolve_pr(cwd, hint, track_id)
+        }
+        fn checks(&self, cwd: &Path, target: &CiTarget) -> Result<CheckSnapshot> {
+            self.inner.checks(cwd, target)
+        }
+        fn squash_merge(
+            &self,
+            cwd: &Path,
+            pr_number: u64,
+            head_oid: Option<&str>,
+        ) -> Result<MergeResult> {
+            self.merges.lock().unwrap().push(cwd.to_path_buf());
+            self.inner.squash_merge(cwd, pr_number, head_oid)
+        }
+        fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
+            self.publishes.lock().unwrap().push(cwd.to_path_buf());
+            self.inner.try_auto_publish(cwd, track_id)
+        }
+        fn pr_files(&self, cwd: &Path, pr_number: u64) -> Result<Vec<String>> {
+            self.inner.pr_files(cwd, pr_number)
+        }
+        fn ensure_label(&self, cwd: &Path, pr_number: u64, label: &str) -> Result<LabelOutcome> {
+            self.labels.lock().unwrap().push(cwd.to_path_buf());
+            self.inner.ensure_label(cwd, pr_number, label)
+        }
+    }
+
+    fn cwd_hook(scripted: ScriptedBackend) -> (TestBackendGuard, std::sync::Arc<CwdBackend>) {
+        let backend = std::sync::Arc::new(CwdBackend::new(scripted));
+        let guard = install_test_backend(backend.clone());
+        (guard, backend)
+    }
+
+    #[test]
+    fn ci_wait_polls_in_the_target_repo() {
+        let _g = poll_env();
+        let (_dir, r, primary, sibling) = two_repo_fixture("sibling", true);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(55, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("ci", CheckBucket::Pending)],
+            &[],
+            MergeStateStatus::Clean,
+        )));
+        let (_hook, backend) = cwd_hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let resolves = backend.resolves.lock().unwrap();
+        assert_eq!(resolves.len(), 1);
+        assert!(crate::workflow::execution_repo::paths_same(
+            &resolves[0],
+            &sibling
+        ));
+        assert!(!crate::workflow::execution_repo::paths_same(
+            &resolves[0],
+            &primary
+        ));
+        clear_ci_env();
+    }
+
+    #[test]
+    fn ci_wait_merge_uses_the_target_repo() {
+        let _g = poll_env();
+        let (_dir, r, _primary, sibling) = two_repo_fixture("sibling", true);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(55, false, false))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: String::new(),
+        }));
+        let (_hook, backend) = cwd_hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("green");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        let merges = backend.merges.lock().unwrap();
+        assert_eq!(merges.len(), 1);
+        assert!(crate::workflow::execution_repo::paths_same(
+            &merges[0], &sibling
+        ));
+        clear_ci_env();
+    }
+
+    #[test]
+    fn publish_in_a_registered_sibling_uses_its_own_remote() {
+        // Hermetic proof is the cwd handed to the backend; remote parsing itself is
+        // covered by the `gh.rs` unit tests.
+        let _g = poll_env();
+        let (_dir, r, _primary, sibling) = two_repo_fixture("sibling", true);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(8, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("ci", CheckBucket::Pending)],
+            &[],
+            MergeStateStatus::Clean,
+        )));
+        let (_hook, backend) = cwd_hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let publishes = backend.publishes.lock().unwrap();
+        assert_eq!(publishes.len(), 1);
+        assert!(crate::workflow::execution_repo::paths_same(
+            &publishes[0],
+            &sibling
+        ));
+        clear_ci_env();
+    }
+
+    #[test]
+    fn publish_refused_for_an_unregistered_absolute_row_path() {
+        let _g = poll_env();
+        let outside = tempdir().unwrap();
+        init_ci_repo(outside.path());
+        let (_dir, r, _primary, _sibling) =
+            two_repo_fixture(&outside.path().display().to_string(), true);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        let (_hook, backend) = cwd_hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("perm");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert!(
+            view.last_event
+                .contains("not a registered execution binding"),
+            "{}",
+            view.last_event
+        );
+        assert!(backend.publishes.lock().unwrap().is_empty());
+        clear_ci_env();
+    }
+
+    #[test]
+    fn publish_refused_for_a_planning_only_target() {
+        let _g = poll_env();
+        let (_dir, r, _primary, _sibling) = two_repo_fixture("workspace", true);
+        let s = ScriptedBackend::new();
+        let (_hook, backend) = cwd_hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("perm");
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert!(
+            view.last_event.contains("planning-only track"),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(backend.resolves.lock().unwrap().len(), 0);
+        assert!(backend.publishes.lock().unwrap().is_empty());
+        clear_ci_env();
+    }
+
+    #[test]
+    fn merge_refused_for_an_unregistered_target() {
+        let _g = poll_env();
+        let outside = tempdir().unwrap();
+        init_ci_repo(outside.path());
+        let (_dir, r, _primary, _sibling) =
+            two_repo_fixture(&outside.path().display().to_string(), true);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(55, false, false))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        let (_hook, backend) = cwd_hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("perm");
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert!(
+            view.last_event.contains("merge refused"),
+            "{}",
+            view.last_event
+        );
+        assert!(
+            view.last_event
+                .contains("not a registered execution binding")
+        );
+        assert!(backend.merges.lock().unwrap().is_empty());
+        clear_ci_env();
+    }
+
+    #[test]
+    fn target_repo_latch_refuses_a_mid_run_change() {
+        let _g = poll_env();
+        let (_dir, r, primary, _sibling) = two_repo_fixture("sibling", true);
+        // The operator edits the row to the primary after the latch.
+        let conductor = r.path.join("conductor").join("conductor.md");
+        std::fs::write(
+            &conductor,
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0010-Example](0010-Example/spec.md) | `{}` | **Ready - not started** | fixture |\n",
+                primary.display()
+            ),
+        )
+        .unwrap();
+        let s = ScriptedBackend::new();
+        let (_hook, backend) = cwd_hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("perm");
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert!(
+            view.last_event.contains("execution target changed from"),
+            "{}",
+            view.last_event
+        );
+        assert!(backend.publishes.lock().unwrap().is_empty());
+        assert!(backend.merges.lock().unwrap().is_empty());
+        clear_ci_env();
+    }
+
+    #[test]
+    fn ci_wait_refuses_publish_after_a_row_edit_during_the_wait() {
+        let _g = poll_env();
+        let (_dir, r, primary, _sibling) = two_repo_fixture("sibling", true);
+        // First tick: no PR yet; the target is latched.
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::skipped("ci-wait: waiting for PR")));
+        let (_hook, backend) = cwd_hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        assert!(
+            load_run_state(&r)
+                .unwrap()
+                .ci
+                .as_ref()
+                .and_then(|ci| ci.target_repo.as_ref())
+                .is_some()
+        );
+        drop(_hook);
+        let conductor = r.path.join("conductor").join("conductor.md");
+        std::fs::write(
+            &conductor,
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0010-Example](0010-Example/spec.md) | `{}` | **Ready - not started** | fixture |\n",
+                primary.display()
+            ),
+        )
+        .unwrap();
+        force_due(&r);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(8, false, false))));
+        let (_hook, backend2) = cwd_hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("perm");
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert!(
+            view.last_event.contains("execution target changed from"),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(backend.publishes.lock().unwrap().len(), 1);
+        assert!(backend2.publishes.lock().unwrap().is_empty());
+        clear_ci_env();
+    }
+
+    #[test]
+    fn frozen_target_still_matching_publishes() {
+        let _g = poll_env();
+        let (_dir, r, _primary, _sibling) = two_repo_fixture("sibling", true);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(8, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("ci", CheckBucket::Pending)],
+            &[],
+            MergeStateStatus::Clean,
+        )));
+        let (_hook, backend) = cwd_hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        assert_eq!(backend.publishes.lock().unwrap().len(), 1);
+        clear_ci_env();
+    }
+
+    #[test]
+    fn primary_target_publish_is_unchanged() {
+        let _g = poll_env();
+        let (_dir, r, primary, _sibling) = two_repo_fixture("primary", true);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(None));
+        s.push_publish(Ok(AutoPublishResult::Opened(pr(8, false, false))));
+        s.push_snapshot(Ok(required_snap(
+            &[("ci", CheckBucket::Pending)],
+            &[],
+            MergeStateStatus::Clean,
+        )));
+        let (_hook, backend) = cwd_hook(s);
+        assert!(crate::workflow::tick(&r).unwrap().is_none());
+        let publishes = backend.publishes.lock().unwrap();
+        assert_eq!(publishes.len(), 1);
+        assert!(crate::workflow::execution_repo::paths_same(
+            &publishes[0],
+            &primary
+        ));
+        clear_ci_env();
+    }
+
+    #[test]
+    fn ai_reviewed_label_compares_the_target_head() {
+        let _g = poll_env();
+        let (_dir, r, _primary, _sibling) = two_repo_fixture("sibling", true);
+        let head = "abc111".to_string();
+        let mut st = load_run_state(&r).unwrap();
+        st.review = Some(crate::state::ReviewWatchState {
+            verdict: Some("PASS".into()),
+            reviewed_oid: Some(head.clone()),
+            ..Default::default()
+        });
+        save_run_state(&r, &st).unwrap();
+        let mut target = pr_with_head(7, false, false, "track/0010-Fixture");
+        if let CiTarget::PullRequest { head_oid, .. } = &mut target {
+            *head_oid = Some(head.clone());
+        }
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(target)));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_files(Ok(vec![".github/workflows/ci.yml".into()]));
+        s.push_label(Ok(LabelOutcome::Applied));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: String::new(),
+        }));
+        let (_hook, backend) = cwd_hook(s);
+        let _ = crate::workflow::tick(&r).unwrap().expect("merged");
+        let labels = backend.labels.lock().unwrap();
+        assert_eq!(
+            labels.len(),
+            1,
+            "label must be applied at the target PR tip"
+        );
+        assert!(crate::workflow::execution_repo::paths_same(
+            &labels[0], &_sibling
+        ));
+        clear_ci_env();
+    }
+
+    #[test]
+    fn ci_gate_fixtures_seed_the_delivery_target() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let st = load_run_state(&r).unwrap();
+        crate::workflow::execution_repo::assert_fixture_has_delivery_target(&st);
+        clear_ci_env();
+    }
+
+    #[test]
+    fn receipt_records_the_delivery_repo() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("product");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_ci_repo(&repo);
+        let track = dir.path().join("conductor").join("0010-Example");
+        std::fs::create_dir_all(&track).unwrap();
+        std::fs::write(track.join("spec.md"), b"spec\n").unwrap();
+        std::fs::write(track.join("plan.md"), b"plan\n").unwrap();
+        std::fs::write(track.join("agy-review.md"), b"agy\n").unwrap();
+        std::fs::write(track.join("opencode-review.md"), b"opencode\n").unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill\n").unwrap();
+        let mut r = rec(dir.path(), true);
+        r.execution_repo = Some(repo.clone());
+        crate::workflow::reuse::write_join_receipt(&r, "0010");
+        run_with_driver(&r, Some("0010".into()), WorkflowDriver::Adapter).unwrap();
+        let mut st = load_run_state(&r).unwrap();
+        st.phase = graph::PHASE_CI_WAIT.into();
+        st.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            &r,
+            "0010",
+            st.run_epoch,
+            graph::PHASE_CI_WAIT,
+            &repo,
+        ));
+        st.ci = Some(crate::state::CiWatchState {
+            target_repo: Some(repo.clone()),
+            ..Default::default()
+        });
+        let s = ScriptedBackend::new();
+        s.push_publish(Ok(AutoPublishResult::Opened(CiTarget::PullRequest {
+            number: 12,
+            url: "https://example/pr/12".into(),
+            is_draft: false,
+            merged: false,
+            head_oid: Some("abc123".into()),
+            merge_state: MergeStateStatus::Clean,
+            head_ref: "track/0010-Fixture".into(),
+            title: "track(0010): fixture".into(),
+        })));
+        let backend = RecordingBackend::wrap(std::sync::Arc::new(s));
+        let result =
+            try_auto_publish_target(&r, &st, &backend, &repo, Utc::now(), &repo).expect("publish");
+        assert!(matches!(result, AutoPublishDrive::Opened(_)));
+        let text = std::fs::read_to_string(
+            crate::workflow::graph::resolve_track_dir(&r, "0010")
+                .unwrap()
+                .join("reuse.json"),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let repo_json = json["pr"]["repo"].as_str().expect("receipt repo");
+        assert!(crate::workflow::execution_repo::paths_same(
+            std::path::Path::new(repo_json),
+            &repo
+        ));
+        clear_ci_env();
     }
 }

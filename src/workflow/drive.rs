@@ -2259,6 +2259,66 @@ mod tests {
     }
 
     #[test]
+    fn capture_prompts_are_thread_local() {
+        let _guard = arm_capture_prompts();
+        std::thread::spawn(|| {
+            let other = arm_capture_prompts();
+            assert!(captured_prompts().is_empty());
+            drop(other);
+        })
+        .join()
+        .unwrap();
+        assert!(
+            capture_slot_armed(),
+            "another thread must not clear this slot"
+        );
+    }
+
+    #[test]
+    fn target_change_between_checkpoint_and_inject_stops_before_prompt() {
+        let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
+        let dir = tempdir().unwrap();
+        let product = implementation_target(dir.path(), "0071");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let out = crate::git_command::command()
+            .args(["init", "-b", "main"])
+            .current_dir(&other)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(product.clone());
+        run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.last_driven_phase = None;
+            state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+                &r,
+                "0071",
+                state.run_epoch,
+                crate::workflow::graph::PHASE_IMPLEMENT,
+                &other,
+            ));
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        let view = tick(&r).unwrap().expect("permission");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert!(
+            view.last_event
+                .contains("execution target changed after checkpoint"),
+            "{}",
+            view.last_event
+        );
+        assert!(super::captured_prompts().is_empty(), "zero prompts");
+    }
+
+    #[test]
     fn address_ci_uses_the_prepared_target_route() {
         let _home = IsolatedHome::enter();
         write_implementor_binding(&_home);
@@ -2342,6 +2402,68 @@ mod tests {
             saved.last_event.contains("leg repo unresolved:"),
             "{}",
             saved.last_event
+        );
+    }
+
+    #[test]
+    fn address_ci_prompt_names_the_target() {
+        let dir = tempdir().unwrap();
+        let product = implementation_target(dir.path(), "0071");
+        let r = rec(dir.path());
+        let target = crate::workflow::execution_repo::seeded_delivery_target(
+            &r,
+            "0071",
+            1,
+            crate::workflow::graph::PHASE_ADDRESS_CI,
+            &product,
+        );
+        let prompt = crate::workflow::prompts::phase_prompt_with_target(
+            &r,
+            crate::workflow::graph::PHASE_ADDRESS_CI,
+            Some("0071"),
+            Some(&target),
+        );
+        assert!(
+            prompt.contains(&format!("Execution repo: {}", product.display())),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn address_ci_installs_the_target_root() {
+        let _home = IsolatedHome::enter();
+        write_implementor_binding(&_home);
+        let dir = tempdir().unwrap();
+        let product = implementation_target(dir.path(), "0071");
+        let mut r = rec(dir.path());
+        r.execution_repo = Some(product.clone());
+        run_with_driver(&r, Some("0071".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_ADDRESS_CI.into();
+            state.last_driven_phase = None;
+            state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+                &r,
+                "0071",
+                state.run_epoch,
+                crate::workflow::graph::PHASE_ADDRESS_CI,
+                &product,
+            ));
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        let prepared = super::captured_prepared();
+        assert_eq!(prepared.len(), 1, "{prepared:?}");
+        assert!(
+            prepared[0]
+                .target()
+                .is_some_and(|t| crate::workflow::execution_repo::paths_same(
+                    &t.prompt_path,
+                    &product
+                )),
+            "the prepared route must install the target root"
         );
     }
 
