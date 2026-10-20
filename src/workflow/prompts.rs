@@ -38,8 +38,7 @@ pub(crate) fn layout_block_with_target(
     let epoch = crate::worktree::active_epoch_dir(record);
     if let Some(target) = target {
         let execution = target.prompt_path.display().to_string();
-        let epoch_line = if target.source == super::execution_repo::ResolutionSource::RowExecution
-            || !crate::worktree::paths_same(&target.prompt_path, &target.declared_path)
+        let epoch_line = if !crate::worktree::paths_same(&target.prompt_path, &target.declared_path)
         {
             format!("Epoch worktree: {}\n", target.prompt_path.display())
         } else {

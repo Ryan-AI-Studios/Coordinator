@@ -3328,6 +3328,54 @@ mod live_tests {
     }
 
     #[tokio::test]
+    async fn selected_sibling_terminal_create_route_allowed() {
+        let root = tempdir().unwrap();
+        let hub = root.path().join("hub");
+        let primary = root.path().join("primary");
+        let sibling = root.path().join("sibling");
+        for path in [&hub, &primary, &sibling] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let mut rec = project_record(&hub, crate::layout::LayoutProfile::MultiSibling);
+        rec.execution_repo = Some(primary.clone());
+        rec.execution_repos.insert("sib".into(), sibling.clone());
+        let mut lines = mock_handshake_ok("sess-term-sibling");
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "terminal/create",
+                "params": {
+                    "sessionId": "sess-term-sibling",
+                    "command": "cmd.exe",
+                    "args": ["/C", "echo hi"],
+                    "cwd": sibling.to_str().unwrap()
+                }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session =
+            GrokSession::start_mock(primary.clone(), lines, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+        session.set_progress_record(rec);
+        session.install_turn_root(&sibling);
+        session
+            .inject_prompt("ok", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let written = session.mock_written().unwrap();
+        let reply = written
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .find(|v| v.get("id") == Some(&json!(77)))
+            .expect("terminal/create reply");
+        assert!(reply.get("error").is_none(), "reply={reply}");
+        assert!(reply["result"]["terminalId"].is_string(), "reply={reply}");
+    }
+
+    #[tokio::test]
     async fn unrelated_sibling_stays_denied() {
         let root = tempdir().unwrap();
         let hub = root.path().join("hub");

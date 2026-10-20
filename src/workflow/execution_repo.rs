@@ -671,8 +671,8 @@ fn metadata_label(line: &str) -> Option<(String, String)> {
             if let Some(value) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('=')) {
                 let value = value
                     .trim()
-                    .trim_start_matches(['*', '_'])
-                    .trim_end_matches(['*', '_'])
+                    .trim_start_matches('*')
+                    .trim_end_matches('*')
                     .trim();
                 return Some((label.to_string(), value.to_string()));
             }
@@ -1634,6 +1634,33 @@ mod tests {
         assert!(out.status.success());
         let err = resolve_track_target(&rec, &state, PHASE_IMPLEMENT).unwrap_err();
         assert!(err.reason.contains("different Git repository"), "{err}");
+    }
+
+    #[test]
+    fn resolution_failure_recovery() {
+        let dir = tempdir().unwrap();
+        let repo = product_repo(&dir.path().join("product"));
+        let mut rec = record(dir.path(), LayoutProfile::Nested);
+        rec.execution_repo = Some(repo.clone());
+        let conductor = dir.path().join("conductor");
+        std::fs::create_dir_all(conductor.join("0099-Example")).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0099-Example](0099-Example/spec.md) | `not-a-target` | **Ready - not started** | s |\n",
+        )
+        .unwrap();
+        let state = running("0099-Example");
+        assert!(resolve_track_target(&rec, &state, PHASE_IMPLEMENT).is_err());
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0099-Example](0099-Example/spec.md) | `{}` | **Ready - not started** | s |\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+        let got = resolve_track_target(&rec, &state, PHASE_IMPLEMENT).unwrap();
+        assert_eq!(got.declared_path, repo);
     }
 
     #[test]

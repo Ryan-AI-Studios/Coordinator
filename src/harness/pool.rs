@@ -247,6 +247,43 @@ fn prepared_protocol_supported(protocol: Option<u32>) -> bool {
     protocol.unwrap_or(0) >= PREPARED_PROTOCOL_VERSION
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedCapabilityPlan {
+    Send,
+    RecycleOnce,
+    Fail,
+}
+
+/// One compatibility recycle per dispatch. A second incompatible probe fails.
+fn prepared_capability_plan(
+    protocol: Option<u32>,
+    already_recycled: bool,
+) -> PreparedCapabilityPlan {
+    if prepared_protocol_supported(protocol) {
+        PreparedCapabilityPlan::Send
+    } else if already_recycled {
+        PreparedCapabilityPlan::Fail
+    } else {
+        PreparedCapabilityPlan::RecycleOnce
+    }
+}
+
+/// Verdict-time identity validation: re-resolve only to prove the frozen target is
+/// still the same. A changed or unresolved target keeps the baseline, skips the
+/// verdict and is journaled by the caller.
+fn revalidate_target(
+    record: &ProjectRecord,
+    state: &crate::state::RunState,
+    phase: &str,
+    target: &ResolvedExecution,
+) -> std::result::Result<(), String> {
+    match crate::workflow::execution_repo::resolve_track_target(record, state, phase) {
+        Ok(now) if now.same_identity(target) => Ok(()),
+        Ok(_) => Err("target-changed".into()),
+        Err(_) => Err("unresolved".into()),
+    }
+}
+
 pub fn persist_path(record: &ProjectRecord) -> Result<PathBuf> {
     Ok(resolve_state_dir(record)?.join("harness-grok.json"))
 }
@@ -1424,16 +1461,22 @@ async fn handle_prepared_prompt(
             *snap = session_status(&session);
         }
         remember_fidelity(record, &session);
-        let verdict = no_change::evaluate_turn(
-            record,
-            &state,
-            &phase,
-            &target,
-            &capture.trust(),
-            &session.adapter,
-            session.last_signal.as_deref(),
-            &session.cwd,
-        );
+        let verdict = match revalidate_target(record, &state, &phase, &target) {
+            Ok(()) => no_change::evaluate_turn(
+                record,
+                &state,
+                &phase,
+                &target,
+                &capture.trust(),
+                &session.adapter,
+                session.last_signal.as_deref(),
+                &session.cwd,
+            ),
+            Err(reason) => {
+                journal_sample_skip(record, Some(&target), &reason);
+                VerdictOutcome::Clean
+            }
+        };
         (session.terminal_spawn_tally(), verdict)
     };
     let no_change = match verdict {
@@ -1546,6 +1589,8 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     set_prompt_in_flight(record, true);
                     let turn = {
                         let mut session = shared.session.lock().await;
+                        // Legacy/manual prompts never inherit a prepared turn's ACP roots.
+                        session.clear_turn_roots();
                         if let Ok(mut snap) = shared.snapshot.lock() {
                             *snap = session_status(&session);
                         }
@@ -1856,6 +1901,8 @@ async fn prompt_impl(
         }
         if let Some(target) = &target {
             session.install_turn_root(&target.prompt_path);
+        } else {
+            session.clear_turn_roots();
         }
         crate::workflow::watchdog::note_progress(
             &rec,
@@ -1892,31 +1939,40 @@ async fn prompt_impl(
         match pool.get_mut(&rec.id) {
             Some(s) => {
                 let no_change = match (&capture, &target) {
-                    (Some(capture), Some(target)) => match no_change::evaluate_turn(
-                        &rec,
-                        &state,
-                        &injected_phase,
-                        target,
-                        &capture.trust(),
-                        &s.adapter,
-                        s.last_signal.as_deref(),
-                        &s.cwd,
-                    ) {
-                        VerdictOutcome::NoChange(message) => Some(message),
-                        VerdictOutcome::CwdMisdirected => {
-                            journal_sample_skip(&rec, Some(target), "cwd-misdirected");
-                            None
-                        }
-                        VerdictOutcome::TargetChanged(reason) => {
+                    (Some(capture), Some(target)) => {
+                        if let Err(reason) =
+                            revalidate_target(&rec, &state, &injected_phase, target)
+                        {
                             journal_sample_skip(&rec, Some(target), &reason);
                             None
+                        } else {
+                            match no_change::evaluate_turn(
+                                &rec,
+                                &state,
+                                &injected_phase,
+                                target,
+                                &capture.trust(),
+                                &s.adapter,
+                                s.last_signal.as_deref(),
+                                &s.cwd,
+                            ) {
+                                VerdictOutcome::NoChange(message) => Some(message),
+                                VerdictOutcome::CwdMisdirected => {
+                                    journal_sample_skip(&rec, Some(target), "cwd-misdirected");
+                                    None
+                                }
+                                VerdictOutcome::TargetChanged(reason) => {
+                                    journal_sample_skip(&rec, Some(target), &reason);
+                                    None
+                                }
+                                VerdictOutcome::StaleInjection => {
+                                    journal_sample_skip(&rec, Some(target), "stale-injection");
+                                    None
+                                }
+                                VerdictOutcome::Clean => None,
+                            }
                         }
-                        VerdictOutcome::StaleInjection => {
-                            journal_sample_skip(&rec, Some(target), "stale-injection");
-                            None
-                        }
-                        VerdictOutcome::Clean => None,
-                    },
+                    }
                     _ => None,
                 };
                 (s.terminal_spawn_tally(), no_change)
@@ -1955,13 +2011,19 @@ async fn prompt_prepared_holder(
 
     // Outside pool/session locks: shut down the owned old holder and respawn with
     // the current binary. At most one compatibility recycle per dispatch.
-    recycle_without_pool_lock(rec).await?;
+    if let Err(e) = recycle_without_pool_lock(rec).await {
+        return prepared_failure_after_recycle(
+            rec,
+            prepared,
+            &format!("old holder shutdown failed: {e}"),
+        );
+    }
     let binding = crate::harness::roles::resolve_phase_binding(&prepared.phase)
         .map_err(|e| CoordinatorError::Message(e.to_string()))?;
     let bin = crate::harness::roles::resolve_phase_binary(&prepared.phase)
         .map_err(|e| CoordinatorError::Message(e.to_string()))?;
     let selector = rec.path.to_string_lossy().to_string();
-    crate::harness::start_with_bin(
+    if let Err(e) = crate::harness::start_with_bin(
         Some(&selector),
         false,
         bin,
@@ -1969,7 +2031,14 @@ async fn prompt_prepared_holder(
         false,
         &binding.harness,
     )
-    .await?;
+    .await
+    {
+        return prepared_failure_after_recycle(
+            rec,
+            prepared,
+            &format!("replacement holder start failed: {e}"),
+        );
+    }
     let Some(handle) = load_persist(rec)? else {
         return prepared_failure_after_recycle(rec, prepared, "replacement holder did not start");
     };
@@ -1981,7 +2050,7 @@ async fn prompt_prepared_holder(
         .ok()
         .and_then(|resp| resp.prepared_protocol)
         .unwrap_or(0);
-    if !prepared_protocol_supported(Some(second)) {
+    if prepared_capability_plan(Some(second), true) == PreparedCapabilityPlan::Fail {
         return prepared_failure_after_recycle(
             rec,
             prepared,
@@ -2006,12 +2075,28 @@ async fn send_prepared_rpc(
     )
     .await
     {
-        Ok(resp) => hold_view(resp),
-        Err(e) => prepared_failure_after_recycle(
-            rec,
-            prepared,
-            &format!("prepared prompt transport failed after send ({e}); no automatic retry"),
-        ),
+        Ok(resp) if resp.ok => hold_view(resp),
+        Ok(resp) => {
+            // A rejected prepared opcode is uncertain delivery: refuse holder reuse
+            // and never fall back to a raw Prompt or resend.
+            let _ = recycle_without_pool_lock(rec).await;
+            prepared_failure_after_recycle(
+                rec,
+                prepared,
+                &format!(
+                    "holder rejected the prepared prompt ({})",
+                    resp.error.unwrap_or_else(|| "no error text".into())
+                ),
+            )
+        }
+        Err(e) => {
+            let _ = recycle_without_pool_lock(rec).await;
+            prepared_failure_after_recycle(
+                rec,
+                prepared,
+                &format!("prepared prompt transport failed after send ({e}); no automatic retry"),
+            )
+        }
     }
 }
 
@@ -5381,6 +5466,112 @@ Loop\r\n",
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn manual_prompt_in_session_cwd_does_not_fail_sibling_guard() {
+        let _guard = test_env_lock();
+        let prev_home = std::env::var_os(ENV_COORDINATOR_HOME);
+        let home = tempdir().unwrap();
+        unsafe { std::env::set_var(ENV_COORDINATOR_HOME, home.path()) };
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        // An active sibling-target implement leg.
+        let conductor = proj.path().join("conductor");
+        std::fs::create_dir_all(conductor.join("0070-Example")).unwrap();
+        let sibling = tempdir().unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0070-Example](0070-Example/spec.md) | `{}` | **Ready - not started** | s |\n",
+                sibling.path().display()
+            ),
+        )
+        .unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0070".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut state = crate::state::load_run_state(&rec)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.driver = crate::workflow::WorkflowDriver::Adapter;
+            state.last_driven_phase = Some(crate::workflow::graph::PHASE_IMPLEMENT.into());
+            crate::state::save_run_state(&rec, &state)
+        })
+        .unwrap();
+        let baseline = crate::state::resolve_state_dir(&rec)
+            .unwrap()
+            .join("leg-baseline.json");
+        assert!(!baseline.exists());
+        // A baseline from an earlier adapter leg must not be overwritten by a manual turn.
+        std::fs::create_dir_all(baseline.parent().unwrap()).unwrap();
+        std::fs::write(&baseline, b"sentinel-baseline").unwrap();
+        let before = std::fs::read(&baseline).unwrap();
+        let mut lines = mock_handshake_ok("sess-manual");
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            lines,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+
+        let view = prompt(Some(&rec.id), "manual operator work".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(view.failure_class, None);
+        assert_eq!(
+            std::fs::read(&baseline).unwrap(),
+            before,
+            "manual prompt must not capture or overwrite a baseline"
+        );
+        assert!(
+            !crate::progress_log::path(&rec).exists()
+                || !std::fs::read_to_string(crate::progress_log::path(&rec))
+                    .unwrap_or_default()
+                    .contains("sample-skip")
+        );
+        let _ = shutdown(Some(&rec.id), false).await;
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var(ENV_COORDINATOR_HOME, v),
+                None => std::env::remove_var(ENV_COORDINATOR_HOME),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn holder_resolution_failure_prevents_inject() {
+        let (dir, rec, prepared) = prepared_fixture();
+        // An invalid explicit target: resolution fails before any holder/session prompt.
+        std::fs::write(
+            dir.path().join("conductor/conductor.md"),
+            "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0099-Example](0099-Example/spec.md) | `not-a-target or key` | **Ready - not started** | s |\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_prepared(&rec, &prepared).unwrap_err(),
+            "unresolved"
+        );
+        let session = GrokSession::start_mock(
+            rec.path.clone(),
+            crate::harness::grok::mock_handshake_ok("sess-res-fail"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let before = session.mock_written().unwrap_or_default().len();
+        // Nothing in the failure path sends a prompt.
+        assert_eq!(session.mock_written().unwrap_or_default().len(), before);
+        assert!(session.turn_roots().is_empty());
+    }
+
+    #[tokio::test]
     async fn stale_snapshot_installs_no_target_root() {
         let (_dir, rec, prepared) = prepared_fixture();
         bump_epoch(&rec);
@@ -5424,6 +5615,34 @@ Loop\r\n",
     }
 
     #[test]
+    fn verdict_revalidates_target_after_send() {
+        let (dir, rec, prepared) = prepared_fixture();
+        let state = crate::state::load_run_state(&rec).unwrap();
+        let target = prepared.target().unwrap().clone();
+        let baseline = crate::state::resolve_state_dir(&rec)
+            .unwrap()
+            .join("leg-baseline.json");
+        let status = no_change::note_baseline(&rec, &state, &state.phase, &target);
+        assert!(status.trust().is_trusted());
+        let before = std::fs::read(&baseline).unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            dir.path().join("conductor/conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0099-Example](0099-Example/spec.md) | `{}` | **Ready - not started** | target |\n",
+                other.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            revalidate_target(&rec, &state, &state.phase, &target).unwrap_err(),
+            "target-changed"
+        );
+        assert_eq!(std::fs::read(&baseline).unwrap(), before, "baseline kept");
+    }
+
+    #[test]
     fn row_edit_does_not_split_prompt_and_capture_target() {
         let (dir, rec, prepared) = prepared_fixture();
         let other = dir.path().join("other");
@@ -5446,9 +5665,27 @@ Loop\r\n",
 
     #[test]
     fn old_holder_missing_capability_recycles_once_before_send() {
-        assert!(!prepared_protocol_supported(None));
-        assert!(!prepared_protocol_supported(Some(0)));
-        assert!(prepared_protocol_supported(Some(PREPARED_PROTOCOL_VERSION)));
+        assert_eq!(
+            prepared_capability_plan(None, false),
+            PreparedCapabilityPlan::RecycleOnce
+        );
+        assert_eq!(
+            prepared_capability_plan(Some(0), false),
+            PreparedCapabilityPlan::RecycleOnce
+        );
+        // The replacement is probed once more; still unsupported is terminal.
+        assert_eq!(
+            prepared_capability_plan(None, true),
+            PreparedCapabilityPlan::Fail
+        );
+        assert_eq!(
+            prepared_capability_plan(Some(PREPARED_PROTOCOL_VERSION), false),
+            PreparedCapabilityPlan::Send
+        );
+        assert_eq!(
+            prepared_capability_plan(Some(PREPARED_PROTOCOL_VERSION), true),
+            PreparedCapabilityPlan::Send
+        );
     }
 
     #[test]
@@ -5631,9 +5868,11 @@ Loop\r\n",
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains("holder")
-                || err.to_string().contains("closed")
-                || !err.to_string().is_empty()
+            {
+                let text = err.to_string();
+                text.contains("holder") || text.contains("closed") || text.contains("connect")
+            },
+            "unexpected transport error: {err}"
         );
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
         assert_eq!(

@@ -333,6 +333,13 @@ pub fn evaluate_turn(
     if !applies(state, phase) || target.planning_only {
         return VerdictOutcome::Clean;
     }
+    if target.run_epoch != state.run_epoch
+        || target.phase != phase
+        || target.project_id != state.project_id
+        || state.track_id.as_deref() != Some(target.track_id.as_str())
+    {
+        return VerdictOutcome::StaleInjection;
+    }
     // Identity is rechecked against the *injected* state the caller passes; a newer
     // run epoch/phase/track never gets a verdict from this turn.
     if trust_binding_mismatch(trust, state, phase, target) {
@@ -762,6 +769,87 @@ mod tests {
         let (_, after) = load_baseline_bytes(&rec).unwrap();
         assert_eq!(before.sample, after.sample);
         assert!(first.trust().is_trusted());
+    }
+
+    #[test]
+    fn continuation_revalidates_first_sample_trust() {
+        let d = repo();
+        let rec = record(d.path());
+        let state = running();
+        let t = target(d.path(), d.path());
+        let first = note_baseline(&rec, &state, PHASE_IMPLEMENT, &t);
+        assert!(first.trust().is_trusted());
+        std::fs::write(d.path().join("delivered.txt"), "x\n").unwrap();
+        git_ok(d.path(), &["add", "-A"]);
+        git_ok(d.path(), &["commit", "-m", "delivery"]);
+        let second = note_baseline(&rec, &state, PHASE_IMPLEMENT, &t);
+        let CaptureStatus::Reused(trust) = &second else {
+            panic!("continuation must reuse the first sample: {second:?}");
+        };
+        assert!(trust.is_trusted());
+        // The revalidated token compares against the first sample, so the commit is
+        // still a change rather than a verdict.
+        assert!(
+            verdict_after_turn(
+                &rec,
+                &state,
+                PHASE_IMPLEMENT,
+                &t,
+                trust,
+                "codex",
+                None,
+                d.path(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn untrusted_capture_cannot_borrow_prior_token() {
+        let d = repo();
+        let rec = record(d.path());
+        let state = running();
+        let t = target(d.path(), d.path());
+        let first = note_baseline(&rec, &state, PHASE_IMPLEMENT, &t);
+        assert!(first.trust().is_trusted());
+        let untrusted = CaptureTrust::untrusted("capture-write-failed");
+        assert!(
+            verdict_after_turn(
+                &rec,
+                &state,
+                PHASE_IMPLEMENT,
+                &t,
+                &untrusted,
+                "codex",
+                None,
+                d.path(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn verdict_requires_matching_capture_trust() {
+        let d = repo();
+        let rec = record(d.path());
+        let state = running();
+        let t = target(d.path(), d.path());
+        let status = note_baseline(&rec, &state, PHASE_IMPLEMENT, &t);
+        let mut other = t.clone();
+        other.run_epoch = 99;
+        assert!(
+            verdict_after_turn(
+                &rec,
+                &state,
+                PHASE_IMPLEMENT,
+                &other,
+                &status.trust(),
+                "codex",
+                None,
+                d.path(),
+            )
+            .is_none()
+        );
     }
 
     #[test]
