@@ -367,6 +367,21 @@ enum FoldReentry {
     Exhausted,
 }
 
+/// Option (b) part 2: a fold re-entry counts toward [`MAX_FOLD_REVIEW_REENTRIES`] only
+/// when it reproduces the identical spec/plan pair it saw at the previous re-entry.
+///
+/// A *changing* pair means the rewrite is converging — the next plan-review covers new
+/// bytes, so treating that as non-progress is what killed 0553 (x3) and 0555 (x2) on
+/// 2026-10-20. A *repeated* pair is the genuine "review never settles" case and still
+/// trips the cap, so the guard keeps its teeth.
+fn fold_counter_step(counter: u32, repeated: bool) -> u32 {
+    if repeated {
+        counter.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 fn short_sha(sha: &str) -> &str {
     sha.get(..8).unwrap_or(sha)
 }
@@ -467,8 +482,13 @@ fn fold_review_reentry(record: &ProjectRecord, state: &mut RunState) -> FoldReen
     if spec_now == spec_rev && plan_now == plan_rev {
         // Settled: a later rewrite in this run starts a fresh count.
         state.fold_review_reentries = 0;
+        state.fold_last_pair = None;
         return FoldReentry::None;
     }
+    let pair_now = (spec_now.clone(), plan_now.clone());
+    let repeated = state.fold_last_pair.as_ref() == Some(&pair_now);
+    state.fold_last_pair = Some(pair_now.clone());
+    state.fold_review_reentries = fold_counter_step(state.fold_review_reentries, repeated);
     if state.fold_review_reentries >= MAX_FOLD_REVIEW_REENTRIES {
         state.status = RunStatus::Stopped;
         state.failure_class = Some(FailureClass::ReviewNeverSettles);
@@ -1082,6 +1102,30 @@ mod tests {
     use crate::watch::{poll_once, wait_for_outcome};
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[test]
+    fn fold_counter_resets_while_the_pair_converges() {
+        // A changing pair on every pass is progress: it never reaches the cap.
+        let mut c = 0;
+        c = fold_counter_step(c, false);
+        c = fold_counter_step(c, false);
+        c = fold_counter_step(c, false);
+        assert_eq!(c, 0);
+        assert!(c < MAX_FOLD_REVIEW_REENTRIES);
+    }
+
+    #[test]
+    fn fold_counter_still_stops_a_repeated_pair() {
+        // The identical pair reproduced on each pass is the real never-settles case.
+        let mut c = 0;
+        for _ in 0..MAX_FOLD_REVIEW_REENTRIES {
+            c = fold_counter_step(c, true);
+        }
+        assert!(
+            c >= MAX_FOLD_REVIEW_REENTRIES,
+            "repeated pair must trip the cap: {c}"
+        );
+    }
 
     #[test]
     fn fold_withheld_status_caps_at_120_scalars() {
@@ -3232,6 +3276,7 @@ mod tests {
         state.track_id = Some("0097".into());
         state.status = RunStatus::Running;
         state.fold_review_reentries = MAX_FOLD_REVIEW_REENTRIES;
+        state.fold_last_pair = crate::workflow::reuse::current_artifact_pair(&dir);
         assert!(matches!(
             fold_review_reentry(&record, &mut state),
             FoldReentry::Exhausted

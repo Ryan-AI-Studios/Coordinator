@@ -99,6 +99,12 @@ pub struct RunState {
     /// must not spin: the run stops with `review_never_settles` at the cap.
     #[serde(default)]
     pub fold_review_reentries: u32,
+    /// Option (b) part 2 (2026-10-20): the last spec/plan pair observed at a fold
+    /// re-entry. A re-entry counts against [`MAX_FOLD_REVIEW_REENTRIES`] only when it
+    /// reproduces this identical pair; a pair that changed since the previous re-entry
+    /// is a converging rewrite and resets the count instead of marching toward the cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold_last_pair: Option<(String, String)>,
     /// When the current phase clock started (Running entry / fresh run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase_started_at: Option<DateTime<Utc>>,
@@ -314,6 +320,7 @@ impl RunState {
             last_event: "idle: no run".into(),
             run_epoch: 0,
             fold_review_reentries: 0,
+            fold_last_pair: None,
             phase_started_at: None,
             total_paused_ms: 0,
             pause_started_at: None,
