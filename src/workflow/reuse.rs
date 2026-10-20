@@ -735,80 +735,196 @@ mod tests {
         path
     }
 
-    fn matching_fixture(root: &Path, id: &str) -> ProjectRecord {
-        let r = rec(root);
-        let dir = track_dir_of(root, id);
+    /// Restore one process variable when the fixture (or a panicking test) drops it.
+    struct RestoreEnv {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl RestoreEnv {
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Machine-config isolation plus a populated track for the whole caller body.
+    ///
+    /// Field order is the drop order: env guards first, then the temp dirs they
+    /// point at, then the non-reentrant test lock. A panic inside a test
+    /// restores the developer's environment before the dirs are removed and
+    /// before the next test can acquire the lock.
+    struct ReuseFixture {
+        _restore_agy: RestoreEnv,
+        _restore_home: RestoreEnv,
+        root: tempfile::TempDir,
+        home: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        record: ProjectRecord,
+    }
+
+    impl ReuseFixture {
+        fn record(&self) -> &ProjectRecord {
+            &self.record
+        }
+
+        fn root(&self) -> &Path {
+            self.root.path()
+        }
+
+        fn home(&self) -> &Path {
+            self.home.path()
+        }
+    }
+
+    fn matching_fixture(id: &str) -> ReuseFixture {
+        matching_fixture_locked(id, test_env_lock())
+    }
+
+    /// Build the fixture with an already-acquired lock. The caller holds the only
+    /// non-reentrant guard, so it can set up sentinel values before construction.
+    fn matching_fixture_locked(id: &str, lock: std::sync::MutexGuard<'static, ()>) -> ReuseFixture {
+        // `slot_matches` resolves the live binding from the machine config, so without
+        // isolation every caller reads the developer's real `config.json`. A host that
+        // pins `plan_reviewer_agy.model` would make the null-model assertions fail while
+        // CI (which has no config) passes on the same commit. The fixture points the
+        // machine home at a temp dir and clears the binding override for the whole body.
+        let root = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let restore_home = RestoreEnv::set_path(crate::config::ENV_COORDINATOR_HOME, home.path());
+        let restore_agy = RestoreEnv::remove(ENV_COORDINATOR_AGY_BIN);
+
+        let r = rec(root.path());
+        let dir = track_dir_of(root.path(), id);
         std::fs::write(dir.join("spec.md"), b"spec-v1").unwrap();
         std::fs::write(dir.join("plan.md"), b"plan-v1").unwrap();
-        write_skill(root, b"skill-v1");
+        write_skill(root.path(), b"skill-v1");
         std::fs::write(dir.join("agy-review.md"), b"agy body\n").unwrap();
         std::fs::write(dir.join("opencode-review.md"), b"oc body\n").unwrap();
         write_join_receipt(&r, id);
-        r
+
+        ReuseFixture {
+            _restore_agy: restore_agy,
+            _restore_home: restore_home,
+            root,
+            home,
+            _lock: lock,
+            record: r,
+        }
     }
 
     #[test]
     fn byte_change_refuses_the_slot() {
-        let dir = tempdir().unwrap();
-        let r = matching_fixture(dir.path(), "0083");
-        assert!(slot_matches(&r, "0083", REVIEW_SLUG_AGY));
-        let review = track_dir_of(dir.path(), "0083").join("agy-review.md");
+        let f = matching_fixture("0083");
+        let r = f.record();
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        let review = track_dir_of(f.root(), "0083").join("agy-review.md");
         std::fs::write(&review, b"agy body!\n").unwrap();
-        assert!(!slot_matches(&r, "0083", REVIEW_SLUG_AGY));
-        assert!(slot_matches(&r, "0083", REVIEW_SLUG_OPENCODE));
+        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_OPENCODE));
     }
 
     #[test]
     fn binding_or_skill_change_refuses_the_slot() {
-        let _lock = test_env_lock();
-        let prev = std::env::var_os(ENV_COORDINATOR_AGY_BIN);
-        // `slot_matches` resolves the live binding from the machine config, so without
-        // isolation this test reads the developer's real `config.json`. A host that pins
-        // `plan_reviewer_agy.model` makes the null-model case below fail, while CI (which
-        // has no config) passes on the same commit. Point the machine home at a temp dir so
-        // the bindings are the compiled defaults wherever the suite runs.
-        let home = tempdir().unwrap();
-        struct RestoreHome(Option<std::ffi::OsString>);
-        impl Drop for RestoreHome {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.0 {
-                        Some(v) => std::env::set_var(crate::config::ENV_COORDINATOR_HOME, v),
-                        None => std::env::remove_var(crate::config::ENV_COORDINATOR_HOME),
-                    }
-                }
-            }
-        }
-        let _restore_home = RestoreHome(std::env::var_os(crate::config::ENV_COORDINATOR_HOME));
-        unsafe {
-            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
-        }
-        let dir = tempdir().unwrap();
-        let r = matching_fixture(dir.path(), "0083");
-        assert!(slot_matches(&r, "0083", REVIEW_SLUG_AGY));
-        let skill = write_skill(dir.path(), b"skill-v1-changed");
-        assert!(!slot_matches(&r, "0083", REVIEW_SLUG_AGY));
+        // The fixture owns the non-reentrant env lock and the AGY_BIN restore.
+        let f = matching_fixture("0083");
+        let r = f.record();
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        let skill = write_skill(f.root(), b"skill-v1-changed");
+        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY));
         std::fs::write(&skill, b"skill-v1").unwrap();
-        assert!(slot_matches(&r, "0083", REVIEW_SLUG_AGY));
-        let receipt = track_dir_of(dir.path(), "0083").join("reuse.json");
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        let receipt = track_dir_of(f.root(), "0083").join("reuse.json");
         let mut v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
         v["slots"]["agy"]["model"] = serde_json::json!("other-model");
         std::fs::write(&receipt, serde_json::to_vec(&v).unwrap()).unwrap();
-        assert!(!slot_matches(&r, "0083", REVIEW_SLUG_AGY));
+        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY));
         v["slots"]["agy"]["model"] = serde_json::Value::Null;
         std::fs::write(&receipt, serde_json::to_vec(&v).unwrap()).unwrap();
-        assert!(slot_matches(&r, "0083", REVIEW_SLUG_AGY));
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY));
         unsafe {
             std::env::set_var(ENV_COORDINATOR_AGY_BIN, r"C:\custom\agy.exe");
         }
-        assert!(!slot_matches(&r, "0083", REVIEW_SLUG_AGY));
+        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY));
+    }
+
+    #[test]
+    fn reuse_fixture_restores_env_on_panic_and_recovers_poisoned_lock() {
+        let prev_agy = r"C:\sentinel\agy.exe";
+        let prev_home = r"C:\sentinel\home";
+        let lock = test_env_lock();
         unsafe {
-            match &prev {
-                Some(v) => std::env::set_var(ENV_COORDINATOR_AGY_BIN, v),
-                None => std::env::remove_var(ENV_COORDINATOR_AGY_BIN),
-            }
+            std::env::set_var(ENV_COORDINATOR_AGY_BIN, prev_agy);
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, prev_home);
         }
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _fixture = matching_fixture_locked("0083", lock);
+            panic!("fixture panic with values present");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            std::env::var_os(ENV_COORDINATOR_AGY_BIN).as_deref(),
+            Some(std::ffi::OsStr::new(prev_agy))
+        );
+        assert_eq!(
+            std::env::var_os(crate::config::ENV_COORDINATOR_HOME).as_deref(),
+            Some(std::ffi::OsStr::new(prev_home))
+        );
+        // The unwind poisoned the shared lock; the helper must recover it.
+        drop(test_env_lock());
+
+        let lock = test_env_lock();
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_AGY_BIN);
+            std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+        }
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _fixture = matching_fixture_locked("0083", lock);
+            panic!("fixture panic with values absent");
+        }));
+        assert!(panicked.is_err());
+        assert!(std::env::var_os(ENV_COORDINATOR_AGY_BIN).is_none());
+        assert!(std::env::var_os(crate::config::ENV_COORDINATOR_HOME).is_none());
+        drop(test_env_lock());
+    }
+
+    #[test]
+    fn matching_fixture_isolates_config_for_entire_test() {
+        let f = matching_fixture("0083");
+        assert_eq!(
+            std::env::var_os(crate::config::ENV_COORDINATOR_HOME).as_deref(),
+            Some(f.home().as_os_str()),
+            "machine home must stay redirected for the whole body"
+        );
+
+        // A binding pinned only in the fixture home must be the one slot_matches
+        // sees; the receipt recorded the compiled default before this write.
+        std::fs::write(
+            f.home().join("config.json"),
+            r#"{"version":1,"scan_roots":[],"role_bindings":{"plan_reviewer_agy":{"harness":"antigravity","command":"agy","model":"host-model"}}}"#,
+        )
+        .unwrap();
+        assert!(!slot_matches(f.record(), "0083", REVIEW_SLUG_AGY));
     }
 
     #[test]
@@ -852,11 +968,11 @@ mod tests {
 
     #[test]
     fn note_pr_attaches_when_hashes_match() {
-        let dir = tempdir().unwrap();
-        let r = matching_fixture(dir.path(), "0083");
-        note_pr(&r, "0083", 80, "abc123", "track/0083-Relaunch");
+        let f = matching_fixture("0083");
+        let r = f.record();
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
         let v: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(track_dir_of(dir.path(), "0083").join("reuse.json")).unwrap(),
+            &std::fs::read(track_dir_of(f.root(), "0083").join("reuse.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(v["pr"]["number"], 80);
@@ -867,13 +983,13 @@ mod tests {
 
     #[test]
     fn note_pr_strips_pr_when_inputs_mismatch() {
-        let dir = tempdir().unwrap();
-        let r = matching_fixture(dir.path(), "0083");
-        note_pr(&r, "0083", 80, "abc123", "track/0083-Relaunch");
-        std::fs::write(track_dir_of(dir.path(), "0083").join("spec.md"), b"spec-v2").unwrap();
-        note_pr(&r, "0083", 81, "def456", "track/0083-Relaunch");
+        let f = matching_fixture("0083");
+        let r = f.record();
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
+        std::fs::write(track_dir_of(f.root(), "0083").join("spec.md"), b"spec-v2").unwrap();
+        note_pr(r, "0083", 81, "def456", "track/0083-Relaunch");
         let v: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(track_dir_of(dir.path(), "0083").join("reuse.json")).unwrap(),
+            &std::fs::read(track_dir_of(f.root(), "0083").join("reuse.json")).unwrap(),
         )
         .unwrap();
         assert!(v.get("pr").is_none() || v["pr"].is_null());
@@ -883,37 +999,37 @@ mod tests {
 
     #[test]
     fn note_pr_no_op_when_pr_already_matching() {
-        let dir = tempdir().unwrap();
-        let r = matching_fixture(dir.path(), "0083");
-        note_pr(&r, "0083", 80, "abc123", "track/0083-Relaunch");
-        let path = track_dir_of(dir.path(), "0083").join("reuse.json");
+        let f = matching_fixture("0083");
+        let r = f.record();
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
+        let path = track_dir_of(f.root(), "0083").join("reuse.json");
         let before = std::fs::read(&path).unwrap();
         std::fs::write(
-            track_dir_of(dir.path(), "0083").join("spec.md"),
+            track_dir_of(f.root(), "0083").join("spec.md"),
             b"spec-later",
         )
         .unwrap();
-        note_pr(&r, "0083", 80, "abc123", "track/0083-Relaunch");
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after);
     }
 
     #[test]
     fn head_sha_target_does_not_note_pr() {
-        let dir = tempdir().unwrap();
-        let r = matching_fixture(dir.path(), "0083");
-        note_pr(&r, "0083", 80, "abc123", "track/0083-Relaunch");
-        let path = track_dir_of(dir.path(), "0083").join("reuse.json");
+        let f = matching_fixture("0083");
+        let r = f.record();
+        note_pr(r, "0083", 80, "abc123", "track/0083-Relaunch");
+        let path = track_dir_of(f.root(), "0083").join("reuse.json");
         let before = std::fs::read(&path).unwrap();
         note_ci_target(
-            &r,
+            r,
             "0083",
             &CiTarget::HeadSha {
                 sha: "deadbeef".into(),
             },
         );
         note_ci_target(
-            &r,
+            r,
             "0083",
             &CiTarget::PullRequest {
                 number: 9,
