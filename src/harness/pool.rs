@@ -455,7 +455,18 @@ async fn apply_turn(
     injected_phase: &str,
     spawn: SpawnTally,
 ) -> Result<HarnessPromptView> {
-    apply_turn_checked(record, turn, harness, injected_phase, spawn, None, None).await
+    apply_turn_checked(
+        record,
+        turn,
+        harness,
+        injected_phase,
+        spawn,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
 }
 
 fn commit_prepared(
@@ -492,7 +503,12 @@ fn prepared_skipped_view(
     prepared: &PreparedInjection,
     reason: &str,
 ) -> HarnessPromptView {
-    journal_sample_skip(record, prepared.target(), reason);
+    journal_sample_skip_for(
+        record,
+        prepared.target(),
+        prepared.track_id.as_deref(),
+        reason,
+    );
     HarnessPromptView {
         text: None,
         stop_reason: None,
@@ -506,7 +522,21 @@ fn prepared_skipped_view(
 }
 
 fn journal_sample_skip(record: &ProjectRecord, target: Option<&ResolvedExecution>, reason: &str) {
-    let track = target.map(|t| t.track_id.as_str()).unwrap_or("(none)");
+    journal_sample_skip_for(record, target, None, reason);
+}
+
+/// A stale/unresolved skip journals the track from the frozen
+/// `PreparedInjection.track_id` when the target is `None` (0098), never `(none)`.
+fn journal_sample_skip_for(
+    record: &ProjectRecord,
+    target: Option<&ResolvedExecution>,
+    fallback_track: Option<&str>,
+    reason: &str,
+) {
+    let track = target
+        .map(|t| t.track_id.as_str())
+        .or(fallback_track)
+        .unwrap_or("(none)");
     let source = target.map(|t| t.source.as_str()).unwrap_or("none");
     crate::progress_log::append(
         record,
@@ -515,8 +545,67 @@ fn journal_sample_skip(record: &ProjectRecord, target: Option<&ResolvedExecution
     );
 }
 
+/// Apply a detected terminal block through the frozen identity only.
+///
+/// Never bare `write_and_apply`: a stale identity is a structured skip that preserves
+/// the turn text, writes no artifact and does not fail the newer run.
+#[allow(clippy::too_many_arguments)]
+fn apply_block_declaration(
+    record: &ProjectRecord,
+    reason: String,
+    text: String,
+    stop_reason: Option<String>,
+    harness: GrokHarnessStatus,
+    injected_phase: &str,
+    injected_epoch: u64,
+    identity: &PreparedInjection,
+) -> Result<HarnessPromptView> {
+    let outcome = PhaseOutcome::failure(
+        injected_phase,
+        FailureClass::Blocked,
+        OutcomeSource::Adapter,
+        Some(reason),
+        Some(injected_epoch),
+    );
+    match write_and_apply_prepared(record, outcome, identity)? {
+        ApplyIdentity::Applied(view) => Ok(HarnessPromptView {
+            text: Some(text),
+            stop_reason,
+            applied: true,
+            skipped: None,
+            error: None,
+            failure_class: Some(FailureClass::Blocked),
+            status: Some(view),
+            harness: Some(harness),
+        }),
+        ApplyIdentity::Stale(reason) => {
+            journal_sample_skip_for(
+                record,
+                identity.target(),
+                identity.track_id.as_deref(),
+                &reason,
+            );
+            Ok(HarnessPromptView {
+                text: Some(text),
+                stop_reason,
+                applied: false,
+                skipped: Some(true),
+                error: None,
+                failure_class: None,
+                status: None,
+                harness: Some(harness),
+            })
+        }
+    }
+}
+
 /// `no_change` is the unchanged-tree verdict (0095) computed beside the prompt, where the session
 /// cwd is known. `Some` turns a would-be success into a `HarnessCrash` failure.
+///
+/// `block_identity` is the block-only frozen identity captured at inject time (0098). It is
+/// **never** passed in the `prepared` slot: `prepared` alone still drives the early skip, the
+/// ordinary `commit_prepared` path, the continuation target and the no-change verdict.
+#[allow(clippy::too_many_arguments)]
 async fn apply_turn_checked(
     record: &ProjectRecord,
     turn: std::result::Result<PromptResult, CoordinatorError>,
@@ -525,11 +614,16 @@ async fn apply_turn_checked(
     spawn: SpawnTally,
     no_change: Option<String>,
     prepared: Option<&PreparedInjection>,
+    block_identity: Option<&PreparedInjection>,
+    manual_prepared_phase: bool,
 ) -> Result<HarnessPromptView> {
     let state = load_run_state(record)?;
     let drifted = state.phase != injected_phase;
     // Outcomes are stamped with the injected epoch, never a newly loaded one.
-    let injected_epoch = prepared.map(|p| p.run_epoch).unwrap_or(state.run_epoch);
+    let injected_epoch = prepared
+        .or(block_identity)
+        .map(|p| p.run_epoch)
+        .unwrap_or(state.run_epoch);
     if let Some(prepared) = prepared
         && (state.status != RunStatus::Running || !prepared.matches_state(&state))
     {
@@ -600,6 +694,52 @@ async fn apply_turn_checked(
                             )
                         }
                         None => {
+                            // 0098: a terminal block declaration is evaluated on the current
+                            // turn text only, after harness-error text and before self-check.
+                            if let Some(reason) =
+                                crate::workflow::block::classify(&pr.text, injected_phase)
+                            {
+                                let Some(identity) = prepared.or(block_identity) else {
+                                    // No frozen identity (manual prompt into a non-Running or
+                                    // non-six-phase run): structured skip, text preserved.
+                                    journal_sample_skip(record, None, "block-no-identity");
+                                    return Ok(HarnessPromptView {
+                                        text: Some(pr.text),
+                                        stop_reason: pr.stop_reason,
+                                        applied: false,
+                                        skipped: Some(true),
+                                        error: None,
+                                        failure_class: None,
+                                        status: None,
+                                        harness: Some(harness),
+                                    });
+                                };
+                                return apply_block_declaration(
+                                    record,
+                                    reason,
+                                    pr.text,
+                                    pr.stop_reason,
+                                    harness,
+                                    injected_phase,
+                                    injected_epoch,
+                                    identity,
+                                );
+                            }
+                            // A manual prompt in a prepared phase is not an adapter leg.
+                            // Non-block text must not acquire a target or apply an ordinary
+                            // outcome (0098 / 0101 interaction).
+                            if manual_prepared_phase {
+                                return Ok(HarnessPromptView {
+                                    text: Some(pr.text),
+                                    stop_reason: pr.stop_reason,
+                                    applied: false,
+                                    skipped: Some(true),
+                                    error: None,
+                                    failure_class: None,
+                                    status: None,
+                                    harness: Some(harness),
+                                });
+                            }
                             if crate::workflow::self_check::hold_continue(
                                 record,
                                 injected_phase,
@@ -1504,6 +1644,8 @@ async fn handle_prepared_prompt(
         tally,
         no_change,
         Some(&prepared),
+        None,
+        false,
     )
     .await?;
     Ok((view_to_hold(view), false))
@@ -1586,9 +1728,10 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     false,
                 ),
                 Ok(_gate) => {
-                    let injected_phase = load_run_state(record)?.phase;
+                    let state = load_run_state(record)?;
+                    let injected_phase = state.phase.clone();
                     set_prompt_in_flight(record, true);
-                    let turn = {
+                    let (turn, block_identity) = {
                         let mut session = shared.session.lock().await;
                         // Legacy/manual prompts never inherit a prepared turn's ACP roots.
                         session.clear_turn_roots();
@@ -1601,11 +1744,18 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             Some(&session.session_id),
                             false,
                         );
+                        // 0098: capture the block-only identity immediately before the send,
+                        // so a long turn that moves epoch or phase is seen as stale.
+                        let block_identity = load_run_state(record)
+                            .ok()
+                            .filter(crate::workflow::block::capture_allowed)
+                            .map(|s| PreparedInjection::legacy(&s));
                         // Legacy Prompt is the manual CLI/HTTP and prompt-only phase seam:
                         // it never resolves a target, captures a baseline or emits a verdict.
-                        session
+                        let turn = session
                             .inject_prompt(&text, prompt_timeout_for(record))
-                            .await
+                            .await;
+                        (turn, block_identity)
                     };
                     let normal = matches!(&turn, Ok(pr) if !crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()));
                     if normal {
@@ -1637,6 +1787,8 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                         tally,
                         None,
                         None,
+                        block_identity.as_ref(),
+                        crate::workflow::execution_repo::prepares_target(&injected_phase),
                     )
                     .await?;
                     (view_to_hold(view), false)
@@ -1881,7 +2033,7 @@ async fn prompt_impl(
     }
 
     set_prompt_in_flight(&rec, true);
-    let turn = {
+    let (turn, block_identity) = {
         let mut pool = global_pool().lock().await;
         let session = pool.get_mut(&rec.id).ok_or_else(|| {
             CoordinatorError::Message(
@@ -1911,9 +2063,15 @@ async fn prompt_impl(
             Some(&session.session_id),
             false,
         );
+        // 0098: block-only identity captured at inject start. Only an Adapter run in a
+        // six-phase, Running state may classify a block.
+        let block_identity = load_run_state(&rec)
+            .ok()
+            .filter(crate::workflow::block::capture_allowed)
+            .map(|s| PreparedInjection::legacy(&s));
         let turn = session.inject_prompt(&text, prompt_timeout_for(&rec)).await;
         session.clear_turn_roots();
-        turn
+        (turn, block_identity)
     };
     let normal = matches!(&turn, Ok(pr) if !crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()));
     if normal {
@@ -1989,6 +2147,8 @@ async fn prompt_impl(
         tally,
         no_change,
         prepared.as_ref(),
+        block_identity.as_ref(),
+        prepared.is_none() && crate::workflow::execution_repo::prepares_target(&injected_phase),
     )
     .await
 }
@@ -5057,6 +5217,8 @@ Loop\r\n",
             SpawnTally::default(),
             Some(msg.clone()),
             None,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -5089,6 +5251,8 @@ Loop\r\n",
             SpawnTally::default(),
             None,
             None,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -6084,6 +6248,8 @@ Loop\r\n",
             SpawnTally::default(),
             None,
             Some(&prepared),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -6101,6 +6267,8 @@ Loop\r\n",
             SpawnTally::default(),
             None,
             Some(&prepared),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -6128,6 +6296,8 @@ Loop\r\n",
             SpawnTally::default(),
             None,
             Some(&prepared),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -6155,6 +6325,8 @@ Loop\r\n",
             SpawnTally::default(),
             None,
             Some(&prepared),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -6232,5 +6404,302 @@ Loop\r\n",
         }
         let state = crate::state::load_run_state(&rec).unwrap();
         assert_eq!(state.status, RunStatus::Stopped);
+    }
+
+    fn block_turn(text: &str) -> std::result::Result<PromptResult, CoordinatorError> {
+        Ok(PromptResult {
+            text: text.into(),
+            stop_reason: Some("end_turn".into()),
+        })
+    }
+
+    fn status_md(rec: &ProjectRecord) -> String {
+        std::fs::read_to_string(crate::progress_log::path(rec)).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn unprepared_plan_block_stops_same_phase_with_one_artifact() {
+        let _guard = test_env_lock();
+        let (rec, _home, _proj) = implement_leg_fixture(crate::workflow::graph::PHASE_PLAN);
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert!(state.delivery_target.is_none());
+        let identity = PreparedInjection::legacy(&state);
+        let view = apply_turn_checked(
+            &rec,
+            block_turn("work done\nBlocked: the repository needs a credential"),
+            harness_stub(),
+            crate::workflow::graph::PHASE_PLAN,
+            SpawnTally::default(),
+            None,
+            None,
+            Some(&identity),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::Blocked));
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(st.failure_class, Some(FailureClass::Blocked));
+        assert_eq!(
+            st.phase,
+            crate::workflow::graph::PHASE_PLAN,
+            "never advances"
+        );
+        assert!(
+            crate::notify::artifact::existing_path(&rec).is_some(),
+            "one Failure Artifact"
+        );
+        let log = status_md(&rec);
+        assert_eq!(log.matches("  fail  ").count(), 1, "{log}");
+        assert!(log.contains("phase=plan"), "{log}");
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_never_classifies_a_block() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        let turn = Ok(PromptResult {
+            text: "Blocked: the turn was cancelled".into(),
+            stop_reason: Some("cancelled".into()),
+        });
+        let view = apply_turn_checked(
+            &rec,
+            turn,
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert!(st.failure_class.is_none());
+    }
+
+    #[tokio::test]
+    async fn block_overrides_no_change_and_precedes_self_check() {
+        let (_dir, mut rec, prepared) = prepared_fixture();
+        rec.self_continuation = true;
+        let text = "Blocked: prerequisite missing\nself-check: continue finding=f action=repair";
+        let view = apply_turn_checked(
+            &rec,
+            block_turn(text),
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            Some("no change detected".into()),
+            Some(&prepared),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::Blocked));
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(st.failure_class, Some(FailureClass::Blocked));
+        assert!(st.self_check.is_none(), "block precedes self-check");
+    }
+
+    #[tokio::test]
+    async fn harness_error_text_precedes_block() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        let text = "Blocked: a reason\nError: RetriableError from the harness";
+        let view = apply_turn_checked(
+            &rec,
+            block_turn(text),
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.failure_class, Some(FailureClass::HarnessCrash));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stale_unprepared_block_is_a_skip_journaling_the_frozen_track() {
+        let _guard = test_env_lock();
+        let (rec, _home, _proj) = implement_leg_fixture(crate::workflow::graph::PHASE_PLAN);
+        crate::state::with_run_state_lock(&rec, || {
+            let mut st = crate::state::load_run_state(&rec)?;
+            st.track_id = Some("0098".into());
+            crate::state::save_run_state(&rec, &st)
+        })
+        .unwrap();
+        let state = crate::state::load_run_state(&rec).unwrap();
+        let identity = PreparedInjection::legacy(&state);
+        bump_epoch(&rec);
+        let view = apply_turn_checked(
+            &rec,
+            block_turn("Blocked: old epoch"),
+            harness_stub(),
+            crate::workflow::graph::PHASE_PLAN,
+            SpawnTally::default(),
+            None,
+            None,
+            Some(&identity),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        assert_eq!(view.text.as_deref(), Some("Blocked: old epoch"));
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        let log = status_md(&rec);
+        assert!(log.contains("track=0098"), "{log}");
+        assert!(!log.contains("track=(none)"), "{log}");
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.run_epoch, state.run_epoch + 1);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn manual_prompt_into_stopped_keeps_text_and_applies_nothing() {
+        let _guard = test_env_lock();
+        let (rec, _home, _proj) = implement_leg_fixture(crate::workflow::graph::PHASE_PLAN);
+        crate::state::with_run_state_lock(&rec, || {
+            let mut st = crate::state::load_run_state(&rec)?;
+            st.status = RunStatus::Stopped;
+            crate::state::save_run_state(&rec, &st)
+        })
+        .unwrap();
+        let view = apply_turn_checked(
+            &rec,
+            block_turn("Blocked: should not apply"),
+            harness_stub(),
+            crate::workflow::graph::PHASE_PLAN,
+            SpawnTally::default(),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        assert_eq!(view.text.as_deref(), Some("Blocked: should not apply"));
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_prepared_block_applies_with_target_none_and_no_mutation() {
+        let (_dir, rec, _prepared) = prepared_fixture();
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert!(state.delivery_target.is_none());
+        let identity = PreparedInjection::legacy(&state);
+        assert!(identity.target().is_none());
+        let view = apply_turn_checked(
+            &rec,
+            block_turn("Blocked: missing prerequisite"),
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            None,
+            Some(&identity),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(st.failure_class, Some(FailureClass::Blocked));
+        assert!(st.delivery_target.is_none(), "block is not a delivery gate");
+    }
+
+    #[tokio::test]
+    async fn non_block_manual_prepared_turn_applies_nothing() {
+        let (_dir, rec, _prepared) = prepared_fixture();
+        let state = crate::state::load_run_state(&rec).unwrap();
+        let identity = PreparedInjection::legacy(&state);
+        let view = apply_turn_checked(
+            &rec,
+            block_turn("ordinary manual prompt"),
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            None,
+            Some(&identity),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+        assert_eq!(view.text.as_deref(), Some("ordinary manual prompt"));
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, crate::workflow::graph::PHASE_IMPLEMENT);
+    }
+
+    #[tokio::test]
+    async fn prepared_block_with_moved_target_uses_frozen_identity() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut st = crate::state::load_run_state(&rec)?;
+            st.delivery_target = Some(ResolvedExecution {
+                declared_path: std::path::PathBuf::from(r"C:\dev\other"),
+                prompt_path: std::path::PathBuf::from(r"C:\dev\other"),
+                sample_path: std::path::PathBuf::from(r"C:\dev\other"),
+                ..prepared.target().unwrap().clone()
+            });
+            crate::state::save_run_state(&rec, &st)
+        })
+        .unwrap();
+        let view = apply_turn_checked(
+            &rec,
+            block_turn("Blocked: moved row"),
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(view.applied);
+        let st = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(
+            st.delivery_target.as_ref().map(|t| t.declared_path.clone()),
+            Some(std::path::PathBuf::from(r"C:\dev\other")),
+            "block does not rewrite delivery_target"
+        );
     }
 }

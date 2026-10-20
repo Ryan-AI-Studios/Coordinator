@@ -77,10 +77,13 @@ pub enum FailureClass {
     /// A leg reported success, but the artifacts say the phase did not actually
     /// complete: no `plan.md`, or a review artifact still asking for a re-plan.
     Gate,
+    /// 0098: the leg declared a terminal prerequisite block in its turn text. The run
+    /// stops and the project holds until `failure resolve`.
+    Blocked,
 }
 
 impl FailureClass {
-    pub const ALL: [FailureClass; 9] = [
+    pub const ALL: [FailureClass; 10] = [
         Self::Permission,
         Self::ModelExhaustion,
         Self::Difficulty,
@@ -90,6 +93,7 @@ impl FailureClass {
         Self::SkillMissing,
         Self::ReviewNeverSettles,
         Self::Gate,
+        Self::Blocked,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -103,6 +107,7 @@ impl FailureClass {
             Self::SkillMissing => "skill_missing",
             Self::ReviewNeverSettles => "review_never_settles",
             Self::Gate => "gate",
+            Self::Blocked => "blocked",
         }
     }
 
@@ -117,6 +122,7 @@ impl FailureClass {
             "skill_missing" => Ok(Self::SkillMissing),
             "review_never_settles" => Ok(Self::ReviewNeverSettles),
             "gate" => Ok(Self::Gate),
+            "blocked" => Ok(Self::Blocked),
             other => Err(CoordinatorError::Message(format!(
                 "unknown failure_class: {other}"
             ))),
@@ -536,6 +542,11 @@ fn note_consecutive_failures(
         }
         OutcomeStatus::Failure => {
             if bounced {
+                return;
+            }
+            // 0098: a blocked turn is a hold, not a failed attempt. It must not move the
+            // policy checkpoint counter; earlier failures still do.
+            if outcome.failure_class == Some(FailureClass::Blocked) {
                 return;
             }
             if outcome
@@ -1060,6 +1071,17 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    fn resolve_for_test(record: &ProjectRecord) {
+        let mut state = load_run_state(record).unwrap();
+        crate::notify::settle_failure(
+            record,
+            &mut state,
+            crate::notify::LAST_EVENT_FAILURE_RESOLVED,
+            true,
+        );
+        save_run_state(record, &state).unwrap();
+    }
+
     fn rec(path: &Path) -> ProjectRecord {
         ProjectRecord {
             id: Uuid::new_v4().to_string(),
@@ -1353,6 +1375,211 @@ mod tests {
         let r = rec(dir.path());
         let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::Cli, None, None, None);
         assert!(apply(&r, o).is_err());
+    }
+
+    #[test]
+    fn failure_class_all_is_ten_with_blocked_last_and_serde_blocked() {
+        assert_eq!(FailureClass::ALL.len(), 10);
+        assert_eq!(FailureClass::ALL[9], FailureClass::Blocked);
+        assert_eq!(FailureClass::Blocked.as_str(), "blocked");
+        assert_eq!(
+            FailureClass::parse("blocked").unwrap(),
+            FailureClass::Blocked
+        );
+        assert_eq!(
+            serde_json::to_string(&FailureClass::Blocked).unwrap(),
+            "\"blocked\""
+        );
+        assert_eq!(
+            serde_json::from_str::<FailureClass>("\"blocked\"").unwrap(),
+            FailureClass::Blocked
+        );
+        for class in FailureClass::ALL {
+            assert_eq!(FailureClass::parse(class.as_str()).unwrap(), class);
+        }
+    }
+
+    #[test]
+    fn old_schema_readers_qualify_the_blocked_downgrade_symptoms() {
+        // Mirror of the pre-0098 enum: an older binary cannot deserialize `blocked`.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum LegacyFailureClass {
+            Permission,
+            ModelExhaustion,
+            Difficulty,
+            HarnessCrash,
+            Timeout,
+            CiFailed,
+            SkillMissing,
+            ReviewNeverSettles,
+            Gate,
+        }
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct LegacyRunState {
+            failure_class: Option<LegacyFailureClass>,
+        }
+        assert!(serde_json::from_str::<LegacyFailureClass>("\"blocked\"").is_err());
+
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_stub(&r, Some("0098".into())).unwrap();
+        ensure_outcomes_dir(&r).unwrap();
+
+        // `current.json`: an unreadable class is a soft skip for the poller and an
+        // error for the direct CLI loader (an old binary's tick is skipped).
+        let mut current = serde_json::to_value(PhaseOutcome::failure(
+            STUB_PHASE_ACTIVE,
+            FailureClass::Blocked,
+            OutcomeSource::File,
+            Some("blocked".into()),
+            None,
+        ))
+        .unwrap();
+        current["failure_class"] = serde_json::json!("legacy_unknown");
+        std::fs::write(
+            outcome_current_path(&r).unwrap(),
+            serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        assert!(try_load_current_outcome(&r).is_none());
+        assert!(load_current_outcome(&r).is_err());
+
+        // `run-state.json`: the same kind of unknown value hard-fails the run-state load,
+        // so status / run / failure resolve are unavailable to the old binary.
+        let state_path = crate::state::resolve_state_dir(&r)
+            .unwrap()
+            .join("run-state.json");
+        let mut state_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        state_json["failure_class"] = serde_json::json!("legacy_unknown");
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&state_json).unwrap()).unwrap();
+        assert!(load_run_state(&r).is_err());
+        assert!(
+            serde_json::from_str::<LegacyRunState>(&std::fs::read_to_string(&state_path).unwrap())
+                .is_err()
+        );
+
+        // The current schema reads `blocked` in both files.
+        state_json["failure_class"] = serde_json::json!("blocked");
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&state_json).unwrap()).unwrap();
+        assert_eq!(
+            load_run_state(&r).unwrap().failure_class,
+            Some(FailureClass::Blocked)
+        );
+        current["failure_class"] = serde_json::json!("blocked");
+        std::fs::write(
+            outcome_current_path(&r).unwrap(),
+            serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_current_outcome(&r).unwrap().unwrap().failure_class,
+            Some(FailureClass::Blocked)
+        );
+    }
+
+    #[test]
+    fn blocked_failure_does_not_increment_or_reset_consecutive_failures() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_stub(&r, Some("0098".into())).unwrap();
+        // Zero -> blocked stays zero.
+        apply(
+            &r,
+            PhaseOutcome::failure(
+                STUB_PHASE_ACTIVE,
+                FailureClass::Blocked,
+                OutcomeSource::Test,
+                Some("prerequisite".into()),
+                None,
+            ),
+        )
+        .unwrap();
+        let state = load_run_state(&r).unwrap();
+        assert_eq!(state.status, RunStatus::Stopped);
+        assert_eq!(state.failure_class, Some(FailureClass::Blocked));
+        assert_eq!(state.consecutive_failures.get("0098").copied(), None);
+
+        // A blocked turn after a real failure keeps the nonzero count; `failure resolve`
+        // retains it too.
+        resolve_for_test(&r);
+        run_stub(&r, Some("0098".into())).unwrap();
+        apply(
+            &r,
+            PhaseOutcome::failure(
+                STUB_PHASE_ACTIVE,
+                FailureClass::HarnessCrash,
+                OutcomeSource::Test,
+                Some("boom".into()),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .consecutive_failures
+                .get("0098")
+                .copied(),
+            Some(1)
+        );
+        resolve_for_test(&r);
+        run_stub(&r, Some("0098".into())).unwrap();
+        apply(
+            &r,
+            PhaseOutcome::failure(
+                STUB_PHASE_ACTIVE,
+                FailureClass::Blocked,
+                OutcomeSource::Test,
+                Some("prerequisite".into()),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .consecutive_failures
+                .get("0098")
+                .copied(),
+            Some(1),
+            "blocked must not increment an existing count"
+        );
+        resolve_for_test(&r);
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .consecutive_failures
+                .get("0098")
+                .copied(),
+            Some(1),
+            "resolve retains the count"
+        );
+
+        // A later ordinary success resets it.
+        run_stub(&r, Some("0098".into())).unwrap();
+        apply(
+            &r,
+            PhaseOutcome::success(
+                STUB_PHASE_ACTIVE,
+                OutcomeSource::Test,
+                Some("ok".into()),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .consecutive_failures
+                .get("0098")
+                .copied(),
+            Some(0)
+        );
     }
 
     #[test]

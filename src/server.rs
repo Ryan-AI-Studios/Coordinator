@@ -1424,4 +1424,51 @@ mod tests {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
     }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn blocked_http_run_is_409_with_normal_error_json() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let rec =
+            api::project_add(proj.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.status = crate::state::RunStatus::Stopped;
+        state.phase = crate::workflow::graph::PHASE_PLAN.into();
+        state.track_id = Some("0098".into());
+        state.failure_class = Some(crate::outcome::FailureClass::Blocked);
+        crate::state::save_run_state(&rec, &state).unwrap();
+
+        let body = serde_json::to_vec(&json!({ "driver": "stub", "track": "0098" })).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let error = v["error"].as_str().expect("normal error JSON body");
+        assert!(error.contains("0098"), "{error}");
+        assert!(error.contains("failure resolve"), "{error}");
+
+        let held = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(
+            held.failure_class,
+            Some(crate::outcome::FailureClass::Blocked)
+        );
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
 }

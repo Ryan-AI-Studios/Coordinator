@@ -87,6 +87,29 @@ pub(crate) fn run_with_origin(
     }
 }
 
+/// 0098: a durable project-wide hold derived from a Blocked failure class.
+///
+/// The refusal names the held track, its current conductor row status (or `unknown`),
+/// and the only release path. It never rewrites the row or any run state.
+pub fn blocked_hold(record: &ProjectRecord, state: &RunState) -> Option<CoordinatorError> {
+    if state.failure_class != Some(crate::outcome::FailureClass::Blocked) {
+        return None;
+    }
+    let track = state
+        .track_id
+        .clone()
+        .unwrap_or_else(|| "(none)".to_string());
+    let row_status = crate::workflow::conductor_md::load_track_rows(record)
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|row| crate::workflow::conductor_md::row_matches_track(row, &track))
+        })
+        .map(|row| crate::workflow::conductor_md::status_clean(&row.status_raw))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    Some(CoordinatorError::BlockedHold { track, row_status })
+}
+
 fn prepare_run_locked(
     record: &ProjectRecord,
     track_id: Option<String>,
@@ -95,6 +118,9 @@ fn prepare_run_locked(
 ) -> Result<RunPrep> {
     ensure_state_dir(record)?;
     let state = load_run_state(record)?;
+    if let Some(err) = blocked_hold(record, &state) {
+        return Err(err);
+    }
     match state.status {
         RunStatus::Idle | RunStatus::Stopped => {
             if track_id.is_none()
@@ -174,6 +200,10 @@ fn finish_probed_run(
         || state.status != ctx.snap_status
     {
         return Ok(StatusView::from_record(record, &state));
+    }
+    // 0098: recheck the hold after the `gh` probe, before `begin_fresh_run`.
+    if let Some(err) = blocked_hold(record, &state) {
+        return Err(err);
     }
     let ci_wait =
         if crate::workflow::reuse::probe_accepts(&ctx.effective_track, &ctx.head_sha, answer) {
@@ -308,6 +338,9 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
     with_run_state_lock(record, || {
         ensure_state_dir(record)?;
         let mut state = load_run_state(record)?;
+        if let Some(err) = blocked_hold(record, &state) {
+            return Err(err);
+        }
         match state.status {
             RunStatus::Idle | RunStatus::Stopped => {
                 let leftover = state.failure_class.is_some()
@@ -545,6 +578,77 @@ mod tests {
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
+    }
+
+    fn blocked_state(r: &ProjectRecord, track: &str) {
+        let mut state = load_run_state(r).unwrap();
+        state.status = RunStatus::Stopped;
+        state.phase = crate::workflow::graph::PHASE_PLAN.into();
+        state.track_id = Some(track.into());
+        state.driver = WorkflowDriver::Adapter;
+        state.failure_class = Some(crate::outcome::FailureClass::Blocked);
+        state.last_event = "outcome: failure class=blocked phase=plan source=adapter".into();
+        save_run_state(r, &state).unwrap();
+    }
+
+    #[test]
+    fn blocked_hold_refuses_locked_preparation_probe_and_test_stub() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        blocked_state(&r, "0098");
+        let before = load_run_state(&r).unwrap();
+
+        match prepare_run_locked(&r, Some("0098".into()), WorkflowDriver::Stub, false) {
+            Err(CoordinatorError::BlockedHold { track, .. }) => assert_eq!(track, "0098"),
+            Ok(_) => panic!("expected BlockedHold"),
+            Err(other) => panic!("expected BlockedHold, got {other}"),
+        }
+        match run_stub(&r, Some("0098".into())) {
+            Err(CoordinatorError::BlockedHold { .. }) => {}
+            other => panic!("expected BlockedHold, got {other:?}"),
+        }
+        let ctx = RunProbeCtx {
+            snap_epoch: before.run_epoch,
+            snap_track: before.track_id.clone(),
+            snap_status: before.status,
+            track_arg: Some("0098".into()),
+            driver: WorkflowDriver::Stub,
+            picked: false,
+            number: 1,
+            head_sha: "deadbeef".into(),
+            effective_track: "0098".into(),
+            resume_repo: None,
+        };
+        let err = finish_probed_run(&r, &ctx, &Ok(None)).unwrap_err();
+        assert!(matches!(err, CoordinatorError::BlockedHold { .. }));
+
+        let after = load_run_state(&r).unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.run_epoch, before.run_epoch);
+        assert_eq!(after.failure_class, before.failure_class);
+    }
+
+    #[test]
+    fn restop_replaces_last_event_but_retains_blocked_class_and_artifact() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        blocked_state(&r, "0098");
+        let artifact = crate::notify::artifact::path(&r).unwrap();
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(
+            &artifact,
+            "# Coordinator failure\n- failure_class: blocked\n",
+        )
+        .unwrap();
+        let view = stop(&r).unwrap();
+        assert_eq!(view.last_event, STOP_LAST_EVENT);
+        assert_eq!(
+            view.failure_class,
+            Some(crate::outcome::FailureClass::Blocked),
+            "stop is not an acknowledgment"
+        );
+        assert!(artifact.is_file(), "re-stop keeps the artifact and hold");
     }
 
     #[test]

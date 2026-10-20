@@ -476,6 +476,12 @@ pub fn cmd_run(
 ) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
     let _ = settle_if_conductor_completed(&rec);
+    // 0098: the durable Blocked hold refuses every fresh run (any driver / track)
+    // before driver resolution, `gh` omit-pick and machine preflight.
+    let state = crate::state::load_run_state(&rec)?;
+    if let Some(err) = crate::run::blocked_hold(&rec, &state) {
+        return Err(err);
+    }
     let driver = crate::workflow::resolve_driver(driver)?;
     let (track, picked) = resolve_run_track_for_driver(&rec, track, driver)?;
     if driver == crate::workflow::WorkflowDriver::Adapter && !skip_preflight {
@@ -751,6 +757,14 @@ pub fn cmd_failure_resolve(project: Option<&str>, infer_cwd: bool) -> Result<Sta
                 from: state.status.to_string(),
             });
         }
+        // 0098: `cmd_failure_resolve` is the only Blocked release. Persist the cleared
+        // class and last_event BEFORE the artifact is removed, so a failed save leaves
+        // the on-disk hold and FAILURE.md unchanged. A retry then succeeds.
+        if state.failure_class == Some(crate::outcome::FailureClass::Blocked) {
+            state.failure_class = None;
+            state.last_event = crate::notify::LAST_EVENT_FAILURE_RESOLVED.into();
+            crate::state::save_run_state(&rec, &state)?;
+        }
         if !crate::notify::settle_failure(
             &rec,
             &mut state,
@@ -779,6 +793,11 @@ pub(crate) fn settle_if_conductor_completed(
             state.status,
             crate::state::RunStatus::Idle | crate::state::RunStatus::Stopped
         ) {
+            return Ok(false);
+        }
+        // 0098: a Blocked hold is released only by `failure resolve`, never by a
+        // conductor-row edit, including the held track's Completed row.
+        if state.failure_class == Some(crate::outcome::FailureClass::Blocked) {
             return Ok(false);
         }
         let body = crate::notify::artifact::read(record)?.map(|s| s.body);
@@ -2671,6 +2690,213 @@ mod tests {
         let target = view.resolved_track.expect("preview");
         assert!(!target.registered);
         assert!(!target.publishable);
+        clear_home();
+    }
+
+    fn write_blocked_row(proj: &std::path::Path, track: &str, status: &str) {
+        let conductor = proj.join("conductor");
+        std::fs::create_dir_all(&conductor).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [{track}]({track}/spec.md) | `.` | {status} | blocked fixture |\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn blocked_fixture(track: &str) -> (tempfile::TempDir, tempfile::TempDir, ProjectRecord) {
+        let (home, proj, rec) = add_isolated_project();
+        write_blocked_row(proj.path(), track, "**In progress**");
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.status = RunStatus::Stopped;
+        state.phase = crate::workflow::graph::PHASE_PLAN.into();
+        state.track_id = Some(track.into());
+        state.driver = crate::workflow::WorkflowDriver::Adapter;
+        state.failure_class = Some(crate::outcome::FailureClass::Blocked);
+        state.last_event =
+            "outcome: failure class=blocked phase=plan source=adapter — prerequisite".into();
+        state.run_epoch = 2;
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let event = crate::notify::NotifyEvent {
+            project_id: rec.id.clone(),
+            track_id: Some(track.into()),
+            phase: crate::workflow::graph::PHASE_PLAN.into(),
+            failure_class: crate::outcome::FailureClass::Blocked,
+            message: Some("prerequisite".into()),
+            last_event: state.last_event.clone(),
+            artifact_path: artifact::path(&rec).unwrap(),
+            written_at: chrono::Utc::now(),
+            run_epoch: 2,
+        };
+        artifact::write(&rec, &event).unwrap();
+        (home, proj, rec)
+    }
+
+    fn assert_blocked_hold(err: CoordinatorError, track: &str, row: &str) {
+        match err {
+            CoordinatorError::BlockedHold {
+                track: got,
+                row_status,
+            } => {
+                assert_eq!(got, track);
+                assert_eq!(row_status, row, "refusal carries the conductor row status");
+            }
+            other => panic!("expected BlockedHold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocked_hold_refuses_cmd_run_for_every_driver_and_track_before_probe() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = blocked_fixture("0098");
+        let before = crate::state::load_run_state(&rec).unwrap();
+        for driver in ["adapter", "stub", "file_wait"] {
+            for track in [Some("0098".to_string()), Some("0404".into()), None] {
+                let err = cmd_run(Some(&rec.id), track, Some(driver), false, false).unwrap_err();
+                assert_blocked_hold(err, "0098", "In progress");
+            }
+        }
+        let after = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.run_epoch, before.run_epoch);
+        assert_eq!(after.failure_class, before.failure_class);
+        assert!(artifact::existing_path(&rec).is_some());
+        assert_eq!(
+            CoordinatorError::BlockedHold {
+                track: "0098".into(),
+                row_status: "In progress".into()
+            }
+            .http_status(),
+            409
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn direct_run_primitives_refuse_the_blocked_hold_without_mutation() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = blocked_fixture("0098");
+        let before = crate::state::load_run_state(&rec).unwrap();
+        let err = crate::run::run_with_origin(
+            &rec,
+            Some("0098".into()),
+            crate::workflow::WorkflowDriver::Stub,
+            false,
+        )
+        .unwrap_err();
+        assert_blocked_hold(err, "0098", "In progress");
+        let err = crate::run::run_stub(&rec, Some("0098".into())).unwrap_err();
+        assert_blocked_hold(err, "0098", "In progress");
+        let after = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.run_epoch, before.run_epoch);
+        assert_eq!(after.failure_class, before.failure_class);
+        clear_home();
+    }
+
+    #[test]
+    fn completed_row_does_not_release_a_blocked_hold() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = blocked_fixture("0098");
+        write_blocked_row(proj.path(), "0098", "**Completed**");
+        assert!(!settle_if_conductor_completed(&rec).unwrap());
+        assert!(artifact::existing_path(&rec).is_some());
+        let shown = cmd_failure_show(Some(&rec.id), false)
+            .unwrap()
+            .expect("artifact stays live");
+        assert!(
+            shown.superseded.is_none(),
+            "a Blocked failure is not SUPERSEDED by a Completed row"
+        );
+        let err = cmd_run(
+            Some(&rec.id),
+            Some("0098".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_blocked_hold(err, "0098", "Completed");
+
+        let view = cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        assert!(view.failure_class.is_none());
+        assert!(artifact::existing_path(&rec).is_none());
+        let running = cmd_run(
+            Some(&rec.id),
+            Some("0098".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(running.status, RunStatus::Running);
+        clear_home();
+    }
+
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn blocked_resolve_save_fault_retains_hold_then_retry_succeeds() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = blocked_fixture("0098");
+        let state_path = crate::state::resolve_state_dir(&rec)
+            .unwrap()
+            .join("run-state.json");
+        let mut perms = std::fs::metadata(&state_path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&state_path, perms).unwrap();
+
+        let err = cmd_failure_resolve(Some(&rec.id), false).unwrap_err();
+        assert!(
+            err.to_string().contains("I/O") || err.to_string().contains("access"),
+            "{err}"
+        );
+        assert!(
+            artifact::existing_path(&rec).is_some(),
+            "a failed save leaves the artifact"
+        );
+        let held = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(
+            held.failure_class,
+            Some(crate::outcome::FailureClass::Blocked),
+            "a failed save leaves the on-disk hold"
+        );
+
+        let mut perms = std::fs::metadata(&state_path).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&state_path, perms).unwrap();
+        let view = cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        assert!(view.failure_class.is_none());
+        assert!(artifact::existing_path(&rec).is_none());
+        clear_home();
+    }
+
+    #[test]
+    fn another_project_is_not_held_by_a_blocked_project() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = blocked_fixture("0098");
+        let other = tempdir().unwrap();
+        let other_rec =
+            project_add(other.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        let view = cmd_run(
+            Some(&other_rec.id),
+            Some("0001".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        let err = cmd_run(
+            Some(&rec.id),
+            Some("0098".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_blocked_hold(err, "0098", "In progress");
         clear_home();
     }
 }

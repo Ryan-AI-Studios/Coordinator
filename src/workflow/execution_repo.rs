@@ -127,7 +127,8 @@ impl PreparedInjection {
         }
     }
 
-    /// Identity-only snapshot for a legacy phase (`address-ci`, manual prompts).
+    /// Identity-only snapshot for unprepared legs (`plan`, `fold`, `advance`) and for
+    /// manual six-phase turns that may classify a block. It carries no target.
     pub fn legacy(state: &RunState) -> Self {
         Self {
             project_id: state.project_id.clone(),
