@@ -2018,10 +2018,26 @@ async fn prompt_prepared_holder(
             &format!("old holder shutdown failed: {e}"),
         );
     }
-    let binding = crate::harness::roles::resolve_phase_binding(&prepared.phase)
-        .map_err(|e| CoordinatorError::Message(e.to_string()))?;
-    let bin = crate::harness::roles::resolve_phase_binary(&prepared.phase)
-        .map_err(|e| CoordinatorError::Message(e.to_string()))?;
+    let binding = match crate::harness::roles::resolve_phase_binding(&prepared.phase) {
+        Ok(binding) => binding,
+        Err(e) => {
+            return prepared_failure_after_recycle(
+                rec,
+                prepared,
+                &format!("replacement holder binding failed: {e}"),
+            );
+        }
+    };
+    let bin = match crate::harness::roles::resolve_phase_binary(&prepared.phase) {
+        Ok(bin) => bin,
+        Err(e) => {
+            return prepared_failure_after_recycle(
+                rec,
+                prepared,
+                &format!("replacement holder binary failed: {e}"),
+            );
+        }
+    };
     let selector = rec.path.to_string_lossy().to_string();
     if let Err(e) = crate::harness::start_with_bin(
         Some(&selector),
@@ -2060,6 +2076,13 @@ async fn prompt_prepared_holder(
     send_prepared_rpc(rec, text, prepared, new_addr).await
 }
 
+/// A holder that applied (or structurally skipped) the turn has a real view even
+/// when `ok` is false because the applied outcome is a failure. Only a response
+/// with no disposition is a rejected opcode/uncertain delivery.
+fn structured_prepared_response(resp: &HoldResponse) -> bool {
+    resp.ok || resp.applied.is_some() || resp.skipped.is_some()
+}
+
 async fn send_prepared_rpc(
     rec: &ProjectRecord,
     text: String,
@@ -2075,7 +2098,7 @@ async fn send_prepared_rpc(
     )
     .await
     {
-        Ok(resp) if resp.ok => hold_view(resp),
+        Ok(resp) if structured_prepared_response(&resp) => hold_view(resp),
         Ok(resp) => {
             // A rejected prepared opcode is uncertain delivery: refuse holder reuse
             // and never fall back to a raw Prompt or resend.
@@ -5546,6 +5569,107 @@ Loop\r\n",
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inprocess_prepared_route_captures_and_verdicts() {
+        let _guard = test_env_lock();
+        let prev_home = std::env::var_os(ENV_COORDINATOR_HOME);
+        let home = tempdir().unwrap();
+        unsafe { std::env::set_var(ENV_COORDINATOR_HOME, home.path()) };
+        let proj = tempdir().unwrap();
+        let product = proj.path().join("product");
+        std::fs::create_dir_all(&product).unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["add", "f.txt"][..],
+            &["commit", "-m", "base"][..],
+        ] {
+            if args[0] == "add" {
+                std::fs::write(product.join("f.txt"), "base\n").unwrap();
+            }
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(&product)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        }
+        let conductor = proj.path().join("conductor");
+        std::fs::create_dir_all(conductor.join("0070-Example")).unwrap();
+        std::fs::write(
+            conductor.join("conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0070-Example](0070-Example/spec.md) | `{}` | **Ready - not started** | s |\n",
+                product.display()
+            ),
+        )
+        .unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.projects[0].execution_repo = Some(product);
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_with_driver(
+            &rec,
+            Some("0070".into()),
+            crate::workflow::WorkflowDriver::Adapter,
+        )
+        .unwrap();
+        let state = crate::state::with_run_state_lock(&rec, || {
+            let mut state = crate::state::load_run_state(&rec)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.driver = crate::workflow::WorkflowDriver::Adapter;
+            state.last_driven_phase = None;
+            crate::state::save_run_state(&rec, &state)?;
+            crate::state::load_run_state(&rec)
+        })
+        .unwrap();
+        let target = crate::workflow::execution_repo::resolve_track_target(
+            &rec,
+            &state,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+        )
+        .unwrap();
+        let prepared = PreparedInjection::for_target(target);
+        let mut lines = mock_handshake_ok("sess-prepared-inproc");
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            lines,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+
+        let view = prompt_prepared(Some(&rec.id), "work".into(), false, prepared)
+            .await
+            .unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(
+            view.error
+                .unwrap_or_default()
+                .contains("produced no changes")
+        );
+        let baseline = crate::state::resolve_state_dir(&rec)
+            .unwrap()
+            .join("leg-baseline.json");
+        assert!(baseline.is_file(), "prepared route must capture");
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap_or_default();
+        assert!(!log.contains("source=none"), "{log}");
+        let _ = shutdown(Some(&rec.id), false).await;
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var(ENV_COORDINATOR_HOME, v),
+                None => std::env::remove_var(ENV_COORDINATOR_HOME),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn holder_resolution_failure_prevents_inject() {
         let (dir, rec, prepared) = prepared_fixture();
         // An invalid explicit target: resolution fails before any holder/session prompt.
@@ -5588,6 +5712,49 @@ Loop\r\n",
         .await
         .unwrap();
         assert!(session.turn_roots().is_empty());
+    }
+
+    #[test]
+    fn holder_applied_failure_is_a_structured_view_not_a_rejected_opcode() {
+        let applied = HoldResponse {
+            ok: false,
+            error: Some("prepared turn failed".into()),
+            text: None,
+            stop_reason: None,
+            status: None,
+            harness: None,
+            applied: Some(true),
+            skipped: None,
+            failure_class: Some(FailureClass::HarnessCrash),
+            prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
+        };
+        assert!(structured_prepared_response(&applied));
+        let skipped = HoldResponse {
+            ok: true,
+            error: None,
+            text: None,
+            stop_reason: None,
+            status: None,
+            harness: None,
+            applied: Some(false),
+            skipped: Some(true),
+            failure_class: None,
+            prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
+        };
+        assert!(structured_prepared_response(&skipped));
+        let rejected = HoldResponse {
+            ok: false,
+            error: Some("unknown op".into()),
+            text: None,
+            stop_reason: None,
+            status: None,
+            harness: None,
+            applied: None,
+            skipped: None,
+            failure_class: None,
+            prepared_protocol: None,
+        };
+        assert!(!structured_prepared_response(&rejected));
     }
 
     #[test]
@@ -5686,6 +5853,71 @@ Loop\r\n",
             prepared_capability_plan(Some(PREPARED_PROTOCOL_VERSION), true),
             PreparedCapabilityPlan::Send
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn old_holder_missing_capability_recycles_once_then_fails_without_prompt() {
+        use tokio::io::AsyncReadExt;
+        let _guard = test_env_lock();
+        let prev_home = std::env::var_os(ENV_COORDINATOR_HOME);
+        let home = tempdir().unwrap();
+        unsafe { std::env::set_var(ENV_COORDINATOR_HOME, home.path()) };
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"version":1,"scan_roots":[],"role_bindings":{"implementor":{"harness":"grok","command":"missing-0099-holder.exe"}}}"#,
+        )
+        .unwrap();
+        let (_dir, rec, prepared) = prepared_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream.write_all(b"{\"ok\":true}\n").await;
+        });
+        let handle = PersistedGrokHandle {
+            version: 1,
+            project_id: rec.id.clone(),
+            session_id: Some("sess-old".into()),
+            cwd: Some(rec.path.clone()),
+            pid: None,
+            holder_pid: None,
+            control_addr: Some(addr.clone()),
+            adapter: "grok".into(),
+            supports_compact: true,
+            alive: true,
+            prompt_in_flight: false,
+            error: None,
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
+        };
+        save_persist(&rec, &handle).unwrap();
+        let view = prompt_prepared_holder(&rec, "work".into(), prepared, &addr)
+            .await
+            .unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        let error = view.error.unwrap_or_default();
+        assert!(error.contains("replacement holder"), "{error}");
+        assert!(error.contains("failure resolve"), "{error}");
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one capability probe, then no prepared prompt is sent"
+        );
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var(ENV_COORDINATOR_HOME, v),
+                None => std::env::remove_var(ENV_COORDINATOR_HOME),
+            }
+        }
     }
 
     #[test]

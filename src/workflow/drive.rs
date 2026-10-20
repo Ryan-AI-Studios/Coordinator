@@ -2098,16 +2098,7 @@ mod tests {
         // Another task holds the global pool lock while the failure applies.
         let pool_lock = crate::harness::pool::global_pool().lock().await;
         let owned = r.clone();
-        let apply = tokio::task::spawn_blocking(move || {
-            let state = load_run_state(&owned).unwrap();
-            super::fail_phase(
-                &owned,
-                &state,
-                FailureClass::Permission,
-                "leg repo unresolved: test".into(),
-                OutcomeSource::Adapter,
-            )
-        });
+        let apply = tokio::task::spawn_blocking(move || crate::workflow::tick(&owned));
         let done = tokio::time::timeout(std::time::Duration::from_secs(5), apply).await;
         assert!(
             done.is_ok(),
