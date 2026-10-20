@@ -49,6 +49,7 @@
 //! Contextual state policies (diff + durable counters gate publish and squash-merge): track **0069**.
 //! Bounded self-check between adapter `implement` and `address-findings` turns (report-only, off by default): track **0070**.
 //! Opt-in same-epoch `address-ci` when the ci-wait gate fails this run's owned PR (cap 2, off by default): track **0071** (slice unified in **0079**).
+//! Machine feature gates for automation duties (default on; env > config > default; fail closed): track **0102**.
 
 pub mod api;
 pub mod checkpoint;
@@ -56,6 +57,7 @@ pub mod ci;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod features;
 pub(crate) mod git_command;
 pub mod harness;
 pub mod layout;

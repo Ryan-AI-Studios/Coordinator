@@ -439,6 +439,9 @@ pub struct StatusView {
     /// Who ticks the machine. Filled only at `api::status` / `status_all` / `cmd_run_cli`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticker: Option<TickerView>,
+    /// Machine feature gates (0102). Omitted on the poll path, like `ticker`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<crate::features::FeatureSnapshot>,
     /// Contextual state-policy alert (0069). Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_gate: Option<crate::policy::StateGate>,
@@ -556,6 +559,7 @@ impl StatusView {
             },
             stall: stall_status_view(record, state),
             ticker: None,
+            features: None,
             state_gate: state.state_gate.clone(),
             self_check: state.self_check.clone(),
         }

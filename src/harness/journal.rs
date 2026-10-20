@@ -716,6 +716,7 @@ mod tests {
             role_bindings: default_role_bindings(),
             phase_timeouts_secs: BTreeMap::new(),
             hermes: crate::config::HermesNotifyConfig::default(),
+            features: crate::config::FeatureTable::default(),
             progress_stall_secs: None,
             journal_keep: Some(2),
             state_policies: Vec::new(),

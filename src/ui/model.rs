@@ -637,6 +637,7 @@ mod tests {
             last_progress_at: None,
             stall: None,
             ticker: None,
+            features: None,
             auto_start: Default::default(),
             parked_next: None,
             state_gate: None,
