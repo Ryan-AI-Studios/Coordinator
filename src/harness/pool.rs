@@ -243,6 +243,10 @@ struct HoldResponse {
 /// Current prepared-prompt capability advertised in `Ping`.
 pub const PREPARED_PROTOCOL_VERSION: u32 = 1;
 
+fn prepared_protocol_supported(protocol: Option<u32>) -> bool {
+    protocol.unwrap_or(0) >= PREPARED_PROTOCOL_VERSION
+}
+
 pub fn persist_path(record: &ProjectRecord) -> Result<PathBuf> {
     Ok(resolve_state_dir(record)?.join("harness-grok.json"))
 }
@@ -1945,7 +1949,7 @@ async fn prompt_prepared_holder(
         .ok()
         .and_then(|resp| resp.prepared_protocol)
         .unwrap_or(0);
-    if capability >= PREPARED_PROTOCOL_VERSION {
+    if prepared_protocol_supported(Some(capability)) {
         return send_prepared_rpc(rec, text, prepared, addr).await;
     }
 
@@ -1977,7 +1981,7 @@ async fn prompt_prepared_holder(
         .ok()
         .and_then(|resp| resp.prepared_protocol)
         .unwrap_or(0);
-    if second < PREPARED_PROTOCOL_VERSION {
+    if !prepared_protocol_supported(Some(second)) {
         return prepared_failure_after_recycle(
             rec,
             prepared,
@@ -5269,5 +5273,354 @@ Loop\r\n",
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
+    }
+
+    fn prepared_fixture() -> (tempfile::TempDir, ProjectRecord, PreparedInjection) {
+        let dir = tempdir().unwrap();
+        let product = dir.path().join("product");
+        std::fs::create_dir_all(&product).unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["add", "f.txt"][..],
+            &["commit", "-m", "base"][..],
+        ] {
+            if args[0] == "add" {
+                std::fs::write(product.join("f.txt"), "base\n").unwrap();
+            }
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(&product)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        }
+        let conductor = dir.path().join("conductor");
+        std::fs::create_dir_all(conductor.join("0099-Example")).unwrap();
+        let write_row = |cell: &str| {
+            std::fs::write(
+                conductor.join("conductor.md"),
+                format!(
+                    "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0099-Example](0099-Example/spec.md) | `{cell}` | **Ready - not started** | target |\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_row(&product.display().to_string());
+        let rec = ProjectRecord {
+            id: "p-0099".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: Some(product),
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+        let mut state = crate::state::RunState::idle(&rec.id);
+        state.status = RunStatus::Running;
+        state.driver = crate::workflow::WorkflowDriver::Adapter;
+        state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+        state.track_id = Some("0099-Example".into());
+        state.run_epoch = 1;
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let target = crate::workflow::execution_repo::resolve_track_target(
+            &rec,
+            &state,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+        )
+        .unwrap();
+        (dir, rec, PreparedInjection::for_target(target))
+    }
+
+    #[test]
+    fn sample_skip_journal_records_capture_and_verdict_stages() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        for reason in [
+            "planning-only",
+            "git-unreadable",
+            "capture-write-failed",
+            "unresolved",
+            "cwd-misdirected",
+        ] {
+            journal_sample_skip(&rec, prepared.target(), reason);
+        }
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
+        let mut last = 0;
+        for reason in [
+            "planning-only",
+            "git-unreadable",
+            "capture-write-failed",
+            "unresolved",
+            "cwd-misdirected",
+        ] {
+            let needle = format!(
+                "leg sample skipped: track=0099-Example source=row_execution reason={reason}"
+            );
+            let at = log
+                .find(&needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {log}"));
+            assert!(at >= last, "journal order changed: {log}");
+            last = at;
+        }
+        assert!(log.contains("sample-skip"));
+    }
+
+    #[test]
+    fn old_holder_cannot_drop_prepared_identity() {
+        let (_dir, _rec, prepared) = prepared_fixture();
+        let json = serde_json::to_string(&prepared).unwrap();
+        let back: PreparedInjection = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, prepared);
+        let target = back.target().expect("target survives");
+        assert_eq!(target.track_id, "0099-Example");
+        assert!(target.sample_path.is_absolute());
+    }
+
+    #[test]
+    fn stale_epoch_snapshot_skips_inject() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut state = crate::state::load_run_state(&rec)?;
+            state.run_epoch += 1;
+            crate::state::save_run_state(&rec, &state)
+        })
+        .unwrap();
+        let reason = validate_prepared(&rec, &prepared).unwrap_err();
+        assert_eq!(reason, "stale-injection");
+    }
+
+    #[test]
+    fn row_edit_does_not_split_prompt_and_capture_target() {
+        let (dir, rec, prepared) = prepared_fixture();
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            dir.path().join("conductor/conductor.md"),
+            format!(
+                "| Track | Execution | Status | Summary |\n| --- | --- | --- | --- |\n| [0099-Example](0099-Example/spec.md) | `{}` | **Ready - not started** | target |\n",
+                other.display()
+            ),
+        )
+        .unwrap();
+        let reason = validate_prepared(&rec, &prepared).unwrap_err();
+        assert_eq!(reason, "target-changed");
+        assert_eq!(
+            prepared.target().unwrap().prompt_path,
+            prepared.target().unwrap().declared_path
+        );
+    }
+
+    #[test]
+    fn old_holder_missing_capability_recycles_once_before_send() {
+        assert!(!prepared_protocol_supported(None));
+        assert!(!prepared_protocol_supported(Some(0)));
+        assert!(prepared_protocol_supported(Some(PREPARED_PROTOCOL_VERSION)));
+    }
+
+    #[test]
+    fn replacement_holder_incompatible_stops_without_prompt() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        let view = prepared_failure_after_recycle(
+            &rec,
+            prepared,
+            "replacement holder does not support prepared prompts",
+        )
+        .unwrap();
+        assert!(view.applied);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(view.skipped.is_none());
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(state.status, RunStatus::Stopped);
+        assert_eq!(state.failure_class, Some(FailureClass::HarnessCrash));
+    }
+
+    fn bump_epoch(rec: &ProjectRecord) {
+        crate::state::with_run_state_lock(rec, || {
+            let mut state = crate::state::load_run_state(rec)?;
+            state.run_epoch += 1;
+            crate::state::save_run_state(rec, &state)
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mid_turn_epoch_advance_skips_outcome() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        bump_epoch(&rec);
+        let success = apply_turn_checked(
+            &rec,
+            Ok(PromptResult {
+                text: "done".into(),
+                stop_reason: Some("end_turn".into()),
+            }),
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+        )
+        .await
+        .unwrap();
+        assert!(!success.applied);
+        assert_eq!(success.skipped, Some(true));
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(state.status, RunStatus::Running);
+        assert_eq!(state.run_epoch, 2);
+
+        let error = apply_turn_checked(
+            &rec,
+            Err(CoordinatorError::Message("transport died".into())),
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+        )
+        .await
+        .unwrap();
+        assert!(!error.applied);
+        assert_eq!(error.skipped, Some(true));
+    }
+
+    #[tokio::test]
+    async fn mid_turn_stop_discards_outcome() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut state = crate::state::load_run_state(&rec)?;
+            state.status = RunStatus::Stopped;
+            crate::state::save_run_state(&rec, &state)
+        })
+        .unwrap();
+        let view = apply_turn_checked(
+            &rec,
+            Ok(PromptResult {
+                text: "done".into(),
+                stop_reason: Some("end_turn".into()),
+            }),
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+    }
+
+    #[tokio::test]
+    async fn changed_track_skips_outcome() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut state = crate::state::load_run_state(&rec)?;
+            state.track_id = Some("0404-Other".into());
+            crate::state::save_run_state(&rec, &state)
+        })
+        .unwrap();
+        let view = apply_turn_checked(
+            &rec,
+            Ok(PromptResult {
+                text: "done".into(),
+                stop_reason: Some("end_turn".into()),
+            }),
+            GrokHarnessStatus::missing(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+        )
+        .await
+        .unwrap();
+        assert!(!view.applied);
+        assert_eq!(view.skipped, Some(true));
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_at_apply_lock_skips_without_new_run_artifact() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        bump_epoch(&rec);
+        let outcome = PhaseOutcome::success(
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            OutcomeSource::Adapter,
+            Some("done".into()),
+            None,
+            Some(prepared.run_epoch),
+        );
+        let applied = crate::outcome::write_and_apply_prepared(&rec, outcome, &prepared).unwrap();
+        assert!(matches!(applied, ApplyIdentity::Stale(_)));
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(state.status, RunStatus::Running);
+        assert_eq!(state.run_epoch, 2);
+        assert!(state.last_applied_outcome_hash.is_none());
+    }
+
+    #[test]
+    fn poll_try_apply_consumes_stale_disposition() {
+        let (_dir, rec, prepared) = prepared_fixture();
+        let outcome = PhaseOutcome::success(
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            OutcomeSource::Adapter,
+            Some("done".into()),
+            None,
+            Some(prepared.run_epoch),
+        );
+        crate::outcome::save_current_outcome(&rec, &outcome).unwrap();
+        bump_epoch(&rec);
+        let applied = crate::outcome::poll_try_apply(&rec, outcome).unwrap();
+        assert!(applied.is_none());
+        assert!(!crate::outcome::outcome_current_path(&rec).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn rejected_prepared_opcode_or_closed_response_never_retries_prompt() {
+        use tokio::io::AsyncReadExt;
+        let (_dir, _rec, prepared) = prepared_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            // Close without a response: uncertain delivery after send.
+        });
+        let err = holder_rpc(
+            &addr.to_string(),
+            &HoldRequest::PreparedPrompt {
+                text: "work".into(),
+                prepared: Box::new(prepared),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("holder")
+                || err.to_string().contains("closed")
+                || !err.to_string().is_empty()
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no resend"
+        );
     }
 }

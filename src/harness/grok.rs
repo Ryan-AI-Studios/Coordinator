@@ -3263,4 +3263,132 @@ mod live_tests {
         let msg = "Starting work.\nError: could not resolve the crate path";
         assert!(harness_error_in_text(msg).is_some(), "{msg}");
     }
+
+    fn project_record(path: &Path, profile: crate::layout::LayoutProfile) -> ProjectRecord {
+        ProjectRecord {
+            id: "p".into(),
+            path: path.to_path_buf(),
+            display_name: None,
+            layout_profile: profile,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    async fn rooted_session(cwd: &Path, rec: ProjectRecord) -> GrokSession {
+        let mut session = GrokSession::start_mock(
+            cwd.to_path_buf(),
+            mock_handshake_ok("sess-0099"),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        session.set_progress_record(rec);
+        session
+    }
+
+    #[tokio::test]
+    async fn selected_sibling_acp_fs_and_terminal_allowed() {
+        let root = tempdir().unwrap();
+        let hub = root.path().join("hub");
+        let primary = root.path().join("primary");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir_all(&hub).unwrap();
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let mut rec = project_record(&hub, crate::layout::LayoutProfile::MultiSibling);
+        rec.execution_repo = Some(primary.clone());
+        rec.execution_repos.insert("sib".into(), sibling.clone());
+        let mut session = rooted_session(&primary, rec).await;
+        session.install_turn_root(&sibling);
+
+        let allowed = session.fs_allowed_roots();
+        assert!(
+            fs_path_allowed(&sibling.join("file.txt"), &allowed),
+            "selected sibling fs root missing: {allowed:?}"
+        );
+        assert!(
+            fs_path_allowed(&sibling.join("file.txt"), &session.fs_allowed_roots())
+                && !session.blocks_shared_checkout(&sibling),
+            "selected sibling terminal cwd must be authorized"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_sibling_stays_denied() {
+        let root = tempdir().unwrap();
+        let hub = root.path().join("hub");
+        let primary = root.path().join("primary");
+        let selected = root.path().join("selected");
+        let other = root.path().join("other");
+        for path in [&hub, &primary, &selected, &other] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let mut rec = project_record(&hub, crate::layout::LayoutProfile::MultiSibling);
+        rec.execution_repo = Some(primary.clone());
+        rec.execution_repos.insert("one".into(), selected.clone());
+        rec.execution_repos.insert("two".into(), other.clone());
+        let mut session = rooted_session(&primary, rec).await;
+        session.install_turn_root(&selected);
+        assert!(!fs_path_allowed(
+            &other.join("file.txt"),
+            &session.fs_allowed_roots()
+        ));
+    }
+
+    #[tokio::test]
+    async fn primary_shared_checkout_stays_blocked() {
+        let root = tempdir().unwrap();
+        let ws = root.path().join("ws");
+        let primary = root.path().join("primary");
+        let epoch = root.path().join("state").join("worktrees").join("1");
+        for path in [&ws, &primary, &epoch] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let mut rec = project_record(&ws, crate::layout::LayoutProfile::Nested);
+        rec.execution_repo = Some(primary.clone());
+        rec.worktree_isolation = true;
+        let session = rooted_session(&epoch, rec).await;
+        assert!(
+            session.blocks_shared_checkout(&primary),
+            "the shared primary checkout must stay blocked under isolation"
+        );
+    }
+
+    #[tokio::test]
+    async fn target_root_cleared_between_turns() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let rec = project_record(&cwd, crate::layout::LayoutProfile::Nested);
+        let mut session = rooted_session(&cwd, rec).await;
+        session.install_turn_root(&sibling);
+        assert!(
+            session
+                .turn_roots()
+                .iter()
+                .any(|p| crate::worktree::paths_same(p, &sibling))
+        );
+        session.clear_turn_roots();
+        assert!(session.turn_roots().is_empty());
+        assert!(!fs_path_allowed(
+            &sibling.join("file.txt"),
+            &session.fs_allowed_roots()
+        ));
+    }
 }

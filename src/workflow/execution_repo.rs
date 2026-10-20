@@ -1057,24 +1057,6 @@ mod tests {
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 
-    struct EnvGuard(Option<std::ffi::OsString>);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var(crate::worktree::ENV_WORKTREE, v),
-                    None => std::env::remove_var(crate::worktree::ENV_WORKTREE),
-                }
-            }
-        }
-    }
-
-    fn no_isolation() -> EnvGuard {
-        let prev = std::env::var_os(crate::worktree::ENV_WORKTREE);
-        unsafe { std::env::set_var(crate::worktree::ENV_WORKTREE, "off") };
-        EnvGuard(prev)
-    }
-
     fn record(path: &Path, profile: LayoutProfile) -> ProjectRecord {
         ProjectRecord {
             id: "proj-0099".into(),
@@ -1170,7 +1152,6 @@ mod tests {
 
     #[test]
     fn execution_target_precedence() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let product = product_repo(dir.path());
         let mut rec = record(dir.path(), LayoutProfile::Nested);
@@ -1212,7 +1193,6 @@ mod tests {
 
     #[test]
     fn empty_execution_cell_falls_through() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let product = product_repo(dir.path());
         let mut rec = record(dir.path(), LayoutProfile::Nested);
@@ -1226,7 +1206,6 @@ mod tests {
 
     #[test]
     fn invalid_explicit_target_never_defaults() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let product = product_repo(dir.path());
         let mut rec = record(dir.path(), LayoutProfile::Nested);
@@ -1244,7 +1223,6 @@ mod tests {
 
     #[test]
     fn relative_target_anchors_at_workspace() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let product = product_repo(dir.path());
         let mut rec = record(dir.path(), LayoutProfile::Nested);
@@ -1260,7 +1238,6 @@ mod tests {
 
     #[test]
     fn dot_hub_vs_single_root() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let hub = dir.path().join("hub");
         std::fs::create_dir_all(&hub).unwrap();
@@ -1292,7 +1269,6 @@ mod tests {
 
     #[test]
     fn multi_sibling_multiple_bindings_without_primary_fails() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let hub = dir.path().join("hub");
         std::fs::create_dir_all(&hub).unwrap();
@@ -1315,7 +1291,6 @@ mod tests {
 
     #[test]
     fn single_root_nested_multi_sibling_defaults() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let single = dir.path().join("single");
         std::fs::create_dir_all(&single).unwrap();
@@ -1354,7 +1329,6 @@ mod tests {
 
     #[test]
     fn absolute_target_outside_map() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let outside = product_repo(dir.path());
         let rec = record(dir.path(), LayoutProfile::Nested);
@@ -1520,7 +1494,6 @@ mod tests {
 
     #[test]
     fn ambiguous_or_missing_track_fails() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let rec = record(dir.path(), LayoutProfile::SingleRoot);
         registry(dir.path(), Some("."));
@@ -1533,7 +1506,6 @@ mod tests {
 
     #[test]
     fn planning_marker_cannot_exempt_product() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let product = product_repo(dir.path());
         let mut rec = record(dir.path(), LayoutProfile::Nested);
@@ -1549,7 +1521,6 @@ mod tests {
 
     #[test]
     fn current_record_only_planning_predicate() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let product = product_repo(dir.path());
         let mut rec = record(dir.path(), LayoutProfile::Nested);
@@ -1563,7 +1534,6 @@ mod tests {
 
     #[test]
     fn prompt_names_epoch_subdir_and_sampler_uses_toplevel() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let repo = product_repo(dir.path());
         let sub = repo.join("crate");
@@ -1582,7 +1552,6 @@ mod tests {
 
     #[test]
     fn isolation_on_external_sibling_subdir_stays_direct() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let primary = product_repo(&dir.path().join("primary"));
         let sibling = product_repo(&dir.path().join("sibling"));
@@ -1605,8 +1574,40 @@ mod tests {
     }
 
     #[test]
+    fn missing_or_foreign_epoch_fails_before_inject() {
+        let dir = tempdir().unwrap();
+        let repo = product_repo(&dir.path().join("primary"));
+        let mut rec = record(dir.path(), LayoutProfile::Nested);
+        rec.execution_repo = Some(repo.clone());
+        rec.worktree_isolation = true;
+        rec.state_dir = Some(dir.path().join("state"));
+        registry(dir.path(), Some(&repo.display().to_string()));
+        let state = running("0099-Example");
+        let err = resolve_track_target(&rec, &state, PHASE_IMPLEMENT).unwrap_err();
+        assert!(err.reason.contains("epoch 1 worktree is missing"), "{err}");
+
+        // A worktree for a different repository is also refused.
+        let epoch = crate::worktree::epoch_dir(&rec, state.run_epoch).unwrap();
+        std::fs::create_dir_all(epoch.parent().unwrap()).unwrap();
+        let foreign = product_repo(&dir.path().join("foreign"));
+        let out = crate::git_command::command()
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                epoch.to_str().unwrap(),
+                "HEAD",
+            ])
+            .current_dir(&foreign)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let err = resolve_track_target(&rec, &state, PHASE_IMPLEMENT).unwrap_err();
+        assert!(err.reason.contains("different Git repository"), "{err}");
+    }
+
+    #[test]
     fn explicit_single_root_target_override() {
-        let _iso = no_isolation();
         let dir = tempdir().unwrap();
         let target = product_repo(&dir.path().join("target"));
         let rec = record(dir.path(), LayoutProfile::SingleRoot);

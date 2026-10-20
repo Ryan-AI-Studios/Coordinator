@@ -1009,6 +1009,158 @@ mod tests {
     }
 
     #[test]
+    fn untracked_content_rewrite_and_collapsed_directory_are_known_noops() {
+        // Characterizes the retained limitation: the predicate hashes HEAD/porcelain/
+        // diff only, so rewriting an already-untracked file is invisible.
+        let d = repo();
+        let rec = record(d.path());
+        let state = running();
+        let t = target(d.path(), d.path());
+        std::fs::write(d.path().join("untracked.txt"), "one\n").unwrap();
+        let status = note_baseline(&rec, &state, PHASE_IMPLEMENT, &t);
+        std::fs::write(d.path().join("untracked.txt"), "two\n").unwrap();
+        assert!(
+            verdict_after_turn(
+                &rec,
+                &state,
+                PHASE_IMPLEMENT,
+                &t,
+                &status.trust(),
+                "codex",
+                None,
+                d.path(),
+            )
+            .is_some()
+        );
+
+        // A directory porcelain collapses to `dir/` behaves the same.
+        std::fs::create_dir_all(d.path().join("dir")).unwrap();
+        std::fs::write(d.path().join("dir/a.txt"), "a\n").unwrap();
+        let mut next = running();
+        next.run_epoch = 7;
+        let mut t7 = t.clone();
+        t7.run_epoch = 7;
+        let status = note_baseline(&rec, &next, PHASE_IMPLEMENT, &t7);
+        std::fs::write(d.path().join("dir/a.txt"), "b\n").unwrap();
+        assert!(
+            verdict_after_turn(
+                &rec,
+                &next,
+                PHASE_IMPLEMENT,
+                &t7,
+                &status.trust(),
+                "codex",
+                None,
+                d.path(),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn epoch357_two_repo_timeline() {
+        // The historical epoch 357 / track 0551 shape, made hermetic: `a` stands in
+        // for the harness repo (label c1aa5c38) and `b` for the track repo
+        // (labels e450ce4 -> 5d8bc93). All commits are generated temp SHAs.
+        let a = repo();
+        let b = repo();
+        let rec = record(b.path());
+        let state = running();
+        let t = target(b.path(), b.path());
+
+        // A legacy pre-turn capture becomes B, not the harness repo.
+        let captured = note_baseline(&rec, &state, PHASE_IMPLEMENT, &t);
+        assert!(matches!(captured, CaptureStatus::Captured(_)));
+        let (_, baseline) = load_baseline_bytes(&rec).unwrap();
+        assert_eq!(baseline.repo.as_deref(), Some(b.path()));
+
+        // The leg commits clean work in B: this is delivery, not a no-op.
+        std::fs::write(b.path().join("bench.txt"), "2,446 insertions\n").unwrap();
+        git_ok(b.path(), &["add", "-A"]);
+        git_ok(
+            b.path(),
+            &["commit", "-m", "track 0551: qualify benchmark oracles"],
+        );
+        assert!(
+            verdict_after_turn(
+                &rec,
+                &state,
+                PHASE_IMPLEMENT,
+                &t,
+                &captured.trust(),
+                "codex",
+                None,
+                b.path(),
+            )
+            .is_none()
+        );
+
+        // True no-op control on the same format.
+        let mut next = running();
+        next.run_epoch = 4;
+        let mut t4 = t.clone();
+        t4.run_epoch = 4;
+        let noop = note_baseline(&rec, &next, PHASE_IMPLEMENT, &t4);
+        assert!(
+            verdict_after_turn(
+                &rec,
+                &next,
+                PHASE_IMPLEMENT,
+                &t4,
+                &noop.trust(),
+                "codex",
+                None,
+                b.path(),
+            )
+            .is_some()
+        );
+
+        // Other-repo change control: A moves, B does not.
+        std::fs::write(a.path().join("harness.txt"), "harness only\n").unwrap();
+        git_ok(a.path(), &["add", "-A"]);
+        git_ok(a.path(), &["commit", "-m", "harness-only"]);
+        let mut other = running();
+        other.run_epoch = 5;
+        let mut t5 = t.clone();
+        t5.run_epoch = 5;
+        let noop = note_baseline(&rec, &other, PHASE_IMPLEMENT, &t5);
+        assert!(
+            verdict_after_turn(
+                &rec,
+                &other,
+                PHASE_IMPLEMENT,
+                &t5,
+                &noop.trust(),
+                "codex",
+                None,
+                b.path(),
+            )
+            .is_some()
+        );
+
+        // Branch-only control: no content or HEAD movement in B.
+        let mut branch = running();
+        branch.run_epoch = 6;
+        let mut t6 = t.clone();
+        t6.run_epoch = 6;
+        let noop = note_baseline(&rec, &branch, PHASE_IMPLEMENT, &t6);
+        git_ok(b.path(), &["checkout", "-b", "track/0551"]);
+        assert!(
+            verdict_after_turn(
+                &rec,
+                &branch,
+                PHASE_IMPLEMENT,
+                &t6,
+                &noop.trust(),
+                "codex",
+                None,
+                b.path(),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
     fn diagnostics_keep_prefix_and_both_cwds() {
         let d = repo();
         let t = target(d.path(), d.path());

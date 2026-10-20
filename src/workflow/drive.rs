@@ -1104,6 +1104,11 @@ mod tests {
         std::fs::write(product.join("f.txt"), "base\n").unwrap();
         git(&["add", "f.txt"]);
         git(&["commit", "-m", "base"]);
+        for name in ["implement", "onboarding"] {
+            let skill = product.join(".agents").join("skills").join(name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "skill\n").unwrap();
+        }
 
         let conductor = root.join("conductor");
         std::fs::create_dir_all(conductor.join(format!("{track}-Example"))).unwrap();
@@ -1869,6 +1874,92 @@ mod tests {
         assert!(body.contains("inject"), "{body}");
         tick(&r).unwrap();
         assert_eq!(super::captured_prompts().len(), 1);
+    }
+
+    #[test]
+    fn initial_implement_capture_uses_prepared_target() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path());
+        let product = implementation_target(dir.path(), "0070");
+        r.execution_repo = Some(product.clone());
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.driver = WorkflowDriver::Adapter;
+            state.last_driven_phase = None;
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        let prompts = super::captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(
+            prompts[0].contains(&product.display().to_string()),
+            "{}",
+            prompts[0]
+        );
+        assert!(load_run_state(&r).unwrap().failure_class.is_none());
+    }
+
+    #[test]
+    fn invalid_target_before_capture_claims_no_continuation() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        // No conductor.md row exists for this track.
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+            state.driver = WorkflowDriver::Adapter;
+            state.last_driven_phase = Some(crate::workflow::graph::PHASE_IMPLEMENT.into());
+            state.self_check = Some(crate::state::SelfCheckState {
+                steps: 1,
+                pending_inject: true,
+                ..crate::state::SelfCheckState::default()
+            });
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        assert!(super::captured_prompts().is_empty());
+        let state = load_run_state(&r).unwrap();
+        assert_eq!(state.status, RunStatus::Stopped);
+        assert_eq!(state.failure_class, Some(FailureClass::Permission));
+        assert_eq!(
+            state.self_check.unwrap().steps,
+            1,
+            "no continuation claimed"
+        );
+    }
+
+    #[test]
+    fn address_ci_remains_prompt_only() {
+        let _home = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0070".into()), WorkflowDriver::Adapter).unwrap();
+        crate::state::with_run_state_lock(&r, || {
+            let mut state = load_run_state(&r)?;
+            state.phase = crate::workflow::graph::PHASE_ADDRESS_CI.into();
+            state.driver = WorkflowDriver::Adapter;
+            state.last_driven_phase = None;
+            crate::state::save_run_state(&r, &state)
+        })
+        .unwrap();
+        let _capture = super::arm_capture_prompts();
+        tick(&r).unwrap();
+        let prompts = super::captured_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].contains("address-ci"), "{}", prompts[0]);
+        assert!(
+            load_run_state(&r).unwrap().failure_class.is_none(),
+            "address-ci must not resolve a track target"
+        );
     }
 
     #[test]

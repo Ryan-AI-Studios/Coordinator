@@ -740,6 +740,32 @@ mod tests {
     }
 
     #[test]
+    fn continuation_prompt_names_frozen_target() {
+        let target = crate::workflow::execution_repo::ResolvedExecution {
+            project_id: "p".into(),
+            run_epoch: 4,
+            phase: PHASE_IMPLEMENT.into(),
+            track_id: "0099".into(),
+            declared_path: std::path::PathBuf::from(r"C:\dev\work"),
+            prompt_path: std::path::PathBuf::from(r"C:\dev\work"),
+            sample_path: std::path::PathBuf::from(r"C:\dev\work"),
+            source: crate::workflow::execution_repo::ResolutionSource::RowExecution,
+            planning_only: false,
+            late_metadata: Vec::new(),
+        };
+        let prompt = continuation_prompt_with_target(
+            PHASE_IMPLEMENT,
+            "0099",
+            2,
+            "self-check: continue finding=none action=progress",
+            Some(&target),
+        );
+        assert!(prompt.contains(r"Frozen execution target: C:\dev\work"));
+        assert!(prompt.contains(r"sample C:\dev\work"));
+        assert!(prompt.contains("step 2 of 8"));
+    }
+
+    #[test]
     fn address_ci_does_not_continue_self_check() {
         let mut state = running("address-ci");
         state.last_driven_phase = Some("address-ci".into());
