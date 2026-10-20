@@ -22,14 +22,8 @@ graphify-out/
 /out/
 /dist/
 
-# Agent harness local state. Product git ships only onboarding + implement-track.
-.agents/*
-!.agents/skills/
-.agents/skills/*
-!.agents/skills/onboarding/
-!.agents/skills/onboarding/**
-!.agents/skills/implement-track/
-!.agents/skills/implement-track/**
+# Agent harness local state. The product repo does not track .agents/.
+.agents/
 .claude/
 .codex/
 .opencode/
