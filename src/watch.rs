@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use crate::config::{ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, outcome_poll_interval};
 use crate::error::{CoordinatorError, Result};
-use crate::outcome::{self, try_load_current_outcome};
-use crate::registry::ProjectRecord;
+use crate::outcome::{self, FailureClass, try_load_current_outcome};
+use crate::registry::{AutoStartPolicy, ProjectRecord};
 use crate::run;
-use crate::state::{RunStatus, StatusView, load_run_state};
+use crate::state::{RunStatus, StatusView, load_run_state, save_run_state, with_run_state_lock};
 
 /// One poll tick: **tick first**, then file apply, then timeout, then progress watchdog.
 ///
@@ -376,7 +376,207 @@ pub async fn poll_once_async(record: &ProjectRecord) -> Result<Option<StatusView
         .map_err(|e| CoordinatorError::Message(format!("poll task join: {e}")))?
 }
 
-/// Background poll all registered projects that are Running or Paused.
+/// Why the ticker did not start anything this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoStartSkip {
+    FeatureOff,
+    /// Hitl / Never (Never also from a mid-tick Full -> Never flip).
+    Policy(AutoStartPolicy),
+    /// Stopped+retain, next_track, non-idle, unreadable run state.
+    NotEligible,
+    DurableFailure,
+    /// No eligible Ready row (benign, no write).
+    NoReadyRow,
+    /// Running/Paused at gate 3, or a lost start race.
+    AlreadyActive,
+    Held,
+    ProjectGone,
+    /// Io read glitch: no write, retry next tick.
+    TransientRead,
+}
+
+/// One auto-start attempt for one project. Never retries internally.
+// Rust-side observability only (not serialized). `StatusView` is the real start
+// payload; boxing it would churn every caller for a test/loop-only enum.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoStartAttempt {
+    Skipped(AutoStartSkip),
+    Started(StatusView),
+    Failed {
+        failure_class: FailureClass,
+        detail: String,
+    },
+}
+
+/// One auto-start attempt for one project (0103).
+///
+/// Stateless: the feature gate, policy, run state and Ready rows are re-read on
+/// every call. `auto_start: full` only; `hitl`/`never` report and wait. The start
+/// uses the canonical [`crate::api::cmd_run`] omit-pick path — there is no second
+/// launch path. Never retries internally.
+pub fn try_auto_start(record: &ProjectRecord) -> AutoStartAttempt {
+    // Gate (a): live re-read every attempt (0102 semantics; never cache).
+    if !crate::features::is_enabled(crate::features::Duty::AutoStart) {
+        return AutoStartAttempt::Skipped(AutoStartSkip::FeatureOff);
+    }
+    // Gate (b): only `full` may auto-start.
+    match record.auto_start {
+        AutoStartPolicy::Full => {}
+        other => return AutoStartAttempt::Skipped(AutoStartSkip::Policy(other)),
+    }
+    // Gate (c): fresh run state.
+    let state = match load_run_state(record) {
+        Ok(s) => s,
+        Err(_) => return AutoStartAttempt::Skipped(AutoStartSkip::NotEligible),
+    };
+    if matches!(state.status, RunStatus::Running | RunStatus::Paused) {
+        return AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive);
+    }
+    // Durable dedupe must precede gate (e): `should_pick_next_ready` is true for an
+    // empty track_id even when a failure class is present.
+    if state.failure_class.is_some() || crate::notify::artifact::existing_path(record).is_some() {
+        return AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure);
+    }
+    let mut pick = crate::workflow::ReadyPickState::from(&state);
+    pick.auto_start = record.auto_start;
+    if !crate::workflow::should_pick_next_ready(&pick) {
+        return AutoStartAttempt::Skipped(AutoStartSkip::NotEligible);
+    }
+    // Gate (f): probeless "is there anything to start" guard. The canonical pick
+    // inside `cmd_run` still decides (merged-PR probe, sticky overlay, skip list).
+    match crate::workflow::pick_next_ready_excluding_sticky(
+        record,
+        &[],
+        None,
+        &state.sticky_ready_ids,
+    ) {
+        Ok(_id) => {}
+        Err(e) => {
+            if crate::workflow::conductor_md::ready_pick_miss_is_benign(&e) {
+                return AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow);
+            }
+            // Transient read glitch (Windows share, delete in flight): skip the tick,
+            // write nothing. A persistent Io skips like poll_once and never latches
+            // harness_crash.
+            if matches!(e, CoordinatorError::Io(_)) {
+                return AutoStartAttempt::Skipped(AutoStartSkip::TransientRead);
+            }
+            return record_auto_start_failure(record, &e);
+        }
+    }
+    // Gate (g): the canonical launch. Omit the id on purpose: pinning would bypass
+    // the merged-PR probe, the sticky overlay and the skip list.
+    match crate::api::cmd_run(Some(&record.id), None, None, false, false) {
+        Ok(view) => AutoStartAttempt::Started(view),
+        Err(e) => auto_start_after_error(record, &e),
+    }
+}
+
+/// `spawn_blocking` wrapper, mirroring [`poll_once_async`].
+pub async fn try_auto_start_async(record: &ProjectRecord) -> Result<AutoStartAttempt> {
+    let rec = record.clone();
+    tokio::task::spawn_blocking(move || try_auto_start(&rec))
+        .await
+        .map_err(|e| CoordinatorError::Message(format!("auto-start task join: {e}")))
+}
+
+/// Map a `cmd_run` error without writing for the benign cases (0103).
+///
+/// Only setup/parse failures and `Preflight` become durable; a lost race, a
+/// policy flip, a transient `Io` read, a 0098 hold and a vanished project never
+/// write.
+pub(crate) fn auto_start_after_error(
+    record: &ProjectRecord,
+    err: &CoordinatorError,
+) -> AutoStartAttempt {
+    use CoordinatorError as E;
+    match err {
+        E::BlockedHold { .. } => AutoStartAttempt::Skipped(AutoStartSkip::Held),
+        E::ProjectNotFound(_) => AutoStartAttempt::Skipped(AutoStartSkip::ProjectGone),
+        E::InvalidTransition { .. } => AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive),
+        E::Message(m) if m.starts_with("auto_start=never") => {
+            AutoStartAttempt::Skipped(AutoStartSkip::Policy(AutoStartPolicy::Never))
+        }
+        E::Message(_) if crate::workflow::conductor_md::ready_pick_miss_is_benign(err) => {
+            AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow)
+        }
+        E::Io(_) => {
+            let active = load_run_state(record)
+                .map(|s| matches!(s.status, RunStatus::Running | RunStatus::Paused))
+                .unwrap_or(false);
+            if active {
+                AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+            } else {
+                AutoStartAttempt::Skipped(AutoStartSkip::TransientRead)
+            }
+        }
+        _ => record_auto_start_failure(record, err),
+    }
+}
+
+/// Cap `last_event` the way `truncate_msg` does: at most
+/// [`crate::outcome::LAST_EVENT_MESSAGE_CAP`] chars plus `…` when cut.
+fn cap_auto_start_event(msg: &str) -> String {
+    if msg.chars().count() <= crate::outcome::LAST_EVENT_MESSAGE_CAP {
+        return msg.to_string();
+    }
+    let cut: String = msg
+        .chars()
+        .take(crate::outcome::LAST_EVENT_MESSAGE_CAP)
+        .collect();
+    format!("{cut}…")
+}
+
+/// Persist a launch failure in the existing `RunState` fields (0103).
+///
+/// Never overwrites Running/Paused and never downgrades a 0098 `Blocked` hold.
+/// No `FAILURE.md`, no toast, no new `FailureClass`, no new journal kind. The
+/// lock/save failure arm is **not durable**: nothing is written, one stderr line
+/// is emitted, and the next tick may retry.
+pub(crate) fn record_auto_start_failure(
+    record: &ProjectRecord,
+    err: &CoordinatorError,
+) -> AutoStartAttempt {
+    let class = match err {
+        CoordinatorError::Preflight { .. } => FailureClass::Permission,
+        _ => FailureClass::HarnessCrash,
+    };
+    let detail = err.to_string();
+    let event = cap_auto_start_event(&format!("auto-start: launch failed ({class}): {detail}"));
+    match with_run_state_lock(record, || {
+        let mut state = load_run_state(record)?;
+        if matches!(state.status, RunStatus::Running | RunStatus::Paused) {
+            return Ok(AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive));
+        }
+        // Never downgrade an existing 0098 hold to a generic class.
+        if state.failure_class == Some(FailureClass::Blocked) {
+            return Ok(AutoStartAttempt::Skipped(AutoStartSkip::Held));
+        }
+        state.failure_class = Some(class);
+        state.last_event = event.clone();
+        state.updated_at = chrono::Utc::now();
+        save_run_state(record, &state)?;
+        Ok(AutoStartAttempt::Failed {
+            failure_class: class,
+            detail: event.clone(),
+        })
+    }) {
+        Ok(attempt) => attempt,
+        // Lock/IO failure: nothing persisted, so the next tick may retry (NOT durable).
+        // Report it once on stderr — the serve loop discards the attempt value.
+        Err(e) => {
+            eprintln!("coordinator: auto-start: failed to persist failure ({e})");
+            AutoStartAttempt::Failed {
+                failure_class: class,
+                detail: e.to_string(),
+            }
+        }
+    }
+}
+
+/// Background poll all registered projects that are Running or Paused, and one
+/// auto-start attempt per non-active project (0103).
 pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut last_fleet: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
@@ -402,6 +602,9 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
                         let rec = rec.clone();
                         let _ = crate::api::settle_if_conductor_completed(&rec);
                     }
+                    // 0103: one attempt per project per tick; the helper is the only
+                    // start point. Awaited so two projects never start concurrently.
+                    let _ = try_auto_start_async(rec).await;
                 }
                 for rec in reg.list() {
                     let _ = crate::worktree::reap_aged(rec);
@@ -1103,5 +1306,845 @@ mod tests {
         let port = refused_port();
         assert_eq!(decide_serve_attach(port), ServeAttach::Start { port });
         clear_home();
+    }
+
+    // ---- 0103 ticker auto-start fixtures -------------------------------------
+
+    use crate::registry::{ProjectAddOptions, Registry};
+    use crate::workflow::conductor_md::write_ready_fixture;
+
+    fn auto_start_env_guard() -> crate::config::TestEnvGuard {
+        let mut names = crate::features::test_feature_env_names();
+        names.push(crate::workflow::ENV_WORKFLOW_DRIVER);
+        names.push(ENV_OUTCOME_POLL_MS);
+        names.push(crate::workflow::ENV_PHASE_TIMEOUT_SECS);
+        names.push(ENV_STUB_PHASE_TIMEOUT_SECS);
+        names.push(crate::worktree::ENV_WORKTREE);
+        names.push(crate::notify::ENV_COORDINATOR_NOTIFY);
+        names.push(crate::notify::ENV_COORDINATOR_NOTIFY_FLEET);
+        crate::config::TestEnvGuard::capture(&names)
+    }
+
+    fn set_auto_start_env(driver: &str) {
+        unsafe {
+            std::env::set_var(crate::workflow::ENV_WORKFLOW_DRIVER, driver);
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "30");
+            std::env::set_var(crate::workflow::ENV_PHASE_TIMEOUT_SECS, "3600");
+            std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "3600");
+            std::env::set_var(crate::notify::ENV_COORDINATOR_NOTIFY, "off");
+            std::env::set_var(crate::notify::ENV_COORDINATOR_NOTIFY_FLEET, "off");
+            std::env::remove_var(crate::worktree::ENV_WORKTREE);
+        }
+    }
+
+    /// Registered project (so `cmd_run(Some(id))` can re-resolve it) + optional
+    /// Ready fixture. The home is set here; the guard restores it on drop.
+    fn auto_start_project(
+        policy: AutoStartPolicy,
+        ready: bool,
+        worktree_isolation: bool,
+        exec: Option<std::path::PathBuf>,
+    ) -> (tempfile::TempDir, tempfile::TempDir, ProjectRecord) {
+        let home = tempdir().unwrap();
+        let ws = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        let mut reg = Registry::default();
+        reg.add(
+            ws.path(),
+            ProjectAddOptions {
+                layout_profile: crate::layout::LayoutProfile::Nested,
+                execution_repo: exec,
+                auto_start: Some(policy),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        if worktree_isolation {
+            reg.projects[0].worktree_isolation = true;
+        }
+        let rec = reg.projects[0].clone();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        if ready {
+            write_ready_fixture(ws.path(), "0020").unwrap();
+        }
+        (home, ws, rec)
+    }
+
+    fn with_ready_aliases(mut rec: ProjectRecord, aliases: &[&str]) -> ProjectRecord {
+        rec.ready_aliases = aliases.iter().map(|s| (*s).to_string()).collect();
+        let path = crate::config::registry_path().unwrap();
+        let mut reg = Registry::load(&path).unwrap();
+        if let Some(p) = reg.projects.iter_mut().find(|p| p.id == rec.id) {
+            p.ready_aliases = rec.ready_aliases.clone();
+        }
+        reg.save(&path).unwrap();
+        rec
+    }
+
+    fn write_features_config(home: &std::path::Path, features: serde_json::Value) {
+        let body = serde_json::json!({
+            "version": 1,
+            "scan_roots": [],
+            "features": features,
+        });
+        std::fs::write(home.join("config.json"), body.to_string()).unwrap();
+    }
+
+    fn write_conductor_row(ws: &std::path::Path, row: &str) {
+        let cond = ws.join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        let md = format!(
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             {row}\n"
+        );
+        std::fs::write(cond.join("conductor.md"), md).unwrap();
+    }
+
+    fn write_track_dir(ws: &std::path::Path, name: &str) {
+        let dir = ws.join("conductor").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("spec.md"), b"fixture spec\n").unwrap();
+        std::fs::write(dir.join("plan.md"), b"fixture plan\n").unwrap();
+    }
+
+    fn on_disk(rec: &ProjectRecord) -> crate::state::RunState {
+        load_run_state(rec).unwrap()
+    }
+
+    fn assert_untouched(rec: &ProjectRecord, before: &crate::state::RunState) {
+        let after = on_disk(rec);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.run_epoch, before.run_epoch);
+        assert_eq!(after.last_event, before.last_event);
+        assert_eq!(after.track_id, before.track_id);
+        assert_eq!(after.failure_class, before.failure_class);
+    }
+
+    fn status_log(rec: &ProjectRecord) -> String {
+        std::fs::read_to_string(crate::progress_log::path(rec)).unwrap_or_default()
+    }
+
+    #[test]
+    fn full_policy_starts_one_ready_track_across_three_ticks() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+        let (_home, _ws, rec) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+
+        let first = try_auto_start(&rec);
+        let AutoStartAttempt::Started(view) = first else {
+            panic!("expected Started, got {first:?}");
+        };
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
+        assert_eq!(view.track_id.as_deref(), Some("0020"));
+        assert_eq!(view.run_epoch, 1);
+
+        for _ in 0..2 {
+            assert_eq!(
+                try_auto_start(&rec),
+                AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+            );
+        }
+        let st = on_disk(&rec);
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.run_epoch, 1, "no double start");
+        assert!(st.failure_class.is_none());
+        let log = status_log(&rec);
+        assert!(log.contains("start  track=0020"), "status.md was: {log}");
+    }
+
+    #[test]
+    fn hitl_policy_never_starts_and_status_reports_hitl() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+        let (_home, _ws, rec) = auto_start_project(AutoStartPolicy::Hitl, true, false, None);
+        let mut st = load_run_state(&rec).unwrap();
+        st.status = RunStatus::Idle;
+        st.last_event = crate::workflow::LAST_EVENT_BACKLOG_CLEAR.into();
+        save_run_state(&rec, &st).unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(
+                try_auto_start(&rec),
+                AutoStartAttempt::Skipped(AutoStartSkip::Policy(AutoStartPolicy::Hitl))
+            );
+        }
+        let after = on_disk(&rec);
+        assert_eq!(after.status, RunStatus::Idle);
+        assert_eq!(after.run_epoch, 0);
+        assert!(after.track_id.is_none());
+        assert!(after.failure_class.is_none());
+        assert_eq!(run::status(&rec).unwrap().auto_start, AutoStartPolicy::Hitl);
+    }
+
+    #[test]
+    fn never_policy_never_starts_even_with_ready_row() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+        let (_home, _ws, rec) = auto_start_project(AutoStartPolicy::Never, true, false, None);
+
+        for _ in 0..3 {
+            assert_eq!(
+                try_auto_start(&rec),
+                AutoStartAttempt::Skipped(AutoStartSkip::Policy(AutoStartPolicy::Never))
+            );
+        }
+        let after = on_disk(&rec);
+        assert_eq!(after.status, RunStatus::Idle);
+        assert_eq!(after.run_epoch, 0);
+        assert!(after.track_id.is_none());
+        assert!(after.failure_class.is_none());
+    }
+
+    #[test]
+    fn running_paused_and_stopped_retain_do_not_auto_start() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+
+        // (i) Running.
+        let (_h1, _w1, running) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        run::run_stub(&running, None).unwrap();
+        let before = on_disk(&running);
+        assert_eq!(before.status, RunStatus::Running);
+        assert_eq!(
+            try_auto_start(&running),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        let after = on_disk(&running);
+        assert_eq!(after.status, RunStatus::Running);
+        assert_eq!(after.run_epoch, before.run_epoch);
+        assert_eq!(after.last_event, before.last_event);
+        assert!(after.failure_class.is_none());
+
+        // (ii) Paused.
+        let (_h2, _w2, paused) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        run::run_stub(&paused, None).unwrap();
+        run::pause(&paused).unwrap();
+        let before = on_disk(&paused);
+        assert_eq!(before.status, RunStatus::Paused);
+        assert_eq!(
+            try_auto_start(&paused),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        let after = on_disk(&paused);
+        assert_eq!(after.status, RunStatus::Paused);
+        assert_eq!(after.run_epoch, before.run_epoch);
+        assert_eq!(after.last_event, before.last_event);
+        assert!(after.failure_class.is_none());
+
+        // (iii) Stopped with a retained track is not re-armed.
+        let (_h3, _w3, stopped) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        run::run_stub(&stopped, Some("0020".into())).unwrap();
+        run::stop(&stopped).unwrap();
+        assert_eq!(
+            try_auto_start(&stopped),
+            AutoStartAttempt::Skipped(AutoStartSkip::NotEligible)
+        );
+        let after = on_disk(&stopped);
+        assert_eq!(after.status, RunStatus::Stopped);
+        assert_eq!(after.track_id.as_deref(), Some("0020"));
+        assert_eq!(after.last_event, crate::state::STOP_LAST_EVENT);
+        assert_eq!(after.run_epoch, 1);
+    }
+
+    #[test]
+    fn feature_gate_config_off_then_live_on_starts() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+        let (home, _ws, rec) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        write_features_config(home.path(), serde_json::json!({ "auto_start": false }));
+
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::FeatureOff)
+        );
+        assert_eq!(on_disk(&rec).run_epoch, 0);
+
+        write_features_config(home.path(), serde_json::json!({ "auto_start": true }));
+        let started = try_auto_start(&rec);
+        assert!(
+            matches!(started, AutoStartAttempt::Started(_)),
+            "{started:?}"
+        );
+        assert_eq!(on_disk(&rec).run_epoch, 1, "live re-read; no restart");
+    }
+
+    #[test]
+    fn feature_gate_env_off_blocks_and_env_removal_starts() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+        let (_home, _ws, rec) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        unsafe {
+            std::env::set_var("COORDINATOR_FEATURE_AUTO_START", "off");
+        }
+
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::FeatureOff)
+        );
+        assert_eq!(on_disk(&rec).run_epoch, 0);
+
+        unsafe {
+            std::env::remove_var("COORDINATOR_FEATURE_AUTO_START");
+        }
+        let started = try_auto_start(&rec);
+        assert!(
+            matches!(started, AutoStartAttempt::Started(_)),
+            "{started:?}"
+        );
+        assert_eq!(on_disk(&rec).run_epoch, 1);
+    }
+
+    #[test]
+    fn invalid_feature_gate_fails_closed() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        set_auto_start_env("stub");
+
+        // (i) unreadable/invalid JSON.
+        let (home, _ws, rec) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        std::fs::write(home.path().join("config.json"), b"{not valid json").unwrap();
+        crate::features::reset_feature_warnings_for_tests();
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::FeatureOff)
+        );
+        assert!(!crate::features::is_enabled(
+            crate::features::Duty::AutoStart
+        ));
+        assert_eq!(on_disk(&rec).run_epoch, 0);
+        assert!(on_disk(&rec).failure_class.is_none());
+        assert!(
+            crate::features::take_feature_warnings().len() <= 1,
+            "one line per condition"
+        );
+
+        // (ii) type-invalid table value.
+        let (home, _ws, rec) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        write_features_config(home.path(), serde_json::json!({ "auto_start": "yes" }));
+        crate::features::reset_feature_warnings_for_tests();
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::FeatureOff)
+        );
+        assert!(!crate::features::is_enabled(
+            crate::features::Duty::AutoStart
+        ));
+        assert_eq!(on_disk(&rec).run_epoch, 0);
+        assert!(on_disk(&rec).failure_class.is_none());
+        assert!(crate::features::take_feature_warnings().len() <= 1);
+    }
+
+    #[test]
+    fn empty_backlog_without_ready_row_is_a_silent_noop() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+
+        // (i) only a Completed row.
+        let (_h1, w1, r1) = auto_start_project(AutoStartPolicy::Full, false, false, None);
+        write_track_dir(w1.path(), "0029-Done");
+        write_conductor_row(w1.path(), "| 0029-Done | `.` | **Completed** | shipped |");
+
+        // (ii) a Ready row marked `<!-- nostart -->`.
+        let (_h2, w2, r2) = auto_start_project(AutoStartPolicy::Full, false, false, None);
+        write_track_dir(w2.path(), "0020-Fixture");
+        write_conductor_row(
+            w2.path(),
+            "| 0020-Fixture | `.` | **Ready — not started** <!-- nostart --> | fixture |",
+        );
+
+        // (iii) custom aliases, only a Completed row (alias error branch).
+        let (_h3, w3, r3) = auto_start_project(AutoStartPolicy::Full, false, false, None);
+        let r3 = with_ready_aliases(r3, &["Ready - full plan @ 0020"]);
+        write_track_dir(w3.path(), "0029-Done");
+        write_conductor_row(w3.path(), "| 0029-Done | `.` | **Completed** | shipped |");
+
+        for rec in [&r1, &r2, &r3] {
+            assert_eq!(
+                try_auto_start(rec),
+                AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow)
+            );
+            let after = on_disk(rec);
+            assert_eq!(after.run_epoch, 0);
+            assert!(after.failure_class.is_none());
+            assert!(
+                !after.last_event.starts_with("auto-start:"),
+                "no churn: {}",
+                after.last_event
+            );
+        }
+    }
+
+    #[test]
+    fn ready_row_without_track_dir_is_a_recorded_setup_failure() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+        let (_home, ws, rec) = auto_start_project(AutoStartPolicy::Full, false, false, None);
+        write_conductor_row(
+            ws.path(),
+            "| 0021-Missing | `.` | **Ready — not started** | fixture |",
+        );
+
+        let first = try_auto_start(&rec);
+        assert!(
+            matches!(
+                first,
+                AutoStartAttempt::Failed {
+                    failure_class: FailureClass::HarnessCrash,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        let st = on_disk(&rec);
+        assert_eq!(st.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(
+            st.last_event
+                .starts_with("auto-start: launch failed (harness_crash):"),
+            "{}",
+            st.last_event
+        );
+        assert!(st.last_event.contains("no matching conductor directory"));
+        assert_eq!(st.run_epoch, 0);
+
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure)
+        );
+    }
+
+    #[test]
+    fn launch_failure_is_recorded_once_and_surfaces_in_fleet() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+        let not_git = tempdir().unwrap();
+        let (_home, _ws, rec) = auto_start_project(
+            AutoStartPolicy::Full,
+            true,
+            true,
+            Some(not_git.path().to_path_buf()),
+        );
+
+        let first = try_auto_start(&rec);
+        assert!(
+            matches!(
+                first,
+                AutoStartAttempt::Failed {
+                    failure_class: FailureClass::HarnessCrash,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        let st = on_disk(&rec);
+        assert_eq!(st.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(
+            st.last_event
+                .starts_with("auto-start: launch failed (harness_crash):"),
+            "{}",
+            st.last_event
+        );
+        assert_eq!(st.run_epoch, 0);
+        assert!(
+            crate::notify::artifact::existing_path(&rec).is_none(),
+            "no FAILURE.md for auto-start"
+        );
+        let recorded_event = st.last_event.clone();
+
+        for _ in 0..2 {
+            assert_eq!(
+                try_auto_start(&rec),
+                AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure)
+            );
+        }
+        // Process-restart equivalent: a fresh read still refuses.
+        let reloaded = on_disk(&rec);
+        assert_eq!(reloaded.failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(reloaded.last_event, recorded_event);
+        assert_eq!(reloaded.run_epoch, 0);
+
+        let fleet = crate::notify::build_fleet_summary_event(chrono::Utc::now()).unwrap();
+        let project = fleet
+            .projects
+            .iter()
+            .find(|p| p.project_id == rec.id)
+            .expect("failed project is in the fleet payload");
+        assert_eq!(project.failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(project.last_event, recorded_event);
+
+        let resolved = crate::api::cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        assert!(resolved.failure_class.is_none());
+        assert!(on_disk(&rec).failure_class.is_none());
+    }
+
+    #[test]
+    fn no_conductor_is_a_recorded_setup_failure() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+        let (_home, _ws, rec) = auto_start_project(AutoStartPolicy::Full, false, false, None);
+
+        let first = try_auto_start(&rec);
+        assert!(
+            matches!(
+                first,
+                AutoStartAttempt::Failed {
+                    failure_class: FailureClass::HarnessCrash,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        let st = on_disk(&rec);
+        assert_eq!(st.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(
+            st.last_event.contains("no conductor.md at"),
+            "{}",
+            st.last_event
+        );
+        assert_eq!(st.run_epoch, 0);
+
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure)
+        );
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+    }
+
+    #[test]
+    fn auto_start_error_classification() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+
+        // Policy flip: a mid-tick `Full -> Never` is a skip, not a crash.
+        let (_h1, _w1, r1) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        let before = on_disk(&r1);
+        assert_eq!(
+            auto_start_after_error(
+                &r1,
+                &CoordinatorError::Message("auto_start=never; pass --track".into())
+            ),
+            AutoStartAttempt::Skipped(AutoStartSkip::Policy(AutoStartPolicy::Never))
+        );
+        assert_untouched(&r1, &before);
+
+        // Lost start race.
+        let (_h2, _w2, r2) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        let before = on_disk(&r2);
+        assert_eq!(
+            auto_start_after_error(
+                &r2,
+                &CoordinatorError::InvalidTransition {
+                    action: "run",
+                    from: "running".into(),
+                }
+            ),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        assert_untouched(&r2, &before);
+
+        // Transient read.
+        let (_h3, _w3, r3) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        let before = on_disk(&r3);
+        assert_eq!(
+            auto_start_after_error(&r3, &CoordinatorError::Io(std::io::Error::other("share"))),
+            AutoStartAttempt::Skipped(AutoStartSkip::TransientRead)
+        );
+        assert_untouched(&r3, &before);
+
+        // A benign pick miss raced in after gate (f).
+        let (_h4, _w4, r4) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        let before = on_disk(&r4);
+        assert_eq!(
+            auto_start_after_error(
+                &r4,
+                &CoordinatorError::Message(
+                    "no Ready — not started track in conductor.md; pass --track <id>".into()
+                )
+            ),
+            AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow)
+        );
+        assert_untouched(&r4, &before);
+
+        // Parse/setup errors are recorded.
+        let (_h5, _w5, r5) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        assert!(matches!(
+            auto_start_after_error(
+                &r5,
+                &CoordinatorError::Message("could not parse track registry: bad".into())
+            ),
+            AutoStartAttempt::Failed {
+                failure_class: FailureClass::HarnessCrash,
+                ..
+            }
+        ));
+        assert_eq!(on_disk(&r5).failure_class, Some(FailureClass::HarnessCrash));
+
+        let (_h6, _w6, r6) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        assert!(matches!(
+            auto_start_after_error(
+                &r6,
+                &CoordinatorError::Message(
+                    "no conductor.md at C:\\x\\conductor.md; pass --track <id>".into()
+                )
+            ),
+            AutoStartAttempt::Failed {
+                failure_class: FailureClass::HarnessCrash,
+                ..
+            }
+        ));
+        assert_eq!(on_disk(&r6).failure_class, Some(FailureClass::HarnessCrash));
+    }
+
+    #[test]
+    fn custom_ready_alias_row_starts_and_empty_alias_backlog_is_benign() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+        let alias = "Ready - full plan @ 0020";
+
+        // (i) the custom phrase is the only Ready token.
+        let (_h1, w1, r1) = auto_start_project(AutoStartPolicy::Full, false, false, None);
+        let r1 = with_ready_aliases(r1, &[alias]);
+        write_track_dir(w1.path(), "0020-Fixture");
+        write_conductor_row(
+            w1.path(),
+            "| 0020-Fixture | `.` | **Ready - full plan @ 0020** | fixture |",
+        );
+        let first = try_auto_start(&r1);
+        let AutoStartAttempt::Started(view) = first else {
+            panic!("expected Started, got {first:?}");
+        };
+        assert_eq!(view.track_id.as_deref(), Some("0020"));
+        assert_eq!(view.run_epoch, 1);
+
+        // (ii) the only row carrying that phrase is Completed → alias benign miss.
+        let (_h2, w2, r2) = auto_start_project(AutoStartPolicy::Full, false, false, None);
+        let r2 = with_ready_aliases(r2, &[alias]);
+        write_track_dir(w2.path(), "0029-Done");
+        write_conductor_row(
+            w2.path(),
+            "| 0029-Done | `.` | **Completed - Ready - full plan @ 0020** | shipped |",
+        );
+        assert_eq!(
+            try_auto_start(&r2),
+            AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow)
+        );
+        let after = on_disk(&r2);
+        assert_eq!(after.run_epoch, 0);
+        assert!(after.failure_class.is_none());
+    }
+
+    #[test]
+    fn preflight_error_maps_to_permission_and_cap_is_respected() {
+        use crate::harness::preflight::{DoctorReport, DoctorRow, RowStatus};
+
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+
+        let (_h1, _w1, r1) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        let report = DoctorReport {
+            ok: false,
+            rows: vec![DoctorRow {
+                role: "planner".into(),
+                harness: "grok".into(),
+                command: "grok".into(),
+                path: None,
+                status: RowStatus::Missing,
+                required: true,
+                login: Some("grok login".into()),
+                detail: None,
+            }],
+        };
+        let out = record_auto_start_failure(
+            &r1,
+            &CoordinatorError::Preflight {
+                report: Box::new(report),
+            },
+        );
+        assert!(
+            matches!(
+                out,
+                AutoStartAttempt::Failed {
+                    failure_class: FailureClass::Permission,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        let st = on_disk(&r1);
+        assert_eq!(st.failure_class, Some(FailureClass::Permission));
+        assert!(
+            st.last_event
+                .starts_with("auto-start: launch failed (permission):"),
+            "{}",
+            st.last_event
+        );
+
+        let (_h2, _w2, r2) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        let out = record_auto_start_failure(&r2, &CoordinatorError::Message("x".repeat(400)));
+        assert!(matches!(out, AutoStartAttempt::Failed { .. }), "{out:?}");
+        let st = on_disk(&r2);
+        assert!(
+            st.last_event.chars().count() <= 201,
+            "len={}",
+            st.last_event.chars().count()
+        );
+        assert!(st.last_event.ends_with('…'), "{}", st.last_event);
+    }
+
+    #[test]
+    fn record_failure_does_not_overwrite_running_paused_or_blocked() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("stub");
+
+        // Running.
+        let (_h1, _w1, running) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        run::run_stub(&running, None).unwrap();
+        let before = on_disk(&running);
+        assert_eq!(
+            record_auto_start_failure(&running, &CoordinatorError::Message("boom".into())),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        let after = on_disk(&running);
+        assert_eq!(after.status, RunStatus::Running);
+        assert_eq!(after.run_epoch, before.run_epoch);
+        assert_eq!(after.last_event, before.last_event);
+        assert!(after.failure_class.is_none());
+
+        // Paused.
+        let (_h2, _w2, paused) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        run::run_stub(&paused, None).unwrap();
+        run::pause(&paused).unwrap();
+        let before = on_disk(&paused);
+        assert_eq!(
+            record_auto_start_failure(&paused, &CoordinatorError::Message("boom".into())),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        let after = on_disk(&paused);
+        assert_eq!(after.status, RunStatus::Paused);
+        assert_eq!(after.last_event, before.last_event);
+        assert!(after.failure_class.is_none());
+
+        // Blocked hold is never downgraded.
+        let (_h3, _w3, blocked) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        let mut st = load_run_state(&blocked).unwrap();
+        st.status = RunStatus::Stopped;
+        st.phase = crate::workflow::graph::PHASE_PLAN.into();
+        st.track_id = Some("0020".into());
+        st.run_epoch = 2;
+        st.failure_class = Some(FailureClass::Blocked);
+        st.last_event = "blocked: prerequisite".into();
+        save_run_state(&blocked, &st).unwrap();
+
+        assert_eq!(
+            record_auto_start_failure(&blocked, &CoordinatorError::Message("boom".into())),
+            AutoStartAttempt::Skipped(AutoStartSkip::Held)
+        );
+        let after = on_disk(&blocked);
+        assert_eq!(after.failure_class, Some(FailureClass::Blocked));
+        assert_eq!(after.track_id.as_deref(), Some("0020"));
+        assert_eq!(after.run_epoch, 2);
+        assert_eq!(after.last_event, "blocked: prerequisite");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn serve_poll_loop_starts_one_ready_track_then_polls_it() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+        let (_home, ws, rec) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        let conductor_before =
+            std::fs::read(ws.path().join("conductor").join("conductor.md")).unwrap();
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(serve_poll_loop(rx));
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let st = load_run_state(&rec).unwrap();
+            if st.status == RunStatus::Running
+                && st.track_id.as_deref() == Some("0020")
+                && st.run_epoch == 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "loop did not start within 15s: status={:?} track={:?} epoch={}",
+                st.status,
+                st.track_id,
+                st.run_epoch
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        let outcome = PhaseOutcome::success(
+            crate::workflow::graph::PHASE_PLAN,
+            OutcomeSource::Test,
+            None,
+            None,
+            None,
+        );
+        save_current_outcome(&rec, &outcome).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = load_run_state(&rec).unwrap();
+            if st.phase == crate::workflow::graph::PHASE_PLAN_REVIEW {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "loop did not poll the Running project to plan-review: phase={} status={:?}",
+                st.phase,
+                st.status
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        let _ = tx.send(true);
+        handle.await.unwrap();
+
+        let st = on_disk(&rec);
+        assert_eq!(st.run_epoch, 1, "no double start");
+        assert_eq!(st.track_id.as_deref(), Some("0020"));
+        assert!(st.failure_class.is_none());
+        let conductor_after =
+            std::fs::read(ws.path().join("conductor").join("conductor.md")).unwrap();
+        assert_eq!(conductor_before, conductor_after, "no registry write");
+        let log = status_log(&rec);
+        assert!(log.contains("start  track=0020"), "status.md was: {log}");
     }
 }
