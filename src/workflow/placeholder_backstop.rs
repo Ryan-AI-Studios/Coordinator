@@ -155,19 +155,23 @@ fn backstop_locked(record: &ProjectRecord, dir: &std::path::Path) -> BackstopOut
         }
         StoreView::Ok => {
             let aliases = ready_aliases_for(record);
-            let promotions: Vec<(String, String)> = snapshot
+            let promotions: Vec<(String, String, String)> = snapshot
                 .rows
                 .iter()
                 .filter(|row| !row.nostart)
                 .filter_map(|row| {
                     placeholder_ready(record, row, &row.id, &aliases)
-                        .map(|ready| (row.id.clone(), ready))
+                        .map(|ready| (row.id.clone(), row.status_raw.clone(), ready))
                 })
                 .collect();
             if promotions.is_empty() {
                 return BackstopOutcome::Skipped(BackstopSkip::NoCandidate);
             }
-            match crate::registry_store::promote_placeholders_locked(dir, &promotions, "backstop") {
+            match crate::registry_store::promote_placeholders_observed_locked(
+                dir,
+                &promotions,
+                "backstop",
+            ) {
                 Ok(crate::registry_store::WriteOutcome::Changed(ids)) => {
                     BackstopOutcome::Promoted(ids)
                 }
@@ -384,6 +388,7 @@ mod tests {
             crate::workflow::conductor_md::FoldAdvance::PromotePlaceholder {
                 key: "0020".into(),
                 ready: READY.into(),
+                observed: PROPOSED.into(),
             }
         );
 

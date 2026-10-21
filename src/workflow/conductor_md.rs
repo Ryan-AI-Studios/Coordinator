@@ -675,7 +675,10 @@ pub fn restore_ready_rows(
                 {
                     // The status cell index in the *original* line: header cell 0 is the
                     // text before the first pipe, so the cell index equals `status_col`.
-                    if let Some(new_line) = replace_cell(&lines[i], sc, prev) {
+                    // 0109: preserve a cell-terminating marker the row already carries.
+                    if let Some(new_line) =
+                        replace_status_cell_preserving_marker(&lines[i], sc, prev)
+                    {
                         lines[i] = new_line;
                         if !restored.iter().any(|e| track_ids_match(e, id)) {
                             restored.push(id.clone());
@@ -725,10 +728,36 @@ fn placeholder_pass_complete(record: &ProjectRecord, key: &str) -> bool {
     }
 }
 
+/// Replace the content of the `status_col`-th cell, preserving a cell-terminating
+/// `<!-- nostart -->` that the row already carried in that cell (0109 spec §3.2 rule 9).
+///
+/// Shared by the store mutation core and the legacy markdown writers so store mode and
+/// markdown mode produce identical bytes for a marker-bearing row.
+pub(crate) fn replace_status_cell_preserving_marker(
+    line: &str,
+    status_col: usize,
+    content: &str,
+) -> Option<String> {
+    let (stripped, _) = strip_nostart_literal(content);
+    let content = stripped.trim();
+    let cells = split_unescaped_pipes(line);
+    let keep_marker = cells
+        .get(status_col)
+        .map(|c| c.trim_end().ends_with(NOSTART_LITERAL))
+        .unwrap_or(false);
+    let cell = if keep_marker {
+        format!("{content} {NOSTART_LITERAL}")
+    } else {
+        content.to_string()
+    };
+    replace_cell(line, status_col, &cell)
+}
+
 /// Set the Status cell of the row matching `key` to `ready`, returning the new registry.
 ///
 /// Pure, mirroring [`restore_ready_rows`]: the caller writes the body. `None` when no row
-/// matched, so a vanished row can never be reported as promoted.
+/// matched, so a vanished row can never be reported as promoted. A status-cell
+/// `<!-- nostart -->` is preserved (0109).
 fn promote_placeholder_in(text: &str, key: &str, ready: &str) -> Option<String> {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let owned: Vec<String> = lines.clone();
@@ -766,7 +795,7 @@ fn promote_placeholder_in(text: &str, key: &str, ready: &str) -> Option<String> 
             });
             if matched
                 && let Some(sc) = status_col
-                && let Some(new_line) = replace_cell(&lines[i], sc, ready)
+                && let Some(new_line) = replace_status_cell_preserving_marker(&lines[i], sc, ready)
             {
                 let trailing_newline = text.ends_with('\n');
                 lines[i] = new_line;
@@ -843,13 +872,53 @@ pub fn promote_placeholder(
     key: &str,
     ready: &str,
 ) -> std::io::Result<bool> {
+    promote_placeholder_inner(record, key, ready, None)
+}
+
+/// Promote only while the row still carries the exact status the fold gate observed.
+///
+/// Closes the read→lock race: a concurrent writer that changed the row wins the write and
+/// this call reports `Ok(false)` (the fold then withholds instead of advancing).
+pub fn promote_placeholder_observed(
+    record: &ProjectRecord,
+    key: &str,
+    ready: &str,
+    observed: &str,
+) -> std::io::Result<bool> {
+    promote_placeholder_inner(record, key, ready, Some(observed))
+}
+
+fn promote_placeholder_inner(
+    record: &ProjectRecord,
+    key: &str,
+    ready: &str,
+    observed: Option<&str>,
+) -> std::io::Result<bool> {
     let dir = crate::layout::resolve(record).conductor_dir;
     let promotions = vec![(key.to_string(), ready.to_string())];
     crate::registry_store::with_registry_lock(&dir, || {
-        match crate::registry_store::promote_placeholders_locked(&dir, &promotions, "fold")? {
+        let store_outcome = match observed {
+            Some(observed) => crate::registry_store::promote_placeholders_observed_locked(
+                &dir,
+                &[(key.to_string(), observed.to_string(), ready.to_string())],
+                "fold",
+            )?,
+            None => crate::registry_store::promote_placeholders_locked(&dir, &promotions, "fold")?,
+        };
+        match store_outcome {
             crate::registry_store::WriteOutcome::NoStore => {
                 let path = dir.join("conductor.md");
                 let text = read_view_for_parse(&path)?;
+                if let Some(observed) = observed {
+                    let current = parse_conductor_md(&text).ok().and_then(|rows| {
+                        rows.into_iter()
+                            .find(|r| row_matches_track(r, key))
+                            .map(|r| r.status_raw)
+                    });
+                    if current.as_deref() != Some(observed) {
+                        return Ok(false);
+                    }
+                }
                 let (promoted, body) = promote_placeholders_in(&text, &promotions);
                 if let Some(body) = body {
                     std::fs::write(&path, body)?;
@@ -1443,6 +1512,9 @@ pub enum FoldAdvance {
     PromotePlaceholder {
         key: String,
         ready: String,
+        /// The raw status this gate observed. The writer promotes only while the row still
+        /// carries exactly this status (a concurrent writer wins; no silent overwrite).
+        observed: String,
     },
 }
 
@@ -1477,6 +1549,7 @@ pub fn fold_advance(record: &ProjectRecord, track_id: Option<&str>) -> FoldAdvan
             return FoldAdvance::PromotePlaceholder {
                 key: key.to_string(),
                 ready,
+                observed: row.status_raw.clone(),
             };
         }
         return FoldAdvance::Withhold {
@@ -1965,7 +2038,8 @@ mod tests {
             fold_advance(&record, Some("0001")),
             FoldAdvance::PromotePlaceholder {
                 key: "0001".into(),
-                ready: "**Ready — not started**".into(),
+                ready: "**Ready - not started**".into(),
+                observed: PLACEHOLDER_STATUS.into(),
             }
         );
     }

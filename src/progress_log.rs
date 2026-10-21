@@ -341,12 +341,11 @@ mod tests {
             all.extend(log_lines(&archive));
         }
         all.extend(log_lines(&path(&r)));
-        let mut actual: Vec<String> = all
+        // Chronological: archives oldest→newest + the active file, in append order.
+        let actual: Vec<String> = all
             .iter()
             .map(|l| l.rsplit("  ").next().unwrap_or_default().to_string())
             .collect();
-        actual.sort();
-        expected.sort();
         assert_eq!(actual, expected);
     }
 

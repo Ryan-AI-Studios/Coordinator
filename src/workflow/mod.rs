@@ -235,8 +235,13 @@ pub fn on_success(
                     crate::progress_log::append(record, FOLD_WITHHELD_KIND, &state.last_event);
                     return AddressCiFollowUp::Continue;
                 }
-                conductor_md::FoldAdvance::PromotePlaceholder { key, ready } => {
-                    let promoted = conductor_md::promote_placeholder(record, &key, &ready);
+                conductor_md::FoldAdvance::PromotePlaceholder {
+                    key,
+                    ready,
+                    observed,
+                } => {
+                    let promoted =
+                        conductor_md::promote_placeholder_observed(record, &key, &ready, &observed);
                     match promoted {
                         Ok(true) => {
                             state.last_event = format!(

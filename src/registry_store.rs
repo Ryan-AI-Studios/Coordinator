@@ -33,7 +33,6 @@ pub(crate) const VIEW_DRIFT_PREFIX: &str = "track registry view drifted";
 const VIEW_FILE: &str = "conductor.md";
 const LOCK_DIR: &str = ".track-registry.lock";
 const BACKUP_KEEP: usize = 5;
-const NOSTART_LITERAL: &str = "<!-- nostart -->";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -398,13 +397,6 @@ fn row_matches_target(row: &StoredRow, key: &str) -> bool {
         format!("{}-{}", row.id, row.slug)
     };
     track_ids_match(&row.id, key) || track_ids_match(&slug, key)
-}
-
-fn status_cell_has_marker(line: &str, status_col: usize) -> bool {
-    split_unescaped_pipes(line)
-        .get(status_col)
-        .map(|c| c.trim_end().ends_with(NOSTART_LITERAL))
-        .unwrap_or(false)
 }
 
 fn classify_track_cell(raw: &str) -> String {
@@ -1092,6 +1084,7 @@ fn import_locked(conductor_dir: &Path, opts: ImportOpts) -> Result<ImportReport>
     }
 
     // Cross-check provenance/order comparisons against an existing store before writing.
+    let store_exists = store_path_at(conductor_dir).is_file();
     let old = load_at(conductor_dir).ok().flatten();
     let mut status_changes = Vec::new();
     let mut order_changes = Vec::new();
@@ -1151,7 +1144,7 @@ fn import_locked(conductor_dir: &Path, opts: ImportOpts) -> Result<ImportReport>
     if opts.dry_run {
         return Ok(ok_report(None));
     }
-    if old.is_some() && !opts.force {
+    if store_exists && !opts.force {
         return Ok(ImportReport {
             status: "refused".into(),
             reason: Some("store exists; use registry verify or import --force".into()),
@@ -1488,14 +1481,7 @@ pub fn set_statuses_at(
     clear_nostart: bool,
 ) -> Result<WriteOutcome> {
     with_registry_lock(conductor_dir, || {
-        mutate_locked(
-            conductor_dir,
-            changes,
-            source,
-            clear_nostart,
-            MatchMode::All,
-            false,
-        )
+        set_statuses_locked(conductor_dir, changes, source, clear_nostart)
     })
 }
 
@@ -1505,14 +1491,7 @@ pub fn promote_placeholders(
     source: &str,
 ) -> Result<WriteOutcome> {
     with_registry_lock(&conductor_dir_for(record), || {
-        mutate_locked(
-            &conductor_dir_for(record),
-            promotions,
-            source,
-            false,
-            MatchMode::First,
-            true,
-        )
+        promote_placeholders_locked(&conductor_dir_for(record), promotions, source)
     })
 }
 
@@ -1522,9 +1501,13 @@ pub(crate) fn set_statuses_locked(
     source: &str,
     clear_nostart: bool,
 ) -> Result<WriteOutcome> {
+    let owned: Vec<(String, Option<String>, String)> = changes
+        .iter()
+        .map(|(target, status)| (target.clone(), None, status.clone()))
+        .collect();
     mutate_locked(
         conductor_dir,
-        changes,
+        &owned,
         source,
         clear_nostart,
         MatchMode::All,
@@ -1537,19 +1520,29 @@ pub(crate) fn promote_placeholders_locked(
     promotions: &[(String, String)],
     source: &str,
 ) -> Result<WriteOutcome> {
-    mutate_locked(
-        conductor_dir,
-        promotions,
-        source,
-        false,
-        MatchMode::First,
-        true,
-    )
+    let owned: Vec<(String, Option<String>, String)> = promotions
+        .iter()
+        .map(|(target, status)| (target.clone(), None, status.clone()))
+        .collect();
+    mutate_locked(conductor_dir, &owned, source, false, MatchMode::First, true)
+}
+
+/// Promote only while each row still carries the exact observed status.
+pub(crate) fn promote_placeholders_observed_locked(
+    conductor_dir: &Path,
+    promotions: &[(String, String, String)],
+    source: &str,
+) -> Result<WriteOutcome> {
+    let owned: Vec<(String, Option<String>, String)> = promotions
+        .iter()
+        .map(|(target, observed, status)| (target.clone(), Some(observed.clone()), status.clone()))
+        .collect();
+    mutate_locked(conductor_dir, &owned, source, false, MatchMode::First, true)
 }
 
 fn mutate_locked(
     conductor_dir: &Path,
-    changes: &[(String, String)],
+    changes: &[(String, Option<String>, String)],
     source: &str,
     clear_nostart: bool,
     mode: MatchMode,
@@ -1575,7 +1568,7 @@ fn mutate_locked(
     }
 
     let mut changed: Vec<String> = Vec::new();
-    for (target, new_status) in changes {
+    for (target, observed, new_status) in changes {
         let (content, _) = strip_nostart_literal(new_status);
         let content = content.trim().to_string();
         let limit = if matches!(mode, MatchMode::First) {
@@ -1610,32 +1603,47 @@ fn mutate_locked(
                 }
             };
             if require_placeholder {
-                // A concurrent writer won between the caller's read and this lock: the
-                // row is no longer the placeholder the caller observed.
+                // The row must still be the placeholder the caller observed, and — when the
+                // caller passed the exact status — still carry it verbatim. A concurrent
+                // writer that won between the caller's read and this lock is skipped.
                 let current = &store.rows[idx].status;
                 if !is_proposed(current) || !status_names_placeholder(current) {
                     continue;
                 }
+                if let Some(expected) = observed
+                    && current != expected
+                {
+                    continue;
+                }
             }
             let row = &mut store.rows[idx];
-            let keep_marker = !clear_nostart && status_cell_has_marker(&row.line, status_col);
             let base_line = if clear_nostart {
                 strip_nostart_literal(&row.line).0
             } else {
                 row.line.clone()
             };
-            let cell_content = if keep_marker {
-                format!("{content} {NOSTART_LITERAL}")
+            let line = if clear_nostart {
+                match replace_cell(&base_line, status_col, &content) {
+                    Some(line) => line,
+                    None => {
+                        return Err(CoordinatorError::Message(format!(
+                            "store row {}: status cell {} is missing from the stored line",
+                            row.id, status_col
+                        )));
+                    }
+                }
             } else {
-                content.clone()
-            };
-            let line = match replace_cell(&base_line, status_col, &cell_content) {
-                Some(line) => line,
-                None => {
-                    return Err(CoordinatorError::Message(format!(
-                        "store row {}: status cell {} is missing from the stored line",
-                        row.id, status_col
-                    )));
+                // Same helper as the legacy markdown writers: writer parity for a marker row.
+                match crate::workflow::conductor_md::replace_status_cell_preserving_marker(
+                    &base_line, status_col, &content,
+                ) {
+                    Some(line) => line,
+                    None => {
+                        return Err(CoordinatorError::Message(format!(
+                            "store row {}: status cell {} is missing from the stored line",
+                            row.id, status_col
+                        )));
+                    }
                 }
             };
             // Re-split post-condition before any write.
@@ -1969,6 +1977,17 @@ mod tests {
         assert_eq!(
             std::fs::read(store_path_at(&fx.dir())).unwrap(),
             store_before
+        );
+
+        // A corrupt store still counts as an existing store: no implicit overwrite.
+        std::fs::write(store_path_at(&fx.dir()), b"{not json").unwrap();
+        let report = fx.import();
+        assert_eq!(report.status, "refused");
+        let reason = report.reason.clone().unwrap_or_default();
+        assert!(reason.contains("store exists"), "{reason}");
+        assert_eq!(
+            std::fs::read(store_path_at(&fx.dir())).unwrap(),
+            b"{not json"
         );
     }
 
@@ -2482,6 +2501,90 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, WriteOutcome::Changed(_)));
         assert_eq!(fx.store().rows[0].status, "**Completed**");
+    }
+
+    #[test]
+    fn promotion_skips_when_the_observed_status_changed() {
+        let fx = single(PROPOSED, "fixture");
+        fx.track("0001-T", "# 0001 — real plan\n");
+        fx.import();
+        // A stale observation (what the fold gate saw) must not overwrite a newer status.
+        let stale = promote_placeholders_observed_locked(
+            &fx.dir(),
+            &[(
+                "0001".to_string(),
+                "**Proposed** — stale".to_string(),
+                READY.to_string(),
+            )],
+            "fold",
+        )
+        .unwrap();
+        assert_eq!(stale, WriteOutcome::Unchanged);
+        assert_eq!(fx.store().rows[0].status, PROPOSED);
+
+        // The exact observed status promotes.
+        let exact = promote_placeholders_observed_locked(
+            &fx.dir(),
+            &[("0001".to_string(), PROPOSED.to_string(), READY.to_string())],
+            "fold",
+        )
+        .unwrap();
+        assert_eq!(exact, WriteOutcome::Changed(vec!["0001".to_string()]));
+        assert_eq!(fx.store().rows[0].status, READY);
+    }
+
+    #[test]
+    fn promote_and_restore_marker_parity_markdown_vs_store() {
+        // Promote a marker-bearing placeholder: both modes keep the marker and match bytes.
+        let marker_proposed = "**Proposed - placeholder** <!-- nostart -->";
+        let legacy = fixture();
+        legacy.write_view(&registry(&[row("0020", marker_proposed, "p")]));
+        legacy.track("0020-T", "# 0020 — real plan\n");
+        assert!(
+            crate::workflow::conductor_md::promote_placeholder(&legacy.record, "0020", READY)
+                .unwrap()
+        );
+
+        let stored = fixture();
+        stored.write_view(&registry(&[row("0020", marker_proposed, "p")]));
+        stored.track("0020-T", "# 0020 — real plan\n");
+        stored.import();
+        assert!(
+            crate::workflow::conductor_md::promote_placeholder(&stored.record, "0020", READY)
+                .unwrap()
+        );
+        assert_eq!(stored.read_view(), legacy.read_view());
+        for fx in [&legacy, &stored] {
+            let rows = crate::workflow::conductor_md::load_track_rows(&fx.record).unwrap();
+            assert!(rows[0].nostart, "{}", fx.read_view());
+            assert_eq!(rows[0].status_raw, READY);
+        }
+
+        // Restore a marker-bearing downgrade: both modes match bytes and keep the marker.
+        let original = registry(&[row("0030", &format!("{READY} <!-- nostart -->"), "a")]);
+        let downgraded = registry(&[row("0030", "**Proposed** <!-- nostart -->", "a")]);
+        let before = crate::workflow::conductor_md::status_snapshot(&original);
+
+        let legacy = fixture();
+        legacy.write_view(&downgraded);
+        legacy.state_before(before.clone());
+        let legacy_restore = crate::workflow::drive::restore_ready_rows_after_phase(&legacy.record);
+        assert_eq!(legacy_restore.restored, vec!["0030".to_string()]);
+
+        let stored = fixture();
+        stored.write_view(&downgraded);
+        stored.import();
+        stored.state_before(before);
+        let stored_restore = crate::workflow::drive::restore_ready_rows_after_phase(&stored.record);
+        assert_eq!(stored_restore.restored, vec!["0030".to_string()]);
+        assert_eq!(stored.read_view(), legacy.read_view());
+        assert!(
+            stored.read_view().contains("<!-- nostart -->"),
+            "{}",
+            stored.read_view()
+        );
+        assert_eq!(stored.store().rows[0].status, READY);
+        assert!(stored.store().rows[0].nostart);
     }
 
     #[test]
