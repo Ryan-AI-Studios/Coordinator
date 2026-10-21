@@ -727,6 +727,38 @@ pub fn ensure_state_dir(record: &ProjectRecord) -> Result<PathBuf> {
     Ok(dir)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only lock-wait override so `LockFailed` is provable without a 10 s wait.
+    static TEST_LOCK_WAIT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII test override for [`run_state_lock_wait`]. Resets the thread-local on drop.
+#[cfg(test)]
+pub(crate) struct TestLockWaitGuard;
+
+#[cfg(test)]
+pub(crate) fn test_run_state_lock_wait(duration: std::time::Duration) -> TestLockWaitGuard {
+    TEST_LOCK_WAIT.with(|cell| cell.set(Some(duration)));
+    TestLockWaitGuard
+}
+
+#[cfg(test)]
+impl Drop for TestLockWaitGuard {
+    fn drop(&mut self) {
+        TEST_LOCK_WAIT.with(|cell| cell.set(None));
+    }
+}
+
+fn run_state_lock_wait() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(wait) = TEST_LOCK_WAIT.with(std::cell::Cell::get) {
+        return wait;
+    }
+    std::time::Duration::from_secs(10)
+}
+
 /// Cross-process exclusive lock for run-state mutation (mkdir is atomic).
 ///
 /// Held across load → decide → save so concurrent CLI vs serve first-commit-wins.
@@ -737,7 +769,7 @@ where
 {
     ensure_state_dir(record)?;
     let lock_path = resolve_state_dir(record)?.join(".run-state.lock");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + run_state_lock_wait();
     loop {
         match std::fs::create_dir(&lock_path) {
             Ok(()) => {

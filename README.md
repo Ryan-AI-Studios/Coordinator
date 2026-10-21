@@ -433,7 +433,7 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 | `stall_paging` | route a detected stall to the owner | `COORDINATOR_FEATURE_STALL_PAGING` | **yes (0104)** |
 | `fleet_notify` | serve-loop fleet summary + 0033 progress veto (0105) | `COORDINATOR_FEATURE_FLEET_NOTIFY` | **yes** |
 | `self_update` | build-and-swap the installed binary | `COORDINATOR_FEATURE_SELF_UPDATE` | reserved (0108) |
-| `self_reap` | reap stale harness holders | `COORDINATOR_FEATURE_SELF_REAP` | reserved (0107) |
+| `self_reap` | reap stale harness holders | `COORDINATOR_FEATURE_SELF_REAP` | **yes (0107)** |
 
 - **Precedence:** env > machine config > default (on).
 - **Tokens:** on `1|true|on|yes`, off `0|false|off|no` — trimmed, ASCII case-insensitive. An
@@ -465,13 +465,27 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 - **Combined condition:** a table with both an unknown key and a non-boolean value takes the
   invalid/type path — `unknown_keys` stays empty and the diagnostic names the bad value. Both
   paths fail closed.
-- **Reserved keys:** `self_reap` (0107) and `self_update` (0108) are reserved now; those duties
-  ship in later tracks and are not wired here.
+- **Reserved keys:** `self_update` (0108) is reserved now; that duty ships in a later track and is
+  not wired here.
 - **Veto semantics:** `fleet_notify` **and** `hermes.fleet_summary` are both required for a
   serve-loop fleet post. `COORDINATOR_NOTIFY_FLEET=1` cannot bypass the gate. The same gate also
   blocks 0033 progress even with `COORDINATOR_NOTIFY_PROGRESS=1` or
   `project.notify_progress=true`. The explicit one-shot `notify fleet-summary` probe is **not**
   gated.
+
+### Holder self-reap (0107)
+
+The serve loop reaps a harness holder only when the project's owning run is **terminal**
+(`Idle`/`Stopped`) and both `run-state.json` and `harness-grok.json` are older than **6 h**. It runs
+at most once per hour, once on the first serve tick after start, and once on graceful shutdown. The
+sweep re-reads `features.self_reap` live; `self_reap:false` (or `COORDINATOR_FEATURE_SELF_REAP=0`)
+is the escape. Ownership is proven by the project's own persist record, the holder cwd being equal
+to or under the project workspace/execution/state roots, and a live control-socket **Ping identity
+handshake** (session id, cwd, adapter, ACP child pid). Termination is the holder's own `Shutdown`
+RPC to that verified address; the reaper never selects by image name and has no PID fallback. Any
+missing/unreadable state, lock failure, live (`Running`/`Paused`) run, young run, in-flight prompt,
+self PID or identity/RPC timeout keeps the holder. A successful reap appends one `holder-reap` line
+to `status.md` and prints one stderr line. Refusals write no run-state, `FAILURE.md` or toast.
 
 ### Ticker auto-start (0103)
 

@@ -3,6 +3,7 @@
 //! Harness preflight (`doctor`): track **0028**.
 //! Windows `terminal/create` shell fallback + spawn-fail `HarnessCrash`: track **0032**.
 //! TerminalHub JSONL command journal + `loop_suspect`: track **0034**.
+//! Product-side self-reap of stale terminal-run harness holders: track **0107**.
 
 pub mod abort;
 pub mod capabilities;
@@ -11,6 +12,7 @@ pub mod journal;
 pub mod no_change;
 pub mod pool;
 pub mod preflight;
+pub mod reap;
 pub mod roles;
 pub mod terminal;
 

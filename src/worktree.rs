@@ -218,7 +218,7 @@ fn slash_eq(a: &Path, b: &Path) -> bool {
     slash_key(a) == slash_key(b)
 }
 
-fn path_is_inside(path: &Path, root: &Path) -> bool {
+pub(crate) fn path_is_inside(path: &Path, root: &Path) -> bool {
     let path = slash_key(path);
     let root = slash_key(root);
     let root = root.trim_end_matches('/');
