@@ -8,6 +8,7 @@ pub mod drive;
 pub mod evidence_stamp;
 pub mod execution_repo;
 pub mod graph;
+pub mod placeholder_backstop;
 pub mod plan_review;
 pub mod prompts;
 pub mod reuse;

@@ -617,6 +617,10 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
                         let rec = rec.clone();
                         let _ = crate::api::settle_if_conductor_completed(&rec);
                     }
+                    // 0106: restore registry truth for a parked/idle project before the 0103 picker runs.
+                    // The backstop refuses Running/Paused under the run-state lock, so it cannot race the
+                    // fold's own promotion. The spawn_blocking wrapper keeps the async loop off the lock.
+                    let _ = crate::workflow::placeholder_backstop::tick_async(rec).await;
                     // 0103: one attempt per project per tick; the helper is the only
                     // start point. Awaited so two projects never start concurrently.
                     let _ = try_auto_start_async(rec).await;
@@ -2161,5 +2165,66 @@ mod tests {
         assert_eq!(conductor_before, conductor_after, "no registry write");
         let log = status_log(&rec);
         assert!(log.contains("start  track=0020"), "status.md was: {log}");
+    }
+
+    /// 0106: the no-run case the fold cannot cover. A `Stopped` project with a retained
+    /// `track_id`, a `Proposed — placeholder…` row and a real spec/plan is promoted by the
+    /// serve tick, without a run. The retained id keeps 0103 from picking, so this proves
+    /// the promotion only. Call order (backstop before `try_auto_start_async`) is by
+    /// construction — two sequential awaits — and is not asserted here.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn serve_poll_loop_promotes_stopped_planned_placeholder_without_starting_it() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+        let (_home, ws, rec) = auto_start_project(AutoStartPolicy::Full, false, false, None);
+        write_conductor_row(
+            ws.path(),
+            "| 0020-Fixture | `.` | **Proposed — placeholder, needs full spec/plan pass** | fixture |",
+        );
+        write_track_dir(ws.path(), "0020-Fixture");
+        let mut state = crate::state::RunState::idle(&rec.id);
+        state.status = RunStatus::Stopped;
+        state.track_id = Some("0099".into());
+        state.run_epoch = 3;
+        save_run_state(&rec, &state).unwrap();
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(serve_poll_loop(rx));
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let conductor =
+                std::fs::read_to_string(ws.path().join("conductor").join("conductor.md")).unwrap();
+            let log = status_log(&rec);
+            // The tick writes the registry under the lock and journals just after releasing
+            // it, so wait for both halves rather than racing the journal line.
+            if conductor.contains("**Ready — not started**") && log.contains("placeholder-promoted")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "row was not promoted + journaled within 15s: conductor={conductor} log={log}"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        let log = status_log(&rec);
+        assert!(log.contains("placeholder-promoted"), "status.md was: {log}");
+        assert!(
+            !log.contains("start  track=0020"),
+            "no start path may run: {log}"
+        );
+
+        let _ = tx.send(true);
+        handle.await.unwrap();
+
+        let st = on_disk(&rec);
+        assert_eq!(st.status, RunStatus::Stopped);
+        assert_eq!(st.track_id.as_deref(), Some("0099"));
+        assert_eq!(st.run_epoch, 3);
     }
 }

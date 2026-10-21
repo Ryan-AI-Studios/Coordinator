@@ -52,6 +52,7 @@
 //! Machine feature gates for automation duties (default on; env > config > default; fail closed): track **0102**.
 //! Ticker auto-start for `auto_start: full` behind the 0102 gate (one attempt per project per tick): track **0103**.
 //! One owner stall page + one matching resolution per `(project, track, epoch)` behind the 0102 gate: track **0104**.
+//! No-run placeholder promotion backstop behind the 0102 `auto_start` gate: track **0106**.
 
 pub mod api;
 pub mod checkpoint;

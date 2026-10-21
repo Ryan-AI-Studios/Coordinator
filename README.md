@@ -429,7 +429,7 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 
 | Key | Duty | Env override | Wired today |
 |-----|------|--------------|-------------|
-| `auto_start` | ticker starts the next Ready track | `COORDINATOR_FEATURE_AUTO_START` | **yes (0103)** |
+| `auto_start` | ticker starts the next Ready track; also promotes a completed placeholder when no run is live (0106) — promotion is **independent of the per-project `auto_start` policy** | `COORDINATOR_FEATURE_AUTO_START` | **yes (0103/0106)** |
 | `stall_paging` | route a detected stall to the owner | `COORDINATOR_FEATURE_STALL_PAGING` | **yes (0104)** |
 | `fleet_notify` | serve-loop fleet summary + 0033 progress veto (0105) | `COORDINATOR_FEATURE_FLEET_NOTIFY` | **yes** |
 | `self_update` | build-and-swap the installed binary | `COORDINATOR_FEATURE_SELF_UPDATE` | reserved (0108) |
@@ -506,6 +506,42 @@ existing settle sweep; polling, reap and fleet order are unchanged.
   workspace `status.md` `start  track=…` line, then a second tick with the epoch unchanged. Retiring
   the launcher scripts is owner action; Coordinator never edits, pauses, or deletes them.
 - **No schema change.** `status --project` already shows `auto_start` and `features.auto_start`.
+
+### Placeholder promotion backstop (0106)
+
+The no-run half of #97. The fold already promotes a completed placeholder, but only while a
+`fold` leg is **Running**. A stopped or idle project with a real `spec.md` and a real `plan.md`
+never re-enters `fold`, so its `Proposed — placeholder…` row stayed invisible to the Ready picker
+and to 0103. The serve tick now promotes that row **without a run**.
+
+- **Gate.** The existing machine gate `features.auto_start` only (default on, live re-read, env
+  `COORDINATOR_FEATURE_AUTO_START` wins). No new duty, config key, or env var.
+- **Policy-independent.** Promotion does **not** require `auto_start: full`. `hitl` (the registry
+  default) and `never` projects get truthful promotion too: the row is registry truth, not a
+  start. 0103 still starts **`full` only**. A promoted `hitl`/`never` row is visible to the
+  operator and to an explicit `run --track` without being started automatically.
+- **Refusal under the log.** The backstop re-reads `RunState` **inside** `with_run_state_lock`
+  and returns `Active` before reading or writing the registry when the project is `Running` or
+  `Paused`. The fold, `run` start, `run stop` and `outcome apply` take the same lock, so the two
+  product writers cannot interleave. A run that starts while the tick waits is seen by the
+  locked re-read.
+- **One read, one atomic write.** Exactly one `conductor.md` read, a CRLF refusal on those bytes
+  (no normalization), an in-memory candidate scan (shared fold predicate), a Status-cell-only
+  rewrite, and one `persist::atomic_write` (temp + replace). Other cells, rows, escaped pipes and
+  the trailing newline are preserved. `<!-- nostart -->`, HITL/owner-only, a stub plan, or a
+  missing `spec.md` skip the row. A durable `failure_class` does **not** block promotion; 0103
+  still blocks the **start**.
+- **Journal.** One `placeholder-promoted` line per promoted row in the workspace `status.md`
+  (distinct from the fold's `fold-promoted`). It never starts a track, never calls `cmd_run`,
+  and never writes `RunState` or a failure artifact.
+- **Bounded diagnostics.** A persistent write or lock failure logs one stderr line per project
+  per condition per process and retries next tick; the run-state lock's 60 s stale break keeps a
+  stuck lock self-healing.
+- **Supersedes the external cron.** `coordinated-flip-planned-placeholders` (id `5479caa0ff73`,
+  15-minute interval) is the external reporter this replaces. It stays **paused**; the product
+  does not edit, pause, delete, rename, or run it. Retiring it is owner action. Re-enabling it
+  while a run is live would break the two-product-writer invariant because it has no
+  `Running`/`Paused` check.
 
 ### Stall paging (0104)
 
