@@ -2194,16 +2194,20 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(serve_poll_loop(rx));
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let conductor =
                 std::fs::read_to_string(ws.path().join("conductor").join("conductor.md")).unwrap();
-            if conductor.contains("**Ready — not started**") {
+            let log = status_log(&rec);
+            // The tick writes the registry under the lock and journals just after releasing
+            // it, so wait for both halves rather than racing the journal line.
+            if conductor.contains("**Ready — not started**") && log.contains("placeholder-promoted")
+            {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "row was not promoted within 10s: {conductor}"
+                "row was not promoted + journaled within 15s: conductor={conductor} log={log}"
             );
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
