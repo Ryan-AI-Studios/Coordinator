@@ -54,6 +54,8 @@
 //! One owner stall page + one matching resolution per `(project, track, epoch)` behind the 0102 gate: track **0104**.
 //! No-run placeholder promotion backstop behind the 0102 `auto_start` gate: track **0106**.
 //! Operator-invoked build/smoke/swap of the installed binary behind the 0102 gate: track **0108**.
+//! `track-registry.json` as the row source of truth with `conductor.md` as its generated
+//! view (drift fails the pick closed), plus bounded `status.md` rotation: track **0109**.
 
 pub mod api;
 pub mod checkpoint;
@@ -71,6 +73,7 @@ pub mod persist;
 pub mod policy;
 pub mod progress_log;
 pub mod registry;
+pub mod registry_store;
 pub mod review;
 pub mod run;
 pub mod scan;

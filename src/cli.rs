@@ -1,7 +1,7 @@
 //! Clap CLI surface (tracks 0004–0006).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -50,6 +50,11 @@ pub enum Commands {
     Status {
         #[arg(long)]
         project: Option<String>,
+    },
+    /// Track-registry store: import, render, verify, set-status
+    Registry {
+        #[command(subcommand)]
+        action: RegistryCommands,
     },
     /// Probe bound harnesses (PATH + cheap auth). Pretty JSON; exit 1 if a required row is missing or logged out.
     Doctor {
@@ -479,6 +484,58 @@ pub enum ProjectCommands {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum RegistryCommands {
+    /// Import conductor.md into track-registry.json (lossless; view bytes unchanged)
+    Import {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long = "conductor-dir")]
+        conductor_dir: Option<PathBuf>,
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+        /// Adopt a hand-edited view / refresh an existing store
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Regenerate conductor.md from the store
+    Render {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long = "conductor-dir")]
+        conductor_dir: Option<PathBuf>,
+        /// Compare only
+        #[arg(long, default_value_t = false)]
+        check: bool,
+        /// Archive a drifted view, then rewrite it
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Verify store/view agreement and row-line consistency
+    Verify {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long = "conductor-dir")]
+        conductor_dir: Option<PathBuf>,
+    },
+    /// Change one row's status cell in the store and regenerate the view
+    SetStatus {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long = "conductor-dir")]
+        conductor_dir: Option<PathBuf>,
+        #[arg(long)]
+        track: String,
+        #[arg(long)]
+        status: String,
+        /// Remove a `<!-- nostart -->` marker from the row
+        #[arg(long = "clear-nostart", default_value_t = false)]
+        clear_nostart: bool,
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum OutcomeCommands {
     /// Write a Phase Outcome and apply it (single apply path)
     Write {
@@ -693,6 +750,58 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             let view = api::status(project.as_deref(), true)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
+        Commands::Registry { action } => match action {
+            RegistryCommands::Import {
+                project,
+                conductor_dir,
+                dry_run,
+                force,
+            } => cmd_registry_import(project.as_deref(), conductor_dir.as_deref(), dry_run, force)?,
+            RegistryCommands::Render {
+                project,
+                conductor_dir,
+                check,
+                force,
+            } => {
+                let target = resolve_registry_target(project.as_deref(), conductor_dir.as_deref())?;
+                let report = crate::registry_store::render_at(&target.conductor_dir, check, force)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if check && report.drift {
+                    return Err(CoordinatorError::Message(
+                        "conductor.md differs from the store; run `registry render --force` to rewrite it or `registry import --force` to adopt it".into(),
+                    ));
+                }
+            }
+            RegistryCommands::Verify {
+                project,
+                conductor_dir,
+            } => {
+                let target = resolve_registry_target(project.as_deref(), conductor_dir.as_deref())?;
+                let report = crate::registry_store::verify_at(&target.conductor_dir)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.status == "drift" || report.status == "invalid" {
+                    return Err(CoordinatorError::Message(format!(
+                        "track registry verify: {}",
+                        report.status
+                    )));
+                }
+            }
+            RegistryCommands::SetStatus {
+                project,
+                conductor_dir,
+                track,
+                status,
+                clear_nostart,
+                dry_run,
+            } => cmd_registry_set_status(
+                project.as_deref(),
+                conductor_dir.as_deref(),
+                &track,
+                &status,
+                clear_nostart,
+                dry_run,
+            )?,
+        },
         Commands::Doctor { project } => {
             let report = api::cmd_doctor(project.as_deref())?;
             if report.ok {
@@ -1057,6 +1166,178 @@ fn read_prompt_text(
         (None, None) => Err(CoordinatorError::Message(
             "harness grok prompt requires --text or --file".into(),
         )),
+    }
+}
+
+/// 0109 registry target: an explicit conductor dir plus the registered project (if any).
+struct RegistryTarget {
+    conductor_dir: PathBuf,
+    record: Option<crate::registry::ProjectRecord>,
+}
+
+fn canonical(path: &std::path::Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Exactly one of `--project` / `--conductor-dir`; neither infers from cwd.
+fn resolve_registry_target(
+    project: Option<&str>,
+    conductor_dir: Option<&std::path::Path>,
+) -> std::result::Result<RegistryTarget, CoordinatorError> {
+    if project.is_some() && conductor_dir.is_some() {
+        return Err(CoordinatorError::Message(
+            "pass exactly one of --project or --conductor-dir".into(),
+        ));
+    }
+    if let Some(id) = project {
+        let rec = api::resolve_selected(Some(id), true)?;
+        let dir = crate::layout::resolve(&rec).conductor_dir;
+        return Ok(RegistryTarget {
+            conductor_dir: dir,
+            record: Some(rec),
+        });
+    }
+    if let Some(dir) = conductor_dir {
+        let want = canonical(dir);
+        let rec = api::project_list()?
+            .into_iter()
+            .find(|r| canonical(&crate::layout::resolve(r).conductor_dir) == want);
+        return Ok(RegistryTarget {
+            conductor_dir: dir.to_path_buf(),
+            record: rec,
+        });
+    }
+    let rec = api::resolve_selected(None, true)?;
+    let dir = crate::layout::resolve(&rec).conductor_dir;
+    Ok(RegistryTarget {
+        conductor_dir: dir,
+        record: Some(rec),
+    })
+}
+
+/// Hold the run-state lock and refuse `Running`/`Paused` (import/set-status posture).
+fn with_idle_project<T>(
+    target: &RegistryTarget,
+    f: impl FnOnce() -> std::result::Result<T, CoordinatorError>,
+) -> std::result::Result<T, CoordinatorError> {
+    match &target.record {
+        None => f(),
+        Some(rec) => crate::state::with_run_state_lock(rec, || {
+            let state = crate::state::load_run_state(rec)?;
+            if matches!(
+                state.status,
+                crate::state::RunStatus::Running | crate::state::RunStatus::Paused
+            ) {
+                return Err(CoordinatorError::Message(format!(
+                    "project is {}; refusing a registry mutation while a run is live (stop first)",
+                    state.status
+                )));
+            }
+            f()
+        }),
+    }
+}
+
+fn cmd_registry_import(
+    project: Option<&str>,
+    conductor_dir: Option<&Path>,
+    dry_run: bool,
+    force: bool,
+) -> std::result::Result<(), CoordinatorError> {
+    let target = resolve_registry_target(project, conductor_dir)?;
+    let dir = target.conductor_dir.clone();
+    with_idle_project(&target, || {
+        let report = crate::registry_store::import_at(
+            &dir,
+            crate::registry_store::ImportOpts { dry_run, force },
+        )?;
+        if let Some(rec) = &target.record
+            && let Ok(state_dir) = crate::state::resolve_state_dir(rec)
+        {
+            let path = state_dir.join("registry").join(format!(
+                "import-{}.json",
+                chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+            ));
+            let _ = crate::persist::atomic_write_json(&path, &report);
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if report.status != "ok" {
+            return Err(CoordinatorError::Message(format!(
+                "registry import refused: {}",
+                report.reason.unwrap_or_else(|| report.status.clone())
+            )));
+        }
+        Ok(())
+    })
+}
+
+fn cmd_registry_set_status(
+    project: Option<&str>,
+    conductor_dir: Option<&Path>,
+    track: &str,
+    status: &str,
+    clear_nostart: bool,
+    dry_run: bool,
+) -> std::result::Result<(), CoordinatorError> {
+    let target = resolve_registry_target(project, conductor_dir)?;
+    let dir = target.conductor_dir.clone();
+    with_idle_project(&target, || {
+        if dry_run {
+            let ids =
+                crate::registry_store::preview_set_statuses_at(&dir, track, status, clear_nostart)?;
+            let out = serde_json::json!({
+                "status": "ok",
+                "dry_run": true,
+                "conductor_dir": dir.display().to_string(),
+                "track": track,
+                "changed": ids,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            return Ok(());
+        }
+        let changes = vec![(track.to_string(), status.to_string())];
+        let outcome =
+            crate::registry_store::set_statuses_at(&dir, &changes, "operator", clear_nostart)?;
+        let changed = match outcome {
+            crate::registry_store::WriteOutcome::NoStore => {
+                return Err(CoordinatorError::Message(format!(
+                    "no track store at {}; set-status has no markdown fallback",
+                    crate::registry_store::store_path_at(&dir).display()
+                )));
+            }
+            crate::registry_store::WriteOutcome::Unchanged => Vec::new(),
+            crate::registry_store::WriteOutcome::Changed(ids) => ids,
+        };
+        if changed.is_empty() {
+            return Err(CoordinatorError::Message(format!(
+                "no row matched --track {track}"
+            )));
+        }
+        let out = serde_json::json!({
+            "status": "ok",
+            "conductor_dir": dir.display().to_string(),
+            "track": track,
+            "changed": changed,
+            "store_path": crate::registry_store::store_path_at(&dir).display().to_string(),
+            "view_path": dir.join("conductor.md").display().to_string(),
+            "clear_nostart": clear_nostart,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        Ok(())
+    })
+}
+
+/// Test seam: the real `Cli::parse` + dispatch, so exit codes are the shipped ones.
+#[cfg(test)]
+pub(crate) fn exit_code_for_test(args: &[&str]) -> i32 {
+    let mut argv: Vec<&str> = vec!["coordinator"];
+    argv.extend_from_slice(args);
+    match Cli::try_parse_from(argv) {
+        Ok(cli) => match dispatch(cli) {
+            Ok(()) => 0,
+            Err(e) => e.exit_code(),
+        },
+        Err(_) => 2,
     }
 }
 
@@ -1718,5 +1999,301 @@ mod tests {
         assert!(show.get_arguments().any(|arg| arg.get_id() == "json"));
         let list = decision.find_subcommand("list").expect("list");
         assert!(list.get_arguments().any(|arg| arg.get_id() == "json"));
+    }
+}
+// 0109 CLI dispatch tests: the real `Cli::parse` + `dispatch`, so exit codes are shipped.
+
+#[cfg(test)]
+mod tests_0109_registry {
+    use super::*;
+    use clap::CommandFactory;
+    use std::path::Path;
+    use tempfile::{TempDir, tempdir};
+
+    const HEAD: &str = "| Track | Execution path | Status | Summary |\n\
+                        | --- | --- | --- | --- |\n";
+
+    struct CliFx {
+        _home: TempDir,
+        _ws: TempDir,
+        _guard: crate::config::TestEnvGuard,
+        record: crate::registry::ProjectRecord,
+    }
+
+    impl CliFx {
+        fn dir(&self) -> std::path::PathBuf {
+            self.record.path.join("conductor")
+        }
+        fn dir_arg(&self) -> String {
+            self.dir().display().to_string()
+        }
+        fn view(&self) -> std::path::PathBuf {
+            self.dir().join("conductor.md")
+        }
+        fn write_view(&self, body: &str) {
+            std::fs::create_dir_all(self.dir()).unwrap();
+            std::fs::write(self.view(), body).unwrap();
+        }
+        fn read_view(&self) -> String {
+            std::fs::read_to_string(self.view()).unwrap()
+        }
+        fn store(&self) -> serde_json::Value {
+            let text = std::fs::read_to_string(self.dir().join("track-registry.json")).unwrap();
+            serde_json::from_str(&text).unwrap()
+        }
+        fn store_exists(&self) -> bool {
+            self.dir().join("track-registry.json").is_file()
+        }
+    }
+
+    fn isolate() -> CliFx {
+        let names = crate::features::test_feature_env_names();
+        let guard = crate::config::TestEnvGuard::capture(&names);
+        let home = tempdir().unwrap();
+        for name in &names {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        let ws = tempdir().unwrap();
+        let record =
+            crate::api::project_add(ws.path(), crate::registry::ProjectAddOptions::default())
+                .unwrap();
+        CliFx {
+            _home: home,
+            _ws: ws,
+            _guard: guard,
+            record,
+        }
+    }
+
+    fn ready_row(id: &str) -> String {
+        format!("| [{id}-T]({id}-T/spec.md) | `.` | **Ready — not started** | go |\n")
+    }
+
+    fn exit(args: &[&str]) -> i32 {
+        exit_code_for_test(args)
+    }
+
+    #[test]
+    fn registry_subcommand_in_help() {
+        let mut cmd = Cli::command();
+        let mut registry = cmd
+            .find_subcommand_mut("registry")
+            .expect("registry subcommand")
+            .clone();
+        let help = registry.render_long_help().to_string();
+        for name in ["import", "render", "verify", "set-status"] {
+            assert!(
+                help.contains(name),
+                "registry --help missing {name}: {help}"
+            );
+        }
+        let import_help = registry
+            .find_subcommand_mut("import")
+            .expect("import")
+            .render_long_help()
+            .to_string();
+        assert!(import_help.contains("--conductor-dir"), "{import_help}");
+        assert!(Cli::try_parse_from(["coordinator", "registry", "--help"]).is_err());
+    }
+
+    #[test]
+    fn registry_verify_cli_exits_zero_after_import() {
+        let _lock = crate::config::test_env_lock();
+        let fx = isolate();
+        fx.write_view(&format!("{HEAD}{}", ready_row("0001")));
+        let dir = fx.dir_arg();
+        assert_eq!(exit(&["registry", "import", "--conductor-dir", &dir]), 0);
+        assert_eq!(exit(&["registry", "verify", "--conductor-dir", &dir]), 0);
+        let report = crate::registry_store::verify_at(&fx.dir()).unwrap();
+        assert_eq!(report.status, "ok");
+        assert!(report.row_diff.missing.is_empty());
+        assert!(report.row_diff.extra.is_empty());
+    }
+
+    #[test]
+    fn registry_cli_exit_codes_at_dispatch() {
+        let _lock = crate::config::test_env_lock();
+        let fx = isolate();
+        // A refused import (cell count) is exit 1.
+        fx.write_view(&format!(
+            "{HEAD}| [0001-T](0001-T/spec.md) | `.` | **Ready — not started** | a | b | c |\n"
+        ));
+        let dir = fx.dir_arg();
+        assert_eq!(exit(&["registry", "import", "--conductor-dir", &dir]), 1);
+        assert!(!fx.store_exists());
+
+        // A clean import is exit 0.
+        fx.write_view(&format!("{HEAD}{}", ready_row("0001")));
+        assert_eq!(exit(&["registry", "import", "--conductor-dir", &dir]), 0);
+
+        // A drifted view makes verify exit 1.
+        fx.write_view(&fx.read_view().replace("| go |", "| drift |"));
+        assert_eq!(exit(&["registry", "verify", "--conductor-dir", &dir]), 1);
+        assert_eq!(
+            exit(&["registry", "render", "--conductor-dir", &dir, "--check"]),
+            1
+        );
+
+        // set-status on an absent store has no markdown fallback: exit 1.
+        let other = tempdir().unwrap();
+        std::fs::create_dir_all(other.path()).unwrap();
+        let other_dir = other.path().display().to_string();
+        assert_eq!(
+            exit(&[
+                "registry",
+                "set-status",
+                "--conductor-dir",
+                &other_dir,
+                "--track",
+                "0001",
+                "--status",
+                "**Completed**",
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn registry_set_status_cli_updates_store_and_view() {
+        let _lock = crate::config::test_env_lock();
+        let fx = isolate();
+        fx.write_view(&format!("{HEAD}{}", ready_row("0001")));
+        let dir = fx.dir_arg();
+        assert_eq!(exit(&["registry", "import", "--conductor-dir", &dir]), 0);
+        assert_eq!(
+            exit(&[
+                "registry",
+                "set-status",
+                "--conductor-dir",
+                &dir,
+                "--track",
+                "0001",
+                "--status",
+                "**Completed** 2026-10-21 — shipped",
+            ]),
+            0
+        );
+        let store = fx.store();
+        assert_eq!(
+            store["rows"][0]["status"],
+            "**Completed** 2026-10-21 — shipped"
+        );
+        assert_eq!(store["rows"][0]["status_source"], "operator");
+        assert!(
+            fx.read_view()
+                .contains("**Completed** 2026-10-21 — shipped")
+        );
+        assert_eq!(exit(&["registry", "verify", "--conductor-dir", &dir]), 0);
+    }
+
+    #[test]
+    fn registry_set_status_clear_nostart_and_guards() {
+        let _lock = crate::config::test_env_lock();
+        let fx = isolate();
+        fx.write_view(&format!(
+            "{HEAD}| [0109-T](0109-T/spec.md) | `.` | **Ready - not started** <!-- nostart --> | go |\n"
+        ));
+        let dir = fx.dir_arg();
+        assert_eq!(exit(&["registry", "import", "--conductor-dir", &dir]), 0);
+        assert_eq!(
+            exit(&[
+                "registry",
+                "set-status",
+                "--conductor-dir",
+                &dir,
+                "--track",
+                "0109",
+                "--status",
+                "**Completed** 2026-10-21 — done",
+                "--clear-nostart",
+            ]),
+            0
+        );
+        let store = fx.store();
+        assert_eq!(
+            store["rows"][0]["status"],
+            "**Completed** 2026-10-21 — done"
+        );
+        assert_eq!(store["rows"][0]["nostart"], false);
+        assert!(!fx.read_view().contains("<!-- nostart -->"));
+
+        // A drifted view refuses and writes nothing.
+        fx.write_view(&format!("{}\nhand edit\n", fx.read_view()));
+        let status_before = fx.store()["rows"][0]["status"].clone();
+        assert_eq!(
+            exit(&[
+                "registry",
+                "set-status",
+                "--conductor-dir",
+                &dir,
+                "--track",
+                "0109",
+                "--status",
+                "**Blocked**",
+            ]),
+            1
+        );
+        assert_eq!(fx.store()["rows"][0]["status"], status_before);
+
+        // A Running project refuses the operator flip under the run-state lock.
+        fx.write_view(&format!(
+            "{HEAD}| [0109-T](0109-T/spec.md) | `.` | **Ready - not started** | go |\n"
+        ));
+        assert_eq!(
+            exit(&["registry", "import", "--conductor-dir", &dir, "--force"]),
+            0
+        );
+        let mut state = crate::state::RunState::idle(&fx.record.id);
+        state.status = crate::state::RunStatus::Running;
+        state.track_id = Some("0109".into());
+        crate::state::save_run_state(&fx.record, &state).unwrap();
+        let status_before = fx.store()["rows"][0]["status"].clone();
+        assert_eq!(
+            exit(&[
+                "registry",
+                "set-status",
+                "--project",
+                &fx.record.id,
+                "--track",
+                "0109",
+                "--status",
+                "**Blocked**",
+            ]),
+            1
+        );
+        assert_eq!(fx.store()["rows"][0]["status"], status_before);
+    }
+
+    #[test]
+    fn import_refuses_registered_conductor_dir_while_running() {
+        let _lock = crate::config::test_env_lock();
+        let fx = isolate();
+        fx.write_view(&format!("{HEAD}{}", ready_row("0001")));
+        let mut state = crate::state::RunState::idle(&fx.record.id);
+        state.status = crate::state::RunStatus::Running;
+        state.track_id = Some("0001".into());
+        crate::state::save_run_state(&fx.record, &state).unwrap();
+
+        let dir = fx.dir_arg();
+        assert_eq!(exit(&["registry", "import", "--conductor-dir", &dir]), 1);
+        assert!(!fx.store_exists());
+        assert_eq!(exit(&["registry", "import", "--project", &fx.record.id]), 1);
+        assert!(!fx.store_exists());
+
+        // Paused refuses too.
+        state.status = crate::state::RunStatus::Paused;
+        crate::state::save_run_state(&fx.record, &state).unwrap();
+        assert_eq!(exit(&["registry", "import", "--conductor-dir", &dir]), 1);
+        assert!(!fx.store_exists());
+    }
+
+    #[allow(dead_code)]
+    fn _unused(path: &Path) {
+        let _ = path;
     }
 }

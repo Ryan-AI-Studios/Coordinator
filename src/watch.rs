@@ -408,6 +408,9 @@ pub enum AutoStartSkip {
     ProjectGone,
     /// Io read glitch: no write, retry next tick.
     TransientRead,
+    /// 0109: the generated view was edited outside the store. Skip the tick, no
+    /// durable failure artifact; `import --force` / `render --force` recovers.
+    RegistryDrift,
 }
 
 /// One auto-start attempt for one project. Never retries internally.
@@ -468,6 +471,9 @@ pub fn try_auto_start(record: &ProjectRecord) -> AutoStartAttempt {
     ) {
         Ok(_id) => {}
         Err(e) => {
+            if crate::registry_store::is_view_drift_error(&e) {
+                return AutoStartAttempt::Skipped(AutoStartSkip::RegistryDrift);
+            }
             if crate::workflow::conductor_md::ready_pick_miss_is_benign(&e) {
                 return AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow);
             }
@@ -512,6 +518,9 @@ pub(crate) fn auto_start_after_error(
         E::InvalidTransition { .. } => AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive),
         E::Message(m) if m.starts_with("auto_start=never") => {
             AutoStartAttempt::Skipped(AutoStartSkip::Policy(AutoStartPolicy::Never))
+        }
+        E::Message(_) if crate::registry_store::is_view_drift_error(err) => {
+            AutoStartAttempt::Skipped(AutoStartSkip::RegistryDrift)
         }
         E::Message(_) if crate::workflow::conductor_md::ready_pick_miss_is_benign(err) => {
             AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow)
