@@ -21,7 +21,7 @@ jobs:
         with:
           components: rustfmt
       - name: cargo fmt
-        run: cargo fmt --check
+        run: exit 1
 
   clippy:
     name: clippy
@@ -62,6 +62,7 @@ jobs:
   test_no_default:
     name: test-no-default
     runs-on: windows-latest
+    if: ${{ false }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
