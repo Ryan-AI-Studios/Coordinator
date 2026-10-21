@@ -217,16 +217,21 @@ impl HermesAdapter {
                 let url = url.clone();
                 let secret = secret.clone();
                 let event = event.clone();
-                let _ = std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("coordinator-hermes-fleet".into())
                     .spawn(move || match post_fleet_http(&url, &secret, &event) {
                         Ok(status) => {
                             eprintln!("coordinator: hermes fleet summary delivered HTTP {status}");
                         }
                         Err(e) => {
-                            eprintln!("coordinator: hermes fleet summary failed (non-fatal): {e}");
+                            eprintln!("coordinator: fleet summary failed (non-fatal): {e}");
                         }
-                    });
+                    })
+                {
+                    return Err(CoordinatorError::Message(format!(
+                        "hermes fleet thread spawn failed: {e}"
+                    )));
+                }
                 Ok(())
             }
             #[cfg(test)]
@@ -242,7 +247,7 @@ impl HermesAdapter {
                 let url = url.clone();
                 let secret = secret.clone();
                 let event = event.clone();
-                let _ = std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("coordinator-hermes-progress".into())
                     .spawn(move || match post_progress_http(&url, &secret, &event) {
                         Ok(status) => {
@@ -251,7 +256,12 @@ impl HermesAdapter {
                         Err(e) => {
                             eprintln!("coordinator: hermes progress failed (non-fatal): {e}");
                         }
-                    });
+                    })
+                {
+                    return Err(CoordinatorError::Message(format!(
+                        "hermes progress thread spawn failed: {e}"
+                    )));
+                }
                 Ok(())
             }
             #[cfg(test)]
@@ -1352,6 +1362,7 @@ mod tests {
             event_type: EVENT_TYPE_FLEET_SUMMARY.into(),
             written_at: chrono::DateTime::from_timestamp_millis(1_778_000_000_123).unwrap(),
             projects: Vec::new(),
+            message: "fleet 0 projects".into(),
         }
     }
 
@@ -1381,6 +1392,9 @@ mod tests {
         let req = &captured[0];
         let parsed: FleetSummaryEvent = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(parsed, ev);
+        assert_eq!(parsed.message, "fleet 0 projects");
+        let value: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(value["message"], "fleet 0 projects");
         let text = String::from_utf8(req.body.clone()).unwrap();
         assert!(!text.contains("s3cret-fleet"));
         assert_eq!(header(req, HEADER_EVENT).unwrap(), EVENT_TYPE_FLEET_SUMMARY);
@@ -1393,6 +1407,60 @@ mod tests {
             header(req, HEADER_SIGNATURE_V2).unwrap(),
             sign_v2("s3cret-fleet", ts, &req.body)
         );
+    }
+
+    #[test]
+    fn fleet_loopback_http_verifies_signature_and_message() {
+        let listener = LoopbackListener::bind();
+        let mut event = fleet_event();
+        event.message =
+            "fleet 1 project: 1 running, 0 paused, 0 idle, 0 stopped\n- Alpha 0105: plan / Running - start"
+                .into();
+        let status = HermesAdapter::http(&listener.url, "loop-secret")
+            .notify_fleet_blocking(&event)
+            .unwrap();
+        assert_eq!(status, 200);
+        let req = listener.recv();
+        assert_eq!(
+            header(&req, HEADER_EVENT).unwrap(),
+            EVENT_TYPE_FLEET_SUMMARY
+        );
+        let ts: u64 = header(&req, HEADER_TIMESTAMP).unwrap().parse().unwrap();
+        assert_eq!(
+            header(&req, HEADER_SIGNATURE_V2).unwrap(),
+            sign_v2("loop-secret", ts, &req.body)
+        );
+        let parsed: FleetSummaryEvent = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(parsed, event);
+        assert!(
+            parsed
+                .message
+                .contains("- Alpha 0105: plan / Running - start")
+        );
+    }
+
+    #[test]
+    fn fleet_detached_post_returns_before_slow_webhook() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::time::Instant;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(1));
+                let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let adapter = HermesAdapter::http(format!("http://{addr}/hook"), "s");
+        let start = Instant::now();
+        adapter.notify_fleet(&fleet_event()).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "detached fleet POST returned in {elapsed:?}"
+        );
+        server.join().unwrap();
     }
 
     fn stall_event(kind: crate::notify::StallKind) -> StallEvent {

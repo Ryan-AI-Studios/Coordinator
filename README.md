@@ -320,7 +320,7 @@ Hard failure may POST `NotifyEvent` JSON to a **loopback** Hermes inbound webhoo
 
 | Item | Rule |
 |------|------|
-| Config | `{COORDINATOR_HOME}/config.json` additive `hermes.enabled` (default `false`) + `hermes.webhook_url` + `hermes.progress` (default `false`). **Do not** store the HMAC secret. |
+| Config | `{COORDINATOR_HOME}/config.json` additive `hermes.enabled` (default `false`) + `hermes.webhook_url` + `hermes.progress` (default `false`) + `hermes.fleet_summary` (default `false`). **Do not** store the HMAC secret. |
 | Env | `COORDINATOR_HERMES=off` force-disables. `COORDINATOR_HERMES_URL` overrides the URL. `COORDINATOR_HERMES_SECRET` is required to POST. `COORDINATOR_NOTIFY=off` still skips **toast only** (does **not** disable Hermes failure or progress). Process start loads gitignored `.env` (cwd/parents, then next to the binary, then `{COORDINATOR_HOME}/.env`); existing process env wins. Copy `.env.example`. |
 | URL | `http://` + literal host in `{127.0.0.1, localhost, ::1, 127.0.0.0/8}` + non-empty path. Docs and examples use **`http://127.0.0.1:8644/...`** (IPv4-deterministic for WSL2). `https://`, non-loopback, empty path, and userinfo are rejected. No redirects off-box. |
 | Auth | Hermes generic **HMAC V2**: `X-Webhook-Signature-V2` + `X-Webhook-Timestamp` over `{timestamp}.{body}` (lowercase hex, no `sha256=` prefix). Unsigned POST is forbidden. |
@@ -367,11 +367,13 @@ platforms:
 
 Omit `events` (or do not filter on GitHub event types).
 
-### Hermes progress (opt-in, default off)
+### Hermes progress (opt-in, default off; 0105 keeps it off)
 
 Hard-failure JSON is **unchanged** (no `event_type` on `NotifyEvent`). Progress is a separate `ProgressEvent` POST: `event_type=progress`, header `X-Coordinator-Event: progress`, never toast, never `FAILURE.md`, never stalls apply.
 
 Enable with **any** of: env `COORDINATOR_NOTIFY_PROGRESS` in `{1,true,on}` (case-insensitive), machine `hermes.progress: true`, or `project set --notify-progress true`. Env `COORDINATOR_NOTIFY_PROGRESS=off` force-disables. Progress still requires the 0015 Hermes gate (`enabled`/URL + `COORDINATOR_HERMES_SECRET`, not `COORDINATOR_HERMES=off`). HTTP `PATCH`/`POST` project set accepts additive `notify_progress`.
+
+**0105 disposition:** `hermes.progress` remains **off** deliberately. The 0033 stream is unbounded (one POST per canonical phase advance plus every cross-model bounce), has no dedupe (the millis request id defeats the Hermes cache), and has no quiet hours. The hourly fleet summary below is the bounded owner channel. `features.fleet_notify=false` now vetoes this path even with `COORDINATOR_NOTIFY_PROGRESS=1` or `project.notify_progress=true`.
 
 Prefer a **second Hermes route** so a failure prompt does not render `{from_phase}` literals:
 
@@ -385,7 +387,24 @@ Prefer a **second Hermes route** so a failure prompt does not render `{from_phas
             Coordinator {from_phase} → {to_phase} track={track_id} {last_event}
 ```
 
-Operator may point `webhook_url` at either route (one URL in Coordinator). Missing template keys stay literal `{key}` per Hermes. Do not ship Hermes config from this repo. The operator poll cron is unchanged.
+Operator may point `webhook_url` at either route (one URL in Coordinator). Missing template keys stay literal `{key}` per Hermes. Do not ship Hermes config from this repo. The `track-progress-watch` cron reporter is the reporter 0105 supersedes; it is named **read-only** in the track review and is **not** edited by the product.
+
+### Fleet summary (0105)
+
+`hermes.fleet_summary: true` makes the serve loop POST one `FleetSummaryEvent` at most once per 3600 s, and only outside **00:00–05:59 local**. The event keeps the complete machine-readable `projects` array and adds an additive `message` digest the existing route template already reads:
+
+```text
+fleet 2 projects: 1 running, 0 paused, 1 idle, 0 stopped
+- Alpha 0105: implement / Running - workflow: advance plan → implement
+- Beta -: idle / Idle - idle: no run
+```
+
+- **Coverage:** one line per project: label (`display_name` → path final component → project id), `track_id` or `-`, phase or `-`, status, `(failure: {class})` when set, and a flattened `last_event` capped at 120 characters.
+- **Bounds:** `message` is capped at 3500 characters; later project lines may be dropped by the cap, while `projects` is never truncated. The Hermes inbound body cap is 1 MiB, so a pathologically large `projects` array can be rejected (non-fatal).
+- **Cadence/quiet:** fixed hourly interval outside 00:00–05:59 local. Quiet ticks do not stamp the due slot, so the first tick at 06:00 posts. This is a constant, not a config key.
+- **Route:** point the subscription prompt at `{message}`; `{track_id}`/`{last_event}` stay literal for fleet payloads unless the operator changes the external route.
+- **Failure:** the POST is detached; a 401/connect failure logs one `coordinator: fleet summary failed (non-fatal): …` line and never blocks or fails a serve tick. A thread-spawn failure is returned and logged the same way.
+- **Gate:** `features.fleet_notify` **and** `hermes.fleet_summary` are both required. `COORDINATOR_NOTIFY_FLEET=1` cannot bypass the gate; the explicit one-shot `notify fleet-summary` probe is not gated.
 
 `COORDINATOR_NOTIFY=off` is the CI / headless default path. `cargo test` never requires a visible toast (recording adapter).
 
@@ -412,7 +431,7 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 |-----|------|--------------|-------------|
 | `auto_start` | ticker starts the next Ready track | `COORDINATOR_FEATURE_AUTO_START` | **yes (0103)** |
 | `stall_paging` | route a detected stall to the owner | `COORDINATOR_FEATURE_STALL_PAGING` | **yes (0104)** |
-| `fleet_notify` | serve-loop fleet summary (`notify::fleet_tick`) | `COORDINATOR_FEATURE_FLEET_NOTIFY` | **yes** |
+| `fleet_notify` | serve-loop fleet summary + 0033 progress veto (0105) | `COORDINATOR_FEATURE_FLEET_NOTIFY` | **yes** |
 | `self_update` | build-and-swap the installed binary | `COORDINATOR_FEATURE_SELF_UPDATE` | reserved (0108) |
 | `self_reap` | reap stale harness holders | `COORDINATOR_FEATURE_SELF_REAP` | reserved (0107) |
 
@@ -449,8 +468,10 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 - **Reserved keys:** `self_reap` (0107) and `self_update` (0108) are reserved now; those duties
   ship in later tracks and are not wired here.
 - **Veto semantics:** `fleet_notify` **and** `hermes.fleet_summary` are both required for a
-  serve-loop post. `COORDINATOR_NOTIFY_FLEET=1` cannot bypass the gate. The explicit one-shot
-  `notify fleet-summary` probe is **not** gated.
+  serve-loop fleet post. `COORDINATOR_NOTIFY_FLEET=1` cannot bypass the gate. The same gate also
+  blocks 0033 progress even with `COORDINATOR_NOTIFY_PROGRESS=1` or
+  `project.notify_progress=true`. The explicit one-shot `notify fleet-summary` probe is **not**
+  gated.
 
 ### Ticker auto-start (0103)
 
