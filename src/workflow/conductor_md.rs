@@ -428,7 +428,7 @@ struct PipeRow {
 }
 
 /// Path to this project's `conductor.md`.
-fn conductor_md_path(record: &ProjectRecord) -> std::path::PathBuf {
+pub(crate) fn conductor_md_path(record: &ProjectRecord) -> std::path::PathBuf {
     crate::layout::resolve(record)
         .conductor_dir
         .join("conductor.md")
@@ -727,21 +727,71 @@ fn promote_placeholder_in(text: &str, key: &str, ready: &str) -> Option<String> 
     None
 }
 
+/// The Ready cell this row should get when its placeholder condition is satisfied.
+///
+/// Shared by the fold gate (0106 refactor) and the no-run backstop. `None` when the row
+/// is not a `Proposed` placeholder, is HITL/owner-only, or its spec/plan pass is
+/// incomplete. The caller decides whether a row-local `<!-- nostart -->` applies: the
+/// fold has already been explicitly started; the backstop has not.
+pub(crate) fn placeholder_ready(
+    record: &ProjectRecord,
+    row: &TrackRow,
+    key: &str,
+    aliases: &[String],
+) -> Option<String> {
+    if !is_proposed(&row.status_raw) {
+        return None;
+    }
+    let clean = status_clean(&row.status_raw);
+    if is_hitl_marked(&row.id, &row.slug, &clean, &row.summary)
+        || !status_names_placeholder(&row.status_raw)
+        || !placeholder_pass_complete(record, key)
+    {
+        return None;
+    }
+    let ready = aliases
+        .first()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_READY_PHRASE.to_string());
+    Some(format!("**{ready}**"))
+}
+
+/// Apply every `(key, ready)` promotion to one registry body.
+///
+/// Pure. Returns the ids actually rewritten and the new body only when at least one row
+/// matched. Sharing one body keeps a multi-row promotion to a single write.
+pub(crate) fn promote_placeholders_in(
+    text: &str,
+    promotions: &[(String, String)],
+) -> (Vec<String>, Option<String>) {
+    let mut body = text.to_string();
+    let mut promoted = Vec::new();
+    for (key, ready) in promotions {
+        if let Some(next) = promote_placeholder_in(&body, key, ready) {
+            body = next;
+            promoted.push(key.clone());
+        }
+    }
+    if promoted.is_empty() {
+        (promoted, None)
+    } else {
+        (promoted, Some(body))
+    }
+}
+
 /// Promote `key`'s row to `ready` in the live registry. `Ok(false)` when no row matched.
 pub fn promote_placeholder(
     record: &ProjectRecord,
     key: &str,
     ready: &str,
 ) -> std::io::Result<bool> {
-    let path = crate::layout::resolve(record)
-        .conductor_dir
-        .join("conductor.md");
+    let path = conductor_md_path(record);
     let text = std::fs::read_to_string(&path)?;
-    let Some(body) = promote_placeholder_in(&text, key, ready) else {
-        return Ok(false);
-    };
-    std::fs::write(&path, body)?;
-    Ok(true)
+    let (promoted, body) = promote_placeholders_in(&text, &[(key.to_string(), ready.to_string())]);
+    if let Some(body) = body {
+        std::fs::write(&path, body)?;
+    }
+    Ok(!promoted.is_empty())
 }
 
 /// [`width_deviations`] for a record's live registry.
@@ -1340,17 +1390,10 @@ pub fn fold_advance(record: &ProjectRecord, track_id: Option<&str>) -> FoldAdvan
         // HITL and owner-only marks still win anywhere in the row, and a bare
         // `Proposed - gated on ...` hold does not name the placeholder condition.
         let clean = status_clean(&row.status_raw);
-        if !is_hitl_marked(&row.id, &row.slug, &clean, &row.summary)
-            && status_names_placeholder(&row.status_raw)
-            && placeholder_pass_complete(record, key)
-        {
-            let ready = aliases
-                .first()
-                .cloned()
-                .unwrap_or_else(|| DEFAULT_READY_PHRASE.to_string());
+        if let Some(ready) = placeholder_ready(record, row, key, &aliases) {
             return FoldAdvance::PromotePlaceholder {
                 key: key.to_string(),
-                ready: format!("**{ready}**"),
+                ready,
             };
         }
         return FoldAdvance::Withhold {
@@ -1918,6 +1961,113 @@ mod tests {
                     | --- | --- | --- |\n\
                     | [0001-One](0001-One/spec.md) | **Proposed — placeholder, needs full spec/plan pass** | ok |\n";
         assert!(promote_placeholder_in(text, "9999", "**Ready — not started**").is_none());
+    }
+
+    /// Delegation-seam guard only (0106). After the refactor `fold_advance` calls the
+    /// helper, so this is near-tautological by construction. The load-bearing fold
+    /// evidence is the six unchanged fold tests plus
+    /// `promote_placeholder_matches_single_row_rewrite`.
+    #[test]
+    fn placeholder_ready_matches_fold_advance_matrix() {
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        let cases = [
+            ("**Ready — not started**", true, "ok", false),
+            ("   ", true, "ok", false),
+            (PLACEHOLDER_STATUS, true, "ok", true),
+            (PLACEHOLDER_STATUS, false, "ok", false),
+            ("**Proposed** — gated on owner GO", true, "ok", false),
+            (PLACEHOLDER_STATUS, true, "needs owner-only sign off", false),
+            ("**Blocked** — waiting", true, "ok", false),
+            ("**Completed**", true, "ok", false),
+            ("**In progress**", true, "ok", false),
+        ];
+        for (status, files, summary, expect) in cases {
+            write_md(dir.path(), &one_row(status, summary, false));
+            let track = dir.path().join("conductor").join("0001-One");
+            if files {
+                write_track_files(dir.path(), "0001-One", "# spec\n", "# plan\n");
+            } else {
+                let _ = std::fs::remove_dir_all(&track);
+            }
+            let text =
+                std::fs::read_to_string(dir.path().join("conductor").join("conductor.md")).unwrap();
+            let rows = parse_conductor_md(&text).unwrap();
+            let row = rows.iter().find(|r| r.id == "0001").unwrap();
+            let aliases = ready_aliases_for(&record);
+            let helper = placeholder_ready(&record, row, &row.id, &aliases);
+            assert_eq!(helper.is_some(), expect, "{status}");
+            assert_eq!(
+                helper.is_some(),
+                matches!(
+                    fold_advance(&record, Some("0001")),
+                    FoldAdvance::PromotePlaceholder { .. }
+                ),
+                "{status}"
+            );
+        }
+    }
+
+    /// R4 placement: the helper has no `nostart` opinion; the no-run caller filters it.
+    #[test]
+    fn placeholder_ready_ignores_nostart_the_caller_filters_it() {
+        let _lock = crate::config::test_env_lock();
+        let _env = crate::config::TestEnvGuard::capture(&crate::features::test_feature_env_names());
+        for name in crate::features::test_feature_env_names() {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        crate::features::reset_feature_warnings_for_tests();
+        crate::workflow::placeholder_backstop::reset_backstop_warnings_for_tests();
+
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        write_md(dir.path(), &one_row(PLACEHOLDER_STATUS, "ok", true));
+        write_track_files(dir.path(), "0001-One", "# spec\n", "# plan\n");
+        let text =
+            std::fs::read_to_string(dir.path().join("conductor").join("conductor.md")).unwrap();
+        let rows = parse_conductor_md(&text).unwrap();
+        let row = rows.iter().find(|r| r.id == "0001").unwrap();
+        assert!(row.nostart);
+        let aliases = ready_aliases_for(&record);
+        assert_eq!(
+            placeholder_ready(&record, row, &row.id, &aliases),
+            Some("**Ready — not started**".to_string())
+        );
+        assert_eq!(
+            crate::workflow::placeholder_backstop::tick(&record),
+            crate::workflow::placeholder_backstop::BackstopOutcome::Skipped(
+                crate::workflow::placeholder_backstop::BackstopSkip::NoCandidate
+            )
+        );
+        assert!(text.contains("**Proposed — placeholder"), "{text}");
+    }
+
+    /// Bytes equal the unchanged pure single-row rewrite: only the Status cell changes,
+    /// escaped pipes / other rows / the trailing newline survive.
+    #[test]
+    fn promote_placeholder_matches_single_row_rewrite() {
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        let before = "| Track | Status | Summary |\n\
+                      | --- | --- | --- |\n\
+                      | [0001-One](0001-One/spec.md) | **Proposed — placeholder, needs full spec/plan pass** | a \\| b |\n\
+                      | [0002-Two](0002-Two/spec.md) | **Ready — not started** | untouched |\n";
+        write_md(dir.path(), before);
+        let expected = promote_placeholder_in(before, "0001", "**Ready — not started**").unwrap();
+        assert!(promote_placeholder(&record, "0001", "**Ready — not started**").unwrap());
+        let after =
+            std::fs::read_to_string(dir.path().join("conductor").join("conductor.md")).unwrap();
+        assert_eq!(after, expected);
+        assert!(
+            after
+                .contains("| [0002-Two](0002-Two/spec.md) | **Ready — not started** | untouched |")
+        );
     }
 
     #[test]
