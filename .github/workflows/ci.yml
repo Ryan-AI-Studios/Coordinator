@@ -10,32 +10,92 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    name: fmt clippy test
+  fmt:
+    name: fmt
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt --check
 
+  clippy:
+    name: clippy
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: cargo fmt
-        run: cargo fmt --check
-
       - name: Cache Rust build
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v1-coordinator
           cache-on-failure: false
-
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  test:
+    name: test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-coordinator
+          cache-on-failure: false
       - name: cargo test
         run: cargo test
 
+  test_no_default:
+    name: test-no-default
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-coordinator
+          cache-on-failure: false
       - name: cargo test --no-default-features --lib
         run: cargo test --no-default-features --lib
+
+  gate:
+    name: fmt clippy test
+    runs-on: windows-latest
+    needs: [fmt, clippy, test, test_no_default]
+    if: ${{ !cancelled() }}
+    timeout-minutes: 5
+    steps:
+      - name: Require every check job to succeed
+        shell: pwsh
+        run: |
+          $results = [ordered]@{
+            fmt             = '${{ needs.fmt.result }}'
+            clippy          = '${{ needs.clippy.result }}'
+            test            = '${{ needs.test.result }}'
+            test_no_default = '${{ needs.test_no_default.result }}'
+          }
+          $failed = @($results.GetEnumerator() | Where-Object { $_.Value -ne 'success' })
+          if ($failed.Count -gt 0) {
+            foreach ($f in $failed) { Write-Host "::error::$($f.Key) result=$($f.Value)" }
+            exit 1
+          }
+          Write-Host "all check jobs succeeded"
