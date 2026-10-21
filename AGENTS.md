@@ -63,7 +63,7 @@ An unreadable config, a malformed/type-invalid table, or an unknown duty key fai
 closed (source `config`) with one stderr line per condition per process; an unknown env token fails
 that duty closed. Env cannot rescue a broken table. Live re-read every tick — no restart.
 `fleet_notify` (0102), `auto_start` (0103) and `stall_paging` (0104) are wired; `self_reap` (0107)
-is wired; `self_update` (0108) remains reserved.
+is wired; `self_update` (0108) is wired (operator-invoked `self-update`; no cadence).
 0106 reuses `auto_start` for the no-run placeholder backstop (machine gate only; promotion does
 not depend on the per-project policy); the fold's own promotion is unchanged.
 0105: `fleet_notify` also vetoes 0033 progress (`COORDINATOR_NOTIFY_PROGRESS=1` and
