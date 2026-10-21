@@ -305,6 +305,15 @@ mod tests {
         write_state(record, RunStatus::Stopped, Some("0099"));
         let state_before = load_run_state(record).unwrap();
         let before = std::fs::read_to_string(md(&record.path)).unwrap();
+        // DoD-1: the row is eligible for the fold's own promotion, so this fixture proves
+        // both halves on the same bytes before the no-run tick writes.
+        assert_eq!(
+            crate::workflow::conductor_md::fold_advance(record, Some("0020")),
+            crate::workflow::conductor_md::FoldAdvance::PromotePlaceholder {
+                key: "0020".into(),
+                ready: READY.into(),
+            }
+        );
 
         assert_eq!(
             tick(record),
@@ -668,6 +677,9 @@ mod tests {
     #[test]
     fn warn_once_dedupes_per_key_and_resets() {
         let _lock = test_env_lock();
+        let _env = TestEnvGuard::capture(&crate::features::test_feature_env_names());
+        let home = tempdir().unwrap();
+        isolate(home.path());
         reset_backstop_warnings_for_tests();
         assert!(warn_once("lock:a".into(), "coordinator: test lock-a"));
         assert!(!warn_once("lock:a".into(), "coordinator: test lock-a"));

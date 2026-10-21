@@ -1853,6 +1853,23 @@ mod tests {
         std::fs::write(dir.join("plan.md"), plan).unwrap();
     }
 
+    /// 0106 test hygiene: hold the env lock, capture/clear every feature token, and
+    /// point `COORDINATOR_HOME` at a temp dir before the caller builds a fixture.
+    fn isolated_test_env() -> (crate::config::TestEnvGuard, tempfile::TempDir) {
+        let guard =
+            crate::config::TestEnvGuard::capture(&crate::features::test_feature_env_names());
+        for name in crate::features::test_feature_env_names() {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        (guard, home)
+    }
+
     const PLACEHOLDER_STATUS: &str = "**Proposed — placeholder, needs full spec/plan pass**";
 
     #[test]
@@ -1969,6 +1986,8 @@ mod tests {
     /// `promote_placeholder_matches_single_row_rewrite`.
     #[test]
     fn placeholder_ready_matches_fold_advance_matrix() {
+        let _lock = crate::config::test_env_lock();
+        let (_env, _home) = isolated_test_env();
         let dir = tempdir().unwrap();
         let record = rec(dir.path());
         let cases = [
@@ -2012,16 +2031,7 @@ mod tests {
     #[test]
     fn placeholder_ready_ignores_nostart_the_caller_filters_it() {
         let _lock = crate::config::test_env_lock();
-        let _env = crate::config::TestEnvGuard::capture(&crate::features::test_feature_env_names());
-        for name in crate::features::test_feature_env_names() {
-            unsafe {
-                std::env::remove_var(name);
-            }
-        }
-        let home = tempdir().unwrap();
-        unsafe {
-            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
-        }
+        let (_env, _home) = isolated_test_env();
         crate::features::reset_feature_warnings_for_tests();
         crate::workflow::placeholder_backstop::reset_backstop_warnings_for_tests();
 
@@ -2052,6 +2062,8 @@ mod tests {
     /// escaped pipes / other rows / the trailing newline survive.
     #[test]
     fn promote_placeholder_matches_single_row_rewrite() {
+        let _lock = crate::config::test_env_lock();
+        let (_env, _home) = isolated_test_env();
         let dir = tempdir().unwrap();
         let record = rec(dir.path());
         let before = "| Track | Status | Summary |\n\
