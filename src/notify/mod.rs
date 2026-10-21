@@ -1213,8 +1213,508 @@ mod tests {
         assert!(!fleet_summary_due(Some(backward), now, true));
     }
 
+    #[test]
+    fn fleet_summary_text_lists_every_project_status_phase_track_and_event() {
+        use crate::state::RunStatus;
+        let dir = tempdir().unwrap();
+        let running = fleet_view(
+            Some("Alpha"),
+            dir.path(),
+            RunStatus::Running,
+            "implement",
+            Some("0105"),
+            "workflow: advance plan -> implement",
+        );
+        let idle = fleet_view(
+            Some("Beta"),
+            dir.path(),
+            RunStatus::Idle,
+            "idle",
+            None,
+            "idle: no run",
+        );
+        let text = fleet_summary_text(&[running, idle]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "fleet 2 projects: 1 running, 0 paused, 1 idle, 0 stopped"
+        );
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(
+            lines[1],
+            "- Alpha 0105: implement / Running - workflow: advance plan -> implement"
+        );
+        assert_eq!(lines[2], "- Beta -: idle / Idle - idle: no run");
+    }
+
+    #[test]
+    fn fleet_summary_text_falls_back_to_path_then_project_id() {
+        use crate::state::RunStatus;
+        let dir = tempdir().unwrap();
+        let mut no_display = fleet_view(
+            None,
+            dir.path(),
+            RunStatus::Idle,
+            "idle",
+            None,
+            "idle: no run",
+        );
+        no_display.path = std::path::PathBuf::from(r"C:\dev\coordinated");
+        let mut root_path = fleet_view(
+            None,
+            dir.path(),
+            RunStatus::Idle,
+            "idle",
+            None,
+            "idle: no run",
+        );
+        root_path.path = std::path::PathBuf::from(r"C:\");
+        let text = fleet_summary_text(&[no_display, root_path.clone()]);
+        assert!(text.contains("- coordinated -: idle / Idle - idle: no run"));
+        assert!(
+            text.contains(&format!(
+                "- {} -: idle / Idle - idle: no run",
+                root_path.project_id
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn fleet_summary_text_flattens_last_event_newlines() {
+        use crate::state::RunStatus;
+        let dir = tempdir().unwrap();
+        let view = fleet_view(
+            Some("A"),
+            dir.path(),
+            RunStatus::Running,
+            "implement",
+            Some("0105"),
+            "line one\r\nline two\nline three",
+        );
+        let text = fleet_summary_text(&[view]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one header + one project line: {text}");
+        assert!(
+            lines[1].contains("line one line two line three"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn fleet_summary_text_caps_last_event_and_total_length() {
+        use crate::state::RunStatus;
+        let dir = tempdir().unwrap();
+        let long_event = "x".repeat(200);
+        let views: Vec<_> = (0..100)
+            .map(|i| {
+                let label = format!("project-{i:03}");
+                fleet_view(
+                    Some(&label),
+                    dir.path(),
+                    RunStatus::Idle,
+                    "idle",
+                    None,
+                    &long_event,
+                )
+            })
+            .collect();
+        let text = fleet_summary_text(&views);
+        assert!(text.chars().count() <= FLEET_SUMMARY_MAX_CHARS);
+        assert!(text.ends_with("... (truncated)"), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.len() > 2);
+        for line in &lines[1..] {
+            if let Some((_, event)) = line.rsplit_once(" - ") {
+                assert!(
+                    event.chars().count() <= FLEET_LAST_EVENT_MAX_CHARS,
+                    "{line}"
+                );
+            }
+        }
+        assert!(
+            !text.contains("project-099"),
+            "the cap drops later project lines"
+        );
+        assert_eq!(views.len(), 100, "the projects slice is never truncated");
+    }
+
+    #[test]
+    fn fleet_summary_text_is_utf8_safe_on_truncation() {
+        use crate::state::RunStatus;
+        let dir = tempdir().unwrap();
+        let long_event = "é".repeat(200);
+        let view = fleet_view(
+            Some("A"),
+            dir.path(),
+            RunStatus::Running,
+            "implement",
+            Some("0105"),
+            &long_event,
+        );
+        let text = fleet_summary_text(&[view]);
+        assert!(text.chars().count() <= FLEET_SUMMARY_MAX_CHARS);
+        let last = text.lines().last().unwrap();
+        let event = last.rsplit_once(" - ").unwrap().1;
+        assert!(event.chars().count() <= FLEET_LAST_EVENT_MAX_CHARS);
+        assert!(event.ends_with("..."));
+    }
+
+    #[test]
+    fn fleet_summary_text_zero_projects() {
+        assert_eq!(fleet_summary_text(&[]), "fleet 0 projects");
+    }
+
+    #[test]
+    fn build_fleet_summary_event_message_comes_from_status_all() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = crate::config::TestEnvGuard::capture(&[crate::config::ENV_COORDINATOR_HOME]);
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        let project = tempdir().unwrap();
+        let mut registry = crate::registry::Registry::default();
+        let record = registry
+            .add(
+                project.path(),
+                crate::registry::ProjectAddOptions {
+                    display_name: Some("Fleet".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        registry
+            .save(&crate::config::registry_path().unwrap())
+            .unwrap();
+        let mut state = crate::state::RunState::idle(&record.id);
+        state.status = crate::state::RunStatus::Running;
+        state.phase = "plan".into();
+        state.track_id = Some("0105".into());
+        state.last_event = "workflow: start track=0105".into();
+        crate::state::save_run_state(&record, &state).unwrap();
+
+        let now = Utc::now();
+        let event = build_fleet_summary_event(now).unwrap();
+        assert_eq!(event.written_at, now);
+        assert_eq!(event.projects.len(), 1);
+        assert!(
+            event
+                .message
+                .contains("- Fleet 0105: plan / Running - workflow: start track=0105"),
+            "{}",
+            event.message
+        );
+    }
+
+    #[test]
+    fn fleet_summary_quiet_hours_are_midnight_to_six() {
+        for hour in 0..=5 {
+            assert!(fleet_summary_quiet(hour), "hour {hour} is quiet");
+        }
+        for hour in 6..=23 {
+            assert!(!fleet_summary_quiet(hour), "hour {hour} is not quiet");
+        }
+    }
+
+    #[test]
+    fn fleet_tick_at_quiet_hour_posts_nothing_and_does_not_stamp() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_COORDINATOR_NOTIFY_FLEET, "1");
+            std::env::remove_var(hermes::ENV_COORDINATOR_HERMES);
+        }
+        write_machine_config(home.path(), true, serde_json::json!({}));
+        assert!(fleet_summary_enabled());
+        let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
+        let now = local_noon_utc();
+        let mut last = None;
+
+        fleet_tick_at(&mut last, now, 3);
+        assert!(last.is_none(), "quiet hours do not stamp");
+        assert!(sink.take().is_empty());
+
+        fleet_tick_at(&mut last, now, 6);
+        assert_eq!(last, Some(now));
+        assert_eq!(sink.take().len(), 1);
+    }
+
+    #[test]
+    fn fleet_tick_at_quiet_hour_does_not_consume_due_after_midnight() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_COORDINATOR_NOTIFY_FLEET, "1");
+            std::env::remove_var(hermes::ENV_COORDINATOR_HERMES);
+        }
+        write_machine_config(home.path(), true, serde_json::json!({}));
+        let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
+        let t0 = Utc::now();
+        let mut last = Some(t0);
+
+        fleet_tick_at(&mut last, t0 + chrono::Duration::minutes(6 * 60 + 59), 5);
+        assert_eq!(last, Some(t0), "a quiet tick must not stamp last_sent");
+        assert!(sink.take().is_empty());
+
+        let catch_up = t0 + chrono::Duration::hours(7);
+        fleet_tick_at(&mut last, catch_up, 6);
+        assert_eq!(last, Some(catch_up));
+        assert_eq!(sink.take().len(), 1, "06:00 catches up one minute later");
+    }
+
+    #[test]
+    fn fleet_tick_scripted_401_is_non_fatal_logged_and_stamped() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY_FLEET);
+            std::env::remove_var(hermes::ENV_COORDINATOR_HERMES);
+        }
+        write_machine_config(home.path(), true, serde_json::json!({}));
+        assert!(fleet_summary_enabled());
+        let sink = hermes::install_scripted(
+            "http://127.0.0.1:9/hook",
+            "s",
+            hermes::ScriptedOutcome::Status(401),
+        );
+        let _ = take_fleet_warnings_for_tests();
+        let now = local_noon_utc();
+        let mut last = None;
+
+        fleet_tick_at(&mut last, now, 12);
+
+        assert_eq!(last, Some(now), "failure still consumes the due slot");
+        let warnings = take_fleet_warnings_for_tests();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("non-fatal"), "{warnings:?}");
+        assert!(warnings[0].contains("401"), "{warnings:?}");
+        assert_eq!(sink.take().len(), 1, "one attempted POST");
+    }
+
+    #[test]
+    fn fleet_tick_connect_fail_is_non_fatal_logged() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY_FLEET);
+            std::env::remove_var(hermes::ENV_COORDINATOR_HERMES);
+        }
+        write_machine_config(home.path(), true, serde_json::json!({}));
+        let sink = hermes::install_scripted(
+            "http://127.0.0.1:9/hook",
+            "s",
+            hermes::ScriptedOutcome::ConnectFail,
+        );
+        let _ = take_fleet_warnings_for_tests();
+        let now = local_noon_utc();
+        let mut last = None;
+
+        fleet_tick_at(&mut last, now, 12);
+
+        assert_eq!(last, Some(now));
+        let warnings = take_fleet_warnings_for_tests();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("non-fatal"), "{warnings:?}");
+        assert!(warnings[0].contains("connect refused"), "{warnings:?}");
+        assert_eq!(sink.take().len(), 1);
+    }
+
+    #[test]
+    fn progress_gate_off_blocks_env_on() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_COORDINATOR_NOTIFY_PROGRESS, "1");
+            std::env::remove_var(hermes::ENV_COORDINATOR_HERMES);
+        }
+        write_machine_config(
+            home.path(),
+            false,
+            serde_json::json!({"fleet_notify": false}),
+        );
+        toast::clear_recorded_toasts();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        assert!(
+            !progress_enabled(&record),
+            "the feature gate vetoes env-on progress"
+        );
+        let sink =
+            hermes::install_recording("http://127.0.0.1:8644/webhooks/coordinator-progress", "s");
+        run_with_driver(&record, Some("0033".into()), WorkflowDriver::FileWait).unwrap();
+        let outcome = PhaseOutcome::success(
+            crate::workflow::graph::PHASE_PLAN,
+            OutcomeSource::Test,
+            None,
+            None,
+            None,
+        );
+        crate::outcome::apply(&record, outcome).unwrap();
+        assert!(sink.take().is_empty(), "no progress POST under a veto");
+        assert!(artifact::existing_path(&record).is_none());
+        assert!(toast::take_recorded_toasts().is_empty());
+    }
+
+    #[test]
+    fn progress_gate_off_blocks_project_flag() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::remove_var(ENV_COORDINATOR_NOTIFY_PROGRESS);
+            std::env::remove_var(hermes::ENV_COORDINATOR_HERMES);
+        }
+        write_machine_config(
+            home.path(),
+            false,
+            serde_json::json!({"fleet_notify": false}),
+        );
+        let dir = tempdir().unwrap();
+        let mut record = rec(dir.path());
+        record.notify_progress = true;
+        assert!(
+            !progress_enabled(&record),
+            "the gate also vetoes the per-project opt-in"
+        );
+    }
+
+    #[test]
+    fn progress_gate_on_env_on_still_posts() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_COORDINATOR_NOTIFY_PROGRESS, "1");
+            std::env::remove_var(hermes::ENV_COORDINATOR_HERMES);
+        }
+        write_machine_config(
+            home.path(),
+            false,
+            serde_json::json!({"fleet_notify": true}),
+        );
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        assert!(progress_enabled(&record));
+        let sink =
+            hermes::install_recording("http://127.0.0.1:8644/webhooks/coordinator-progress", "s");
+        run_with_driver(&record, Some("0033".into()), WorkflowDriver::FileWait).unwrap();
+        let outcome = PhaseOutcome::success(
+            crate::workflow::graph::PHASE_PLAN,
+            OutcomeSource::Test,
+            None,
+            None,
+            None,
+        );
+        crate::outcome::apply(&record, outcome).unwrap();
+        let posts = sink.take();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(hdr(&posts[0], "X-Coordinator-Event"), "progress");
+    }
+
+    #[test]
+    fn progress_gate_broken_config_fails_closed() {
+        let _lock = crate::config::test_env_lock();
+        let _guard = fleet_env_guard();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(ENV_COORDINATOR_NOTIFY_PROGRESS, "1");
+            std::env::remove_var(hermes::ENV_COORDINATOR_HERMES);
+        }
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+
+        write_machine_config(
+            home.path(),
+            false,
+            serde_json::json!({"fleet_notify": "yes"}),
+        );
+        crate::features::reset_feature_warnings_for_tests();
+        assert!(!progress_enabled(&record));
+        assert_eq!(
+            crate::features::take_feature_warnings().len(),
+            1,
+            "one line for the type-invalid table"
+        );
+
+        std::fs::write(home.path().join("config.json"), "{not-json").unwrap();
+        crate::features::reset_feature_warnings_for_tests();
+        assert!(!progress_enabled(&record));
+        assert_eq!(
+            crate::features::take_feature_warnings().len(),
+            1,
+            "one line for the unreadable table"
+        );
+
+        let sink =
+            hermes::install_recording("http://127.0.0.1:8644/webhooks/coordinator-progress", "s");
+        run_with_driver(&record, Some("0033".into()), WorkflowDriver::FileWait).unwrap();
+        let outcome = PhaseOutcome::success(
+            crate::workflow::graph::PHASE_PLAN,
+            OutcomeSource::Test,
+            None,
+            None,
+            None,
+        );
+        crate::outcome::apply(&record, outcome).unwrap();
+        assert!(sink.take().is_empty(), "a broken config fails progress closed");
+    }
+
     fn fleet_env_guard() -> crate::config::TestEnvGuard {
-        crate::config::TestEnvGuard::capture(&crate::features::test_feature_env_names())
+        let mut names = crate::features::test_feature_env_names();
+        names.push(crate::config::ENV_COORDINATOR_HOME);
+        names.push(ENV_COORDINATOR_NOTIFY_FLEET);
+        names.push(ENV_COORDINATOR_NOTIFY_PROGRESS);
+        names.push(hermes::ENV_COORDINATOR_HERMES);
+        crate::config::TestEnvGuard::capture(&names)
+    }
+
+    fn fleet_view(
+        display_name: Option<&str>,
+        path: &std::path::Path,
+        status: crate::state::RunStatus,
+        phase: &str,
+        track: Option<&str>,
+        last_event: &str,
+    ) -> crate::state::StatusView {
+        let record = rec(path);
+        let idle = crate::state::RunState::idle(&record.id);
+        let mut view = crate::state::StatusView::from_record(&record, &idle);
+        view.display_name = display_name.map(str::to_string);
+        view.path = path.to_path_buf();
+        view.status = status;
+        view.phase = phase.to_string();
+        view.track_id = track.map(str::to_string);
+        view.last_event = last_event.to_string();
+        view.failure_class = None;
+        view
+    }
+
+    fn local_noon_utc() -> DateTime<Utc> {
+        use chrono::TimeZone;
+        chrono::Local
+            .with_ymd_and_hms(2026, 10, 20, 12, 0, 0)
+            .single()
+            .expect("unambiguous local noon")
+            .with_timezone(&Utc)
     }
 
     fn probe_env_guard() -> crate::config::TestEnvGuard {
@@ -1266,7 +1766,7 @@ mod tests {
         assert!(!fleet_summary_enabled());
         let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
         let mut last = None;
-        fleet_tick(&mut last, Utc::now());
+        fleet_tick_at(&mut last, Utc::now(), 12);
         assert!(last.is_none());
         assert!(sink.take().is_empty());
     }
@@ -1284,7 +1784,7 @@ mod tests {
         }
         assert!(fleet_summary_enabled());
         let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
-        let now = Utc::now();
+        let now = local_noon_utc();
         let mut last = None;
         fleet_tick(&mut last, now);
         assert_eq!(last, Some(now));
@@ -1297,6 +1797,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
         assert_eq!(body["event_type"], "fleet_summary");
         assert!(body["projects"].as_array().unwrap().is_empty());
+        assert_eq!(body["message"], "fleet 0 projects");
         let text = String::from_utf8(posts[0].body.clone()).unwrap();
         assert!(!text.contains("s3cret-fleet"));
         fleet_tick(&mut last, now);
@@ -1321,7 +1822,7 @@ mod tests {
         let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
         let mut last = None;
 
-        fleet_tick(&mut last, t0);
+        fleet_tick_at(&mut last, t0, 12);
         assert_eq!(sink.take().len(), 1, "tick N posts while the gate is on");
         assert_eq!(last, Some(t0));
         assert_fleet_gate(true, FeatureSource::Config);
@@ -1331,13 +1832,13 @@ mod tests {
             true,
             serde_json::json!({"fleet_notify": false}),
         );
-        fleet_tick(&mut last, later);
+        fleet_tick_at(&mut last, later, 12);
         assert!(sink.take().is_empty(), "tick N+1 honours the config edit");
         assert_eq!(last, Some(t0), "a gated-off tick does not stamp last_sent");
         assert_fleet_gate(false, FeatureSource::Config);
 
         write_machine_config(home.path(), true, serde_json::json!({"fleet_notify": true}));
-        fleet_tick(&mut last, later);
+        fleet_tick_at(&mut last, later, 12);
         assert_eq!(sink.take().len(), 1, "tick N+2 posts again");
         assert_fleet_gate(true, FeatureSource::Config);
     }
@@ -1361,7 +1862,7 @@ mod tests {
         assert!(!fleet_summary_enabled());
         let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
         let mut last = None;
-        fleet_tick(&mut last, Utc::now());
+        fleet_tick_at(&mut last, Utc::now(), 12);
         assert!(last.is_none());
         assert!(sink.take().is_empty());
         assert!(
@@ -1392,7 +1893,7 @@ mod tests {
         );
         let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
         let mut last = None;
-        fleet_tick(&mut last, Utc::now());
+        fleet_tick_at(&mut last, Utc::now(), 12);
         assert!(last.is_none());
         assert!(sink.take().is_empty());
     }
@@ -1416,8 +1917,8 @@ mod tests {
         let sink = hermes::install_recording("http://127.0.0.1:9/hook", "s3cret-fleet");
         let now = Utc::now();
         let mut last = None;
-        fleet_tick(&mut last, now);
-        fleet_tick(&mut last, now + chrono::Duration::hours(2));
+        fleet_tick_at(&mut last, now, 12);
+        fleet_tick_at(&mut last, now + chrono::Duration::hours(2), 12);
         assert!(last.is_none());
         assert!(sink.take().is_empty());
         assert_eq!(
@@ -1498,9 +1999,11 @@ mod tests {
             event_type: EVENT_TYPE_FLEET_SUMMARY.into(),
             written_at: Utc::now(),
             projects: vec![view],
+            message: "fleet 1 project".into(),
         };
         let value = serde_json::to_value(&event).unwrap();
         forbid_secret_keys(&value);
+        assert_eq!(value["message"], "fleet 1 project");
         assert_eq!(value["projects"][0]["run_epoch"], 4);
         assert_eq!(value["projects"][0]["phase"], "implement");
         assert_eq!(value["projects"][0]["failure_class"], "timeout");
