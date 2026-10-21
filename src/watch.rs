@@ -594,6 +594,7 @@ pub(crate) fn record_auto_start_failure(
 /// auto-start attempt per non-active project (0103).
 pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut last_fleet: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut last_reap: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
         if *shutdown.borrow() {
             break;
@@ -633,6 +634,7 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
                 // Registry missing/unreadable: skip tick.
             }
         }
+        let _ = crate::harness::reap::tick_async(&mut last_reap, chrono::Utc::now()).await;
         crate::notify::fleet_tick(&mut last_fleet, chrono::Utc::now());
 
         tokio::select! {
@@ -644,6 +646,7 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
             }
         }
     }
+    let _ = crate::harness::reap::sweep_on_shutdown_async().await;
 }
 
 /// Documented env names (tests / docs).

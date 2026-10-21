@@ -297,6 +297,151 @@ fn load_persist(record: &ProjectRecord) -> Result<Option<PersistedGrokHandle>> {
     Ok(Some(serde_json::from_str(&text)?))
 }
 
+/// Read-only projection of the durable holder identity used by the 0107 reaper.
+///
+/// Every listed field maps 1:1 by name to [`PersistedGrokHandle`]. `version`,
+/// `supports_compact`, `error`, `context_usage`, `last_signal` and
+/// `last_tool_title` are not identity fields and are deliberately omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistIdentity {
+    pub project_id: String,
+    pub session_id: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub pid: Option<u32>,
+    pub holder_pid: Option<u32>,
+    pub control_addr: Option<String>,
+    pub adapter: String,
+    pub alive: bool,
+    pub prompt_in_flight: bool,
+}
+
+impl PersistIdentity {
+    fn from_handle(handle: &PersistedGrokHandle) -> Self {
+        Self {
+            project_id: handle.project_id.clone(),
+            session_id: handle.session_id.clone(),
+            cwd: handle.cwd.clone(),
+            pid: handle.pid,
+            holder_pid: handle.holder_pid,
+            control_addr: handle.control_addr.clone(),
+            adapter: handle.adapter.clone(),
+            alive: handle.alive,
+            prompt_in_flight: handle.prompt_in_flight,
+        }
+    }
+}
+
+/// Result of a verified holder control-socket exchange (0107).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HolderReapRpc {
+    Verified,
+    IdentityUnproven(String),
+    ShutdownUnproven(String),
+}
+
+/// Read-only view of the persist identity plus the file mtime.
+///
+/// `Ok(None)` means the persist file is absent; `Err` means it is unreadable or
+/// corrupt. The reaper keeps the holder in both cases.
+pub(crate) fn persist_identity(
+    record: &ProjectRecord,
+) -> Result<Option<(PersistIdentity, std::time::SystemTime)>> {
+    let Some(handle) = load_persist(record)? else {
+        return Ok(None);
+    };
+    let mtime = std::fs::metadata(persist_path(record)?)?.modified()?;
+    Ok(Some((PersistIdentity::from_handle(&handle), mtime)))
+}
+
+/// Bounded synchronous holder RPC used by the reaper.
+///
+/// The async [`holder_rpc`] has no timeout of its own; the reaper runs on a
+/// blocking worker and must bound every socket operation at 750 ms.
+fn holder_rpc_sync(
+    addr: &str,
+    req: &HoldRequest,
+    timeout: std::time::Duration,
+) -> Result<HoldResponse> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let sock: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| CoordinatorError::Message(format!("holder addr {addr}: {e}")))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&sock, timeout)
+        .map_err(|e| CoordinatorError::Message(format!("holder connect {addr}: {e}")))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let payload = serde_json::to_string(req)?;
+    stream.write_all(payload.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(CoordinatorError::Message(
+            "holder closed without response".into(),
+        ));
+    }
+    Ok(serde_json::from_str(line.trim())?)
+}
+
+/// Prove the process behind `want.control_addr` is the holder named by the
+/// project's persist record. Any mismatch, timeout, closed connection, non-JSON
+/// response or non-holder service is unproven.
+pub(crate) fn verify_holder_identity(
+    want: &PersistIdentity,
+    timeout: std::time::Duration,
+) -> HolderReapRpc {
+    let Some(addr) = want.control_addr.as_deref() else {
+        return HolderReapRpc::IdentityUnproven("no-control-addr".into());
+    };
+    let resp = match holder_rpc_sync(addr, &HoldRequest::Ping, timeout) {
+        Ok(resp) => resp,
+        Err(e) => return HolderReapRpc::IdentityUnproven(format!("ping: {e}")),
+    };
+    if !resp.ok {
+        return HolderReapRpc::IdentityUnproven("ping-not-ok".into());
+    }
+    let Some(harness) = resp.harness else {
+        return HolderReapRpc::IdentityUnproven("no-harness".into());
+    };
+    match (want.session_id.as_deref(), harness.session_id.as_deref()) {
+        (Some(a), Some(b)) if a == b => {}
+        _ => return HolderReapRpc::IdentityUnproven("session".into()),
+    }
+    match (want.cwd.as_deref(), harness.cwd.as_deref()) {
+        (Some(a), Some(b)) if crate::worktree::paths_same(a, b) => {}
+        _ => return HolderReapRpc::IdentityUnproven("cwd".into()),
+    }
+    if !harness.adapter.eq_ignore_ascii_case(&want.adapter) {
+        return HolderReapRpc::IdentityUnproven("adapter".into());
+    }
+    if let (Some(a), Some(b)) = (want.pid, harness.pid)
+        && a != b
+    {
+        return HolderReapRpc::IdentityUnproven("pid".into());
+    }
+    HolderReapRpc::Verified
+}
+
+/// Ask the identity-verified holder to run its own existing `Shutdown` path.
+/// A timeout or rejection is unproven; there is no fallback termination.
+pub(crate) fn request_holder_shutdown(
+    want: &PersistIdentity,
+    timeout: std::time::Duration,
+) -> HolderReapRpc {
+    let Some(addr) = want.control_addr.as_deref() else {
+        return HolderReapRpc::ShutdownUnproven("no-control-addr".into());
+    };
+    match holder_rpc_sync(addr, &HoldRequest::Shutdown, timeout) {
+        Ok(resp) if resp.ok => HolderReapRpc::Verified,
+        Ok(resp) => {
+            HolderReapRpc::ShutdownUnproven(resp.error.unwrap_or_else(|| "shutdown-not-ok".into()))
+        }
+        Err(e) => HolderReapRpc::ShutdownUnproven(format!("shutdown: {e}")),
+    }
+}
+
 fn save_persist(record: &ProjectRecord, handle: &PersistedGrokHandle) -> Result<()> {
     ensure_state_dir(record)?;
     atomic_write_json(&persist_path(record)?, handle)
@@ -6701,5 +6846,82 @@ Loop\r\n",
             Some(std::path::PathBuf::from(r"C:\dev\other")),
             "block does not rewrite delivery_target"
         );
+    }
+
+    /// 0107 DoD-1 production integration: the synchronous reaper RPC must round-trip
+    /// against the real `hold_accept_loop` (real Ping/Shutdown framing), not only the
+    /// scripted holder. Bounded persist wait and bounded join, matching the 2 s
+    /// precedent in `holder_cancel_and_status_return_during_hung_prompt`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn holder_rpc_sync_round_trips_with_real_accept_loop() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        let _env = crate::config::TestEnvGuard::capture(&[
+            ENV_COORDINATOR_HOME,
+            crate::config::ENV_COORDINATOR_STATE_DIR,
+        ]);
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+        }
+        let rec = Registry::default()
+            .add(proj.path(), ProjectAddOptions::default())
+            .unwrap();
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            mock_handshake_ok("sess-sync"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let rec_hold = rec.clone();
+        let hold = tokio::spawn(async move { hold_loop_with_session(rec_hold, session).await });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(Some(h)) = load_persist(&rec)
+                && h.control_addr.is_some()
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("holder persist never became ready");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let rec_identity = rec.clone();
+        let (identity, _mtime) =
+            tokio::task::spawn_blocking(move || persist_identity(&rec_identity))
+                .await
+                .expect("identity join")
+                .expect("identity read")
+                .expect("identity present");
+        let want = identity.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            verify_holder_identity(&want, Duration::from_millis(750))
+        })
+        .await
+        .expect("verify join");
+        assert_eq!(verified, HolderReapRpc::Verified);
+
+        let want = identity.clone();
+        let shutdown = tokio::task::spawn_blocking(move || {
+            request_holder_shutdown(&want, Duration::from_millis(750))
+        })
+        .await
+        .expect("shutdown join");
+        assert_eq!(shutdown, HolderReapRpc::Verified);
+
+        tokio::time::timeout(Duration::from_secs(2), hold)
+            .await
+            .expect("holder join must complete")
+            .expect("holder task")
+            .expect("holder loop");
+        let dead = load_persist(&rec).unwrap().expect("persist present");
+        assert!(!dead.alive);
+        assert!(dead.control_addr.is_none());
     }
 }
