@@ -137,6 +137,27 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
     },
+    /// Build, smoke-test and swap the installed coordinator.exe (operator-invoked)
+    ///
+    /// Refuses while a build/test, a live coordinator.exe, an active run, a dirty
+    /// tree, a recent tree write or a git write is present. Run the installed (or
+    /// built) coordinator.exe directly: `cargo run -- self-update` self-blocks
+    /// because the invoking cargo.exe is in the process table. Stop serve/UI/
+    /// holders before a real swap; the product never restarts them.
+    SelfUpdate {
+        /// Product repo (default: git toplevel of cwd)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Install target (default: the running executable)
+        #[arg(long)]
+        install: Option<PathBuf>,
+        /// Prebuilt artefact; skips the build
+        #[arg(long)]
+        artifact: Option<PathBuf>,
+        /// Report the decision only; build, rename and write nothing
+        #[arg(long)]
+        check: bool,
+    },
     /// Drive a harness session (Grok ACP this track)
     Harness {
         #[command(subcommand)]
@@ -789,6 +810,21 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
         Commands::Ui { port } => {
             crate::ui::run_cli(port)?;
         }
+        Commands::SelfUpdate {
+            repo,
+            install,
+            artifact,
+            check,
+        } => {
+            let report = crate::selfupdate::cmd_self_update(repo, install, artifact, check)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if report.outcome == "deployed" {
+                eprintln!("{}", report.summary());
+            }
+            if !report.ok() {
+                return Err(CoordinatorError::Message(report.summary()));
+            }
+        }
         Commands::Harness { action } => match action {
             HarnessCommands::Grok { action } => match action {
                 GrokCommands::Start { project } => {
@@ -1145,6 +1181,33 @@ mod tests {
             }
             other => panic!("expected restore, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn self_update_subcommand_in_help() {
+        let cmd = Cli::command();
+        let sub = cmd.find_subcommand("self-update").expect("self-update");
+        for flag in ["repo", "install", "artifact", "check"] {
+            assert!(
+                sub.get_arguments().any(|arg| arg.get_id() == flag),
+                "self-update --{flag}"
+            );
+        }
+        let mut help = sub.clone();
+        let help = help.render_long_help().to_string();
+        assert!(
+            help.contains("--install"),
+            "self-update --help should document --install: {help}"
+        );
+        assert!(
+            help.contains("cargo run -- self-update") || help.contains("self-blocks"),
+            "help should warn that cargo run self-blocks: {help}"
+        );
+        let parsed = Cli::try_parse_from(["coordinator", "self-update", "--check"]).expect("parse");
+        assert!(matches!(
+            parsed.command,
+            Commands::SelfUpdate { check: true, .. }
+        ));
     }
 
     #[test]

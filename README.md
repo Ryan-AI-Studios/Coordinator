@@ -432,7 +432,7 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 | `auto_start` | ticker starts the next Ready track; also promotes a completed placeholder when no run is live (0106) — promotion is **independent of the per-project `auto_start` policy** | `COORDINATOR_FEATURE_AUTO_START` | **yes (0103/0106)** |
 | `stall_paging` | route a detected stall to the owner | `COORDINATOR_FEATURE_STALL_PAGING` | **yes (0104)** |
 | `fleet_notify` | serve-loop fleet summary + 0033 progress veto (0105) | `COORDINATOR_FEATURE_FLEET_NOTIFY` | **yes** |
-| `self_update` | build-and-swap the installed binary | `COORDINATOR_FEATURE_SELF_UPDATE` | reserved (0108) |
+| `self_update` | build-and-swap the installed binary | `COORDINATOR_FEATURE_SELF_UPDATE` | **yes (0108)** |
 | `self_reap` | reap stale harness holders | `COORDINATOR_FEATURE_SELF_REAP` | **yes (0107)** |
 
 - **Precedence:** env > machine config > default (on).
@@ -465,13 +465,52 @@ Every automation duty has one machine-level kill switch. The switches are **defa
 - **Combined condition:** a table with both an unknown key and a non-boolean value takes the
   invalid/type path — `unknown_keys` stays empty and the diagnostic names the bad value. Both
   paths fail closed.
-- **Reserved keys:** `self_update` (0108) is reserved now; that duty ships in a later track and is
-  not wired here.
+- **Reserved keys:** none — all five duties are wired (`self_update` shipped in 0108).
 - **Veto semantics:** `fleet_notify` **and** `hermes.fleet_summary` are both required for a
   serve-loop fleet post. `COORDINATOR_NOTIFY_FLEET=1` cannot bypass the gate. The same gate also
   blocks 0033 progress even with `COORDINATOR_NOTIFY_PROGRESS=1` or
   `project.notify_progress=true`. The explicit one-shot `notify fleet-summary` probe is **not**
   gated.
+
+### Self-update (0108)
+
+`coordinator self-update [--repo PATH] [--install PATH] [--artifact PATH] [--check]` builds the
+product on `main`, smoke-tests the artefact, and replaces the installed `coordinator.exe` while
+keeping the previous binary as `coordinator.exe.old`. It is **operator-invoked only** — no timer, no
+serve tick, and no autonomous deploy. The 0102 gate `features.self_update`
+(`COORDINATOR_FEATURE_SELF_UPDATE`) is a veto read live: `false`/`off` refuses before any process
+snapshot, git read, build or file write.
+
+- **Gate (all signals collected; any one refuses).** Machine-wide build tools (`cargo.exe`,
+  `cargo-nextest.exe`, `cargo-clippy.exe`, `rustc.exe`, `rustdoc.exe`, `rustfmt.exe`,
+  `clippy-driver.exe`), any other `coordinator.exe` (self pid excluded), recent writes under `src/`,
+  `Cargo.toml`, `Cargo.lock`, `build.rs`, `.github/workflows/`, `README.md` or `AGENTS.md` inside
+  120 s, `.git/index.lock`, committable dirt, a non-`main` branch, a registered project owning this
+  repo in `Running`/`Paused`, and the product lock `{COORDINATOR_HOME}/self-update.lock`. After the
+  build the same signals plus HEAD are re-read; a moved HEAD refuses `changed-during-build` first and
+  every collected second-gate reason is still named.
+- **Swap order.** `--artifact` (or `cargo build --release --locked`) → pre-swap smoke on the
+  artefact → staged `<install>.new` + fsync + sha check → clear/rotate `.old` → `rename(install →
+  .old)` → `rename(.new → install)` → post-swap sha + smoke. A crash journal
+  `<install>.self-update.journal` is written before each mutating step and is kept from
+  `renaming-old` onward; routine refusals remove it. **No automatic recovery** — a journal at entry
+  refuses `interrupted` with phase-derived instructions (see the spec/plan), and `--check` reports it
+  instead of a false `already-deployed`.
+- **Proof.** `sha256(installed) == sha256(artifact)` is recomputed from the files on disk; the ledger
+  `{COORDINATOR_HOME}/self-update.json` (schema v1) records `head_sha`, branch, both sha256 values,
+  sizes, the previous identity and `decided_by` (pid/exe/exe sha256/version). The ledger is written
+  only after the verified swap; it is a record, not the proof.
+- **`.old` and rotation.** `coordinator.exe.old` is preserved for rollback. If `.old` is pinned by an
+  older process it is rotated to `.old.<utc>` and named in the outcome; if rotation also fails the
+  run refuses with nothing swapped. Rotated copies (~13 MB each) are **not** auto-deleted — prune
+  them manually when you no longer need the rollback.
+- **Operator preflight.** Stop **every** `coordinator.exe` — `serve`, the UI, and holders (let 0107's
+  sweep or `harness grok shutdown` end holders) — then run the **installed or built** exe directly:
+  `coordinator self-update`, then start `serve`. `cargo run -- self-update` always refuses because
+  the invoking `cargo.exe` is in the process table; that is correct, not a bug. `--check` runs every
+  gate and reports, touching nothing. The product never stops, restarts or kills any process; a live
+  `coordinator.exe` is a refusal. Tests use temp install/artifact fixtures only and never swap the
+  machine install.
 
 ### Holder self-reap (0107)
 

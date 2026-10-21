@@ -53,6 +53,7 @@
 //! Ticker auto-start for `auto_start: full` behind the 0102 gate (one attempt per project per tick): track **0103**.
 //! One owner stall page + one matching resolution per `(project, track, epoch)` behind the 0102 gate: track **0104**.
 //! No-run placeholder promotion backstop behind the 0102 `auto_start` gate: track **0106**.
+//! Operator-invoked build/smoke/swap of the installed binary behind the 0102 gate: track **0108**.
 
 pub mod api;
 pub mod checkpoint;
@@ -73,6 +74,7 @@ pub mod registry;
 pub mod review;
 pub mod run;
 pub mod scan;
+pub mod selfupdate;
 pub mod serve_lease;
 pub mod server;
 pub mod state;
