@@ -1,9 +1,18 @@
 //! Failure notify: artifact + toast + adapter trait (track 0009) + Hermes (0015).
 //! Opt-in progress POSTs on phase advance (track 0033) use [`ProgressEvent`],
 //! never toast / `FAILURE.md`, and never fail apply.
-//! Opt-in fleet summaries (track 0068) use [`FleetSummaryEvent`] on that same
-//! Hermes path. `notify fleet-summary` posts once. `serve` posts at most once
-//! per hour, and only when the fleet flag is on.
+//! Opt-in fleet summaries (track 0068, digest 0105) use [`FleetSummaryEvent`] on
+//! that same Hermes path. `notify fleet-summary` posts once. `serve` posts at
+//! most once per hour, outside 00:00–05:59 local, and only when the fleet flag is
+//! on. The digest carries one line per project, and `projects` stays the full
+//! machine-readable payload.
+//!
+//! **0105 progress disposition:** `hermes.progress` stays **off** deliberately.
+//! The 0033 stream is unbounded (one POST per canonical phase advance plus every
+//! cross-model bounce), has no dedupe (the millis request id defeats the Hermes
+//! cache), and has no quiet hours. The hourly fleet summary is the bounded owner
+//! channel. The existing 0102 `Duty::FleetNotify` gate vetoes progress first, so
+//! an operator opt-in still has a machine kill switch.
 //!
 //! Hook failure notify only after a successful Phase Outcome **failure** commit.
 //! Operator `stop` is not a Failure Class and must not notify.
@@ -14,12 +23,13 @@ pub mod hermes;
 pub mod recovery;
 pub mod toast;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::features::{Duty, evaluate_loaded};
 use crate::outcome::FailureClass;
 use crate::registry::ProjectRecord;
+use crate::state::{RunStatus, StatusView};
 
 pub use adapter::{
     ArtifactAdapter, Composite, HermesAdapter, LogAdapter, NotifyAdapter, RecordingAdapter,
@@ -49,6 +59,18 @@ pub const EVENT_TYPE_STALL: &str = "stall";
 
 /// Minimum gap between serve-loop fleet posts.
 pub const FLEET_SUMMARY_INTERVAL: chrono::Duration = chrono::Duration::seconds(3600);
+
+/// 0105: Telegram `sendMessage` allows 1–4096 characters after entity parsing;
+/// leave room for the route template prefix.
+const FLEET_SUMMARY_MAX_CHARS: usize = 3500;
+
+/// 0105: one project's `last_event` in the digest (the retired reporter used 120).
+const FLEET_LAST_EVENT_MAX_CHARS: usize = 120;
+
+/// 0105: the retired `track-progress-watch.py` kept Telegram silent 00:00–05:59
+/// local. This is a constant, not a config key; a different window is a later
+/// track.
+const FLEET_SUMMARY_QUIET_UNTIL_HOUR: u32 = 6;
 
 /// Payload fanned out to every [`NotifyAdapter`].
 ///
@@ -87,15 +109,20 @@ pub struct ProgressEvent {
     pub next_track: Option<String>,
 }
 
-/// Fleet snapshot posted on the Hermes path (track 0068).
+/// Fleet snapshot posted on the Hermes path (track 0068; digest 0105).
 ///
-/// `projects` is [`crate::state::StatusView`] from `api::status_all`. Not a
-/// [`NotifyEvent`] and not a [`ProgressEvent`].
+/// `projects` is [`StatusView`] from `api::status_all` and remains the full
+/// machine-readable payload (never truncated). `message` is the human-readable
+/// digest the existing Hermes route template reads as `{message}`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetSummaryEvent {
     pub event_type: String,
     pub written_at: DateTime<Utc>,
-    pub projects: Vec<crate::state::StatusView>,
+    pub projects: Vec<StatusView>,
+    /// 0105: human-readable digest. `projects` remains the full machine-readable payload.
+    /// The existing Hermes route template reads `{message}`.
+    #[serde(default)]
+    pub message: String,
 }
 
 /// Stall page kind. `begin` opens one owner page per `(project, track, epoch)`;
@@ -205,18 +232,26 @@ fn env_flag_on(name: &str) -> bool {
     )
 }
 
-/// Env `off` wins; else env on **or** machine `hermes.progress` **or** project flag.
-/// Actual POST still requires 0015 Hermes resolve (or a test recording backend).
+/// Feature gate **veto** first (0102 `fleet_notify`, the notify-family key), then
+/// env `off` wins; else env on **or** machine `hermes.progress` **or** project flag.
+/// One config load per call (live re-read; no caching).
+///
+/// 0105 deliberately keeps the 0033 stream off: it is unbounded, has no dedupe
+/// (the millis request id defeats the Hermes cache), and has no quiet hours. The
+/// gate means a later opt-in still has a machine kill switch.
 pub fn progress_enabled(record: &ProjectRecord) -> bool {
+    let loaded = crate::config::load_machine_config();
+    let gate = evaluate_loaded(&loaded);
+    if !gate.enabled(Duty::FleetNotify) {
+        return false;
+    }
     if env_flag_off(ENV_COORDINATOR_NOTIFY_PROGRESS) {
         return false;
     }
     if env_flag_on(ENV_COORDINATOR_NOTIFY_PROGRESS) {
         return true;
     }
-    let machine = crate::config::load_machine_config()
-        .map(|c| c.hermes.progress)
-        .unwrap_or(false);
+    let machine = loaded.map(|c| c.hermes.progress).unwrap_or(false);
     machine || record.notify_progress
 }
 
@@ -254,19 +289,163 @@ pub fn fleet_summary_due(
     }
 }
 
+/// 0105: the reporter's quiet window (00:00–05:59 local), fixed for now.
+fn fleet_summary_quiet(local_hour: u32) -> bool {
+    local_hour < FLEET_SUMMARY_QUIET_UNTIL_HOUR
+}
+
+fn project_label(view: &StatusView) -> String {
+    view.display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            view.path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| view.project_id.clone())
+}
+
+/// Flatten CR/LF to spaces, cap by characters (not bytes), append `...` only when cut.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let flattened: String = text
+        .chars()
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .collect();
+    if flattened.chars().count() <= max_chars {
+        return flattened;
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut out: String = flattened.chars().take(keep).collect();
+    out.push_str("...");
+    out
+}
+
+fn cap_fleet_text(text: String) -> String {
+    if text.chars().count() <= FLEET_SUMMARY_MAX_CHARS {
+        return text;
+    }
+    let marker = "\n... (truncated)";
+    let keep = FLEET_SUMMARY_MAX_CHARS.saturating_sub(marker.chars().count());
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str(marker);
+    out
+}
+
+/// 0105: one full snapshot line per project, registry order preserved. The total
+/// digest is capped; later project lines may be dropped by the cap, while the
+/// caller's `projects` slice is never truncated.
+fn fleet_summary_text(projects: &[StatusView]) -> String {
+    if projects.is_empty() {
+        return "fleet 0 projects".to_string();
+    }
+    let running = projects
+        .iter()
+        .filter(|v| v.status == RunStatus::Running)
+        .count();
+    let paused = projects
+        .iter()
+        .filter(|v| v.status == RunStatus::Paused)
+        .count();
+    let idle = projects
+        .iter()
+        .filter(|v| v.status == RunStatus::Idle)
+        .count();
+    let stopped = projects
+        .iter()
+        .filter(|v| v.status == RunStatus::Stopped)
+        .count();
+    let mut out = format!(
+        "fleet {} projects: {} running, {} paused, {} idle, {} stopped",
+        projects.len(),
+        running,
+        paused,
+        idle,
+        stopped
+    );
+    for view in projects {
+        let track = view
+            .track_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("-");
+        let phase = if view.phase.trim().is_empty() {
+            "-"
+        } else {
+            view.phase.trim()
+        };
+        let failure = view
+            .failure_class
+            .map(|c| format!(" (failure: {})", c.as_str()))
+            .unwrap_or_default();
+        let event = one_line(view.last_event.trim(), FLEET_LAST_EVENT_MAX_CHARS);
+        let event = if event.is_empty() {
+            "-".to_string()
+        } else {
+            event
+        };
+        out.push('\n');
+        out.push_str(&format!(
+            "- {} {}: {} / {}{} - {}",
+            project_label(view),
+            track,
+            phase,
+            view.status,
+            failure,
+            event
+        ));
+    }
+    cap_fleet_text(out)
+}
+
 /// One fleet snapshot. `written_at` is the caller's clock, not a second read.
 pub fn build_fleet_summary_event(now: DateTime<Utc>) -> crate::error::Result<FleetSummaryEvent> {
+    let projects = crate::api::status_all()?;
+    let message = fleet_summary_text(&projects);
     Ok(FleetSummaryEvent {
         event_type: EVENT_TYPE_FLEET_SUMMARY.to_string(),
         written_at: now,
-        projects: crate::api::status_all()?,
+        projects,
+        message,
     })
 }
 
-/// One serve-loop chance to post. Sets `last_sent` when the post is due, including
-/// when build or POST fails, so a failure cannot retry on every poll tick.
-/// Never fails the caller.
+#[cfg(test)]
+thread_local! {
+    static RECORDED_FLEET_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One stderr line per failed fleet attempt; the test recorder proves the line
+/// for the synchronous Hermes Test arm. The production `HermesKind::Http` arm
+/// logs the same literal from its detached thread (inspection-only).
+fn fleet_warn(line: &str) {
+    eprintln!("{line}");
+    #[cfg(test)]
+    RECORDED_FLEET_WARNINGS.with(|r| r.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_fleet_warnings_for_tests() -> Vec<String> {
+    RECORDED_FLEET_WARNINGS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+/// Production entry: one chance per serve pass; derives the local hour from the
+/// caller's `now` (no second clock sample), so tests can pass a local-noon instant.
 pub fn fleet_tick(last_sent: &mut Option<DateTime<Utc>>, now: DateTime<Utc>) {
+    let local_hour = chrono::DateTime::<chrono::Local>::from(now).hour();
+    fleet_tick_at(last_sent, now, local_hour);
+}
+
+/// Test seam. Quiet hours return **before** `last_sent` is stamped, so the first
+/// tick at 06:00 posts rather than waiting another hour.
+fn fleet_tick_at(last_sent: &mut Option<DateTime<Utc>>, now: DateTime<Utc>, local_hour: u32) {
+    if fleet_summary_quiet(local_hour) {
+        return;
+    }
     if !fleet_summary_due(*last_sent, now, fleet_summary_enabled()) {
         return;
     }
@@ -274,12 +453,16 @@ pub fn fleet_tick(last_sent: &mut Option<DateTime<Utc>>, now: DateTime<Utc>) {
     let event = match build_fleet_summary_event(now) {
         Ok(event) => event,
         Err(e) => {
-            eprintln!("coordinator: fleet summary failed (non-fatal): {e}");
+            fleet_warn(&format!(
+                "coordinator: fleet summary failed (non-fatal): {e}"
+            ));
             return;
         }
     };
     if let Err(e) = hermes::HermesAdapter::for_default_stack().notify_fleet(&event) {
-        eprintln!("coordinator: fleet summary failed (non-fatal): {e}");
+        fleet_warn(&format!(
+            "coordinator: fleet summary failed (non-fatal): {e}"
+        ));
     }
 }
 
@@ -1295,10 +1478,9 @@ mod tests {
         let text = fleet_summary_text(&[view]);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one header + one project line: {text}");
-        assert!(
-            lines[1].contains("line one line two line three"),
-            "{text}"
-        );
+        assert!(!text.contains('\r'), "{text}");
+        assert!(lines[1].contains("line one"), "{text}");
+        assert!(lines[1].contains("line two line three"), "{text}");
     }
 
     #[test]
@@ -1675,7 +1857,10 @@ mod tests {
             None,
         );
         crate::outcome::apply(&record, outcome).unwrap();
-        assert!(sink.take().is_empty(), "a broken config fails progress closed");
+        assert!(
+            sink.take().is_empty(),
+            "a broken config fails progress closed"
+        );
     }
 
     fn fleet_env_guard() -> crate::config::TestEnvGuard {

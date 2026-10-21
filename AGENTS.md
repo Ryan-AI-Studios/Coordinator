@@ -64,6 +64,9 @@ closed (source `config`) with one stderr line per condition per process; an unkn
 that duty closed. Env cannot rescue a broken table. Live re-read every tick — no restart.
 `fleet_notify` (0102), `auto_start` (0103) and `stall_paging` (0104) are wired; `self_update` (0108)
 and `self_reap` (0107) remain reserved.
+0105: `fleet_notify` also vetoes 0033 progress (`COORDINATOR_NOTIFY_PROGRESS=1` and
+`project.notify_progress=true` included); fleet summaries are hourly outside 00:00–05:59 local and
+carry a `message` digest while `projects` stays complete.
 
 ## Code style
 

@@ -217,16 +217,21 @@ impl HermesAdapter {
                 let url = url.clone();
                 let secret = secret.clone();
                 let event = event.clone();
-                let _ = std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("coordinator-hermes-fleet".into())
                     .spawn(move || match post_fleet_http(&url, &secret, &event) {
                         Ok(status) => {
                             eprintln!("coordinator: hermes fleet summary delivered HTTP {status}");
                         }
                         Err(e) => {
-                            eprintln!("coordinator: hermes fleet summary failed (non-fatal): {e}");
+                            eprintln!("coordinator: fleet summary failed (non-fatal): {e}");
                         }
-                    });
+                    })
+                {
+                    return Err(CoordinatorError::Message(format!(
+                        "hermes fleet thread spawn failed: {e}"
+                    )));
+                }
                 Ok(())
             }
             #[cfg(test)]
@@ -242,7 +247,7 @@ impl HermesAdapter {
                 let url = url.clone();
                 let secret = secret.clone();
                 let event = event.clone();
-                let _ = std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("coordinator-hermes-progress".into())
                     .spawn(move || match post_progress_http(&url, &secret, &event) {
                         Ok(status) => {
@@ -251,7 +256,12 @@ impl HermesAdapter {
                         Err(e) => {
                             eprintln!("coordinator: hermes progress failed (non-fatal): {e}");
                         }
-                    });
+                    })
+                {
+                    return Err(CoordinatorError::Message(format!(
+                        "hermes progress thread spawn failed: {e}"
+                    )));
+                }
                 Ok(())
             }
             #[cfg(test)]
@@ -1411,7 +1421,10 @@ mod tests {
             .unwrap();
         assert_eq!(status, 200);
         let req = listener.recv();
-        assert_eq!(header(&req, HEADER_EVENT).unwrap(), EVENT_TYPE_FLEET_SUMMARY);
+        assert_eq!(
+            header(&req, HEADER_EVENT).unwrap(),
+            EVENT_TYPE_FLEET_SUMMARY
+        );
         let ts: u64 = header(&req, HEADER_TIMESTAMP).unwrap().parse().unwrap();
         assert_eq!(
             header(&req, HEADER_SIGNATURE_V2).unwrap(),

@@ -297,10 +297,16 @@ pub struct HermesNotifyConfig {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
-    /// Opt-in phase-advance progress POSTs (track 0033). Missing key → false.
+    /// Opt-in phase-advance progress POSTs (track 0033). Missing key -> false.
+    /// **0105 leaves this off deliberately:** one POST per canonical phase advance
+    /// plus every cross-model bounce, no dedupe (the millis request id defeats the
+    /// Hermes cache), and no quiet hours. The hourly fleet summary is the bounded
+    /// owner channel. `features.fleet_notify` vetoes this path too.
     #[serde(default)]
     pub progress: bool,
-    /// Opt-in periodic fleet summaries while `serve` runs (track 0068). Missing key → false.
+    /// Opt-in periodic fleet summaries while `serve` runs (track 0068). Missing
+    /// key -> false. The 0105 digest (`message`) is hourly outside 00:00–05:59
+    /// local, capped at 3500 chars, and `projects` stays complete.
     #[serde(default)]
     pub fleet_summary: bool,
 }
