@@ -197,6 +197,11 @@ pub struct GrokSession {
     pub supports_compact: bool,
     /// Harness slug (`grok` or `cursor`).
     pub adapter: String,
+    /// Model chosen at the `session/new` handshake (0110 live identity). `None` = harness
+    /// default.
+    pub model: Option<String>,
+    /// Resolved binary this session was spawned from (0110 live identity).
+    pub bin: PathBuf,
     /// Session-only slash command (`/compact`, `/summarize`). Always leading `/` when `Some`.
     pub compact_command: Option<String>,
     next_id: u64,
@@ -393,6 +398,8 @@ impl GrokSession {
             pid,
             supports_compact: true,
             adapter: harness.to_string(),
+            model: model.map(str::to_string),
+            bin: bin.clone(),
             compact_command: None,
             next_id: 1,
             collected_text: String::new(),
@@ -466,6 +473,8 @@ impl GrokSession {
             pid: Some(4242),
             supports_compact: true,
             adapter: harness.to_string(),
+            model: None,
+            bin: PathBuf::from("mock"),
             compact_command: None,
             next_id: 1,
             collected_text: String::new(),

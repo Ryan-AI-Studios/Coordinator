@@ -1,7 +1,7 @@
 //! Session pool keyed by `project_id` plus CLI holder + persist metadata.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -77,6 +77,8 @@ impl SessionPool {
             context_usage: s.context_usage.clone(),
             last_signal: s.last_signal.clone(),
             last_tool_title: s.last_tool_title.clone(),
+            model: s.model.clone(),
+            bin: Some(s.bin.clone()),
         })
     }
 }
@@ -99,6 +101,12 @@ pub struct GrokHarnessStatus {
     pub last_signal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tool_title: Option<String>,
+    /// Live session model (0110 identity). Missing on a pre-upgrade persist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Live session binary (0110 identity). Missing on a pre-upgrade persist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<PathBuf>,
 }
 
 impl GrokHarnessStatus {
@@ -113,12 +121,68 @@ impl GrokHarnessStatus {
             context_usage: None,
             last_signal: None,
             last_tool_title: None,
+            model: None,
+            bin: None,
         }
     }
 }
 
 fn default_adapter() -> String {
     "grok".into()
+}
+
+/// Live-session identity (0110, OD-110-7).
+///
+/// The binding defines what the NEXT start must use; a live holder carries the identity it
+/// was started with. `adapter` alone was the old predicate, which made a same-harness
+/// model/command change a silent no-op.
+pub(crate) fn identity_matches_parts(
+    live: &GrokHarnessStatus,
+    harness: &str,
+    model: Option<&str>,
+    resolved_bin: Option<&Path>,
+) -> bool {
+    let adapter = if live.adapter.trim().is_empty() {
+        "grok"
+    } else {
+        live.adapter.as_str()
+    };
+    if !adapter.eq_ignore_ascii_case(harness.trim()) {
+        return false;
+    }
+    let live_model = live
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    let want_model = model.map(str::trim).filter(|m| !m.is_empty());
+    if live_model != want_model {
+        return false;
+    }
+    if let Some(bin) = resolved_bin {
+        // A pre-upgrade persist has no `bin`: it mismatches a known binding binary and
+        // forces one honest recycle.
+        let Some(live_bin) = live.bin.as_ref() else {
+            return false;
+        };
+        if !crate::worktree::paths_same(live_bin, bin) {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn identity_matches(
+    live: &GrokHarnessStatus,
+    binding: &crate::config::RoleBinding,
+    resolved_bin: Option<&Path>,
+) -> bool {
+    identity_matches_parts(
+        live,
+        &binding.harness,
+        binding.model.as_deref(),
+        resolved_bin,
+    )
 }
 
 fn default_supports_compact() -> bool {
@@ -180,6 +244,13 @@ struct PersistedGrokHandle {
     last_signal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_tool_title: Option<String>,
+    /// 0110: live session model. No persist version bump (same pattern as
+    /// `prompt_in_flight`); missing key = unknown identity, which recycles once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    /// 0110: the resolved binary this session was spawned from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bin: Option<PathBuf>,
 }
 
 impl PersistedGrokHandle {
@@ -194,6 +265,8 @@ impl PersistedGrokHandle {
             context_usage: self.context_usage.clone(),
             last_signal: self.last_signal.clone(),
             last_tool_title: self.last_tool_title.clone(),
+            model: self.model.clone(),
+            bin: self.bin.clone(),
         }
     }
 }
@@ -442,6 +515,52 @@ pub(crate) fn request_holder_shutdown(
     }
 }
 
+/// 0110 `roles prove`: the holder's own bounded `Ping`.
+///
+/// Returns the live status only when `verify_holder_identity` is `Verified` **and** the
+/// persisted pid and the Ping pid are both present and equal. The identity contract for
+/// the reaper is deliberately unchanged; this is the stricter read-only proof used by the
+/// swap CLI.
+pub(crate) fn probe_holder(
+    record: &ProjectRecord,
+    _role: &str,
+) -> Result<Option<GrokHarnessStatus>> {
+    let Some(handle) = load_persist(record)? else {
+        return Ok(None);
+    };
+    if !handle.alive || handle.control_addr.is_none() {
+        return Ok(None);
+    }
+    let timeout = crate::harness::reap::RPC_TIMEOUT;
+    let want = PersistIdentity::from_handle(&handle);
+    if !matches!(
+        verify_holder_identity(&want, timeout),
+        HolderReapRpc::Verified
+    ) {
+        return Ok(None);
+    }
+    let Some(addr) = handle.control_addr.as_deref() else {
+        return Ok(None);
+    };
+    let resp = match holder_rpc_sync(addr, &HoldRequest::Ping, timeout) {
+        Ok(resp) => resp,
+        Err(_) => return Ok(None),
+    };
+    if !resp.ok {
+        return Ok(None);
+    }
+    let Some(status) = resp.harness else {
+        return Ok(None);
+    };
+    let (Some(persisted), Some(pinged)) = (handle.pid, status.pid) else {
+        return Ok(None);
+    };
+    if persisted != pinged {
+        return Ok(None);
+    }
+    Ok(Some(status))
+}
+
 fn save_persist(record: &ProjectRecord, handle: &PersistedGrokHandle) -> Result<()> {
     ensure_state_dir(record)?;
     atomic_write_json(&persist_path(record)?, handle)
@@ -455,6 +574,8 @@ fn write_session_persist(
 ) {
     let handle = PersistedGrokHandle {
         version: 1,
+        model: session.model.clone(),
+        bin: Some(session.bin.clone()),
         project_id: record.id.clone(),
         session_id: Some(session.session_id.clone()),
         cwd: Some(session.cwd.clone()),
@@ -484,6 +605,8 @@ fn persist_adapter_name(harness: &str) -> String {
 fn save_attempt_persist(record: &ProjectRecord, harness: &str, error: Option<String>) {
     let handle = PersistedGrokHandle {
         version: 1,
+        model: None,
+        bin: None,
         project_id: record.id.clone(),
         session_id: None,
         cwd: None,
@@ -1202,7 +1325,8 @@ async fn start_inner(
                 .cwd
                 .as_ref()
                 .is_some_and(|cwd| !crate::worktree::paths_same(cwd, &want));
-            if refuse || !s.adapter.eq_ignore_ascii_case(harness) || cwd_mismatch {
+            let identity_ok = identity_matches_parts(&s, harness, model.as_deref(), bin.as_deref());
+            if refuse || !identity_ok || cwd_mismatch {
                 if let Some(mut session) = pool.remove(&rec.id) {
                     let _ = session.shutdown().await;
                 }
@@ -1216,7 +1340,9 @@ async fn start_inner(
         if let Ok(Some(existing)) = load_persist(&rec) {
             reap_stale_holder(&rec, &existing);
         }
-    } else if let Some(existing) = reuse_or_reap_existing(&rec, harness).await? {
+    } else if let Some(existing) =
+        reuse_or_reap_existing(&rec, harness, model.as_deref(), bin.as_deref()).await?
+    {
         return Ok(existing);
     }
 
@@ -1233,6 +1359,8 @@ async fn start_inner(
 async fn reuse_or_reap_existing(
     record: &ProjectRecord,
     harness: &str,
+    model: Option<&str>,
+    bin: Option<&Path>,
 ) -> Result<Option<GrokHarnessStatus>> {
     let Some(existing) = load_persist(record)? else {
         return Ok(None);
@@ -1253,7 +1381,8 @@ async fn reuse_or_reap_existing(
         reap_stale_holder(record, &existing);
         return Ok(None);
     }
-    if !existing.adapter.eq_ignore_ascii_case(harness) {
+    let status = existing.to_status();
+    if !identity_matches_parts(&status, harness, model, bin) {
         reap_stale_holder(record, &existing);
         return Ok(None);
     }
@@ -1593,6 +1722,8 @@ async fn hold_accept_loop(rec: ProjectRecord, mut session: GrokSession) -> Resul
     let _ = session.shutdown().await;
     let dead = PersistedGrokHandle {
         version: 1,
+        model: session.model.clone(),
+        bin: Some(session.bin.clone()),
         project_id: rec.id.clone(),
         session_id: Some(session.session_id.clone()),
         cwd: Some(session.cwd.clone()),
@@ -2052,6 +2183,8 @@ fn session_status(session: &GrokSession) -> GrokHarnessStatus {
         context_usage: session.context_usage.clone(),
         last_signal: session.last_signal.clone(),
         last_tool_title: session.last_tool_title.clone(),
+        model: session.model.clone(),
+        bin: Some(session.bin.clone()),
     }
 }
 
@@ -2587,6 +2720,8 @@ pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarn
         }
         let dead = PersistedGrokHandle {
             version: 1,
+            model: session.model.clone(),
+            bin: Some(session.bin.clone()),
             project_id: rec.id.clone(),
             session_id: Some(session.session_id.clone()),
             cwd: Some(session.cwd.clone()),
@@ -2641,6 +2776,8 @@ fn persist_marked_dead(h: &PersistedGrokHandle) -> PersistedGrokHandle {
         supports_compact: h.supports_compact,
         alive: false,
         prompt_in_flight: false,
+        model: h.model.clone(),
+        bin: h.bin.clone(),
         error: None,
         context_usage: h.context_usage.clone(),
         last_signal: h.last_signal.clone(),
@@ -3536,6 +3673,8 @@ mod tests {
         crate::state::ensure_state_dir(&rec).unwrap();
         let handle = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess".into()),
             cwd: Some(PathBuf::from(r"C:\other\epoch")),
@@ -3553,8 +3692,141 @@ mod tests {
             last_tool_title: None,
         };
         save_persist(&rec, &handle).unwrap();
-        let got = reuse_or_reap_existing(&rec, "grok").await.unwrap();
+        let got = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
         assert!(got.is_none());
+        assert!(load_persist(&rec).unwrap().is_none());
+    }
+
+    #[test]
+    fn identity_predicate_covers_adapter_model_and_bin() {
+        let base = GrokHarnessStatus {
+            alive: true,
+            session_id: Some("s".into()),
+            cwd: None,
+            supports_compact: true,
+            pid: Some(1),
+            adapter: "codex".into(),
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
+            model: Some("gpt-6.1-sol[medium]".into()),
+            bin: Some(PathBuf::from(r"C:\bin\codex-acp.cmd")),
+        };
+        let bin = PathBuf::from(r"C:\bin\codex-acp.cmd");
+        assert!(identity_matches_parts(
+            &base,
+            "codex",
+            Some("gpt-6.1-sol[medium]"),
+            Some(&bin)
+        ));
+        // model-only change (the track's headline case)
+        assert!(!identity_matches_parts(
+            &base,
+            "codex",
+            Some("gpt-6-luna"),
+            Some(&bin)
+        ));
+        // adapter-only change
+        assert!(!identity_matches_parts(
+            &base,
+            "claude",
+            Some("gpt-6.1-sol[medium]"),
+            Some(&bin)
+        ));
+        // bin-only change
+        assert!(!identity_matches_parts(
+            &base,
+            "codex",
+            Some("gpt-6.1-sol[medium]"),
+            Some(Path::new(r"C:\bin\other.exe"))
+        ));
+        // None binding model matches only None live model
+        let unpinned = GrokHarnessStatus {
+            model: None,
+            ..base.clone()
+        };
+        assert!(identity_matches_parts(&unpinned, "codex", None, Some(&bin)));
+        assert!(!identity_matches_parts(
+            &unpinned,
+            "codex",
+            Some("gpt-6-luna"),
+            Some(&bin)
+        ));
+        // pre-upgrade persist: no bin identity, mismatches a resolved binding bin
+        let mut legacy = base.clone();
+        legacy.bin = None;
+        assert!(!identity_matches_parts(
+            &legacy,
+            "codex",
+            Some("gpt-6.1-sol[medium]"),
+            Some(&bin)
+        ));
+        assert!(identity_matches_parts(
+            &legacy,
+            "codex",
+            Some("gpt-6.1-sol[medium]"),
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn persist_reuse_with_a_different_model_is_reaped_not_returned() {
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: "p-model".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: Default::default(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+        crate::state::ensure_state_dir(&rec).unwrap();
+        let cwd = grok_cwd(&rec);
+        let handle = PersistedGrokHandle {
+            version: 1,
+            model: Some("gpt-6.1-sol[medium]".into()),
+            bin: Some(PathBuf::from(r"C:\bin\codex-acp.cmd")),
+            project_id: rec.id.clone(),
+            session_id: Some("sess-model".into()),
+            cwd: Some(cwd),
+            pid: None,
+            holder_pid: None,
+            control_addr: Some("127.0.0.1:1".into()),
+            adapter: "codex".into(),
+            supports_compact: true,
+            alive: true,
+            prompt_in_flight: false,
+            error: None,
+
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
+        };
+        save_persist(&rec, &handle).unwrap();
+        let got = reuse_or_reap_existing(
+            &rec,
+            "codex",
+            Some("gpt-6-luna"),
+            Some(Path::new(r"C:\bin\codex-acp.cmd")),
+        )
+        .await
+        .unwrap();
+        assert!(got.is_none(), "same adapter + different model must reap");
         assert!(load_persist(&rec).unwrap().is_none());
     }
 
@@ -3584,6 +3856,8 @@ mod tests {
         };
         let stale = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: None,
             cwd: None,
@@ -3615,6 +3889,8 @@ mod tests {
         );
         let ready = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess-retry".into()),
             cwd: Some(dir.path().to_path_buf()),
@@ -3884,6 +4160,8 @@ mod tests {
         let pid = child.id();
         let handle = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess-dummy".into()),
             cwd: Some(proj.path().to_path_buf()),
@@ -3944,6 +4222,8 @@ mod tests {
         let mut child = spawn_dummy_long_child();
         let handle = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess-stale".into()),
             cwd: Some(proj.path().to_path_buf()),
@@ -3962,7 +4242,9 @@ mod tests {
         };
         save_persist(&rec, &handle).unwrap();
 
-        let reused = reuse_or_reap_existing(&rec, "grok").await.unwrap();
+        let reused = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
         assert!(reused.is_none(), "dead control_addr must not reuse");
         assert!(
             load_persist(&rec).unwrap().is_none(),
@@ -4101,6 +4383,8 @@ Loop\r\n",
         let (_dir, mut parent, gc) = spawn_cmd_tree_with_grandchild();
         let handle = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess-tree".into()),
             cwd: Some(proj.path().to_path_buf()),
@@ -4149,6 +4433,8 @@ Loop\r\n",
         let (_dir, mut parent, gc) = spawn_cmd_tree_with_grandchild();
         let handle = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess-tree-mismatch".into()),
             cwd: Some(proj.path().to_path_buf()),
@@ -4166,7 +4452,9 @@ Loop\r\n",
             last_tool_title: None,
         };
         save_persist(&rec, &handle).unwrap();
-        let reused = reuse_or_reap_existing(&rec, "cursor").await.unwrap();
+        let reused = reuse_or_reap_existing(&rec, "cursor", None, None)
+            .await
+            .unwrap();
         assert!(
             reused.is_none(),
             "adapter mismatch must not reuse grok persist"
@@ -4410,6 +4698,8 @@ Loop\r\n",
         let mut child = spawn_dummy_long_child();
         let handle = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess-old".into()),
             cwd: Some(proj.path().to_path_buf()),
@@ -4525,6 +4815,8 @@ Loop\r\n",
 
         let old = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess-wedged".into()),
             cwd: Some(proj.path().to_path_buf()),
@@ -4543,7 +4835,9 @@ Loop\r\n",
         };
         save_persist(&rec, &old).unwrap();
 
-        let reused = reuse_or_reap_existing(&rec, "grok").await.unwrap();
+        let reused = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
         assert!(reused.is_none());
         assert!(
             crate::harness::abort::should_refuse_reuse(&rec),
@@ -4630,6 +4924,8 @@ Loop\r\n",
         };
         let handle = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess".into()),
             cwd: Some(dir.path().to_path_buf()),
@@ -4712,6 +5008,8 @@ Loop\r\n",
             context_usage: None,
             last_signal: None,
             last_tool_title: None,
+            model: None,
+            bin: None,
         }
     }
 
@@ -6314,6 +6612,8 @@ Loop\r\n",
         });
         let handle = PersistedGrokHandle {
             version: 1,
+            model: None,
+            bin: None,
             project_id: rec.id.clone(),
             session_id: Some("sess-old".into()),
             cwd: Some(rec.path.clone()),

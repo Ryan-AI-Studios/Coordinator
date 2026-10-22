@@ -268,6 +268,16 @@ fn refresh_plan_evidence_stamp(record: &ProjectRecord, state: &RunState) -> Resu
     )
 }
 
+/// 0110: the live holder identity is the binding (adapter + model + resolved bin), not just
+/// the adapter. A mismatch recycles through the existing `recycle_without_pool_lock` path.
+fn holder_mismatch(
+    live: &crate::harness::GrokHarnessStatus,
+    binding: &crate::config::RoleBinding,
+    bin: &std::path::Path,
+) -> bool {
+    live.alive && !crate::harness::pool::identity_matches(live, binding, Some(bin))
+}
+
 fn drive_adapter(
     record: &ProjectRecord,
     state: &RunState,
@@ -356,6 +366,12 @@ fn drive_adapter(
         );
     }
 
+    // 0110: a deferred role swap applies in-process at the first tick of the phase that
+    // resolves the role, before the binding is read and before any spawn/recycle.
+    if !continuing {
+        let _ = crate::harness::roles_swap::apply_pending_for_phase_for(&state.phase, record);
+    }
+
     // Resolve the phase binding *before* live-session reuse so a non-grok
     // planner cannot silently prompt an existing Grok session.
     let bindings = crate::harness::load_role_bindings()
@@ -419,17 +435,11 @@ fn drive_adapter(
     }
 
     let live = crate::harness::status_bundle_sync(record).and_then(|b| b.grok);
-    let recycle_mismatch = live.as_ref().is_some_and(|g| {
-        if !g.alive {
-            return false;
-        }
-        let adapter = if g.adapter.trim().is_empty() {
-            "grok"
-        } else {
-            g.adapter.as_str()
-        };
-        !adapter.eq_ignore_ascii_case(&binding.harness)
-    });
+    // 0110: the live identity is adapter + model + resolved binary. A same-harness model or
+    // command change therefore recycles here; the existing path below is the only recycle.
+    let recycle_mismatch = live
+        .as_ref()
+        .is_some_and(|g| holder_mismatch(g, &binding, phase_bin.as_path()));
 
     let prompt = if continuing {
         match super::self_check::claim_continuation(record, prepared_target)? {
@@ -3039,5 +3049,50 @@ mod tests {
             .unwrap()
             .registry_status_before;
         assert_eq!(map.get("0090").map(String::as_str), Some(READY_CELL));
+    }
+
+    #[test]
+    fn a_model_or_bin_change_recycles_a_same_harness_holder() {
+        let bin = std::path::PathBuf::from(r"C:\bin\codex-acp.cmd");
+        let live = crate::harness::GrokHarnessStatus {
+            alive: true,
+            session_id: Some("s".into()),
+            cwd: None,
+            supports_compact: false,
+            pid: Some(1),
+            adapter: "codex".into(),
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
+            model: Some("gpt-6.1-sol[medium]".into()),
+            bin: Some(bin.clone()),
+        };
+        let binding = crate::config::RoleBinding {
+            harness: "codex".into(),
+            command: "codex-acp".into(),
+            model: Some("gpt-6.1-sol[medium]".into()),
+        };
+        assert!(!holder_mismatch(&live, &binding, &bin));
+        let model_b = crate::config::RoleBinding {
+            model: Some("gpt-6-luna[medium]".into()),
+            ..binding.clone()
+        };
+        assert!(holder_mismatch(&live, &model_b, &bin), "model-only change");
+        let other_harness = crate::config::RoleBinding {
+            harness: "claude".into(),
+            ..binding.clone()
+        };
+        assert!(
+            holder_mismatch(&live, &other_harness, &bin),
+            "harness change"
+        );
+        let other_bin = std::path::PathBuf::from(r"C:\bin\other.exe");
+        assert!(
+            holder_mismatch(&live, &binding, &other_bin),
+            "resolved bin change"
+        );
+        let mut dead = live.clone();
+        dead.alive = false;
+        assert!(!holder_mismatch(&dead, &model_b, &bin), "dead holder");
     }
 }

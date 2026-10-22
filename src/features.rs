@@ -30,16 +30,18 @@ pub enum Duty {
     FleetNotify,
     SelfUpdate,
     SelfReap,
+    ModelSwap,
 }
 
 impl Duty {
     /// Every duty, in contract order.
-    pub const ALL: [Duty; 5] = [
+    pub const ALL: [Duty; 6] = [
         Duty::AutoStart,
         Duty::StallPaging,
         Duty::FleetNotify,
         Duty::SelfUpdate,
         Duty::SelfReap,
+        Duty::ModelSwap,
     ];
 
     /// Stable machine-config key.
@@ -50,6 +52,7 @@ impl Duty {
             Duty::FleetNotify => "fleet_notify",
             Duty::SelfUpdate => "self_update",
             Duty::SelfReap => "self_reap",
+            Duty::ModelSwap => "model_swap",
         }
     }
 
@@ -61,6 +64,7 @@ impl Duty {
             Duty::FleetNotify => "COORDINATOR_FEATURE_FLEET_NOTIFY",
             Duty::SelfUpdate => "COORDINATOR_FEATURE_SELF_UPDATE",
             Duty::SelfReap => "COORDINATOR_FEATURE_SELF_REAP",
+            Duty::ModelSwap => "COORDINATOR_FEATURE_MODEL_SWAP",
         }
     }
 }
@@ -146,9 +150,9 @@ pub(crate) fn reset_feature_warnings_for_tests() {
     }
 }
 
-/// Every duty env name (fixtures capture/restore all five).
+/// Every duty env name (fixtures capture/restore all six).
 #[cfg(test)]
-pub(crate) fn test_duty_env_vars() -> [&'static str; 5] {
+pub(crate) fn test_duty_env_vars() -> [&'static str; 6] {
     Duty::ALL.map(|duty| duty.env_var())
 }
 
@@ -384,7 +388,7 @@ mod tests {
         let _guard = guard();
         reset_feature_warnings_for_tests();
         let snapshot = evaluate_with(&FeatureTable::default(), None, &no_env);
-        assert_eq!(snapshot.duties.len(), 5);
+        assert_eq!(snapshot.duties.len(), 6);
         for duty in Duty::ALL {
             let view = &snapshot.duties[duty.as_str()];
             assert!(view.enabled, "{} should default on", duty.as_str());
@@ -674,7 +678,8 @@ mod tests {
                 "stall_paging",
                 "fleet_notify",
                 "self_update",
-                "self_reap"
+                "self_reap",
+                "model_swap"
             ]
         );
         let envs: Vec<&str> = Duty::ALL.iter().map(|duty| duty.env_var()).collect();
@@ -685,7 +690,8 @@ mod tests {
                 "COORDINATOR_FEATURE_STALL_PAGING",
                 "COORDINATOR_FEATURE_FLEET_NOTIFY",
                 "COORDINATOR_FEATURE_SELF_UPDATE",
-                "COORDINATOR_FEATURE_SELF_REAP"
+                "COORDINATOR_FEATURE_SELF_REAP",
+                "COORDINATOR_FEATURE_MODEL_SWAP"
             ]
         );
     }

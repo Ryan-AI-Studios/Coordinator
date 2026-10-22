@@ -111,7 +111,7 @@ pub fn resolve_phase_binary(phase: &str) -> Result<PathBuf> {
     resolve_binding_binary(binding, &key)
 }
 
-fn resolve_binding_binary(binding: &RoleBinding, role: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_binding_binary(binding: &RoleBinding, role: &str) -> Result<PathBuf> {
     let raw = if binding.harness.eq_ignore_ascii_case("grok") {
         match std::env::var(ENV_GROK_BIN) {
             Ok(over) if !over.trim().is_empty() => over,
@@ -139,6 +139,8 @@ pub fn roles_show() -> Result<BTreeMap<String, RoleBinding>> {
 ///
 /// Clears `model`. Does not touch plan-reviewers or cross-model keys.
 pub fn roles_use(target: &str) -> Result<BTreeMap<String, RoleBinding>> {
+    // OD-110-5 arm A: serialize role writers on the same machine lock as `roles swap`.
+    let _lock = crate::harness::roles_swap::RoleSwapLock::acquire()?;
     let (harness, command) = match target.trim().to_ascii_lowercase().as_str() {
         "grok" => ("grok", "grok"),
         "cursor" => ("cursor", "cursor-agent"),
@@ -192,6 +194,8 @@ pub fn roles_set(
     model: Option<&str>,
     clear_model: bool,
 ) -> Result<BTreeMap<String, RoleBinding>> {
+    // OD-110-5 arm A: serialize role writers on the same machine lock as `roles swap`.
+    let _lock = crate::harness::roles_swap::RoleSwapLock::acquire()?;
     let key = role.trim();
     let mut cfg = load_machine_config()?;
     if !cfg.role_bindings.contains_key(key) {
@@ -646,5 +650,20 @@ mod tests {
         assert!(err.contains("opencode"), "err={err}");
         assert!(err.contains("grok") && err.contains("cursor"), "err={err}");
         let _ = home;
+    }
+
+    #[test]
+    fn roles_set_and_use_take_the_swap_lock() {
+        let _home = IsolatedHome::enter();
+        let lock = crate::harness::roles_swap::RoleSwapLock::acquire().unwrap();
+        let err = roles_set("planner", Some("grok"), None, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("in progress"), "err={err}");
+        let err = roles_use("grok").unwrap_err().to_string();
+        assert!(err.contains("in progress"), "err={err}");
+        drop(lock);
+        roles_set("planner", Some("grok"), None, None, false).unwrap();
+        roles_use("grok").unwrap();
     }
 }

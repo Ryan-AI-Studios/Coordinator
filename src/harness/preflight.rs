@@ -16,9 +16,15 @@ use crate::config::{
 use crate::error::Result;
 use crate::harness::grok::{ENV_CURSOR_BIN, ENV_GROK_BIN, reject_or_replace_ps1, resolve_command};
 use crate::harness::roles::{ROLE_FOLD, ROLE_NEXT, load_role_bindings};
+use crate::harness::roles_swap::{
+    ModelCheck, ModelProbeRefusal, ProbeReceipt, ProbeRefusal, RoleClass, check_command_class,
+    class_for_role, target_profile,
+};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const CURSOR_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Model-list probes (`opencode models`, `grok models`, `agy models`).
+const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn probe_timeout(harness: &str) -> Duration {
     if harness.eq_ignore_ascii_case("cursor") {
@@ -161,8 +167,10 @@ struct ScriptedInner {
     calls: std::sync::Mutex<Vec<RecordedCall>>,
     version_by_stem: HashMap<String, RawOut>,
     auth_by_stem: HashMap<String, RawOut>,
+    models_by_stem: HashMap<String, RawOut>,
     default_version: RawOut,
     default_auth: RawOut,
+    default_models: RawOut,
 }
 
 #[cfg(test)]
@@ -174,6 +182,7 @@ impl ScriptedProbe {
                 calls: std::sync::Mutex::new(Vec::new()),
                 version_by_stem: HashMap::new(),
                 auth_by_stem: HashMap::new(),
+                models_by_stem: HashMap::new(),
                 default_version: RawOut {
                     exit: 0,
                     stdout: "1.0.0\n".into(),
@@ -183,6 +192,14 @@ impl ScriptedProbe {
                 default_auth: RawOut {
                     exit: 0,
                     stdout: "{\"loggedIn\":true}\nxai credential\n".into(),
+                    stderr: String::new(),
+                    timed_out: false,
+                },
+                default_models: RawOut {
+                    exit: 0,
+                    stdout: "You are logged in with grok.com.\n\nDefault model: grok-4.7\n\n\
+                             Available models:\n  * grok-4.7 (default)\n"
+                        .into(),
                     stderr: String::new(),
                     timed_out: false,
                 },
@@ -235,6 +252,23 @@ impl ScriptedProbe {
         self
     }
 
+    pub fn with_models(mut self, stem: &str, exit: i32, stdout: &str, timed_out: bool) -> Self {
+        self.ensure_unique();
+        std::sync::Arc::get_mut(&mut self.inner)
+            .expect("scripted probe unique")
+            .models_by_stem
+            .insert(
+                stem.to_ascii_lowercase(),
+                RawOut {
+                    exit,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                    timed_out,
+                },
+            );
+        self
+    }
+
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.inner.calls.lock().expect("scripted calls").clone()
     }
@@ -245,8 +279,10 @@ impl ScriptedProbe {
                 calls: std::sync::Mutex::new(self.calls()),
                 version_by_stem: self.inner.version_by_stem.clone(),
                 auth_by_stem: self.inner.auth_by_stem.clone(),
+                models_by_stem: self.inner.models_by_stem.clone(),
                 default_version: self.inner.default_version.clone(),
                 default_auth: self.inner.default_auth.clone(),
+                default_models: self.inner.default_models.clone(),
             };
             self.inner = std::sync::Arc::new(inner);
         }
@@ -270,13 +306,19 @@ impl Probe for ScriptedProbe {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let version = args.first().map(|s| s.as_str()) == Some("--version");
-        if version {
+        let first = args.first().map(|s| s.as_str());
+        if first == Some("--version") {
             self.inner
                 .version_by_stem
                 .get(&stem)
                 .cloned()
                 .unwrap_or_else(|| self.inner.default_version.clone())
+        } else if first == Some("models") {
+            self.inner
+                .models_by_stem
+                .get(&stem)
+                .cloned()
+                .unwrap_or_else(|| self.inner.default_models.clone())
         } else {
             self.inner
                 .auth_by_stem
@@ -319,6 +361,646 @@ fn active_probe() -> std::sync::Arc<dyn Probe> {
         }
     }
     std::sync::Arc::new(DefaultProbe)
+}
+
+// ---------------------------------------------------------------------------
+// 0110 targeted probe (one seam for the swap engine)
+// ---------------------------------------------------------------------------
+
+/// Probe one proposed binding with the runtime's own resolver for its role class.
+///
+/// Order: capability (`class_for_role` → `target_profile`) → per-class bin resolve →
+/// command-class check → runtime `--version` → auth → model list. Every hard failure is
+/// returned in [`ProbeRefusal::failures`] with the partial receipt; a refusal never
+/// writes anything.
+pub fn probe_target(
+    role: &str,
+    binding: &RoleBinding,
+) -> std::result::Result<ProbeReceipt, ProbeRefusal> {
+    let probe = active_probe();
+    probe_target_with(probe.as_ref(), role, binding)
+}
+
+fn probe_target_with(
+    probe: &dyn Probe,
+    role: &str,
+    binding: &RoleBinding,
+) -> std::result::Result<ProbeReceipt, ProbeRefusal> {
+    let class = class_for_role(role);
+    let mut receipt = ProbeReceipt::empty(role, class, binding);
+    let mut failures: Vec<String> = Vec::new();
+    let mut cache: HashMap<(PathBuf, String), RawOut> = HashMap::new();
+
+    if class == RoleClass::Other {
+        failures.push(format!(
+            "role {role} is not swappable (adapter, plan-review or cross-model role required)"
+        ));
+        return Err(ProbeRefusal {
+            receipt: Box::new(receipt),
+            failures,
+        });
+    }
+    if let Err(e) = target_profile(class, &binding.harness) {
+        failures.push(e.to_string());
+        return Err(ProbeRefusal {
+            receipt: Box::new(receipt),
+            failures,
+        });
+    }
+
+    let runtime = match resolve_runtime_bin(class, role, binding) {
+        Ok(path) => path,
+        Err(e) => {
+            failures.push(format!(
+                "runtime {} ({}) not resolvable for role class {}: {e}",
+                binding.command,
+                binding.harness,
+                class.as_str()
+            ));
+            return Err(ProbeRefusal {
+                receipt: Box::new(receipt),
+                failures,
+            });
+        }
+    };
+    receipt.runtime_path = Some(runtime.clone());
+    if let Err(e) = check_command_class(class, &binding.harness, &runtime) {
+        failures.push(e.to_string());
+    }
+
+    let version = run_cached(
+        probe,
+        &mut cache,
+        &runtime,
+        &["--version".to_string()],
+        probe_timeout(&binding.harness),
+    );
+    if version.timed_out {
+        failures.push(format!(
+            "runtime --version timed out: {}",
+            runtime.display()
+        ));
+    } else if version.exit != 0 {
+        failures.push(format!(
+            "runtime --version failed (exit {}): {}",
+            version.exit,
+            runtime.display()
+        ));
+    } else {
+        receipt.runtime_version =
+            first_nonempty_line(&format!("{}\n{}", version.stdout, version.stderr));
+        if receipt.runtime_version.is_none() {
+            failures.push(format!(
+                "runtime --version produced no output: {}",
+                runtime.display()
+            ));
+        }
+    }
+
+    match auth_step_for(class, &binding.harness, &runtime) {
+        Ok(step) => {
+            receipt.auth_path = Some(step.path.clone());
+            receipt.auth_argv = step.argv.clone();
+            if step.note.is_some() {
+                receipt.auth_detail = step.note.clone();
+            }
+            let out = run_cached(
+                probe,
+                &mut cache,
+                &step.path,
+                &step.argv,
+                probe_timeout(&binding.harness),
+            );
+            let detail = classify_target_auth(&binding.harness, &out);
+            receipt.auth_detail = Some(match (&receipt.auth_detail, &detail.detail) {
+                (Some(note), Some(detail)) => format!("{note}; {detail}"),
+                (Some(note), None) => note.clone(),
+                (None, Some(detail)) => detail.clone(),
+                (None, None) => String::new(),
+            });
+            if !detail.ready {
+                failures.push(format!(
+                    "auth {} {}: {}",
+                    step.path.display(),
+                    step.argv.join(" "),
+                    detail
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| "not authenticated".into())
+                ));
+            }
+        }
+        Err(e) => failures.push(format!("auth probe unavailable: {e}")),
+    }
+
+    match probe_model_with(
+        probe,
+        &mut cache,
+        &binding.harness,
+        &runtime,
+        binding.model.as_deref(),
+    ) {
+        Ok(check) => {
+            if check.is_fail() {
+                failures.push(format!(
+                    "model {}: {}",
+                    binding.model.as_deref().unwrap_or("-"),
+                    check.detail().unwrap_or("not available")
+                ));
+            }
+            receipt.model_check = check;
+        }
+        Err(refusal) => {
+            failures.push(format!(
+                "model {}: {}",
+                binding.model.as_deref().unwrap_or("-"),
+                refusal.detail()
+            ));
+            receipt.model_check = ModelCheck::Fail {
+                detail: refusal.detail().to_string(),
+            };
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(receipt)
+    } else {
+        Err(ProbeRefusal {
+            receipt: Box::new(receipt),
+            failures,
+        })
+    }
+}
+
+pub(crate) fn resolve_runtime_bin(
+    class: RoleClass,
+    role: &str,
+    binding: &RoleBinding,
+) -> crate::error::Result<PathBuf> {
+    match class {
+        RoleClass::Adapter => crate::harness::roles::resolve_binding_binary(binding, role),
+        RoleClass::PlanReviewAgy => {
+            if binding.harness.eq_ignore_ascii_case("codex") {
+                crate::review::spawn::resolve_review_bin("codex", &binding.command)
+            } else {
+                crate::workflow::plan_review::resolve_agy_bin(&binding.command)
+            }
+        }
+        RoleClass::PlanReviewOpenCode => {
+            let harness = if binding.harness.eq_ignore_ascii_case("codex") {
+                "codex"
+            } else {
+                "opencode"
+            };
+            crate::review::spawn::resolve_review_bin(harness, &binding.command)
+        }
+        RoleClass::CrossModel => {
+            crate::review::spawn::resolve_review_bin(&binding.harness, &binding.command)
+        }
+        RoleClass::Other => Err(crate::error::CoordinatorError::Message(format!(
+            "role {role} is not swappable"
+        ))),
+    }
+}
+
+struct AuthStep {
+    path: PathBuf,
+    argv: Vec<String>,
+    note: Option<String>,
+}
+
+fn companion_step(cli: &str, env_name: &str, argv: Vec<String>) -> crate::error::Result<AuthStep> {
+    let mut note = None;
+    let path = match trim_env(env_name) {
+        Some(pin) => {
+            let pin_path = Path::new(&pin);
+            if crate::harness::roles_swap::command_basename(pin_path).eq_ignore_ascii_case(cli) {
+                resolve_command(&pin).and_then(reject_or_replace_ps1)?
+            } else {
+                note = Some("env pin points at an ACP shim; companion auth used PATH".into());
+                resolve_command(cli).and_then(reject_or_replace_ps1)?
+            }
+        }
+        None => resolve_command(cli).and_then(reject_or_replace_ps1)?,
+    };
+    Ok(AuthStep { path, argv, note })
+}
+
+fn auth_step_for(
+    class: RoleClass,
+    harness: &str,
+    runtime: &Path,
+) -> crate::error::Result<AuthStep> {
+    match class {
+        RoleClass::Adapter => match harness.to_ascii_lowercase().as_str() {
+            "grok" => Ok(AuthStep {
+                path: runtime.to_path_buf(),
+                argv: vec!["models".into()],
+                note: Some("grok models (login truth from output, not auth.json)".into()),
+            }),
+            "cursor" => Ok(AuthStep {
+                path: runtime.to_path_buf(),
+                argv: vec!["status".into(), "--format".into(), "json".into()],
+                note: None,
+            }),
+            "claude" => companion_step(
+                "claude",
+                ENV_COORDINATOR_CLAUDE_BIN,
+                vec!["auth".into(), "status".into(), "--json".into()],
+            ),
+            "codex" => companion_step(
+                "codex",
+                ENV_COORDINATOR_CODEX_BIN,
+                vec!["login".into(), "status".into()],
+            ),
+            other => Err(crate::error::CoordinatorError::Message(format!(
+                "no adapter auth probe for {other}"
+            ))),
+        },
+        RoleClass::PlanReviewAgy => {
+            if harness.eq_ignore_ascii_case("codex") {
+                Ok(AuthStep {
+                    path: runtime.to_path_buf(),
+                    argv: vec!["login".into(), "status".into()],
+                    note: None,
+                })
+            } else {
+                Ok(AuthStep {
+                    path: runtime.to_path_buf(),
+                    argv: vec!["models".into()],
+                    note: Some("agy has no auth-status CLI; `agy models` is the availability probe and auth stays unverified".into()),
+                })
+            }
+        }
+        RoleClass::PlanReviewOpenCode | RoleClass::CrossModel => {
+            match harness.to_ascii_lowercase().as_str() {
+                "codex" => Ok(AuthStep {
+                    path: runtime.to_path_buf(),
+                    argv: vec!["login".into(), "status".into()],
+                    note: None,
+                }),
+                "claude" => Ok(AuthStep {
+                    path: runtime.to_path_buf(),
+                    argv: vec!["auth".into(), "status".into(), "--json".into()],
+                    note: None,
+                }),
+                "opencode" => Ok(AuthStep {
+                    path: runtime.to_path_buf(),
+                    argv: vec!["auth".into(), "list".into()],
+                    note: None,
+                }),
+                other => Err(crate::error::CoordinatorError::Message(format!(
+                    "no auth probe for {other}"
+                ))),
+            }
+        }
+        RoleClass::Other => Err(crate::error::CoordinatorError::Message(
+            "not swappable".into(),
+        )),
+    }
+}
+
+struct AuthVerdict {
+    ready: bool,
+    detail: Option<String>,
+}
+
+fn classify_target_auth(harness: &str, out: &RawOut) -> AuthVerdict {
+    if out.timed_out {
+        return AuthVerdict {
+            ready: false,
+            detail: Some("auth probe timed out".into()),
+        };
+    }
+    match harness.to_ascii_lowercase().as_str() {
+        "grok" => {
+            let text = format!("{}\n{}", out.stdout, out.stderr);
+            let lower = text.to_ascii_lowercase();
+            if lower.contains("not authenticated") {
+                return AuthVerdict {
+                    ready: false,
+                    detail: Some("`grok models` says not authenticated".into()),
+                };
+            }
+            let (default, ids) = parse_grok_models(&text);
+            if lower.contains("logged in") || default.is_some() || !ids.is_empty() {
+                AuthVerdict {
+                    ready: true,
+                    detail: Some(format!(
+                        "`grok models` logged in (default {})",
+                        default.unwrap_or_else(|| "-".into())
+                    )),
+                }
+            } else {
+                AuthVerdict {
+                    ready: false,
+                    detail: Some("`grok models` output is ambiguous".into()),
+                }
+            }
+        }
+        "cursor" => match serde_json::from_str::<serde_json::Value>(&out.stdout) {
+            Ok(v) => match v.get("isAuthenticated").and_then(|x| x.as_bool()) {
+                Some(true) => AuthVerdict {
+                    ready: true,
+                    detail: Some("cursor-agent status authenticated".into()),
+                },
+                Some(false) => AuthVerdict {
+                    ready: false,
+                    detail: Some("cursor-agent not authenticated".into()),
+                },
+                None => AuthVerdict {
+                    ready: false,
+                    detail: Some("cursor-agent status unparseable".into()),
+                },
+            },
+            Err(_) => AuthVerdict {
+                ready: false,
+                detail: Some("cursor-agent status unparseable".into()),
+            },
+        },
+        "antigravity" | "agy" => {
+            let ids = parse_agy_models(&out.stdout);
+            if out.exit == 0 && !ids.is_empty() {
+                AuthVerdict {
+                    ready: true,
+                    detail: Some(format!(
+                        "`agy models` listed {} ids; auth unverified",
+                        ids.len()
+                    )),
+                }
+            } else {
+                AuthVerdict {
+                    ready: false,
+                    detail: Some("`agy models` listed no ids".into()),
+                }
+            }
+        }
+        "opencode" => {
+            if out.exit == 0 && out.stdout.lines().any(|l| !l.trim().is_empty()) {
+                AuthVerdict {
+                    ready: true,
+                    detail: Some("`opencode auth list` has a stored credential".into()),
+                }
+            } else {
+                AuthVerdict {
+                    ready: false,
+                    detail: Some("`opencode auth list` is empty".into()),
+                }
+            }
+        }
+        "codex" => {
+            if out.exit == 0 {
+                AuthVerdict {
+                    ready: true,
+                    detail: first_nonempty_line(&out.stdout),
+                }
+            } else {
+                AuthVerdict {
+                    ready: false,
+                    detail: Some("`codex login status` failed".into()),
+                }
+            }
+        }
+        "claude" => match serde_json::from_str::<serde_json::Value>(&out.stdout) {
+            Ok(v) => match v.get("loggedIn").and_then(|x| x.as_bool()) {
+                Some(true) => AuthVerdict {
+                    ready: true,
+                    detail: Some("claude auth status loggedIn=true".into()),
+                },
+                Some(false) => AuthVerdict {
+                    ready: false,
+                    detail: Some("claude auth status loggedIn=false".into()),
+                },
+                None => AuthVerdict {
+                    ready: false,
+                    detail: Some("claude auth status unparseable".into()),
+                },
+            },
+            Err(_) => AuthVerdict {
+                ready: false,
+                detail: Some("claude auth status unparseable".into()),
+            },
+        },
+        other => {
+            if out.exit == 0 {
+                AuthVerdict {
+                    ready: true,
+                    detail: first_nonempty_line(&out.stdout),
+                }
+            } else {
+                AuthVerdict {
+                    ready: false,
+                    detail: Some(format!("auth probe for {other} failed")),
+                }
+            }
+        }
+    }
+}
+
+fn first_nonempty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_grok_models(text: &str) -> (Option<String>, Vec<String>) {
+    let mut default = None;
+    let mut ids = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Default model:") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                default = Some(value.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("* ") {
+            let id = rest.trim().trim_end_matches("(default)").trim();
+            if !id.is_empty() {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    (default, ids)
+}
+
+fn parse_agy_models(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let id = parts.next()?.trim();
+            let display = parts.next()?;
+            if id.is_empty() || display.trim().is_empty() {
+                return None;
+            }
+            if id.to_ascii_lowercase().starts_with("fetching") {
+                return None;
+            }
+            Some(id.to_string())
+        })
+        .collect()
+}
+
+fn run_cached(
+    probe: &dyn Probe,
+    cache: &mut HashMap<(PathBuf, String), RawOut>,
+    bin: &Path,
+    args: &[String],
+    timeout: Duration,
+) -> RawOut {
+    let key = (bin.to_path_buf(), args.join(" "));
+    cache
+        .entry(key)
+        .or_insert_with(|| sanitize_out(probe.run(bin, args, timeout)))
+        .clone()
+}
+
+fn probe_model_with(
+    probe: &dyn Probe,
+    cache: &mut HashMap<(PathBuf, String), RawOut>,
+    harness: &str,
+    runtime: &Path,
+    model: Option<&str>,
+) -> std::result::Result<ModelCheck, ModelProbeRefusal> {
+    let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+        return Ok(ModelCheck::NotRequested);
+    };
+    match harness.to_ascii_lowercase().as_str() {
+        "opencode" => {
+            let out = run_cached(
+                probe,
+                cache,
+                runtime,
+                &["models".to_string()],
+                MODEL_PROBE_TIMEOUT,
+            );
+            if out.timed_out {
+                return Err(ModelProbeRefusal::Timeout {
+                    detail: "`opencode models` timed out".into(),
+                });
+            }
+            if out.exit != 0 {
+                return Err(ModelProbeRefusal::Unavailable {
+                    detail: format!("`opencode models` exited {}", out.exit),
+                });
+            }
+            let lines: Vec<&str> = out
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            if lines.is_empty() {
+                return Err(ModelProbeRefusal::Unavailable {
+                    detail: "`opencode models` listed nothing".into(),
+                });
+            }
+            // Variants are catalog-defined: the installed list has no `#` line. Match the
+            // BASE selector exactly and carry the variant verbatim into the argv.
+            let (base, variant) = match model.rfind('#') {
+                Some(i) => (&model[..i], Some(&model[i + 1..])),
+                None => (model, None),
+            };
+            if base.trim().is_empty() {
+                return Err(ModelProbeRefusal::Unparseable {
+                    detail: format!("model selector {model} has an empty base"),
+                });
+            }
+            if lines.iter().any(|line| *line == base.trim()) {
+                let detail = match variant {
+                    Some(v) => format!(
+                        "base {} listed; variant #{v} catalog-defined (not enumerated by `opencode models`)",
+                        base.trim()
+                    ),
+                    None => format!("{} listed by `opencode models`", base.trim()),
+                };
+                Ok(ModelCheck::Pass { detail })
+            } else {
+                Ok(ModelCheck::Fail {
+                    detail: format!(
+                        "base {} is not listed by `opencode models` ({} lines)",
+                        base.trim(),
+                        lines.len()
+                    ),
+                })
+            }
+        }
+        "grok" => {
+            let out = run_cached(
+                probe,
+                cache,
+                runtime,
+                &["models".to_string()],
+                MODEL_PROBE_TIMEOUT,
+            );
+            if out.timed_out {
+                return Err(ModelProbeRefusal::Timeout {
+                    detail: "`grok models` timed out".into(),
+                });
+            }
+            let text = format!("{}\n{}", out.stdout, out.stderr);
+            if text.to_ascii_lowercase().contains("not authenticated") {
+                return Err(ModelProbeRefusal::Auth {
+                    detail: "`grok models` says not authenticated".into(),
+                });
+            }
+            let (default, ids) = parse_grok_models(&text);
+            if default.is_none() && ids.is_empty() {
+                return Err(ModelProbeRefusal::Ambiguous {
+                    detail: "`grok models` output has no default and no bullet list".into(),
+                });
+            }
+            if ids.iter().any(|id| id == model) || default.as_deref() == Some(model) {
+                Ok(ModelCheck::Pass {
+                    detail: format!("{model} listed by `grok models`"),
+                })
+            } else {
+                Ok(ModelCheck::Fail {
+                    detail: format!("{model} is not in `grok models`"),
+                })
+            }
+        }
+        "antigravity" | "agy" => {
+            let out = run_cached(
+                probe,
+                cache,
+                runtime,
+                &["models".to_string()],
+                MODEL_PROBE_TIMEOUT,
+            );
+            if out.timed_out {
+                return Err(ModelProbeRefusal::Timeout {
+                    detail: "`agy models` timed out".into(),
+                });
+            }
+            let ids = parse_agy_models(&out.stdout);
+            if ids.is_empty() {
+                return Err(ModelProbeRefusal::Unparseable {
+                    detail: "`agy models` produced a banner but no `id<TAB>display` rows".into(),
+                });
+            }
+            if ids.iter().any(|id| id == model) {
+                Ok(ModelCheck::Pass {
+                    detail: format!("{model} listed by `agy models`"),
+                })
+            } else {
+                Ok(ModelCheck::Fail {
+                    detail: format!("{model} is not in `agy models`"),
+                })
+            }
+        }
+        "codex" | "claude" | "cursor" => Ok(ModelCheck::Unverified {
+            detail: format!(
+                "{} exposes no model list; auth checked only (OD-110-3: not availability proof)",
+                harness
+            ),
+        }),
+        other => Ok(ModelCheck::Unverified {
+            detail: format!("{other} exposes no model list; auth checked only"),
+        }),
+    }
 }
 
 /// Probe machine Role Bindings plus synthetic `ci`/`gh`.
@@ -456,11 +1138,14 @@ fn classify_auth(
     let key = harness.to_ascii_lowercase();
     match key.as_str() {
         "grok" => {
-            if grok_auth_ready() {
-                (RowStatus::Ready, None)
-            } else {
-                (RowStatus::Auth, Some("logged out".into()))
-            }
+            let cache_key = (path.to_path_buf(), "models".to_string());
+            let out = auth_cache
+                .entry(cache_key)
+                .or_insert_with(|| {
+                    sanitize_out(probe.run(path, &["models".to_string()], probe_timeout("grok")))
+                })
+                .clone();
+            classify_auth_out("grok", &out)
         }
         "antigravity" | "agy" => (RowStatus::Ready, None),
         other => {
@@ -484,6 +1169,37 @@ fn classify_auth_out(harness: &str, out: &RawOut) -> (RowStatus, Option<String>)
         return (RowStatus::Unknown, Some("probe timed out".into()));
     }
     match harness {
+        // 0110: read `grok models`, not the presence of `~/.grok/auth.json`.
+        // Observed twice in one pass on 2026-10-21: the file existed while the command
+        // said "You are not authenticated." The command output wins; the file/key is a
+        // fallback only when the models probe itself is unavailable.
+        "grok" => {
+            if out.timed_out || out.exit == 127 {
+                if grok_auth_ready() {
+                    return (
+                        RowStatus::Ready,
+                        Some("models probe unavailable; XAI_API_KEY/auth.json present".into()),
+                    );
+                }
+                return (
+                    RowStatus::Auth,
+                    Some("logged out (models probe unavailable)".into()),
+                );
+            }
+            let text = format!("{}\n{}", out.stdout, out.stderr);
+            let lower = text.to_ascii_lowercase();
+            if lower.contains("not authenticated") {
+                return (RowStatus::Auth, Some("logged out".into()));
+            }
+            let (default, ids) = parse_grok_models(&text);
+            if lower.contains("logged in") || default.is_some() || !ids.is_empty() {
+                return (RowStatus::Ready, first_nonempty_line(&text));
+            }
+            (
+                RowStatus::Unknown,
+                Some("grok models output ambiguous".into()),
+            )
+        }
         "opencode" => {
             if out.exit != 0 {
                 return (RowStatus::Auth, Some("logged out".into()));
@@ -1019,8 +1735,9 @@ mod tests {
     fn doctor_scripted_auth_required_refuses_run() {
         let iso = IsolatedDoctor::enter();
         iso.point_all_to_dummies();
-        // no XAI_API_KEY, no auth.json → grok auth
-        let probe = ScriptedProbe::ready();
+        // no XAI_API_KEY, no auth.json and the truthful `grok models` probe says logged out
+        let probe =
+            ScriptedProbe::ready().with_models("grok", 0, "You are not authenticated.", false);
         let _g = install_test_probe(probe);
         let (_proj, rec) = iso.add_project();
         let err = api::cmd_run(
@@ -1254,7 +1971,8 @@ mod tests {
             std::env::set_var("XAI_API_KEY", "  ");
         }
         assert!(!iso.grok_home.path().join("auth.json").exists());
-        let probe = ScriptedProbe::ready();
+        let probe =
+            ScriptedProbe::ready().with_models("grok", 0, "You are not authenticated.", false);
         let _g = install_test_probe(probe);
         let report = probe_machine().unwrap();
         assert_eq!(row(&report, "planner").status, RowStatus::Auth);

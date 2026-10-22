@@ -849,6 +849,8 @@ mod tests {
                 context_usage: None,
                 last_signal: None,
                 last_tool_title: None,
+                model: None,
+                bin: None,
             }),
         });
         let rows = session_rows(&v);
@@ -886,6 +888,8 @@ mod tests {
                 context_usage: None,
                 last_signal: None,
                 last_tool_title: None,
+                model: None,
+                bin: None,
             }),
         });
         let rows = session_rows(&v);
@@ -910,6 +914,8 @@ mod tests {
                 context_usage: None,
                 last_signal: None,
                 last_tool_title: None,
+                model: None,
+                bin: None,
             }),
         });
         let plain = session_rows(&bare);
@@ -933,6 +939,8 @@ mod tests {
                 }),
                 last_signal: Some(crate::harness::capabilities::APPROVALS_AUTO_ALLOWED.to_string()),
                 last_tool_title: Some("read file".into()),
+                model: None,
+                bin: None,
             }),
         });
         let detail = &session_rows(&v)[0].detail;

@@ -125,6 +125,20 @@ pub fn drive_with(
         );
     }
 
+    // 0110: a pending role swap applies at gate start only, before the bindings are read.
+    // A tick after a tier was attempted never swaps a later tier mid-gate.
+    let gate_start = state
+        .review
+        .as_ref()
+        .map(|r| r.attempted.is_empty())
+        .unwrap_or(true);
+    if gate_start {
+        let _ = crate::harness::roles_swap::apply_pending_for_roles_for(
+            graph::cross_model_roles(),
+            record,
+        );
+    }
+
     let bindings = crate::harness::load_role_bindings()
         .unwrap_or_else(|_| crate::config::default_role_bindings());
     let already = state
@@ -160,6 +174,20 @@ pub fn drive_with(
             })?;
             saw_permission = true;
             last_note = format!("empty command ({slug})");
+            continue;
+        }
+
+        // 0110 defensive check: `argv_for`'s `_` arm is codex, so a tier bound to any other
+        // harness used to run codex silently. That is now a Permission skip with a message.
+        if !matches!(
+            slug.to_ascii_lowercase().as_str(),
+            "codex" | "claude" | "opencode"
+        ) {
+            saw_permission = true;
+            last_note = format!(
+                "tier {role} harness {slug} is unsupported (allowed: codex, claude, opencode; \
+                 this tier previously ran codex instead)"
+            );
             continue;
         }
 
@@ -1222,6 +1250,35 @@ mod tests {
             view.last_event
         );
         assert_eq!(counts.n(), 0);
+        clear_env();
+    }
+
+    #[test]
+    fn cross_model_tier_bound_to_an_unsupported_harness_is_permission_with_zero_spawns() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        // Before 0110 this config fell through `argv_for`'s `_` arm and ran codex.
+        let mut cfg = crate::config::load_machine_config().unwrap();
+        for role in graph::cross_model_roles() {
+            let binding = cfg.role_bindings.get_mut(*role).unwrap();
+            binding.harness = "grok".into();
+            binding.command = "grok".into();
+            binding.model = None;
+        }
+        crate::config::save_machine_config(&cfg).unwrap();
+        let scripted = ScriptedBackend::new().push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("permission");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert_eq!(counts.n(), 0, "unsupported tier must not spawn");
+        assert!(
+            view.last_event.contains("all reviewers unavailable"),
+            "{}",
+            view.last_event
+        );
         clear_env();
     }
 

@@ -448,6 +448,113 @@ fn slot_role(slug: &str) -> &'static str {
     }
 }
 
+/// One driver decision used by the resolver, the argv builder and the backend.
+///
+/// The plan-review slots are SLOT names (`agy`, `opencode`); their binding chooses the
+/// driver. A slot may keep its native driver or adopt `codex`. Nothing else: the prompt
+/// research block and the stdout adoption path are slot-specific, so "an Agy driver
+/// exists" is not a slot-adoption path for the opencode slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanReviewDriver {
+    Agy,
+    OpenCode,
+    Codex,
+}
+
+impl PlanReviewDriver {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            PlanReviewDriver::Agy => "agy",
+            PlanReviewDriver::OpenCode => "opencode",
+            PlanReviewDriver::Codex => "codex",
+        }
+    }
+}
+
+pub(crate) fn driver_for(slug: &str, harness: &str) -> Result<PlanReviewDriver> {
+    let h = harness.trim().to_ascii_lowercase();
+    match slug {
+        REVIEW_SLUG_AGY => match h.as_str() {
+            "antigravity" | "agy" => Ok(PlanReviewDriver::Agy),
+            "codex" => Ok(PlanReviewDriver::Codex),
+            other => Err(CoordinatorError::Message(format!(
+                "plan-review slot {slug} cannot adopt harness {other} (allowed: antigravity, \
+                 codex)"
+            ))),
+        },
+        REVIEW_SLUG_OPENCODE => match h.as_str() {
+            "opencode" => Ok(PlanReviewDriver::OpenCode),
+            "codex" => Ok(PlanReviewDriver::Codex),
+            other => Err(CoordinatorError::Message(format!(
+                "plan-review slot {slug} cannot adopt harness {other} (allowed: opencode, \
+                 codex)"
+            ))),
+        },
+        other => Err(CoordinatorError::Message(format!(
+            "unknown plan-review slot {other}"
+        ))),
+    }
+}
+
+pub(crate) fn resolve_driver_bin(driver: PlanReviewDriver, command: &str) -> Result<PathBuf> {
+    match driver {
+        PlanReviewDriver::Agy => resolve_agy_bin(command),
+        PlanReviewDriver::OpenCode => resolve_review_bin("opencode", command),
+        PlanReviewDriver::Codex => resolve_review_bin("codex", command),
+    }
+}
+
+struct DriverArgv {
+    argv: Vec<String>,
+    last_message_path: Option<PathBuf>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn driver_argv(
+    driver: PlanReviewDriver,
+    slug: &str,
+    prompt: &str,
+    remaining: Duration,
+    model: Option<&str>,
+    workspace_root: &Path,
+    execution_repo: Option<&Path>,
+    track_id: Option<&str>,
+) -> DriverArgv {
+    match driver {
+        PlanReviewDriver::Agy => DriverArgv {
+            argv: {
+                let add_dir = add_dir_arg(workspace_root, execution_repo);
+                agy_argv(prompt, remaining, model, add_dir.as_deref())
+            },
+            last_message_path: None,
+        },
+        PlanReviewDriver::OpenCode => DriverArgv {
+            argv: {
+                let title = track_id.map(|id| format!("plan-review {id}"));
+                opencode_argv(model, title.as_deref())
+            },
+            last_message_path: None,
+        },
+        PlanReviewDriver::Codex => {
+            let tmp = std::env::temp_dir().join(format!(
+                "coordinator-plan-review-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+            let last = tmp.join("last-message.txt");
+            let _ = slug;
+            DriverArgv {
+                argv: codex_plan_review_argv(model, workspace_root, execution_repo, &last),
+                last_message_path: Some(last),
+            }
+        }
+    }
+}
+
 fn remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
     timeout_for_phase(record, PHASE_PLAN_REVIEW)
         .saturating_sub(state.effective_running_elapsed(chrono::Utc::now()))
@@ -521,9 +628,18 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
     if !live.pending_roles.iter().any(|s| s == slug) {
         return Ok(());
     }
+    // Recovery ordering (folded M3): a latched slug with a matching receipt must still be
+    // reused and clear `pending_roles`. Only after that does the latch stop this phase.
     if try_reuse_slot(record, &live, slug)? {
         return Ok(());
     }
+    if live.plan_review_spawned.iter().any(|s| s == slug) {
+        // 0110: a slot that already spawned this phase never applies a pending swap today.
+        return Ok(());
+    }
+
+    // 0110 deferred swap: apply before the binding is read and before any spawn.
+    let _ = crate::harness::roles_swap::apply_pending_for_roles_for(&[slot_role(slug)], record);
 
     let binding = load_slot_binding(slug);
     if binding.command.trim().is_empty() {
@@ -536,21 +652,25 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
         return Ok(());
     }
 
-    let backend = backend_for(record, slug, &binding);
-    if !has_test_backend(record) {
-        let resolved = match slug {
-            REVIEW_SLUG_OPENCODE => resolve_review_bin("opencode", &binding.command),
-            _ => resolve_agy_bin(&binding.command),
-        };
-        if let Err(e) = resolved {
-            write_sync_permission_failure(
-                record,
-                &live,
-                slug,
-                format!("{slug} not resolvable: {e}"),
-            )?;
+    // One driver decision: resolver, argv and backend all use it.
+    let driver = match driver_for(slug, &binding.harness) {
+        Ok(driver) => driver,
+        Err(e) => {
+            write_sync_permission_failure(record, &live, slug, e.to_string())?;
             return Ok(());
         }
+    };
+    let backend = backend_for(record, driver);
+    if !has_test_backend(record)
+        && let Err(e) = resolve_driver_bin(driver, &binding.command)
+    {
+        write_sync_permission_failure(
+            record,
+            &live,
+            slug,
+            format!("{slug} driver {} not resolvable: {e}", driver.name()),
+        )?;
+        return Ok(());
     }
 
     let should_spawn = with_run_state_lock(record, || {
@@ -595,50 +715,19 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
     };
     // The driver follows the ROLE BINDING, not the slot name. `plan_reviewer_agy` is a slot;
     // a binding may re-point it at another harness when the bound one is exhausted.
-    let (argv, last_message_path) = match slug {
-        REVIEW_SLUG_OPENCODE => {
-            let title = spawn_track_id
-                .as_deref()
-                .map(|id| format!("plan-review {id}"));
-            (
-                opencode_argv(binding.model.as_deref(), title.as_deref()),
-                None,
-            )
-        }
-        _ if binding.harness.eq_ignore_ascii_case("codex") => {
-            let tmp = std::env::temp_dir().join(format!(
-                "coordinator-plan-review-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or_default()
-            ));
-            let _ = std::fs::create_dir_all(&tmp);
-            let last = tmp.join("last-message.txt");
-            (
-                codex_plan_review_argv(
-                    binding.model.as_deref(),
-                    &paths.workspace_root,
-                    paths.execution_repo.as_deref(),
-                    &last,
-                ),
-                Some(last),
-            )
-        }
-        _ => {
-            let add_dir = add_dir_arg(&paths.workspace_root, paths.execution_repo.as_deref());
-            (
-                agy_argv(
-                    &prompt,
-                    remaining,
-                    binding.model.as_deref(),
-                    add_dir.as_deref(),
-                ),
-                None,
-            )
-        }
-    };
+    let DriverArgv {
+        argv,
+        last_message_path,
+    } = driver_argv(
+        driver,
+        slug,
+        &prompt,
+        remaining,
+        binding.model.as_deref(),
+        &paths.workspace_root,
+        paths.execution_repo.as_deref(),
+        spawn_track_id.as_deref(),
+    );
     let req = PlanReviewRequest {
         slug: slug.into(),
         command: binding.command,
@@ -658,6 +747,13 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
     if let Some(ref dir) = req.track_dir {
         let _ = std::fs::remove_file(dir.join(format!("{slug}-review.md")));
     }
+
+    // Exactly one durable driver line per spawn (DoD-6 evidence; no schema field).
+    crate::progress_log::append(
+        record,
+        "plan-review",
+        &format!("plan-review: {slug} driver {}", driver.name()),
+    );
 
     let slug_owned = slug.to_string();
     if let Err(e) = std::thread::Builder::new()
@@ -1343,11 +1439,7 @@ fn has_test_backend(record: &ProjectRecord) -> bool {
     }
 }
 
-fn backend_for(
-    record: &ProjectRecord,
-    slug: &str,
-    binding: &RoleBinding,
-) -> Arc<dyn PlanReviewBackend> {
+fn backend_for(record: &ProjectRecord, driver: PlanReviewDriver) -> Arc<dyn PlanReviewBackend> {
     #[cfg(test)]
     {
         if let Some(b) = test_backend_for(&record.id) {
@@ -1358,14 +1450,10 @@ fn backend_for(
     {
         let _ = record;
     }
-    // The driver follows the role binding, not the slot name: a slot whose bound harness is
-    // exhausted can be re-pointed at another one without touching the graph.
-    if binding.harness.eq_ignore_ascii_case("codex") {
-        return Arc::new(CodexCli);
-    }
-    match slug {
-        REVIEW_SLUG_OPENCODE => Arc::new(OpenCodeCli),
-        _ => Arc::new(AgyCli),
+    match driver {
+        PlanReviewDriver::Agy => Arc::new(AgyCli),
+        PlanReviewDriver::OpenCode => Arc::new(OpenCodeCli),
+        PlanReviewDriver::Codex => Arc::new(CodexCli),
     }
 }
 
@@ -2101,25 +2189,147 @@ mod tests {
     fn the_driver_follows_the_binding_not_the_slot_name() {
         let ws = tempdir().unwrap();
         let record = rec(ws.path());
-        let agy = RoleBinding {
-            harness: "antigravity".into(),
-            command: "agy".into(),
-            model: None,
-        };
-        let codex = RoleBinding {
-            harness: "codex".into(),
-            command: "codex".into(),
-            model: Some("gpt-6-luna".into()),
-        };
-        // Same slot, different binding -> different driver.
+        // Pure resolver: all six slot/harness pairs, no test-backend seam.
         assert_eq!(
-            backend_for(&record, REVIEW_SLUG_AGY, &agy).driver_name(),
+            driver_for(REVIEW_SLUG_AGY, "antigravity").unwrap(),
+            PlanReviewDriver::Agy
+        );
+        assert_eq!(
+            driver_for(REVIEW_SLUG_AGY, "agy").unwrap(),
+            PlanReviewDriver::Agy
+        );
+        assert_eq!(
+            driver_for(REVIEW_SLUG_AGY, "codex").unwrap(),
+            PlanReviewDriver::Codex
+        );
+        assert_eq!(
+            driver_for(REVIEW_SLUG_OPENCODE, "opencode").unwrap(),
+            PlanReviewDriver::OpenCode
+        );
+        assert_eq!(
+            driver_for(REVIEW_SLUG_OPENCODE, "codex").unwrap(),
+            PlanReviewDriver::Codex
+        );
+        // Agy on the opencode slot stays refused: the research block and stdout adoption
+        // path are slot-specific.
+        let err = driver_for(REVIEW_SLUG_OPENCODE, "agy")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed: opencode, codex"), "err={err}");
+        let err = driver_for(REVIEW_SLUG_AGY, "claude")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed: antigravity, codex"), "err={err}");
+
+        // Same slot, different binding -> different backend.
+        assert_eq!(
+            backend_for(&record, PlanReviewDriver::Agy).driver_name(),
             "agy"
         );
         assert_eq!(
-            backend_for(&record, REVIEW_SLUG_AGY, &codex).driver_name(),
+            backend_for(&record, PlanReviewDriver::Codex).driver_name(),
             "codex"
         );
+    }
+
+    #[test]
+    fn plan_review_resolver_for_codex_uses_the_codex_pin_not_the_slot_name() {
+        let dir = tempdir().unwrap();
+        let pin = dir.path().join("pinned-codex.exe");
+        std::fs::write(&pin, b"").unwrap();
+        let previous = std::env::var_os(crate::config::ENV_COORDINATOR_CODEX_BIN);
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_CODEX_BIN, &pin);
+        }
+        let driver = driver_for(REVIEW_SLUG_OPENCODE, "codex").unwrap();
+        let resolved = resolve_driver_bin(driver, "codex").unwrap();
+        match previous {
+            Some(v) => unsafe {
+                std::env::set_var(crate::config::ENV_COORDINATOR_CODEX_BIN, v);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::config::ENV_COORDINATOR_CODEX_BIN);
+            },
+        }
+        assert_eq!(resolved, pin);
+    }
+
+    #[test]
+    fn refused_slot_harness_pair_writes_permission_and_spawns_nothing() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["agy".into()];
+        state.plan_review_spawned = vec!["opencode".into()];
+        save_run_state(&r, &state).unwrap();
+        // The agy slot has no adoption path for opencode (research block + stdout path
+        // are slot-specific).
+        let mut cfg = crate::config::load_machine_config().unwrap();
+        let binding = cfg.role_bindings.get_mut("plan_reviewer_agy").unwrap();
+        binding.harness = "opencode".into();
+        binding.command = "opencode".into();
+        crate::config::save_machine_config(&cfg).unwrap();
+
+        let state = load_run_state(&r).unwrap();
+        maybe_spawn_slot(&r, &state, "agy").unwrap();
+        let mut last = String::new();
+        for _ in 0..80 {
+            let path = outcome_roles_dir(&r).unwrap().join("agy.json");
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(o) = serde_json::from_str::<PhaseOutcome>(&text)
+                && o.status == OutcomeStatus::Failure
+            {
+                assert_eq!(o.failure_class, Some(FailureClass::Permission));
+                last = o.message.unwrap_or_default();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            last.contains("allowed: antigravity, codex"),
+            "refusal must name the allowed set: {last}"
+        );
+        let track = dir.path().join("conductor").join("0001-Example");
+        assert!(
+            !track.join("agy-review.md").exists(),
+            "no spawn, no artifact"
+        );
+    }
+
+    #[test]
+    fn opencode_slot_bound_to_codex_builds_codex_argv_with_no_opencode_run() {
+        let ws = tempdir().unwrap();
+        let exec = ws.path().join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        let out = driver_argv(
+            PlanReviewDriver::Codex,
+            REVIEW_SLUG_OPENCODE,
+            "prompt",
+            Duration::from_secs(120),
+            Some("gpt-6-luna"),
+            ws.path(),
+            Some(&exec),
+            Some("0001"),
+        );
+        assert_eq!(out.argv[0], "exec");
+        assert!(out.last_message_path.is_some());
+        assert!(out.argv.windows(2).any(|w| w[0] == "-C"), "{:?}", out.argv);
+        assert!(
+            out.argv
+                .windows(2)
+                .any(|w| w[0] == "-s" && w[1] == "read-only"),
+            "{:?}",
+            out.argv
+        );
+        assert!(out.argv.iter().any(|a| a == "--ephemeral"));
+        assert!(out.argv.iter().any(|a| a == "--add-dir"));
+        assert!(out.argv.iter().any(|a| a == "-"));
+        assert!(!out.argv.iter().any(|a| a == "--print"));
+        assert!(!out.argv.iter().any(|a| a == "--output-schema"));
+        assert!(!out.argv.iter().any(|a| a == "run"));
     }
 
     #[test]
@@ -2559,6 +2769,41 @@ mod tests {
         let state = load_run_state(&r).unwrap();
         assert!(state.failure_class.is_none());
         assert!(!state.last_event.to_ascii_lowercase().contains("fail"));
+    }
+
+    #[test]
+    fn opencode_slot_bound_to_codex_logs_driver_codex_and_keeps_the_slot_artifact() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["opencode".into()];
+        state.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &state).unwrap();
+        let mut cfg = crate::config::load_machine_config().unwrap();
+        let slot = cfg.role_bindings.get_mut("plan_reviewer_opencode").unwrap();
+        slot.harness = "codex".into();
+        slot.command = "codex".into();
+        slot.model = Some("gpt-6-luna".into());
+        crate::config::save_machine_config(&cfg).unwrap();
+
+        let _hook = install_test_backend(
+            &r.id,
+            Arc::new(ScriptedBackend::ok_file(ok_review_body("0001"))),
+        );
+        tick_retry(&r).unwrap();
+        wait_slots_consumed(&r, &["opencode"]);
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(
+            log.contains("plan-review: opencode driver codex"),
+            "durable driver evidence: {log}"
+        );
+        assert!(
+            track_file(dir.path(), "0001", "opencode").is_file(),
+            "the slot keeps its artifact name"
+        );
     }
 
     #[test]

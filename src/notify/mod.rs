@@ -2169,6 +2169,8 @@ mod tests {
                 context_usage: None,
                 last_signal: None,
                 last_tool_title: None,
+                model: None,
+                bin: None,
             }),
         });
         view.ci = Some(crate::state::CiStatusView {

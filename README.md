@@ -319,7 +319,7 @@ GateFail on `cross-model-review` with `address_findings_attempts < 2` does **not
 
 Status JSON includes additive `workflow` `{ id, driver, pending_roles, address_findings_attempts, ci_fix_attempts }` (`address_findings_attempts` and `ci_fix_attempts` omitted when 0), additive `ci` (`pr`, `pr_url`, `head_sha`, `last_summary`, `interval_ms`, `auto_merge`, `merge`) — `null` when phase is not `ci-wait` and no watch state is persisted — and additive `review` (`attempted`, `active`, `verdict`, `report`, `stalled`) — `stalled` omitted when empty; `null` when phase is not `cross-model-review` and no review state is persisted. Existing additive fields include `failure_class`, `next_track`, `auto_start`, `parked_next` (omitted when none), `phase_started_at`, `run_epoch`, `failure_artifact`. CLI `status` / `GET /v1/status` also attach additive `ticker` (`{ owner: "serve", port }` when coordinator health answers, or `{ owner: "none" }`). Poll-path `run::status` / `from_record` omit `ticker`.
 
-**Plan-review:** adapter starts `agy --print` and `opencode run` once each (cwd = workspace root). Agy uses `--print-timeout` = remaining budget, `--dangerously-skip-permissions`, `--output-format json`. OpenCode takes its directory from the child cwd (workspace root; no `--dir` — `opencode v2.0.32` rejects it), `--format json`, **prompt on stdin** (not argv — npm `.cmd` `%*` truncates newlines), no `--auto`. A degenerate `opencode-review.md` (missing `# Track review:` + track id) is not Success: one in-thread retry, then role failure. Review files are source of truth (`agy-review.md` / `opencode-review.md` on the track, copied into `{state_dir}/reviews/`). Join assembles `{workspace}/AI-review.md`. One reviewer may degrade; **both** missing/fail → Stopped. Line endings normalized to `\n`. Override binaries with `COORDINATOR_AGY_BIN` / `COORDINATOR_OPENCODE_BIN` (else Role Binding `command`, else PATH). Optional ignored live smokes: `COORDINATOR_AGY_LIVE=1` and `COORDINATOR_OPENCODE_LIVE=1` (do not reuse `COORDINATOR_REVIEW_LIVE`). The 0011 cross-model gate still uses `opencode run --format default` (cwd = execution repo) with **prompt on stdin** and no `--auto`.
+**Plan-review:** adapter starts `agy --print` and `opencode run` once each (cwd = workspace root). Agy uses `--print-timeout` = remaining budget, `--dangerously-skip-permissions`, `--output-format json`. OpenCode takes its directory from the child cwd (workspace root; no `--dir` — `opencode v2.0.32` rejects it), `--format json`, **prompt on stdin** (not argv — npm `.cmd` `%*` truncates newlines), no `--auto`. A degenerate `opencode-review.md` (missing `# Track review:` + track id) is not Success: one in-thread retry, then role failure. Review files are source of truth (`agy-review.md` / `opencode-review.md` on the track, copied into `{state_dir}/reviews/`). Join assembles `{workspace}/AI-review.md`. One reviewer may degrade; **both** missing/fail → Stopped. Line endings normalized to `\n`. Override binaries with `COORDINATOR_AGY_BIN` / `COORDINATOR_OPENCODE_BIN` (else Role Binding `command`, else PATH). **0110:** the driver follows the binding, not the slot name — an `agy` slot may keep `agy` or adopt `codex`, an `opencode` slot may keep `opencode` or adopt `codex`. One `PlanReviewDriver` decision feeds the pre-spawn resolver, argv and backend; a pair with no adoption path (`plan_reviewer_agy` + `opencode`) writes a Permission role outcome, names the allowed set and spawns nothing. Artifact names stay slot-based (`agy-review.md` / `opencode-review.md`). Optional ignored live smokes: `COORDINATOR_AGY_LIVE=1` and `COORDINATOR_OPENCODE_LIVE=1` (do not reuse `COORDINATOR_REVIEW_LIVE`). The 0011 cross-model gate still uses `opencode run --format default` (cwd = execution repo) with **prompt on stdin** and no `--auto`.
 
 **Injected prompt contract:** adapter injects a **per-phase** body (not one shared blurb). Every one of the six Adapter phase bodies (`plan`, `fold`, `implement`, `address-findings`, `address-ci`, `advance`), the self-check clause and the continuation prompt requires a terminal `Blocked: <reason>` (or `<canonical-phase> blocked: <reason>`) for incomplete work, with no self-check/`next_track:` tail on a blocked turn; successful turns keep their existing control-line contracts. Each Grok-bound phase that loads a skill (`plan` / `fold` / `implement` / `address-findings` / `advance`) and each plan-review slot names that phase’s skill as an absolute `{workspace|execution}/.agents/skills/<name>/SKILL.md` path (planning skills live above the product git root and are not auto-discovered from `grok_cwd`). `plan`, plan-review, and `implement` include a live-research line (verify pins/APIs against primary sources). Adapter-driven Grok turns complete by **ending the turn** — do **not** run `coordinator outcome write` during that inject (file_wait / hooks still use the CLI). `address-ci` is also Grok-bound (implementor), carries the gate's failing checks and (0101) uses the prepared route: it names the target `Execution repo:` and installs that target as the per-turn ACP root; it does not name a phase skill. A project or track whose row/target cannot be resolved now stops `address-ci` with `permission` instead of running the legacy layout prompt. Mid-inject CLI writes that change `state.phase` are ignored when the turn returns (`apply_turn` skips if the live phase drifted from the injected phase).
 
@@ -730,7 +730,7 @@ There are **no skip slots**. `cross-model-review` is a real one-shot gate (track
 - **Migration / rollback.** `delivery_target` and `gate_target_journal` are additive optional fields; an old `run-state.json` loads them as `None` and gates re-resolve. A reverted binary ignores the fields. Restore refuses when the frozen repo has no checkpoint ref (`restore refused: no checkpoint for this epoch in <repo>`) instead of rewinding the wrong repo; recover with `run --track <id>` or delete the stale namespaced ref. Reap is bounded to the stored target, the primary/epoch and registered bindings, and never deletes outside `refs/coordinator/checkpoints/<project>/`. For a rollback, stop the affected run, revert the product commit, remove only `{state_dir}/leg-baseline.json` before running the old code, then take a fresh capture or restart explicitly; never delete evidence or other state and never auto-advance a stop.
 - **Retained limits.** Omit-pick/`finish_advance` still probe the primary for a merged PR; unregistered absolute row paths still never publish; concurrent runs (0073), untracked-content detection, CRLF normalization and the 0063 Completed-row writer are unchanged.
 
-After implement, Coordinator runs a **fresh, read-only CLI exec** (not a Grok Session) in Role Binding order **Codex → Claude → OpenCode**. Defaults ship `model: null` (omit `-m` / `--model`). File slug is the binding `harness` field (`review.codex.md`). Coordinator **does not** write `review.md`.
+After implement, Coordinator runs a **fresh, read-only CLI exec** (not a Grok Session) in Role Binding order **Codex → Claude → OpenCode**. Defaults ship `model: null` (omit `-m` / `--model`). File slug is the binding `harness` field (`review.codex.md`). Coordinator **does not** write `review.md`. A tier bound to any other harness is now a **Permission** skip that names the unsupported harness (before 0110 it fell through `argv_for`'s `_` arm and silently ran codex). Cross-model `model_swap` pending entries apply only at **gate start**, never between tiers.
 
 | Item | Behavior |
 |------|----------|
@@ -800,7 +800,7 @@ $env:COORDINATOR_CURSOR_LIVE = "1"
 cargo test cursor_live -- --ignored --nocapture
 ```
 
-`COORDINATOR_GROK_BIN` overrides the `grok` executable (absolute path) for the **grok** harness. `COORDINATOR_CURSOR_BIN` does the same for **cursor**. Adapter ticks for plan/fold/implement/advance resolve the **phase** Role Binding (`plan` → `planner`, `implement` → `implementor`, `fold`/`advance` inherit `planner` unless optional `fold`/`next` keys are present with a non-empty `command`). CLI / HTTP `harness grok start` still uses implementor-then-planner (no phase context). Default resolution walks `PATH` + Windows `PATHEXT` (no `which` crate). A non-empty binding `model` is passed on **new** session start only (`grok agent -m {model} stdio`, or cursor `--model` before `acp`); a reused live session keeps its model. Role Binding `harness: cursor` / `command: cursor-agent` is a long-lived ACP adapter (`--yolo --trust acp`, auth `cursor_login`, compact `/summarize`). Toggle planner+implementor (and present `fold`/`next`) with `coordinator roles use grok|cursor` without editing `config.json`. Defaults stay Grok. Non-ACP `harness` values (OpenCode, agy, …) still fail `permission`.
+`COORDINATOR_GROK_BIN` overrides the `grok` executable (absolute path) for the **grok** harness. `COORDINATOR_CURSOR_BIN` does the same for **cursor**. Adapter ticks for plan/fold/implement/advance resolve the **phase** Role Binding (`plan` → `planner`, `implement` → `implementor`, `fold`/`advance` inherit `planner` unless optional `fold`/`next` keys are present with a non-empty `command`). CLI / HTTP `harness grok start` still uses implementor-then-planner (no phase context). Default resolution walks `PATH` + Windows `PATHEXT` (no `which` crate). A non-empty binding `model` is passed on **new** session start only (`grok agent -m {model} stdio`, or cursor `--model` before `acp`); a reused live session keeps its model **and is only reused when `adapter`+`model`+resolved `bin` match the binding** (0110). A same-harness model/command swap therefore recycles the old session at the next phase boundary through the existing `recycle_mismatch` path; the persist/status carry additive `model`/`bin` (no persist version bump), and a pre-upgrade persist forces one honest recycle. Role Binding `harness: cursor` / `command: cursor-agent` is a long-lived ACP adapter (`--yolo --trust acp`, auth `cursor_login`, compact `/summarize`). Toggle planner+implementor (and present `fold`/`next`) with `coordinator roles use grok|cursor` without editing `config.json`. Defaults stay Grok. Non-ACP `harness` values (OpenCode, agy, …) still fail `permission`.
 
 Default `role_bindings` in `config.json`:
 
@@ -894,8 +894,44 @@ coordinator harness grok status [--project …]
 coordinator harness grok shutdown [--project …]
 coordinator roles show
 coordinator roles use grok|cursor
+coordinator roles swap [<role>] [--harness H] [--command C] [--model M|--clear-model] [--json]
+coordinator roles swap --status [--role R] [--json]
+coordinator roles swap <role> --cancel
+coordinator roles swap --unlock
+coordinator roles rollback <role> [--from <snapshot>] [--json]
+coordinator roles prove <role> [--project <id>] [--json]
 coordinator serve [--port <u16>] [--check]   # default 7420, 127.0.0.1 only
 ```
+
+**Role swap (0110).** `roles swap` is the validated, reversible editor: it resolves the binary the
+**runtime** would spawn for that role class, runs its `--version`, runs the companion auth CLI (for
+adapter `codex-acp` / `claude-agent-acp` the shim is not asked to log in), and checks the model list
+where the harness exposes one (`opencode models`, `grok models`, `agy models`). Codex/Claude/Cursor
+record `model_check: unverified` — that is **not** availability proof. An OpenCode `#variant` matches
+its **base** selector and is recorded as catalog-defined (the installed `opencode v2.0.32` list has no
+`#` line). A refusal leaves the previous binding byte-identical and names every probe. The write is
+field-exact: a unique `{COORDINATOR_HOME}/config.json.bak-roles-<role>-<UTC-millis>-<nonce>` snapshot,
+a re-load before save, and a reloaded `harness`/`command`/`model` comparison; a mismatch restores the
+snapshot. `rollback` restores the exact previous object from `last[role].snapshot` (or `--from`) and
+takes its own pre-rollback snapshot. The machine ledger is `{COORDINATOR_HOME}/role-swap.json`
+schema 1 (`pending`, `last`, `errors`); `roles swap --status` renders it plus the lock holder.
+
+A swap requested while the role is in use by a `Running`/`Paused` run is **deferred**: config is not
+written, the in-flight leg keeps the previous binding, and the running `serve` consumes the pending
+entry in-process at the next phase that resolves the role (before the binding read and before any
+spawn) under `{COORDINATOR_HOME}/role-swap.lock`. **Never restart `serve` to apply a swap.** A
+crash-left lock is recovered explicitly with `roles swap --unlock` (printed holder pid/started_at);
+there is no silent age-only deletion. `roles prove` is read-only and Pings the holder; `proven: true`
+requires the requested role to be the current phase's role and the live `adapter`+`model`+`bin` to
+equal the binding, with both the persisted and Ping pids present and equal.
+
+The live holder identity is now `adapter` + `model` + resolved `bin` (additive persist/status fields).
+A same-harness model/command swap therefore recycles through the existing `recycle_mismatch` path at
+the next boundary; 0110 adds **no** second termination path. `Duty::ModelSwap`
+(`COORDINATOR_FEATURE_MODEL_SWAP`, default on) gates new swap writes and automatic pending
+application; `rollback`, `prove` and `swap --status` stay available as recovery/read-only.
+`roles set` / `roles use` take the same lock (OD-110-5 arm A); other config writers are **not**
+serialized, so a raw writer landing between the swap's final reload and save can still be lost.
 
 `--project` stays optional. With more than one registered project, CLI omit infers unique cwd containment then last-used (`{COORDINATOR_HOME}/last-used.json`, not a secret, not `config.json`). HTTP never infers from the serve cwd.
 
@@ -907,7 +943,7 @@ HTTP: `POST/GET /v1/projects` (layout fields + optional `auto_merge`), `POST /v1
 
 | Harness | PATH | Auth / ready | Login (print only) |
 |---------|------|----------------|--------------------|
-| grok | `--version` | nonempty `XAI_API_KEY` **or** `%USERPROFILE%\.grok\auth.json` exists (unread; `GROK_HOME` when set) | `grok login` |
+| grok | `--version` | `grok models` output: `logged in` / a parsed list → ready; `not authenticated` → auth. `XAI_API_KEY` / `~/.grok/auth.json` is a fallback only when the models probe is unavailable. | `grok login` |
 | agy | `--version` | PATH only (no auth CLI) | `agy` |
 | opencode | `--version` | `auth list` (any credential line) | `opencode auth login` |
 | codex | `--version` | `login status` exit 0 | `codex login` |
