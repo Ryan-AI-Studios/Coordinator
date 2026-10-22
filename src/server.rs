@@ -191,13 +191,42 @@ pub async fn serve(port: u16) -> Result<(), CoordinatorError> {
 
 /// Bind + tick until `shutdown` completes. Writes `{COORDINATOR_HOME}/serve.json`
 /// after a successful bind; deletes it on the way out.
+///
+/// This is the production wiring: it always injects [`DEFAULT_SERVE_PORT`] as the
+/// guard's default port, so a `serve --port 7421` never attaches to a healthy 7420
+/// through the lease arm (0116).
 pub async fn serve_until<F>(port: u16, shutdown: F) -> Result<(), CoordinatorError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    serve_until_with_default(port, DEFAULT_SERVE_PORT, shutdown).await
+}
+
+/// [`serve_until`] with an injectable default port (tests only; production always
+/// passes [`DEFAULT_SERVE_PORT`]).
+///
+/// The start guard is the shipped [`crate::watch::decide_serve_attach_with_default`]
+/// decision, so `serve` refuses to start a second machine ticker: health on the
+/// requested port, or — only when the requested port is the default — health on the
+/// lease port, exits 0 **before** binding, without rewriting the lease and without
+/// touching the running process. A stale/torn/unknown lease never blocks a start
+/// (health JSON is the truth). `SkipOccupied` falls through to the real bind, which
+/// keeps the existing `bind ...` error for a foreign occupant. The decision's bind
+/// probe is transient and only classifies `Start` vs occupied; another process may
+/// still take the port before the real bind below (same error, no new failure class).
+async fn serve_until_with_default<F>(
+    port: u16,
+    default_port: u16,
+    shutdown: F,
+) -> Result<(), CoordinatorError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     require_loopback(crate::config::LOOPBACK)?;
-    if crate::watch::coordinator_serve_listening(port) {
-        eprintln!("already listening on 127.0.0.1:{port}");
+    if let crate::watch::ServeAttach::Attach { port: owner } =
+        crate::watch::decide_serve_attach_with_default(port, default_port)
+    {
+        eprintln!("already listening on 127.0.0.1:{owner}");
         return Ok(());
     }
     let addr = loopback_addr(port);
@@ -1424,6 +1453,257 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
+    }
+
+    // ---- 0116 start guard -------------------------------------------------
+
+    /// A loopback port that nothing is listening on right now.
+    fn refused_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        port
+    }
+
+    /// A free port that is neither the machine default nor any of `excluded`
+    /// (never assert-and-hope: a draw of 7420 would make these tests flaky on a
+    /// host that runs the production serve).
+    fn free_port_excluding(excluded: &[u16]) -> u16 {
+        loop {
+            let port = refused_port();
+            if port != DEFAULT_SERVE_PORT && !excluded.contains(&port) {
+                return port;
+            }
+        }
+    }
+
+    fn isolate_serve_home() -> tempfile::TempDir {
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        home
+    }
+
+    fn release_serve_home() {
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    fn wait_until_healthy(port: u16) {
+        use crate::watch::coordinator_serve_listening;
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        while !coordinator_serve_listening(port) {
+            assert!(
+                started.elapsed() <= Duration::from_secs(5),
+                "serve did not become healthy on {port}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Run `serve_until_with_default` on its own runtime thread; the returned sender
+    /// shuts it down.
+    #[allow(clippy::type_complexity)]
+    fn spawn_serve_with_default(
+        port: u16,
+        default_port: u16,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        std::thread::JoinHandle<Result<(), CoordinatorError>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(serve_until_with_default(port, default_port, async move {
+                    let _ = rx.await;
+                }))
+        });
+        (tx, handle)
+    }
+
+    fn stop_serve(
+        tx: tokio::sync::oneshot::Sender<()>,
+        handle: std::thread::JoinHandle<Result<(), CoordinatorError>>,
+    ) {
+        let _ = tx.send(());
+        handle.join().unwrap().unwrap();
+    }
+
+    /// Run `serve_until` (the **public** production wiring) on its own runtime thread.
+    fn spawn_serve_until(
+        port: u16,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        std::thread::JoinHandle<Result<(), CoordinatorError>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(serve_until(port, async move {
+                    let _ = rx.await;
+                }))
+        });
+        (tx, handle)
+    }
+
+    /// The only assertion that separates correct
+    /// `serve_until(p) -> serve_until_with_default(p, DEFAULT_SERVE_PORT)` wiring
+    /// from a one-token `(port, port)` mistake: with a healthy lease on another
+    /// port, a `(port, port)` delegation would attach and never bind `p`, so the
+    /// health wait below times out.
+    #[test]
+    fn serve_until_pins_default_port_wiring() {
+        use crate::serve_lease::{read_serve_lease, write_serve_lease};
+        use crate::watch::spawn_health_hold;
+
+        let _guard = test_env_lock();
+        let _home = isolate_serve_home();
+
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        let leased = hold.port;
+        write_serve_lease(leased).unwrap();
+
+        let port = free_port_excluding(&[leased]);
+        let (tx, handle) = spawn_serve_until(port);
+        wait_until_healthy(port);
+        assert_eq!(
+            read_serve_lease().expect("lease after bind").port,
+            port,
+            "public serve_until must bind the requested port, not attach to the lease port"
+        );
+
+        stop_serve(tx, handle);
+        assert!(read_serve_lease().is_none());
+        drop(hold);
+        release_serve_home();
+    }
+
+    /// The lease arm (P2): a 7420 start while a healthy coordinator answers on the
+    /// lease port attaches and exits without binding, without a lease write, and
+    /// without touching that process. Hermetic-only — on a host where production
+    /// answers 7420, the requested-port arm wins first.
+    #[test]
+    fn second_serve_on_lease_port_is_ok_without_writing_a_lease() {
+        use crate::serve_lease::{read_serve_lease, serve_lease_path, write_serve_lease};
+        use crate::watch::{
+            ServeAttach, coordinator_serve_listening, decide_serve_attach_with_default,
+            spawn_health_hold,
+        };
+
+        let _guard = test_env_lock();
+        let _home = isolate_serve_home();
+
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        let leased = hold.port;
+        write_serve_lease(leased).unwrap();
+        let path = serve_lease_path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let requested = free_port_excluding(&[leased]);
+        assert_eq!(
+            decide_serve_attach_with_default(requested, requested),
+            ServeAttach::Attach { port: leased },
+            "the decision must take the lease arm, not the requested-port arm"
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(serve_until_with_default(requested, requested, async {}))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "attach must not rewrite the lease"
+        );
+        assert_eq!(
+            read_serve_lease().expect("lease still present").port,
+            leased
+        );
+        assert!(
+            coordinator_serve_listening(leased),
+            "the healthy lease-port serve must be left running"
+        );
+        drop(hold);
+        release_serve_home();
+    }
+
+    /// A stale lease (names a dead port) must never block a start.
+    #[test]
+    fn stale_lease_starts_serve_on_default_and_overwrites_it() {
+        use crate::serve_lease::{read_serve_lease, write_serve_lease};
+
+        let _guard = test_env_lock();
+        let _home = isolate_serve_home();
+
+        let dead = free_port_excluding(&[]);
+        write_serve_lease(dead).unwrap();
+        let port = free_port_excluding(&[dead]);
+
+        let (tx, handle) = spawn_serve_with_default(port, port);
+        wait_until_healthy(port);
+        assert_eq!(read_serve_lease().expect("lease after bind").port, port);
+
+        stop_serve(tx, handle);
+        assert!(read_serve_lease().is_none());
+        release_serve_home();
+    }
+
+    /// A torn lease (`read_serve_lease() == None`) must never block a start.
+    #[test]
+    fn torn_lease_starts_serve_on_default() {
+        use crate::serve_lease::read_serve_lease;
+
+        let _guard = test_env_lock();
+        let home = isolate_serve_home();
+
+        let torn = home.path().join("serve.json");
+        std::fs::write(&torn, b"{not valid json").unwrap();
+        assert!(read_serve_lease().is_none());
+
+        let port = free_port_excluding(&[]);
+        let (tx, handle) = spawn_serve_with_default(port, port);
+        wait_until_healthy(port);
+        assert_eq!(read_serve_lease().expect("rewritten lease").port, port);
+
+        stop_serve(tx, handle);
+        assert!(read_serve_lease().is_none());
+        release_serve_home();
+    }
+
+    /// A non-default requested port ignores a healthy lease (0110's 7421 path).
+    #[test]
+    fn non_default_port_ignores_a_healthy_lease() {
+        use crate::serve_lease::{read_serve_lease, write_serve_lease};
+        use crate::watch::spawn_health_hold;
+
+        let _guard = test_env_lock();
+        let _home = isolate_serve_home();
+
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        let leased = hold.port;
+        write_serve_lease(leased).unwrap();
+
+        let requested = free_port_excluding(&[leased]);
+        let injected_default = free_port_excluding(&[leased, requested]);
+        let (tx, handle) = spawn_serve_with_default(requested, injected_default);
+        wait_until_healthy(requested);
+        assert_eq!(
+            read_serve_lease().expect("lease after bind").port,
+            requested,
+            "a non-default port must bind, not attach to the healthy lease port"
+        );
+
+        stop_serve(tx, handle);
+        assert!(read_serve_lease().is_none());
+        drop(hold);
+        release_serve_home();
     }
 
     #[tokio::test]

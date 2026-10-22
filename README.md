@@ -56,7 +56,7 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 | Machine home (registry) | `%LOCALAPPDATA%\coordinator\` | `COORDINATOR_HOME` |
 | Registry file | `{home}/registry.json` | — |
 | Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`, `phase_timeouts_secs`, `hermes`, `features`) | — |
-| Serve lease | `{home}/serve.json` | written after a successful `serve` bind; deleted on graceful shutdown |
+| Serve lease | `{home}/serve.json` | written after a successful `serve` bind; deleted on graceful shutdown (a stale lease is harmless — it never blocks a bind) |
 | Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
 | Active Phase Outcome | `{state_dir}/outcomes/current.json` | same state-dir rules |
 | Last applied outcome | `{state_dir}/outcomes/current.applied.json` | written on successful apply; `current.json` removed |
@@ -227,7 +227,9 @@ When more than one project is registered, omit `--project` is OK from a unique r
 
 ### Two daily paths
 
-Keep both. After a reboot the operator starts installed `coordinator serve` (or `coordinator ui`) again — there is **no** login installer or Windows Service.
+Keep both. After a reboot the logon task `CoordinatorServe` starts `coordinator serve` (see **Serve
+supervision (0116)** below); before the task is installed the operator starts it. There is **no**
+Windows Service and no second start path.
 
 | Path | When | What happens |
 |------|------|----------------|
@@ -247,17 +249,88 @@ coordinator status --project C:\dev\Orca
 
 **`serve --check`:** one-shot. Does **not** bind and does **not** write a lease. Default probe is the same Auto as `run` (healthy lease, else 7420). `--check --port N` probes N only. Exit **0** + `{ok:true, service, port, source}` when coordinator; exit **1** + `{ok:false, port, source}` otherwise. `source` is `flag` | `lease` | `default`.
 
-**Already listening:** a second `serve` on a live coordinator port does **not** bind. stderr: already listening. Exit **0**. Occupied by a non-coordinator process → error (exit 1).
+**Already listening:** a second `serve` on a live coordinator port does **not** bind. stderr: already listening. Exit **0**. This is `serve`'s own start guard (the Status Surface's `decide_serve_attach`): when the requested port is **7420** and `serve.json` names a port where a coordinator answers, it also exits **0** without binding, without rewriting the lease, and without touching that process — one machine ticker only. A stale, torn or unknown-version lease never blocks a start (health JSON is the truth). Occupied by a non-coordinator process → error (exit 1); the product never kills an occupant.
 
-**Custom-port serve:** `serve --port 7500` writes the lease. A later default `run` finds that port via the lease — `--detach` is no longer required.
+**Custom-port serve:** `serve --port 7500` writes the lease. A later default `run` finds that port via the lease — `--detach` is no longer required. A non-default port is an explicit operator action and is **not** blocked by a healthy lease (0110's isolated 7421 proof path); the guard protects the machine ticker (the default port) only.
 
-**Optional operator login task (not a CLI, not installed by this product):**
+### Serve supervision (0116)
 
+There is exactly **one** supervisor: the Windows logon Scheduled Task `CoordinatorServe`, which runs
+the installed `coordinator.exe serve --port 7420` as the interactive user at logon.
+`Start-ScheduledTask -TaskName CoordinatorServe` is the supported on-demand start and the recovery
+path after a dead serve. The task is the only owner of the machine ticker; `RestartOnFailure` is
+configured (3 attempts, 1 min apart) but Windows applies it only when the action **fails to start** —
+it does not revive a serve that exits non-zero or is killed (verified on this host; see honest
+limits). `serve` itself refuses to start a second machine ticker: if a
+coordinator answers on 7420, or on the lease port while 7420 is requested, it exits 0 without
+binding, without rewriting the lease, and without touching the running process. **Nothing autonomous
+kills serve.** A manual `coordinator serve` in a terminal is a debugging path: it is not adopted by
+the task and not supervised. `coordinator self-update` never restarts serve (0108); after a swap,
+start it with the task. The paused Hermes `ensure_serve()` carriers may be retired by 0111 only after
+this task is installed and a logon start is proven — do not resume them. ADR-0024 stop semantics are
+unchanged: Stop aborts the phase and leaves harness sessions running; process kill is not the stop
+mechanism.
+
+Install (normal PowerShell; elevate only if `Register-ScheduledTask` returns Access Denied — the task
+still runs as the interactive user). `$exe` must match the installed binary; the command fails loudly
+if the path is missing, because a task registered against a missing path only fails at logon
+(`LastTaskResult 0x80070002`):
+
+```powershell
+$exe     = (Get-Command coordinator -CommandType Application -ErrorAction Stop).Source
+if (-not (Test-Path -LiteralPath $exe)) { throw "coordinator.exe not found: $exe" }
+$user    = "$env:USERDOMAIN\$env:USERNAME"
+$action  = New-ScheduledTaskAction -Execute $exe -Argument 'serve --port 7420' -WorkingDirectory $env:USERPROFILE
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+$settings  = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -MultipleInstances IgnoreNew `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName 'CoordinatorServe' `
+    -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+    -Description 'Coordinator machine ticker: coordinator.exe serve --port 7420. Starts a missing serve; never kills a live one.' `
+    -Force
+$exe   # record this exact path: it is the task's verified action target
 ```
-schtasks /Create /TN "Coordinator serve" /TR "<full-path>\coordinator.exe serve" /SC ONLOGON /IT /F
+
+```powershell
+# verify
+Get-ScheduledTask -TaskName 'CoordinatorServe' | Select-Object -ExpandProperty Actions
+Get-ScheduledTask -TaskName 'CoordinatorServe' | Select-Object -ExpandProperty Settings
+Get-ScheduledTask -TaskName 'CoordinatorServe' | Get-ScheduledTaskInfo
+coordinator serve --check
+
+# on-demand start (the supported manual start)
+Start-ScheduledTask -TaskName 'CoordinatorServe'
+
+# stop half of the deploy preflight (0108 self-update still refuses while a live coordinator.exe exists)
+# confirm with: coordinator serve --check   # exit 1 when serve is really down
+Stop-ScheduledTask -TaskName 'CoordinatorServe'
+
+# uninstall
+Stop-ScheduledTask -TaskName 'CoordinatorServe' -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName 'CoordinatorServe' -Confirm:$false
 ```
 
-Owner machine policy. `/IT` so it runs only while that user is logged on. `/ru System` is wrong (not interactive). Coordinator does **not** install this.
+Why each setting is load-bearing: the **72 h default execution limit would kill a long-lived serve**,
+so `ExecutionTimeLimit` must be `PT0S`; battery/idle defaults would stop a laptop task; `IgnoreNew`
+prevents a second task instance; `RestartCount`/`RestartInterval` are the only restart mechanism;
+`Interactive`/`Limited` keep harness OAuth/profile working and avoid elevation.
+
+**Honest limits.** Logon-only (no ticker before the user logs on — harness OAuth needs the interactive
+user); the task supervises only the process **it** started. `RestartOnFailure` retries only a task
+whose action cannot start (`LastTaskResult 0x80070002`): the isolated 0116 proof observed the configured
+3 retries for a missing action, but **no** retry after a serve exited non-zero or was killed, so a
+crashed serve is **not** revived automatically. Recovery is
+`Start-ScheduledTask -TaskName CoordinatorServe` (verified: kill the isolated serve, start the task,
+and a new serve answers). There is no timer, no watchdog loop, no kill. A serve that is bound but stops
+answering `/health` is not restarted. **A logon run that finds a healthy serve exits 0 and is not
+re-run until the next logon or a manual `Start-ScheduledTask`; if that serve later dies there is no
+automatic retry — recovery is `Start-ScheduledTask -TaskName CoordinatorServe`.** On an interactive-logon
+task a console-subsystem exe may show a console window; that is accepted (no wrapper, no hidden second
+path).
 
 ### Autonomous pipeline dogfood
 
@@ -268,7 +341,7 @@ cd C:\dev\coordinator\coordinator
 # Do NOT: coordinator project scan --root C:\dev --add
 # Do NOT: coordinator run --track 0001   (or 0002–0013, including 0009)
 cargo install --path . --locked
-coordinator serve                 # leave running; default 7420
+coordinator serve                 # pre-install/manual path; leave running, default 7420. Supported always-on = the logon task
 coordinator serve --check         # exit 0; service=coordinator
 coordinator ui                    # attach; do not start a second ticker
 coordinator run --project C:\dev\Helping-Hands --track 0099 --detach
@@ -560,7 +633,10 @@ snapshot, git read, build or file write.
   them manually when you no longer need the rollback.
 - **Operator preflight.** Stop **every** `coordinator.exe` — `serve`, the UI, and holders (let 0107's
   sweep or `harness grok shutdown` end holders) — then run the **installed or built** exe directly:
-  `coordinator self-update`, then start `serve`. `cargo run -- self-update` always refuses because
+  `coordinator self-update`, then start `serve`. When the logon task owns serve, the stop half is
+  `Stop-ScheduledTask -TaskName CoordinatorServe` (not a PID) and the start half is
+  `Start-ScheduledTask -TaskName CoordinatorServe` (or the operator foreground command; see **Serve
+  supervision (0116)**). `cargo run -- self-update` always refuses because
   the invoking `cargo.exe` is in the process table; that is correct, not a bug. `--check` runs every
   gate and reports, touching nothing. The product never stops, restarts or kills any process; a live
   `coordinator.exe` is a refusal. Tests use temp install/artifact fixtures only and never swap the

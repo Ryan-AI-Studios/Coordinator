@@ -300,7 +300,11 @@ pub fn ticker_view_with_default(default_port: u16) -> crate::state::TickerView {
     }
 }
 
-/// Status Surface attach vs start vs skip (health JSON, never bind-probe for “up”).
+/// Status Surface attach vs start vs skip. Health decides *up* (a healthy coordinator
+/// on the requested port, or — for the default port — on the lease port); a transient
+/// bind probe only classifies `Start` vs `SkipOccupied`. Since 0116 this is also
+/// `serve`'s own start guard (`serve_until_with_default`), so `serve` inherits that
+/// probe before its real bind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeAttach {
     Attach { port: u16 },
