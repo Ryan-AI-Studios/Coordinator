@@ -1973,18 +1973,33 @@ impl PlanReviewBackend for GatedBackend {
     }
 }
 
-/// 0113 seam control: hold only `opencode` while `agy` succeeds and writes its review.
+/// 0113 seam control: two independent per-slug gates.
+///
+/// Both workers are held on the spawning tick (so that tick cannot consume either one), then `agy`
+/// is released and becomes a ready-but-pending sibling while `opencode` is still in flight.
 #[cfg(test)]
-struct GateOpencodeBackend {
-    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+struct TwoGateBackend {
+    agy: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    opencode: Arc<(Mutex<bool>, std::sync::Condvar)>,
     body: String,
 }
 
 #[cfg(test)]
-impl PlanReviewBackend for GateOpencodeBackend {
+impl TwoGateBackend {
+    fn gate_for(&self, slug: &str) -> Option<&Arc<(Mutex<bool>, std::sync::Condvar)>> {
+        match slug {
+            REVIEW_SLUG_AGY => Some(&self.agy),
+            REVIEW_SLUG_OPENCODE => Some(&self.opencode),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl PlanReviewBackend for TwoGateBackend {
     fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
-        if req.slug == REVIEW_SLUG_OPENCODE {
-            let (lock, cv) = &*self.gate;
+        if let Some(gate) = self.gate_for(&req.slug) {
+            let (lock, cv) = &**gate;
             let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
             while !*g {
                 g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
@@ -4415,19 +4430,59 @@ mod tests {
         let r = rec(dir.path());
         enter_plan_review(&r, "0001");
 
-        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let agy_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let opencode_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let _hook = install_test_backend(
             &r.id,
-            Arc::new(GateOpencodeBackend {
-                gate: gate.clone(),
+            Arc::new(TwoGateBackend {
+                agy: agy_gate.clone(),
+                opencode: opencode_gate.clone(),
                 body: ok_review_body("0001"),
             }),
         );
-        tick_retry(&r).unwrap();
 
+        // Both workers are held, so the spawning tick cannot consume either one.
+        tick_retry(&r).unwrap();
         let roles = outcome_roles_dir(&r).unwrap();
         let agy_json = roles.join("agy.json");
         let opencode_json = roles.join("opencode.json");
+
+        // Both workers are now inside `apply_slot_result` (the stamp is written before the backend).
+        let started_deadline = Instant::now() + WORKER_CEILING;
+        loop {
+            let s = load_run_state(&r).unwrap();
+            if s.plan_review_slot_ran.iter().any(|x| x == "agy")
+                && s.plan_review_slot_ran.iter().any(|x| x == "opencode")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < started_deadline,
+                "both workers must start: {}",
+                plan_review_diag(&s)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Release `agy` only: it becomes a ready, pending sibling while `opencode` is in flight.
+        {
+            let (lock, cv) = &*agy_gate;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            cv.notify_all();
+        }
+        let ready_deadline = Instant::now() + WORKER_CEILING;
+        while !agy_json.is_file() && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(agy_json.is_file(), "agy mailbox was written");
+        assert!(
+            load_run_state(&r)
+                .unwrap()
+                .pending_roles
+                .iter()
+                .any(|x| x == "agy"),
+            "agy is still pending before any helper tick"
+        );
 
         let waiter = r.clone();
         let handle = std::thread::spawn(move || {
@@ -4438,6 +4493,10 @@ mod tests {
         assert!(
             !handle.is_finished(),
             "the helper must not return while a worker is in flight"
+        );
+        assert!(
+            inflight_count(&r.id) >= 1,
+            "opencode is still in flight at T+300ms"
         );
         let mid = load_run_state(&r).unwrap();
         assert!(
@@ -4451,7 +4510,7 @@ mod tests {
         );
 
         {
-            let (lock, cv) = &*gate;
+            let (lock, cv) = &*opencode_gate;
             *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
             cv.notify_all();
         }
