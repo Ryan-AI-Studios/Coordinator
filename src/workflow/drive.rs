@@ -833,7 +833,7 @@ fn take_pending_save_failure(project_id: &str, slug: &str) -> bool {
     }
 }
 
-pub(crate) fn remove_pending(record: &ProjectRecord, slug: &str) -> Result<()> {
+fn remove_pending(record: &ProjectRecord, slug: &str) -> Result<()> {
     with_run_state_lock(record, || {
         let mut s = load_run_state(record)?;
         s.pending_roles.retain(|x| x != slug);
@@ -845,6 +845,37 @@ pub(crate) fn remove_pending(record: &ProjectRecord, slug: &str) -> Result<()> {
             ));
         }
         save_run_state(record, &s)
+    })
+}
+
+/// Remove a pending slug only while the live run still matches `run_epoch` / `track_id`.
+///
+/// 0113: the stamp-failure fallback must not let a stale worker clear a slot that a newer run owns.
+/// Returns `true` when the slug was actually removed.
+pub(crate) fn remove_pending_if_epoch(
+    record: &ProjectRecord,
+    slug: &str,
+    run_epoch: u64,
+    track_id: Option<&str>,
+) -> Result<bool> {
+    with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if s.phase != PHASE_PLAN_REVIEW
+            || s.run_epoch != run_epoch
+            || s.track_id.as_deref() != track_id
+        {
+            return Ok(false);
+        }
+        s.pending_roles.retain(|x| x != slug);
+        s.updated_at = chrono::Utc::now();
+        #[cfg(test)]
+        if take_pending_save_failure(&record.id, slug) {
+            return Err(CoordinatorError::Message(
+                "injected remove_pending failure".into(),
+            ));
+        }
+        save_run_state(record, &s)?;
+        Ok(true)
     })
 }
 

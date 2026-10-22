@@ -1120,22 +1120,28 @@ fn is_transient_save_err(e: &CoordinatorError) -> bool {
 /// through the normal join path (the progress line names the cause) instead of hanging on a role
 /// file that will never appear.
 fn write_stamp_failure_outcome(record: &ProjectRecord, req: &PlanReviewRequest, msg: &str) {
-    let Ok(state) = load_run_state(record) else {
-        return;
-    };
-    if !apply_allowed(&state, req) {
-        return;
-    }
     for attempt in 0..STAMP_SAVE_ATTEMPTS {
-        match write_role_outcome(
-            record,
-            &state,
-            &req.slug,
-            OutcomeStatus::Failure,
-            Some(FailureClass::HarnessCrash),
-            Some(msg.to_string()),
-        ) {
-            Ok(()) => return,
+        // Re-load and re-check under the run-state lock on every attempt: an epoch transition
+        // takes the same lock, so the write cannot land in a newer epoch even if the retry ladder
+        // spans one.
+        let outcome = with_run_state_lock(record, || {
+            let state = load_run_state(record)?;
+            if !apply_allowed(&state, req) {
+                return Ok(false);
+            }
+            write_role_outcome(
+                record,
+                &state,
+                &req.slug,
+                OutcomeStatus::Failure,
+                Some(FailureClass::HarnessCrash),
+                Some(msg.to_string()),
+            )?;
+            Ok(true)
+        });
+        match outcome {
+            Ok(true) => return,
+            Ok(false) => return, // a newer epoch/track owns this slot; never write a stale mailbox
             Err(e) if is_transient_save_err(&e) => {
                 if attempt + 1 < STAMP_SAVE_ATTEMPTS {
                     std::thread::sleep(STAMP_SAVE_BACKOFF);
@@ -1144,7 +1150,12 @@ fn write_stamp_failure_outcome(record: &ProjectRecord, req: &PlanReviewRequest, 
             Err(_) => break,
         }
     }
-    let _ = crate::workflow::drive::remove_pending(record, &req.slug);
+    let _ = crate::workflow::drive::remove_pending_if_epoch(
+        record,
+        &req.slug,
+        req.spawn_epoch,
+        req.spawn_track_id.as_deref(),
+    );
 }
 
 /// Record that this slot ran, durably.
@@ -3653,6 +3664,97 @@ mod tests {
         assert!(
             load_run_state(&r).unwrap().plan_review_slot_ran.is_empty(),
             "epoch mismatch must not mark the live run as having run"
+        );
+    }
+
+    /// 0113 stale guard: the stamp-failure mailbox retry and its last-resort removal must not
+    /// touch a slot owned by a newer epoch.
+    #[test]
+    fn stamp_failure_refuses_a_stale_epoch_write_and_removal() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        std::fs::create_dir_all(dir.path().join("conductor").join("0002-Next")).unwrap();
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let first_epoch = load_run_state(&r).unwrap().run_epoch;
+        run::stop(&r).unwrap();
+        enter_plan_review(&r, "0002");
+        let live = load_run_state(&r).unwrap();
+        assert_ne!(live.run_epoch, first_epoch, "the second run is a new epoch");
+        assert!(live.pending_roles.iter().any(|x| x == "opencode"));
+
+        let stale = PlanReviewRequest {
+            slug: "opencode".into(),
+            command: "opencode".into(),
+            model: None,
+            last_message_path: None,
+            workspace_root: dir.path().to_path_buf(),
+            execution_repo: None,
+            track_dir: None,
+            prompt: String::new(),
+            remaining: Duration::from_secs(60),
+            argv: Vec::new(),
+            extra_env: Vec::new(),
+            spawn_epoch: first_epoch,
+            spawn_track_id: Some("0001".into()),
+        };
+
+        write_stamp_failure_outcome(
+            &r,
+            &stale,
+            "plan-review: opencode slot-ran stamp not persisted: injected",
+        );
+        assert!(
+            !outcome_roles_dir(&r)
+                .unwrap()
+                .join("opencode.json")
+                .exists(),
+            "a stale worker must not write a failure mailbox into a newer epoch"
+        );
+        assert!(
+            load_run_state(&r)
+                .unwrap()
+                .pending_roles
+                .iter()
+                .any(|x| x == "opencode"),
+            "the newer run still owns the slot"
+        );
+
+        // The last-resort removal is epoch-guarded too.
+        assert!(
+            !crate::workflow::drive::remove_pending_if_epoch(
+                &r,
+                "opencode",
+                first_epoch,
+                Some("0001")
+            )
+            .unwrap(),
+            "a stale worker must not clear a newer epoch's slot"
+        );
+        assert!(
+            load_run_state(&r)
+                .unwrap()
+                .pending_roles
+                .iter()
+                .any(|x| x == "opencode")
+        );
+        // The live epoch may remove it.
+        assert!(
+            crate::workflow::drive::remove_pending_if_epoch(
+                &r,
+                "opencode",
+                live.run_epoch,
+                Some("0002")
+            )
+            .unwrap()
+        );
+        assert!(
+            !load_run_state(&r)
+                .unwrap()
+                .pending_roles
+                .iter()
+                .any(|x| x == "opencode")
         );
     }
 
