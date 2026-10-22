@@ -136,10 +136,17 @@ impl PlanReviewBackend for CodexCli {
         if let Some(ref td) = req.track_dir {
             watch_paths.push(td.join(format!("{}-review.md", req.slug)));
         }
+        // The child's cwd is the execution repo: `codex exec` refuses to start outside a
+        // trusted directory, and the repo is the trusted one.
+        let cwd = req
+            .execution_repo
+            .as_ref()
+            .unwrap_or(&req.workspace_root)
+            .clone();
         let out = run_process(
             &bin,
             &req.argv,
-            &req.workspace_root,
+            &cwd,
             ProcessWait {
                 timeout: req.remaining,
                 stall: crate::workflow::watchdog::progress_stall_interval(),
@@ -176,10 +183,18 @@ impl PlanReviewBackend for CodexCli {
 pub fn codex_plan_review_argv(
     model: Option<&str>,
     workspace_root: &Path,
+    exec_repo: Option<&Path>,
     last_path: &Path,
 ) -> Vec<String> {
-    let mut args = vec![
-        "exec".into(),
+    let mut args = vec!["exec".into()];
+    // `codex exec` refuses to run outside a trusted directory ("Not inside a trusted
+    // directory and --skip-git-repo-check was not specified"), so the execution repo is
+    // named with `-C` and is also the child's cwd. The cross-model driver does the same.
+    if let Some(dir) = exec_repo.or(Some(workspace_root)) {
+        args.push("-C".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    args.extend([
         "-s".into(),
         "read-only".into(),
         "--ephemeral".into(),
@@ -187,7 +202,7 @@ pub fn codex_plan_review_argv(
         last_path.to_string_lossy().into_owned(),
         "--add-dir".into(),
         workspace_root.to_string_lossy().into_owned(),
-    ];
+    ]);
     if let Some(m) = model
         && !m.trim().is_empty()
     {
@@ -602,7 +617,12 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
             let _ = std::fs::create_dir_all(&tmp);
             let last = tmp.join("last-message.txt");
             (
-                codex_plan_review_argv(binding.model.as_deref(), &paths.workspace_root, &last),
+                codex_plan_review_argv(
+                    binding.model.as_deref(),
+                    &paths.workspace_root,
+                    paths.execution_repo.as_deref(),
+                    &last,
+                ),
                 Some(last),
             )
         }
@@ -2034,7 +2054,12 @@ mod tests {
     #[test]
     fn codex_plan_review_argv_uses_codex_exec_and_a_stdin_prompt() {
         let last = PathBuf::from("C:\\tmp\\last-message.txt");
-        let args = codex_plan_review_argv(Some("gpt-6-luna"), Path::new("C:\\ws"), &last);
+        let args = codex_plan_review_argv(
+            Some("gpt-6-luna"),
+            Path::new("C:\\ws"),
+            Some(Path::new("C:\\exec")),
+            &last,
+        );
         assert_eq!(args[0], "exec");
         assert!(
             args.windows(2).any(|w| w[0] == "-s" && w[1] == "read-only"),
@@ -2051,6 +2076,11 @@ mod tests {
             "{args:?}"
         );
         assert_eq!(args.last().unwrap(), "-", "{args:?}");
+        // `codex exec` refuses to start outside a trusted directory: the exec repo is named.
+        assert!(
+            args.windows(2).any(|w| w[0] == "-C" && w[1] == "C:\\exec"),
+            "{args:?}"
+        );
         // The prompt is stdin, never argv: cmd.exe `%*` truncates newlines.
         assert!(
             !args
@@ -2062,7 +2092,8 @@ mod tests {
 
     #[test]
     fn codex_plan_review_argv_omits_an_empty_model() {
-        let args = codex_plan_review_argv(None, Path::new("C:\\ws"), Path::new("C:\\tmp\\l.txt"));
+        let args =
+            codex_plan_review_argv(None, Path::new("C:\\ws"), None, Path::new("C:\\tmp\\l.txt"));
         assert!(!args.iter().any(|a| a == "-m"), "{args:?}");
     }
 
