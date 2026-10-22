@@ -473,6 +473,9 @@ pub fn status(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
 
 /// Status for all projects (aggregate). One health probe and one feature
 /// snapshot; both cloned onto every view so status and fleet agree.
+///
+/// The `ready` object (0115) is deliberately absent here: this aggregate feeds
+/// the fleet/UI paths, and `ready` is CLI `status --project` only.
 pub fn status_all() -> Result<Vec<StatusView>> {
     let reg = load_registry()?;
     let ticker = watch::ticker_view();
@@ -485,6 +488,61 @@ pub fn status_all() -> Result<Vec<StatusView>> {
         out.push(view);
     }
     Ok(out)
+}
+
+/// CLI `status --project`: like [`status`] plus the additive `ready` object.
+///
+/// `api::status` itself stays unchanged because it is also the HTTP
+/// `GET /v1/status?project` route and the UI Run precheck. The report reuses the
+/// one `FeatureSnapshot` the view already carries, so `features` and
+/// `ready.feature` cannot disagree.
+pub fn status_with_ready(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+    let rec = resolve_selected(project, infer_cwd)?;
+    let mut view = attach_operator_view(run::status(&rec)?);
+    let features = match view.features.as_ref() {
+        Some(features) => features.clone(),
+        None => crate::features::resolve_all(),
+    };
+    view.registry = Some(crate::registry_store::status_view_for(&rec));
+    view.ready = Some(crate::workflow::readiness::status_view(
+        &crate::workflow::readiness::report_with_features(&rec, false, &features),
+    ));
+    Ok(view)
+}
+
+/// Read-only `coordinator ready`: resolve the selector without writing
+/// `last-used.json` (0115). Starts nothing, writes nothing.
+pub fn ready(
+    project: Option<&str>,
+    infer_cwd: bool,
+    all_rows: bool,
+) -> Result<crate::workflow::readiness::ReadyReport> {
+    let rec = resolve_selected_readonly(project, infer_cwd)?;
+    Ok(crate::workflow::readiness::report(&rec, all_rows))
+}
+
+/// Read-only `coordinator ready --all`: one report per registered project.
+///
+/// The feature snapshot is resolved once for the fleet. `readiness::report` is
+/// infallible and every per-project read failure is already a named decision, so
+/// no project can abort the fleet.
+pub fn ready_all(all_rows: bool) -> Result<crate::workflow::readiness::ReadyFleet> {
+    use crate::workflow::readiness;
+    let reg = load_registry()?;
+    let features = crate::features::resolve_all();
+    let home = crate::config::machine_home()?;
+    let mut projects = Vec::with_capacity(reg.projects.len());
+    for rec in reg.list() {
+        projects.push(readiness::report_with_features(rec, all_rows, &features));
+    }
+    Ok(readiness::ReadyFleet {
+        generated_at: chrono::Utc::now(),
+        machine: readiness::MachineReady {
+            home,
+            feature_auto_start: readiness::gate_of(&features),
+        },
+        projects,
+    })
 }
 
 pub fn cmd_run(

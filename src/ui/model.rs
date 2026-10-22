@@ -643,6 +643,7 @@ mod tests {
             state_gate: None,
             self_check: None,
             registry: None,
+            ready: None,
         }
     }
 

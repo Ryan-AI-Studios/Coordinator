@@ -157,28 +157,80 @@ fn bare_track_digits(track_id: &str) -> Option<&str> {
     }
 }
 
-fn existing_child_dir(conductor: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    let path = conductor.join(name);
-    path.is_dir().then_some(path)
-}
-
-/// First directory whose name starts with `prefix`, in sorted path order.
-fn first_prefixed_dir(conductor: &std::path::Path, prefix: &str) -> Option<std::path::PathBuf> {
-    let mut found = Vec::new();
-    let rd = std::fs::read_dir(conductor).ok()?;
-    for ent in rd.flatten() {
-        let path = ent.path();
+/// Sorted directory names under `conductor` (one `read_dir`), or `None` when unreadable.
+///
+/// 0115: the ready report resolves a directory for **every** parsed row, and the
+/// prefix rules below need the child list. Reading it once per report keeps
+/// `status --project` on a 527-row registry fast; `resolve_track_dir` still works
+/// without an index.
+pub(crate) fn conductor_dir_names(conductor: &std::path::Path) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(conductor).ok()?.flatten() {
+        let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && name.starts_with(prefix)
-        {
-            found.push(path);
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            names.push(name.to_string());
         }
     }
-    found.sort();
-    found.into_iter().next()
+    names.sort();
+    Some(names)
+}
+
+/// [`resolve_track_dir`] against a pre-read, sorted directory-name list.
+pub(crate) fn resolve_track_dir_in(
+    conductor: &std::path::Path,
+    names: &[String],
+    track_id: &str,
+) -> Option<std::path::PathBuf> {
+    let exists = |name: &str| {
+        names
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    };
+    let first = |prefix: &str| {
+        names
+            .iter()
+            .find(|candidate| candidate.starts_with(prefix))
+            .map(|candidate| conductor.join(candidate))
+    };
+    if exists(track_id) {
+        return Some(conductor.join(track_id));
+    }
+    let norm = bare_track_digits(track_id);
+    if let Some(norm) = norm {
+        if norm != track_id && exists(norm) {
+            return Some(conductor.join(norm));
+        }
+        let track_name = format!("track{norm}");
+        if track_name != track_id && exists(&track_name) {
+            return Some(conductor.join(track_name));
+        }
+    }
+    let raw_prefix = format!("{track_id}-");
+    if let Some(hit) = first(&raw_prefix) {
+        return Some(hit);
+    }
+    let norm = norm?;
+    let norm_prefix = format!("{norm}-");
+    if norm_prefix != raw_prefix
+        && let Some(hit) = first(&norm_prefix)
+    {
+        return Some(hit);
+    }
+    if norm.len() < 4 {
+        let padded = format!("{norm:0>4}");
+        if padded != norm {
+            if exists(&padded) {
+                return Some(conductor.join(&padded));
+            }
+            if let Some(hit) = first(&format!("{padded}-")) {
+                return Some(hit);
+            }
+        }
+    }
+    None
 }
 
 /// Resolve `track_id` to a conductor directory.
@@ -191,49 +243,8 @@ pub fn resolve_track_dir(
     track_id: &str,
 ) -> Option<std::path::PathBuf> {
     let conductor = crate::layout::resolve(record).conductor_dir;
-    if !conductor.is_dir() {
-        return None;
-    }
-    if let Some(exact) = existing_child_dir(&conductor, track_id) {
-        return Some(exact);
-    }
-    let norm = bare_track_digits(track_id);
-    if let Some(norm) = norm {
-        if norm != track_id
-            && let Some(bare) = existing_child_dir(&conductor, norm)
-        {
-            return Some(bare);
-        }
-        let track_name = format!("track{norm}");
-        if track_name != track_id
-            && let Some(prefixed) = existing_child_dir(&conductor, &track_name)
-        {
-            return Some(prefixed);
-        }
-    }
-    let raw_prefix = format!("{track_id}-");
-    if let Some(hit) = first_prefixed_dir(&conductor, &raw_prefix) {
-        return Some(hit);
-    }
-    let norm = norm?;
-    let norm_prefix = format!("{norm}-");
-    if norm_prefix != raw_prefix
-        && let Some(hit) = first_prefixed_dir(&conductor, &norm_prefix)
-    {
-        return Some(hit);
-    }
-    if norm.len() < 4 {
-        let padded = format!("{norm:0>4}");
-        if padded != norm {
-            if let Some(exact) = existing_child_dir(&conductor, &padded) {
-                return Some(exact);
-            }
-            if let Some(hit) = first_prefixed_dir(&conductor, &format!("{padded}-")) {
-                return Some(hit);
-            }
-        }
-    }
-    None
+    let names = conductor_dir_names(&conductor)?;
+    resolve_track_dir_in(&conductor, &names, track_id)
 }
 
 #[cfg(test)]
