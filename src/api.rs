@@ -214,6 +214,20 @@ pub fn resolve_selected(project: Option<&str>, infer_cwd: bool) -> Result<Projec
     Ok(rec)
 }
 
+/// Read-only operator selector for `roles prove` (folded m3): same resolution rules as
+/// [`resolve_selected`] but it never writes `last-used.json`.
+pub fn resolve_selected_readonly(project: Option<&str>, infer_cwd: bool) -> Result<ProjectRecord> {
+    let last = config::load_last_used_id();
+    let cwd = if infer_cwd {
+        std::env::current_dir().ok()
+    } else {
+        None
+    };
+    Ok(load_registry()?
+        .resolve_project_in(project, cwd.as_deref(), last.as_deref())?
+        .clone())
+}
+
 fn parse_optional_path(s: Option<String>) -> Option<PathBuf> {
     s.filter(|p| !p.is_empty()).map(PathBuf::from)
 }
@@ -1256,7 +1270,7 @@ mod tests {
         assert_eq!(view.status, RunStatus::Idle);
         // `wait_for_outcome` return carries the snapshot too (0102 DoD-2).
         let features = view.features.as_ref().expect("features on wait return");
-        assert_eq!(features.duties.len(), 5);
+        assert_eq!(features.duties.len(), 6);
     }
 
     #[test]
@@ -1280,7 +1294,7 @@ mod tests {
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.phase, crate::workflow::graph::PHASE_PLAN);
         let features = view.features.as_ref().expect("features on detach return");
-        assert_eq!(features.duties.len(), 5);
+        assert_eq!(features.duties.len(), 6);
         duties_match(
             &view,
             crate::features::Duty::FleetNotify,
@@ -1670,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn status_json_has_the_five_stable_duty_keys() {
+    fn status_json_has_the_six_stable_duty_keys() {
         let _guard = test_env_lock();
         let _env = feature_env_guard();
         crate::features::reset_feature_warnings_for_tests();
@@ -1685,6 +1699,7 @@ mod tests {
             vec![
                 "auto_start",
                 "fleet_notify",
+                "model_swap",
                 "self_reap",
                 "self_update",
                 "stall_paging"

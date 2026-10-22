@@ -1034,13 +1034,17 @@ mod tests {
         write_plan_skill(proj.path());
         run_with_driver(&r, Some("0013".into()), WorkflowDriver::Adapter).unwrap();
 
-        let session = crate::harness::GrokSession::start_mock(
+        let mut session = crate::harness::GrokSession::start_mock(
             crate::harness::grok_cwd(&r),
             mock_handshake_ok("sess-hang"),
             Duration::from_secs(2),
         )
         .await
         .unwrap();
+        // 0110: a real session records the resolved phase binary; the mock must carry the
+        // same identity or `start_inner` correctly recycles it.
+        session.bin =
+            crate::harness::resolve_phase_binary(crate::workflow::graph::PHASE_PLAN).unwrap();
         insert_test_session(r.id.clone(), session).await;
 
         let started = Instant::now();

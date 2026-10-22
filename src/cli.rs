@@ -216,6 +216,60 @@ pub enum RolesCommands {
         #[arg(long)]
         clear_model: bool,
     },
+    /// Validated, reversible swap with a truthful probe and a unique snapshot
+    Swap {
+        /// Role key; required for apply and --cancel, optional for --status
+        role: Option<String>,
+        /// Role filter for --status (the positional form is also accepted)
+        #[arg(long = "role")]
+        role_flag: Option<String>,
+        /// New harness (uses that harness's command for the role class)
+        #[arg(long)]
+        harness: Option<String>,
+        /// New command (partial update; must match the role class)
+        #[arg(long)]
+        command: Option<String>,
+        /// New model id (verbatim; an OpenCode `#variant` stays catalog-defined)
+        #[arg(long)]
+        model: Option<String>,
+        /// Remove the model pin
+        #[arg(long)]
+        clear_model: bool,
+        /// Drop the role's deferred entry (no config write)
+        #[arg(long)]
+        cancel: bool,
+        /// Print the machine ledger (pending/last/errors) and the lock holder
+        #[arg(long)]
+        status: bool,
+        /// Explicit recovery for a crash-left role-swap.lock
+        #[arg(long)]
+        unlock: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore the exact previous RoleBinding from a snapshot
+    Rollback {
+        /// Role key
+        role: String,
+        /// Snapshot path (default: last[role].snapshot)
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prove the live holder identity for an adapter role (read-only)
+    Prove {
+        /// Adapter role key (planner | implementor | fold | next)
+        role: String,
+        /// Project id (read-only resolve; never writes last-used.json)
+        #[arg(long)]
+        project: Option<String>,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -997,6 +1051,116 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 )?;
                 println!("{}", serde_json::to_string_pretty(&bindings)?);
             }
+            RolesCommands::Swap {
+                role,
+                role_flag,
+                harness,
+                command,
+                model,
+                clear_model,
+                cancel,
+                status,
+                unlock,
+                json,
+            } => {
+                let role = role.or(role_flag);
+                let modes = [cancel, status, unlock].iter().filter(|b| **b).count();
+                if modes > 1 {
+                    return Err(CoordinatorError::Message(
+                        "--cancel, --status and --unlock are mutually exclusive".into(),
+                    ));
+                }
+                if unlock {
+                    let info = crate::harness::roles_swap::unlock()?;
+                    print_swap_json(json, &info)?;
+                    return Ok(());
+                }
+                if status {
+                    let view = crate::harness::roles_swap::status()?;
+                    if let Some(role) = role.as_deref() {
+                        let mut one = view.clone();
+                        one.ledger.pending.retain(|k, _| k == role);
+                        one.ledger.last.retain(|k, _| k == role);
+                        one.ledger.errors.retain(|k, _| k == role);
+                        print_swap_json(json, &one)?;
+                    } else {
+                        print_swap_json(json, &view)?;
+                    }
+                    return Ok(());
+                }
+                let Some(role) = role.as_deref() else {
+                    return Err(CoordinatorError::Message(
+                        "roles swap requires a role (or --status/--unlock)".into(),
+                    ));
+                };
+                if cancel {
+                    let ledger = crate::harness::roles_swap::cancel(role)?;
+                    print_swap_json(json, &ledger)?;
+                    return Ok(());
+                }
+                let partial = crate::harness::roles_swap::PartialBinding {
+                    harness,
+                    command,
+                    model,
+                    clear_model,
+                };
+                let outcome = match crate::harness::roles_swap::swap(role, partial) {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "role": role,
+                                    "applied": false,
+                                    "deferred": false,
+                                    "refused": true,
+                                    "message": e.to_string(),
+                                }))?
+                            );
+                        }
+                        return Err(e);
+                    }
+                };
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    println!("{}", outcome.message);
+                }
+            }
+            RolesCommands::Rollback { role, from, json } => {
+                let outcome = match crate::harness::roles_swap::rollback(&role, from.as_deref()) {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "role": role,
+                                    "applied": false,
+                                    "deferred": false,
+                                    "refused": true,
+                                    "message": e.to_string(),
+                                }))?
+                            );
+                        }
+                        return Err(e);
+                    }
+                };
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    println!("{}", outcome.message);
+                }
+            }
+            RolesCommands::Prove {
+                role,
+                project,
+                json,
+            } => {
+                let view = crate::harness::roles_swap::prove(&role, project.as_deref())?;
+                print_swap_json(json, &view)?;
+            }
         },
         Commands::Notify { action } => match action {
             NotifyCommands::HermesTest { project, progress } => {
@@ -1325,6 +1489,12 @@ fn cmd_registry_set_status(
         println!("{}", serde_json::to_string_pretty(&out)?);
         Ok(())
     })
+}
+
+/// One shape for every `roles swap|rollback|prove` JSON payload.
+fn print_swap_json<T: serde::Serialize>(_json: bool, value: &T) -> Result<(), CoordinatorError> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }
 
 /// Test seam: the real `Cli::parse` + dispatch, so exit codes are the shipped ones.
@@ -1999,6 +2169,57 @@ mod tests {
         assert!(show.get_arguments().any(|arg| arg.get_id() == "json"));
         let list = decision.find_subcommand("list").expect("list");
         assert!(list.get_arguments().any(|arg| arg.get_id() == "json"));
+    }
+
+    #[test]
+    fn roles_swap_rollback_and_prove_parse() {
+        assert!(
+            Cli::try_parse_from(["coordinator", "roles", "swap", "planner", "--model", "m"])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "coordinator",
+                "roles",
+                "swap",
+                "--status",
+                "--role",
+                "planner",
+                "--json"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["coordinator", "roles", "swap", "planner", "--cancel"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["coordinator", "roles", "swap", "--unlock"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "coordinator",
+                "roles",
+                "rollback",
+                "planner",
+                "--from",
+                "snap.json"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "coordinator",
+                "roles",
+                "prove",
+                "planner",
+                "--project",
+                "p",
+                "--json"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["coordinator", "roles", "swap", "--help"]).is_err(),
+            "clap prints help via Err(DisplayHelp)"
+        );
     }
 }
 // 0109 CLI dispatch tests: the real `Cli::parse` + `dispatch`, so exit codes are shipped.

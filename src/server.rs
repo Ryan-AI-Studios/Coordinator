@@ -1002,7 +1002,8 @@ mod tests {
         }
         let _rec =
             api::project_add(proj.path(), crate::registry::ProjectAddOptions::default()).unwrap();
-        let probe = ScriptedProbe::ready();
+        let probe =
+            ScriptedProbe::ready().with_models("grok", 0, "You are not authenticated.", false);
         let _pg = install_test_probe(probe);
 
         let get = app()

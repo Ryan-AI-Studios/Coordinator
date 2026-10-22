@@ -14,6 +14,7 @@ pub mod pool;
 pub mod preflight;
 pub mod reap;
 pub mod roles;
+pub mod roles_swap;
 pub mod terminal;
 
 pub use grok::{
