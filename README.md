@@ -317,7 +317,11 @@ prevents a second task instance; `RestartCount`/`RestartInterval` are the only r
 `Interactive`/`Limited` keep harness OAuth/profile working and avoid elevation.
 
 **Honest limits.** Logon-only (no ticker before the user logs on — harness OAuth needs the interactive
-user); the task supervises only the process **it** started; at most 3 restarts 1 min apart; no timer,
+user); the task supervises only the process **it** started; `RestartOnFailure` is configured at 3
+attempts 1 min apart, but a restart after a crashed serve is **not proven on this host** (the isolated
+0116 proof did not observe one, and neither did a trivial failing-action probe), so treat the restart
+as unconfirmed until the owner's logon proof and a forced-kill observation; recovery is
+`Start-ScheduledTask -TaskName CoordinatorServe`. There is no timer,
 no watchdog loop, no kill. A serve that is bound but stops answering `/health` is not restarted — the
 task's next run fails to bind, retries 3× and stops; recovery is `Stop-ScheduledTask` then
 `Start-ScheduledTask`. **A logon run that finds a healthy serve exits 0 and is not re-run until the
