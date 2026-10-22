@@ -756,9 +756,18 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
     );
 
     let slug_owned = slug.to_string();
+    // Acquire the in-flight token before the spawn and move it into the worker, so the test
+    // quiescence seam covers the window between the state mark and the worker start. Test-only:
+    // release builds emit no token.
+    #[cfg(test)]
+    let inflight = InflightToken::enter(&record.id);
     if let Err(e) = std::thread::Builder::new()
         .name(format!("plan-review-{slug}-{}", rec.id))
-        .spawn(move || apply_slot_result(&rec, backend.as_ref(), &req))
+        .spawn(move || {
+            #[cfg(test)]
+            let _inflight = inflight;
+            apply_slot_result(&rec, backend.as_ref(), &req)
+        })
     {
         write_sync_permission_failure(
             record,
@@ -806,7 +815,17 @@ fn apply_slot_result(
     backend: &dyn PlanReviewBackend,
     req: &PlanReviewRequest,
 ) {
-    mark_slot_ran(record, req);
+    if let Err(e) = mark_slot_ran(record, req) {
+        // Never run the backend for an unstamped slot: the phase must degrade with a named cause
+        // instead of silently losing the slug from the join retry set.
+        let msg = format!(
+            "plan-review: {} slot-ran stamp not persisted: {e}",
+            req.slug
+        );
+        crate::progress_log::append(record, "plan-review", &msg);
+        write_stamp_failure_outcome(record, req, &msg);
+        return;
+    }
     let t0 = Instant::now();
     let result = backend.run(req);
     if let Ok(ref out) = result {
@@ -1075,19 +1094,97 @@ fn journal_reviewer_stall(
     });
 }
 
-fn mark_slot_ran(record: &ProjectRecord, req: &PlanReviewRequest) {
-    let _ = with_run_state_lock(record, || {
-        let mut s = load_run_state(record)?;
-        if !apply_allowed(&s, req) {
-            return Ok(());
+/// Bounded ladder for the transient run-state replace class (0113, OD-113-5).
+///
+/// `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)` can be refused with access-denied/sharing
+/// (os error 5/32) while another handle holds `run-state.json`. A lock timeout is **not** retried:
+/// the lock wait already spent 10 s (`state.rs:775`) and 40 more waits would stall the wave.
+const STAMP_SAVE_ATTEMPTS: usize = 40;
+const STAMP_SAVE_BACKOFF: Duration = Duration::from_millis(25);
+
+fn is_transient_save_err(e: &CoordinatorError) -> bool {
+    match e {
+        CoordinatorError::Io(io) => {
+            io.kind() == std::io::ErrorKind::PermissionDenied
+                || matches!(io.raw_os_error(), Some(5) | Some(32))
         }
-        if !s.plan_review_slot_ran.iter().any(|x| x == &req.slug) {
-            s.plan_review_slot_ran.push(req.slug.clone());
-            s.updated_at = chrono::Utc::now();
-            save_run_state(record, &s)?;
+        _ => false,
+    }
+}
+
+/// Persist the named failure for an unstamped slot, and never let it stay pending.
+///
+/// The mailbox write is retried over the same transient class as the stamp, and the epoch/track
+/// gate is re-checked first: a stale worker must not write a failure into a newer plan-review
+/// epoch. If the mailbox cannot be written at all, clear the pending slug so the phase degrades
+/// through the normal join path (the progress line names the cause) instead of hanging on a role
+/// file that will never appear.
+fn write_stamp_failure_outcome(record: &ProjectRecord, req: &PlanReviewRequest, msg: &str) {
+    let Ok(state) = load_run_state(record) else {
+        return;
+    };
+    if !apply_allowed(&state, req) {
+        return;
+    }
+    for attempt in 0..STAMP_SAVE_ATTEMPTS {
+        match write_role_outcome(
+            record,
+            &state,
+            &req.slug,
+            OutcomeStatus::Failure,
+            Some(FailureClass::HarnessCrash),
+            Some(msg.to_string()),
+        ) {
+            Ok(()) => return,
+            Err(e) if is_transient_save_err(&e) => {
+                if attempt + 1 < STAMP_SAVE_ATTEMPTS {
+                    std::thread::sleep(STAMP_SAVE_BACKOFF);
+                }
+            }
+            Err(_) => break,
         }
-        Ok(())
-    });
+    }
+    let _ = crate::workflow::drive::remove_pending(record, &req.slug);
+}
+
+/// Record that this slot ran, durably.
+///
+/// The stamp feeds `maybe_rearm_join_retry`'s retry set; losing it silently drops a slot that did
+/// run from the join retry. Each attempt re-loads inside the lock so a concurrent tick cannot be
+/// clobbered, and the `apply_allowed` epoch/track gate is unchanged.
+fn mark_slot_ran(record: &ProjectRecord, req: &PlanReviewRequest) -> Result<()> {
+    let mut last: Option<CoordinatorError> = None;
+    for attempt in 0..STAMP_SAVE_ATTEMPTS {
+        let outcome = with_run_state_lock(record, || {
+            let mut s = load_run_state(record)?;
+            if !apply_allowed(&s, req) {
+                return Ok(());
+            }
+            if !s.plan_review_slot_ran.iter().any(|x| x == &req.slug) {
+                s.plan_review_slot_ran.push(req.slug.clone());
+                s.updated_at = chrono::Utc::now();
+                #[cfg(test)]
+                if take_stamp_save_failure(&record.id, &req.slug) {
+                    return Err(std::io::Error::from_raw_os_error(5).into());
+                }
+                save_run_state(record, &s)?;
+            }
+            Ok(())
+        });
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(e) if is_transient_save_err(&e) => {
+                last = Some(e);
+                if attempt + 1 < STAMP_SAVE_ATTEMPTS {
+                    std::thread::sleep(STAMP_SAVE_BACKOFF);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        CoordinatorError::Message("slot-ran stamp save did not converge".into())
+    }))
 }
 
 /// Re-arm empty/dud slugs once after the shipped per-slot retry (0054).
@@ -1467,6 +1564,145 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 static TEST_BACKENDS: Mutex<Option<HashMap<String, Arc<dyn PlanReviewBackend>>>> = Mutex::new(None);
 
+/// Test-only, RAII-disarmed slot-ran save failpoint (0113, OD-113-4).
+///
+/// Scoped to one `(project_id, slug)` and to a remaining count, so it can outlast the release
+/// ladder without leaking into a sibling test. Cleared on drop, including on panic.
+#[cfg(test)]
+static TEST_STAMP_SAVE_FAILS: Mutex<Option<(String, String, usize)>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct StampSaveFailpoint;
+
+#[cfg(test)]
+impl Drop for StampSaveFailpoint {
+    fn drop(&mut self) {
+        *TEST_STAMP_SAVE_FAILS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_stamp_save(project_id: &str, slug: &str, times: usize) -> StampSaveFailpoint {
+    *TEST_STAMP_SAVE_FAILS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) =
+        Some((project_id.to_string(), slug.to_string(), times));
+    StampSaveFailpoint
+}
+
+#[cfg(test)]
+fn take_stamp_save_failure(project_id: &str, slug: &str) -> bool {
+    let mut armed = TEST_STAMP_SAVE_FAILS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    match armed.as_mut() {
+        Some((id, s, remaining)) if id == project_id && s == slug && *remaining > 0 => {
+            *remaining -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Test-only per-project in-flight worker token + condvar (0113, OD-113-4).
+///
+/// `maybe_spawn_slot` takes a token before `thread::Builder::spawn` and moves it into the worker
+/// closure, so the window between the state mark and the worker start is covered and the token
+/// lives until `apply_slot_result` (including the role-file write) returns. A spawn `Err` drops the
+/// closure and its token. The whole seam is `#[cfg(test)]`, so release builds emit nothing.
+#[cfg(test)]
+struct InflightState {
+    counts: Mutex<HashMap<String, usize>>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+static TEST_INFLIGHT: std::sync::OnceLock<InflightState> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn inflight_state() -> &'static InflightState {
+    TEST_INFLIGHT.get_or_init(|| InflightState {
+        counts: Mutex::new(HashMap::new()),
+        cv: std::sync::Condvar::new(),
+    })
+}
+
+#[cfg(test)]
+pub(crate) struct InflightToken {
+    project_id: String,
+}
+
+#[cfg(test)]
+impl InflightToken {
+    fn enter(project_id: &str) -> Self {
+        let state = inflight_state();
+        *state
+            .counts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(project_id.to_string())
+            .or_insert(0) += 1;
+        Self {
+            project_id: project_id.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for InflightToken {
+    fn drop(&mut self) {
+        let state = inflight_state();
+        {
+            let mut counts = state.counts.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(n) = counts.get_mut(&self.project_id) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    counts.remove(&self.project_id);
+                }
+            }
+        }
+        state.cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn inflight_count(project_id: &str) -> usize {
+    inflight_state()
+        .counts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(project_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Wait until no worker is in flight for this project, bounded by `ceiling`.
+///
+/// `Condvar::wait_timeout` is best-effort and may wake spuriously, so the count predicate is
+/// re-checked against a monotonic deadline on every wake.
+#[cfg(test)]
+fn wait_inflight_idle(project_id: &str, ceiling: Duration) -> bool {
+    let state = inflight_state();
+    let mut counts = state.counts.lock().unwrap_or_else(|p| p.into_inner());
+    let deadline = Instant::now() + ceiling;
+    loop {
+        if counts.get(project_id).copied().unwrap_or(0) == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let (guard, _) = state
+            .cv
+            .wait_timeout(counts, deadline - now)
+            .unwrap_or_else(|p| p.into_inner());
+        counts = guard;
+    }
+}
+
 #[cfg(test)]
 fn test_backend_for(project_id: &str) -> Option<Arc<dyn PlanReviewBackend>> {
     TEST_BACKENDS
@@ -1723,6 +1959,35 @@ impl PlanReviewBackend for GatedBackend {
             g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
         }
         self.inner.run(req)
+    }
+}
+
+/// 0113 seam control: hold only `opencode` while `agy` succeeds and writes its review.
+#[cfg(test)]
+struct GateOpencodeBackend {
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    body: String,
+}
+
+#[cfg(test)]
+impl PlanReviewBackend for GateOpencodeBackend {
+    fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
+        if req.slug == REVIEW_SLUG_OPENCODE {
+            let (lock, cv) = &*self.gate;
+            let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while !*g {
+                g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+        if let Some(dir) = &req.track_dir {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(dir.join(format!("{}-review.md", req.slug)), &self.body);
+        }
+        Ok(PlanReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
     }
 }
 
@@ -1983,22 +2248,108 @@ mod tests {
         }
     }
 
+    /// Hang detector for an in-process/scripted worker wave.
+    ///
+    /// Derived 0113 Phase 1.6: the measured maximum scripted worker lifetime in this module was
+    /// 17 ms; `max(10x, 60 s)` is the floor. A test that runs a real child derives its own
+    /// deadline from that test's slot budget (the sleeper does, from its 2 s slot).
+    const WORKER_CEILING: Duration = Duration::from_secs(60);
+
+    /// Hang detector for consumption once no worker is in flight.
+    ///
+    /// Derived 0113: `3 x` the 10 s run-state lock wait (`src/state.rs:775`) covers one contended
+    /// lock acquisition plus one atomic replace. Only the ack save and mailbox delete remain.
+    const CONSUME_CEILING: Duration = Duration::from_secs(30);
+
+    /// Hang detector for a timed-out reviewer's post-slot tail (role-file write after the kill).
+    ///
+    /// Derived 0113 Phase 1.6: 20 loaded runs measured 213-498 ms; `max(10 x 498 ms, 30 s)` is the
+    /// 30 s floor. The 2 s slot timeout itself is unchanged; this allowance only bounds the test.
+    const POST_KILL_ALLOWANCE: Duration = Duration::from_secs(30);
+
+    fn plan_review_mailbox_diag(r: &ProjectRecord, slugs: &[&str]) -> String {
+        let dir = match outcome_roles_dir(r) {
+            Ok(d) => d,
+            Err(e) => return format!("roles_dir=<{e}>"),
+        };
+        let mut parts = Vec::new();
+        for slug in slugs {
+            let path = dir.join(format!("{slug}.json"));
+            match std::fs::metadata(&path) {
+                Ok(m) => parts.push(format!("{slug}.json=exists(mtime={:?})", m.modified().ok())),
+                Err(_) => parts.push(format!("{slug}.json=missing")),
+            }
+        }
+        parts.join(" ")
+    }
+
+    fn plan_review_wait_diag(r: &ProjectRecord, slugs: &[&str]) -> String {
+        match load_run_state(r) {
+            Ok(s) => format!(
+                "{} {}",
+                plan_review_diag(&s),
+                plan_review_mailbox_diag(r, slugs)
+            ),
+            Err(e) => format!("run-state=<{e}>"),
+        }
+    }
+
+    /// Wait until every slot in `slugs` leaves `pending_roles`.
+    ///
+    /// At the top of every iteration this waits for the **current** wave to quiesce before ticking:
+    /// a tick can start a new worker wave (after the join re-arm), and the old 200-iteration count
+    /// could exhaust while that wave was still in flight. Only after quiescence (when just the ack
+    /// save and mailbox delete remain) does a separate `CONSUME_CEILING` window apply.
     fn wait_slots_consumed(r: &ProjectRecord, slugs: &[&str]) {
-        for _ in 0..200 {
-            tick_or_continue(r);
-            let s = load_run_state(r).unwrap();
+        let mut consume_deadline: Option<Instant> = None;
+        loop {
+            if inflight_count(&r.id) > 0 {
+                if !wait_inflight_idle(&r.id, WORKER_CEILING) {
+                    panic!(
+                        "worker wave did not quiesce within {WORKER_CEILING:?}: {}",
+                        plan_review_wait_diag(r, slugs)
+                    );
+                }
+                consume_deadline = None;
+            }
+            let s = match load_run_state(r) {
+                Ok(s) => s,
+                Err(e) => panic!("load run state: {e}"),
+            };
             if slugs
                 .iter()
                 .all(|slug| !s.pending_roles.iter().any(|x| x == slug))
             {
                 return;
             }
+            let deadline =
+                *consume_deadline.get_or_insert_with(|| Instant::now() + CONSUME_CEILING);
+            if Instant::now() >= deadline {
+                panic!(
+                    "no worker in flight, slugs still pending after {CONSUME_CEILING:?}: {}",
+                    plan_review_wait_diag(r, slugs)
+                );
+            }
+            tick_or_continue(r);
             std::thread::sleep(Duration::from_millis(25));
         }
-        panic!(
-            "slots still pending: {:?}",
-            load_run_state(r).unwrap().pending_roles
-        );
+    }
+
+    /// One-line state dump for plan-review wait/assert failures (0113 DoD-1).
+    ///
+    /// A loaded failure must name the fields, not just a line number: the same panic string can
+    /// come from the join re-arm, the wait, or a lost slot-ran stamp.
+    fn plan_review_diag(s: &crate::state::RunState) -> String {
+        format!(
+            "pending_roles={:?} plan_review_spawned={:?} join_retries={} \
+             slot_ran={:?} status={:?} last_event={:?}",
+            s.pending_roles,
+            s.plan_review_spawned,
+            s.plan_review_join_retries,
+            s.plan_review_slot_ran,
+            s.status,
+            s.last_event
+        )
     }
 
     fn wait_agy_consumed(r: &ProjectRecord) {
@@ -2011,7 +2362,18 @@ mod tests {
 
     fn wait_join_retry_latched(r: &ProjectRecord) {
         use crate::state::RunStatus;
-        for _ in 0..200 {
+        let slugs = ["agy", "opencode"];
+        let mut tick_deadline: Option<Instant> = None;
+        loop {
+            if inflight_count(&r.id) > 0 {
+                if !wait_inflight_idle(&r.id, WORKER_CEILING) {
+                    panic!(
+                        "worker wave did not quiesce within {WORKER_CEILING:?}: {}",
+                        plan_review_wait_diag(r, &slugs)
+                    );
+                }
+                tick_deadline = None;
+            }
             let s = load_run_state(r).unwrap();
             if s.plan_review_join_retries >= 1
                 || s.last_event.contains("plan-review: retrying join")
@@ -2021,14 +2383,16 @@ mod tests {
             if s.status == RunStatus::Stopped {
                 return;
             }
+            let deadline = *tick_deadline.get_or_insert_with(|| Instant::now() + CONSUME_CEILING);
+            if Instant::now() >= deadline {
+                panic!(
+                    "no worker in flight, join retry not latched after {CONSUME_CEILING:?}: {}",
+                    plan_review_wait_diag(r, &slugs)
+                );
+            }
             tick_or_continue(r);
             std::thread::sleep(Duration::from_millis(25));
         }
-        let s = load_run_state(r).unwrap();
-        panic!(
-            "join retry not latched: retries={} status={:?} event={}",
-            s.plan_review_join_retries, s.status, s.last_event
-        );
     }
 
     fn wait_stopped(r: &ProjectRecord) {
@@ -2691,7 +3055,14 @@ mod tests {
         let dir = tempdir().unwrap();
         setup_track(dir.path(), "0001");
         let sleeper = dir.path().join("sleep-opencode.cmd");
-        std::fs::write(&sleeper, "@echo off\r\nping -n 30 127.0.0.1 >nul 2>&1\r\n").unwrap();
+        // The spawn log counts real processes, which `plan_review_spawned` alone cannot: it also
+        // catches an internal `finish_slot` retry that starts a second child.
+        std::fs::write(
+            &sleeper,
+            "@echo off\r\n>>\"%~dp0spawn.log\" echo opencode-run\r\nping -n 30 127.0.0.1 >nul 2>&1\r\n",
+        )
+        .unwrap();
+        let spawn_log = dir.path().join("spawn.log");
         unsafe {
             std::env::set_var(ENV_COORDINATOR_OPENCODE_BIN, &sleeper);
         }
@@ -2704,41 +3075,88 @@ mod tests {
         state.plan_review_spawned = vec!["agy".into()];
         save_run_state(&r, &state).unwrap();
         write_review_markdown(&r, "agy", Some("agy done\n")).unwrap();
+
+        let spawn_at = Instant::now();
         tick_retry(&r).unwrap();
+        let path = outcome_roles_dir(&r).unwrap().join("opencode.json");
+
+        // Poll only: never tick here, so nothing can consume the proof. The old loop observed and
+        // consumed in the same iteration; a Timeout written between its poll and its consume was
+        // never seen. 2 s slot + a measured hang allowance, not an 8 s latency contract.
+        let deadline = spawn_at + Duration::from_secs(2) + POST_KILL_ALLOWANCE;
         let mut saw_timeout = false;
         let mut spawned_at_timeout: Vec<String> = Vec::new();
-        for _ in 0..80 {
-            let path = outcome_roles_dir(&r).unwrap().join("opencode.json");
-            if path.is_file()
-                && let Ok(text) = std::fs::read_to_string(&path)
+        while Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&path)
                 && let Ok(o) = serde_json::from_str::<PhaseOutcome>(&text)
                 && o.status == OutcomeStatus::Failure
                 && o.failure_class == Some(FailureClass::Timeout)
             {
                 saw_timeout = true;
-                spawned_at_timeout = load_run_state(&r).unwrap().plan_review_spawned.clone();
-            }
-            let s = load_run_state(&r).unwrap();
-            if !s.pending_roles.iter().any(|x| x == "opencode") && saw_timeout {
+                spawned_at_timeout = match load_run_state(&r) {
+                    Ok(s) => s.plan_review_spawned.clone(),
+                    Err(e) => panic!("load run state at timeout: {e}"),
+                };
                 break;
             }
-            let _ = tick(&r);
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(
-            saw_timeout,
-            "opencode role outcome must be Timeout before consume"
-        );
+        if !saw_timeout {
+            let state = load_run_state(&r)
+                .map(|s| plan_review_diag(&s))
+                .unwrap_or_else(|e| format!("run-state=<{e}>"));
+            let listing: Vec<String> = std::fs::read_dir(outcome_roles_dir(&r).unwrap())
+                .map(|it| {
+                    it.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            panic!(
+                "opencode role outcome must be Timeout before consume within 2s + \
+                 {POST_KILL_ALLOWANCE:?} (elapsed {:?}): {state} roles={listing:?}",
+                spawn_at.elapsed()
+            );
+        }
         let oc_spawned = spawned_at_timeout
             .iter()
             .filter(|x| *x == "opencode")
             .count();
         assert_eq!(oc_spawned, 1, "spawned at timeout={spawned_at_timeout:?}");
-        let s = load_run_state(&r).unwrap();
+        let spawn_lines = |log: &str| log.lines().filter(|l| l.trim() == "opencode-run").count();
+        let log_at_timeout = std::fs::read_to_string(&spawn_log).unwrap_or_default();
+        assert_eq!(
+            spawn_lines(&log_at_timeout),
+            1,
+            "exactly one opencode process before consume; spawn log={log_at_timeout:?}"
+        );
+
+        // Consume, then prove the mailbox is gone. A worker cannot be in flight now: the Timeout
+        // outcome is the last thing the slot thread writes.
+        let consume_deadline = Instant::now() + CONSUME_CEILING;
+        loop {
+            let s = load_run_state(&r).unwrap();
+            if !s.pending_roles.iter().any(|x| x == "opencode") {
+                break;
+            }
+            if Instant::now() >= consume_deadline {
+                panic!(
+                    "no worker in flight, opencode still pending after {CONSUME_CEILING:?}: {}",
+                    plan_review_diag(&s)
+                );
+            }
+            tick_retry(&r).unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+        }
         assert!(
-            !s.pending_roles.iter().any(|x| x == "opencode"),
-            "opencode still pending: {:?}",
-            s.pending_roles
+            !path.exists(),
+            "the consumed role JSON must be deleted (0039 row)"
+        );
+        let log_after = std::fs::read_to_string(&spawn_log).unwrap_or_default();
+        assert_eq!(
+            spawn_lines(&log_after),
+            1,
+            "exit 124 must not be retried into a second process; spawn log={log_after:?}"
         );
     }
 
@@ -3231,7 +3649,7 @@ mod tests {
             spawn_epoch: first_epoch,
             spawn_track_id: Some("0001".into()),
         };
-        mark_slot_ran(&r, &stale);
+        mark_slot_ran(&r, &stale).unwrap();
         assert!(
             load_run_state(&r).unwrap().plan_review_slot_ran.is_empty(),
             "epoch mismatch must not mark the live run as having run"
@@ -3882,6 +4300,202 @@ mod tests {
         assert!(state.plan_review_slot_ran.is_empty());
     }
 
+    /// 0113 seam control: the wait must await the current worker wave before consuming.
+    ///
+    /// Deleting `wait_idle` from `wait_slots_consumed` makes the helper consume the ready `agy`
+    /// sibling immediately and the T+300 ms assertions fail. The subject test still passes without
+    /// the seam, which is exactly why this control exists.
+    #[test]
+    fn wait_slots_consumed_waits_for_the_inflight_wave() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let _hook = install_test_backend(
+            &r.id,
+            Arc::new(GateOpencodeBackend {
+                gate: gate.clone(),
+                body: ok_review_body("0001"),
+            }),
+        );
+        tick_retry(&r).unwrap();
+
+        let roles = outcome_roles_dir(&r).unwrap();
+        let agy_json = roles.join("agy.json");
+        let opencode_json = roles.join("opencode.json");
+
+        let waiter = r.clone();
+        let handle = std::thread::spawn(move || {
+            wait_slots_consumed(&waiter, &["agy", "opencode"]);
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "the helper must not return while a worker is in flight"
+        );
+        let mid = load_run_state(&r).unwrap();
+        assert!(
+            mid.pending_roles.iter().any(|x| x == "agy"),
+            "quiescence-first: a ready sibling is not consumed while the wave runs: {}",
+            plan_review_diag(&mid)
+        );
+        assert!(
+            agy_json.is_file(),
+            "agy mailbox survives until the wave is quiescent"
+        );
+
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            cv.notify_all();
+        }
+        let deadline = Instant::now() + WORKER_CEILING;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "helper returned after release");
+        handle.join().unwrap();
+
+        let done = load_run_state(&r).unwrap();
+        assert!(
+            !done.pending_roles.iter().any(|x| x == "agy"),
+            "{}",
+            plan_review_diag(&done)
+        );
+        assert!(
+            !done.pending_roles.iter().any(|x| x == "opencode"),
+            "{}",
+            plan_review_diag(&done)
+        );
+        assert!(!opencode_json.exists(), "opencode mailbox is consumed");
+        assert!(!agy_json.exists(), "agy mailbox is consumed");
+    }
+
+    /// 0113 stamp regression: an unstamped slot must degrade loudly and never run its backend.
+    ///
+    /// On the pre-fix `let _ =` code the backend runs and no such role outcome exists.
+    #[test]
+    fn slot_ran_stamp_failure_is_loud() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            ok_review_body("0001"),
+        ))));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["opencode".into()];
+        state.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &state).unwrap();
+        write_review_markdown(&r, "agy", Some("agy done\n")).unwrap();
+
+        // More failures than the release ladder: the ladder must exhaust, not swallow.
+        let _fail = fail_stamp_save(&r.id, "opencode", STAMP_SAVE_ATTEMPTS + 10);
+        tick_retry(&r).unwrap();
+
+        let path = outcome_roles_dir(&r).unwrap().join("opencode.json");
+        let deadline = Instant::now() + WORKER_CEILING;
+        let mut outcome: Option<PhaseOutcome> = None;
+        while Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(o) = serde_json::from_str::<PhaseOutcome>(&text)
+            {
+                outcome = Some(o);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let outcome = outcome.expect("a role outcome must be written on stamp exhaustion");
+        assert_eq!(outcome.status, OutcomeStatus::Failure);
+        assert_eq!(outcome.failure_class, Some(FailureClass::HarnessCrash));
+        let msg = outcome.message.clone().unwrap_or_default();
+        assert!(
+            msg.contains("slot-ran stamp not persisted"),
+            "message={msg}"
+        );
+        assert!(msg.contains("opencode"), "message={msg}");
+
+        let oc_runs = counts
+            .slugs()
+            .into_iter()
+            .filter(|s| s == "opencode")
+            .count();
+        assert_eq!(oc_runs, 0, "the backend must not run for an unstamped slot");
+        let s = load_run_state(&r).unwrap();
+        assert!(!s.plan_review_slot_ran.iter().any(|x| x == "opencode"));
+
+        let status_path = crate::layout::resolve(&r).workspace_root.join("status.md");
+        let log = std::fs::read_to_string(&status_path).unwrap_or_default();
+        assert!(
+            log.contains("slot-ran stamp not persisted"),
+            "progress log must name the failure: {log}"
+        );
+    }
+
+    /// 0113 stamp fallback: when the failure mailbox cannot be written, the slot is still consumed
+    /// (named in the progress log) instead of hanging on a role file that will never appear.
+    #[test]
+    fn stamp_failure_consumes_the_slot_when_the_mailbox_cannot_be_written() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let rec_backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            ok_review_body("0001"),
+        ))));
+        let counts = rec_backend.counts.clone();
+        let _hook = install_test_backend(&r.id, rec_backend);
+
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles = vec!["opencode".into()];
+        state.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &state).unwrap();
+
+        // Make the role-outcome write impossible: the roles path is a regular file.
+        let roles = outcome_roles_dir(&r).unwrap();
+        std::fs::create_dir_all(roles.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&roles);
+        std::fs::write(&roles, b"not a directory").unwrap();
+
+        let _fail = fail_stamp_save(&r.id, "opencode", STAMP_SAVE_ATTEMPTS + 10);
+        tick_retry(&r).unwrap();
+
+        let deadline = Instant::now() + WORKER_CEILING;
+        let mut pending = vec!["opencode".to_string()];
+        while Instant::now() < deadline {
+            pending = load_run_state(&r).unwrap().pending_roles;
+            if !pending.iter().any(|x| x == "opencode") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !pending.iter().any(|x| x == "opencode"),
+            "an unwritable failure mailbox must still consume the slot: {pending:?}"
+        );
+        assert_eq!(
+            counts
+                .slugs()
+                .into_iter()
+                .filter(|s| s == "opencode")
+                .count(),
+            0,
+            "the backend must not run for an unstamped slot"
+        );
+        let status_path = crate::layout::resolve(&r).workspace_root.join("status.md");
+        let log = std::fs::read_to_string(&status_path).unwrap_or_default();
+        assert!(log.contains("slot-ran stamp not persisted"), "{log}");
+    }
+
     #[test]
     fn join_zero_output_retries_then_pass() {
         use crate::state::RunStatus;
@@ -3917,11 +4531,21 @@ mod tests {
             latched.last_event
         );
         assert!(latched.last_event.contains("(1/1)"));
-        assert!(latched.pending_roles.iter().any(|x| x == "agy"));
-        assert!(latched.pending_roles.iter().any(|x| x == "opencode"));
-        assert!(!latched.plan_review_spawned.iter().any(|x| x == "agy"));
-        assert!(!latched.plan_review_spawned.iter().any(|x| x == "opencode"));
-        assert!(latched.failure_class.is_none());
+        let diag = plan_review_diag(&latched);
+        assert!(latched.pending_roles.iter().any(|x| x == "agy"), "{diag}");
+        assert!(
+            latched.pending_roles.iter().any(|x| x == "opencode"),
+            "{diag}"
+        );
+        assert!(
+            !latched.plan_review_spawned.iter().any(|x| x == "agy"),
+            "{diag}"
+        );
+        assert!(
+            !latched.plan_review_spawned.iter().any(|x| x == "opencode"),
+            "{diag}"
+        );
+        assert!(latched.failure_class.is_none(), "{diag}");
         let first_wave_agy = counts.slugs().into_iter().filter(|s| s == "agy").count();
         let first_wave_oc = counts
             .slugs()

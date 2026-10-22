@@ -791,11 +791,59 @@ fn consume_role_files(record: &ProjectRecord) -> Result<()> {
     Ok(())
 }
 
-fn remove_pending(record: &ProjectRecord, slug: &str) -> Result<()> {
+#[cfg(test)]
+static TEST_FAIL_PENDING_SAVE: std::sync::Mutex<Option<(String, String)>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only, RAII-disarmed `remove_pending` save failpoint (0113).
+///
+/// Scoped to one `(project_id, slug)` and cleared on drop, so a panic cannot leave it armed for a
+/// sibling test. Consumed once by the next matching save.
+#[cfg(test)]
+pub(crate) struct PendingSaveFailpoint;
+
+#[cfg(test)]
+impl Drop for PendingSaveFailpoint {
+    fn drop(&mut self) {
+        *TEST_FAIL_PENDING_SAVE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_pending_save_once(project_id: &str, slug: &str) -> PendingSaveFailpoint {
+    *TEST_FAIL_PENDING_SAVE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((project_id.to_string(), slug.to_string()));
+    PendingSaveFailpoint
+}
+
+#[cfg(test)]
+fn take_pending_save_failure(project_id: &str, slug: &str) -> bool {
+    let mut armed = TEST_FAIL_PENDING_SAVE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    match armed.as_ref() {
+        Some((id, s)) if id == project_id && s == slug => {
+            *armed = None;
+            true
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn remove_pending(record: &ProjectRecord, slug: &str) -> Result<()> {
     with_run_state_lock(record, || {
         let mut s = load_run_state(record)?;
         s.pending_roles.retain(|x| x != slug);
         s.updated_at = chrono::Utc::now();
+        #[cfg(test)]
+        if take_pending_save_failure(&record.id, slug) {
+            return Err(CoordinatorError::Message(
+                "injected remove_pending failure".into(),
+            ));
+        }
         save_run_state(record, &s)
     })
 }
@@ -3094,5 +3142,59 @@ mod tests {
         let mut dead = live.clone();
         dead.alive = false;
         assert!(!holder_mismatch(&dead, &model_b, &bin), "dead holder");
+    }
+
+    /// 0088 regression: the acknowledgment save must land BEFORE the mailbox delete.
+    ///
+    /// On the pre-0088 delete-first order this test fails twice over: the mailbox is already gone
+    /// when the save fails, so the retry has nothing to read and `pending_roles` keeps the slug.
+    #[test]
+    fn pending_ack_save_failure_retains_mailbox_and_retries() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        let record = rec(dir.path());
+        crate::state::ensure_state_dir(&record).unwrap();
+        let mut state = plan_state(&record, PHASE_PLAN_REVIEW, "0001");
+        state.status = RunStatus::Running;
+        state.pending_roles = vec!["agy".into()];
+        crate::state::save_run_state(&record, &state).unwrap();
+
+        let roles = outcome_roles_dir(&record).unwrap();
+        std::fs::create_dir_all(&roles).unwrap();
+        let mailbox = roles.join("agy.json");
+        let outcome = PhaseOutcome::failure(
+            role_phase("agy"),
+            FailureClass::Permission,
+            OutcomeSource::Adapter,
+            None,
+            Some(state.run_epoch),
+        );
+        crate::persist::atomic_write_json(&mailbox, &outcome).unwrap();
+
+        let _fail = fail_pending_save_once(&record.id, "agy");
+        assert!(
+            consume_role_files(&record).is_err(),
+            "injected ack-save failure must surface as an error"
+        );
+        assert!(
+            mailbox.is_file(),
+            "a failed ack save must retain the role mailbox"
+        );
+        assert!(
+            load_run_state(&record)
+                .unwrap()
+                .pending_roles
+                .iter()
+                .any(|s| s == "agy"),
+            "the slug must still be pending after a failed ack save"
+        );
+
+        // Idempotent retry: the same mailbox is still there, the ack persists, then it is deleted.
+        consume_role_files(&record).unwrap();
+        assert!(!mailbox.exists(), "acked mailbox is deleted");
+        assert!(
+            load_run_state(&record).unwrap().pending_roles.is_empty(),
+            "retry clears pending_roles"
+        );
     }
 }
