@@ -37,6 +37,12 @@ thread_local! {
 /// One-shot plan-review CLI (scripted in default tests; live CLI otherwise).
 pub trait PlanReviewBackend: Send + Sync {
     fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult>;
+
+    /// Which driver ran the slot. The slot NAME is not the driver: a binding may re-point
+    /// `plan_reviewer_agy` at another harness, and the journal must say what actually ran.
+    fn driver_name(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +56,9 @@ pub struct PlanReviewRequest {
     pub prompt: String,
     pub remaining: Duration,
     pub argv: Vec<String>,
+    /// Where a `codex exec` slot writes its final message (`-o <file>`). `None` for the
+    /// CLI slots that answer on stdout.
+    pub last_message_path: Option<PathBuf>,
     /// Child-only env (never exported on the Coordinator process).
     pub extra_env: Vec<(String, String)>,
     /// Originating run; apply is dropped if the live run no longer matches.
@@ -69,6 +78,10 @@ pub struct PlanReviewResult {
 pub struct AgyCli;
 
 impl PlanReviewBackend for AgyCli {
+    fn driver_name(&self) -> &'static str {
+        "agy"
+    }
+
     fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
         let bin = resolve_agy_bin(&req.command)?;
         let mut watch_paths = Vec::new();
@@ -101,11 +114,99 @@ impl PlanReviewBackend for AgyCli {
     }
 }
 
+/// Live `codex exec` child for a plan-review slot.
+///
+/// The plan-review slots are named for the harness that used to own them, but the driver
+/// follows the role binding: `plan_reviewer_agy` is a SLOT, and a binding may re-point that
+/// slot at another harness when the bound one is exhausted. `codex exec` writes its final
+/// message to `-o <file>`; that file is the review text and stdout is only a fallback.
+pub struct CodexCli;
+
+impl PlanReviewBackend for CodexCli {
+    fn driver_name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
+        let bin = resolve_review_bin("codex", &req.command)?;
+        let mut watch_paths = Vec::new();
+        if let Some(ref last) = req.last_message_path {
+            watch_paths.push(last.clone());
+        }
+        if let Some(ref td) = req.track_dir {
+            watch_paths.push(td.join(format!("{}-review.md", req.slug)));
+        }
+        let out = run_process(
+            &bin,
+            &req.argv,
+            &req.workspace_root,
+            ProcessWait {
+                timeout: req.remaining,
+                stall: crate::workflow::watchdog::progress_stall_interval(),
+                watch_paths: &watch_paths,
+            },
+            &[],
+            Some(req.prompt.as_bytes()),
+        )?;
+        let last_message = req
+            .last_message_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        let stdout = if last_message.trim().is_empty() {
+            out.stdout.clone()
+        } else {
+            last_message
+        };
+        Ok(PlanReviewResult {
+            exit: out.exit,
+            stdout,
+            stderr: out.stderr,
+        })
+    }
+}
+
+/// Argv for a `codex exec` plan-review slot.
+///
+/// Mirrors the cross-model review driver (`src/review/spawn.rs`): the prompt goes on stdin
+/// (`-`), the sandbox is read-only, and the final message is written to `-o <file>`. The
+/// model id is passed verbatim: the codex CLI takes a plain id (`gpt-6-luna`) and reads its
+/// reasoning effort from its own config — the `[effort]` bracket form belongs to the ACP
+/// adapter, not to this CLI.
+pub fn codex_plan_review_argv(
+    model: Option<&str>,
+    workspace_root: &Path,
+    last_path: &Path,
+) -> Vec<String> {
+    let mut args = vec![
+        "exec".into(),
+        "-s".into(),
+        "read-only".into(),
+        "--ephemeral".into(),
+        "-o".into(),
+        last_path.to_string_lossy().into_owned(),
+        "--add-dir".into(),
+        workspace_root.to_string_lossy().into_owned(),
+    ];
+    if let Some(m) = model
+        && !m.trim().is_empty()
+    {
+        args.push("-m".into());
+        args.push(m.to_string());
+    }
+    args.push("-".into());
+    args
+}
+
 /// Live `opencode run` child. Default `cargo test` does not construct this
 /// unless `COORDINATOR_OPENCODE_LIVE=1`.
 pub struct OpenCodeCli;
 
 impl PlanReviewBackend for OpenCodeCli {
+    fn driver_name(&self) -> &'static str {
+        "opencode"
+    }
+
     fn run(&self, req: &PlanReviewRequest) -> Result<PlanReviewResult> {
         let bin = resolve_review_bin("opencode", &req.command)?;
         let extra: Vec<(&str, String)> = req
@@ -420,7 +521,7 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
         return Ok(());
     }
 
-    let backend = backend_for(record, slug);
+    let backend = backend_for(record, slug, &binding);
     if !has_test_backend(record) {
         let resolved = match slug {
             REVIEW_SLUG_OPENCODE => resolve_review_bin("opencode", &binding.command),
@@ -477,20 +578,44 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
         )],
         _ => Vec::new(),
     };
-    let argv = match slug {
+    // The driver follows the ROLE BINDING, not the slot name. `plan_reviewer_agy` is a slot;
+    // a binding may re-point it at another harness when the bound one is exhausted.
+    let (argv, last_message_path) = match slug {
         REVIEW_SLUG_OPENCODE => {
             let title = spawn_track_id
                 .as_deref()
                 .map(|id| format!("plan-review {id}"));
-            opencode_argv(binding.model.as_deref(), title.as_deref())
+            (
+                opencode_argv(binding.model.as_deref(), title.as_deref()),
+                None,
+            )
+        }
+        _ if binding.harness.eq_ignore_ascii_case("codex") => {
+            let tmp = std::env::temp_dir().join(format!(
+                "coordinator-plan-review-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+            let last = tmp.join("last-message.txt");
+            (
+                codex_plan_review_argv(binding.model.as_deref(), &paths.workspace_root, &last),
+                Some(last),
+            )
         }
         _ => {
             let add_dir = add_dir_arg(&paths.workspace_root, paths.execution_repo.as_deref());
-            agy_argv(
-                &prompt,
-                remaining,
-                binding.model.as_deref(),
-                add_dir.as_deref(),
+            (
+                agy_argv(
+                    &prompt,
+                    remaining,
+                    binding.model.as_deref(),
+                    add_dir.as_deref(),
+                ),
+                None,
             )
         }
     };
@@ -504,6 +629,7 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
         prompt,
         remaining,
         argv,
+        last_message_path,
         extra_env,
         spawn_epoch,
         spawn_track_id,
@@ -1197,7 +1323,11 @@ fn has_test_backend(record: &ProjectRecord) -> bool {
     }
 }
 
-fn backend_for(record: &ProjectRecord, slug: &str) -> Arc<dyn PlanReviewBackend> {
+fn backend_for(
+    record: &ProjectRecord,
+    slug: &str,
+    binding: &RoleBinding,
+) -> Arc<dyn PlanReviewBackend> {
     #[cfg(test)]
     {
         if let Some(b) = test_backend_for(&record.id) {
@@ -1207,6 +1337,11 @@ fn backend_for(record: &ProjectRecord, slug: &str) -> Arc<dyn PlanReviewBackend>
     #[cfg(not(test))]
     {
         let _ = record;
+    }
+    // The driver follows the role binding, not the slot name: a slot whose bound harness is
+    // exhausted can be re-pointed at another one without touching the graph.
+    if binding.harness.eq_ignore_ascii_case("codex") {
+        return Arc::new(CodexCli);
     }
     match slug {
         REVIEW_SLUG_OPENCODE => Arc::new(OpenCodeCli),
@@ -1893,6 +2028,66 @@ mod tests {
                 .iter()
                 .any(|a| a.contains("review please") || a.contains('\n')),
             "prompt must be stdin, not argv: {args:?}"
+        );
+    }
+
+    #[test]
+    fn codex_plan_review_argv_uses_codex_exec_and_a_stdin_prompt() {
+        let last = PathBuf::from("C:\\tmp\\last-message.txt");
+        let args = codex_plan_review_argv(Some("gpt-6-luna"), Path::new("C:\\ws"), &last);
+        assert_eq!(args[0], "exec");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-s" && w[1] == "read-only"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == last.to_string_lossy().as_ref()),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-m" && w[1] == "gpt-6-luna"),
+            "{args:?}"
+        );
+        assert_eq!(args.last().unwrap(), "-", "{args:?}");
+        // The prompt is stdin, never argv: cmd.exe `%*` truncates newlines.
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("review please") || a.contains('\n')),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn codex_plan_review_argv_omits_an_empty_model() {
+        let args = codex_plan_review_argv(None, Path::new("C:\\ws"), Path::new("C:\\tmp\\l.txt"));
+        assert!(!args.iter().any(|a| a == "-m"), "{args:?}");
+    }
+
+    #[test]
+    fn the_driver_follows_the_binding_not_the_slot_name() {
+        let ws = tempdir().unwrap();
+        let record = rec(ws.path());
+        let agy = RoleBinding {
+            harness: "antigravity".into(),
+            command: "agy".into(),
+            model: None,
+        };
+        let codex = RoleBinding {
+            harness: "codex".into(),
+            command: "codex".into(),
+            model: Some("gpt-6-luna".into()),
+        };
+        // Same slot, different binding -> different driver.
+        assert_eq!(
+            backend_for(&record, REVIEW_SLUG_AGY, &agy).driver_name(),
+            "agy"
+        );
+        assert_eq!(
+            backend_for(&record, REVIEW_SLUG_AGY, &codex).driver_name(),
+            "codex"
         );
     }
 
@@ -2749,6 +2944,7 @@ mod tests {
             slug: "agy".into(),
             command: "agy".into(),
             model: None,
+            last_message_path: None,
             workspace_root: dir.path().to_path_buf(),
             execution_repo: None,
             track_dir: None,
@@ -3324,6 +3520,7 @@ mod tests {
             slug: REVIEW_SLUG_OPENCODE.into(),
             command: "opencode".into(),
             model: None,
+            last_message_path: None,
             workspace_root: dir.path().to_path_buf(),
             execution_repo: None,
             track_dir: Some(dir.path().join("conductor").join("0001-Example")),
