@@ -257,9 +257,11 @@ coordinator status --project C:\dev\Orca
 
 There is exactly **one** supervisor: the Windows logon Scheduled Task `CoordinatorServe`, which runs
 the installed `coordinator.exe serve --port 7420` as the interactive user at logon.
-`Start-ScheduledTask -TaskName CoordinatorServe` is the supported on-demand start. The task may
-restart only the serve process **it** started, and only after that process exits with a failure
-(`RestartCount 3`, interval 1 min). `serve` itself refuses to start a second machine ticker: if a
+`Start-ScheduledTask -TaskName CoordinatorServe` is the supported on-demand start and the recovery
+path after a dead serve. The task is the only owner of the machine ticker; `RestartOnFailure` is
+configured (3 attempts, 1 min apart) but Windows applies it only when the action **fails to start** —
+it does not revive a serve that exits non-zero or is killed (verified on this host; see honest
+limits). `serve` itself refuses to start a second machine ticker: if a
 coordinator answers on 7420, or on the lease port while 7420 is requested, it exits 0 without
 binding, without rewriting the lease, and without touching the running process. **Nothing autonomous
 kills serve.** A manual `coordinator serve` in a terminal is a debugging path: it is not adopted by
@@ -288,7 +290,7 @@ $settings  = New-ScheduledTaskSettingsSet `
     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 Register-ScheduledTask -TaskName 'CoordinatorServe' `
     -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-    -Description 'Coordinator machine ticker: coordinator.exe serve --port 7420. Restarts only a dead serve; never kills a live one.' `
+    -Description 'Coordinator machine ticker: coordinator.exe serve --port 7420. Starts a missing serve; never kills a live one.' `
     -Force
 $exe   # record this exact path: it is the task's verified action target
 ```
@@ -304,6 +306,7 @@ coordinator serve --check
 Start-ScheduledTask -TaskName 'CoordinatorServe'
 
 # stop half of the deploy preflight (0108 self-update still refuses while a live coordinator.exe exists)
+# confirm with: coordinator serve --check   # exit 1 when serve is really down
 Stop-ScheduledTask -TaskName 'CoordinatorServe'
 
 # uninstall
@@ -317,17 +320,17 @@ prevents a second task instance; `RestartCount`/`RestartInterval` are the only r
 `Interactive`/`Limited` keep harness OAuth/profile working and avoid elevation.
 
 **Honest limits.** Logon-only (no ticker before the user logs on — harness OAuth needs the interactive
-user); the task supervises only the process **it** started; `RestartOnFailure` is configured at 3
-attempts 1 min apart, but a restart after a crashed serve is **not proven on this host** (the isolated
-0116 proof did not observe one, and neither did a trivial failing-action probe), so treat the restart
-as unconfirmed until the owner's logon proof and a forced-kill observation; recovery is
-`Start-ScheduledTask -TaskName CoordinatorServe`. There is no timer,
-no watchdog loop, no kill. A serve that is bound but stops answering `/health` is not restarted — the
-task's next run fails to bind, retries 3× and stops; recovery is `Stop-ScheduledTask` then
-`Start-ScheduledTask`. **A logon run that finds a healthy serve exits 0 and is not re-run until the
-next logon or a manual `Start-ScheduledTask`; if that serve later dies there is no automatic retry —
-recovery is `Start-ScheduledTask -TaskName CoordinatorServe`.** On an interactive-logon task a
-console-subsystem exe may show a console window; that is accepted (no wrapper, no hidden second path).
+user); the task supervises only the process **it** started. `RestartOnFailure` retries only a task
+whose action cannot start (`LastTaskResult 0x80070002`): the isolated 0116 proof observed the configured
+3 retries for a missing action, but **no** retry after a serve exited non-zero or was killed, so a
+crashed serve is **not** revived automatically. Recovery is
+`Start-ScheduledTask -TaskName CoordinatorServe` (verified: kill the isolated serve, start the task,
+and a new serve answers). There is no timer, no watchdog loop, no kill. A serve that is bound but stops
+answering `/health` is not restarted. **A logon run that finds a healthy serve exits 0 and is not
+re-run until the next logon or a manual `Start-ScheduledTask`; if that serve later dies there is no
+automatic retry — recovery is `Start-ScheduledTask -TaskName CoordinatorServe`.** On an interactive-logon
+task a console-subsystem exe may show a console window; that is accepted (no wrapper, no hidden second
+path).
 
 ### Autonomous pipeline dogfood
 
