@@ -2289,16 +2289,21 @@ mod tests {
         let dir = fx.dir();
         let view = fx.view();
         let holder_dir = dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
             with_registry_lock(&holder_dir, || {
+                // The lock is held before the signal, so the import below cannot win it.
+                tx.send(()).unwrap();
                 let body = std::fs::read_to_string(&view).unwrap();
                 std::fs::write(&view, format!("{body}{}", row("0002", READY, "b"))).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(std::time::Duration::from_millis(150));
                 Ok(())
             })
             .unwrap();
         });
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder signalled");
+        assert!(dir.join(LOCK_DIR).exists(), "holder must hold the lock");
         let report = import_at(&dir, ImportOpts::default()).unwrap();
         holder.join().unwrap();
         assert_eq!(report.status, "ok");
@@ -2848,8 +2853,10 @@ mod tests {
         let dir = fx.dir();
         let view = fx.view();
         let holder_dir = dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
             with_registry_lock(&holder_dir, || {
+                tx.send(()).unwrap();
                 let body = std::fs::read_to_string(&view).unwrap();
                 std::fs::write(&view, format!("{body}{}", row("0020", PROPOSED, "p"))).unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(150));
@@ -2857,7 +2864,8 @@ mod tests {
             })
             .unwrap();
         });
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder signalled");
         let report = import_at(&dir, ImportOpts::default()).unwrap();
         holder.join().unwrap();
         assert_eq!(report.status, "ok");

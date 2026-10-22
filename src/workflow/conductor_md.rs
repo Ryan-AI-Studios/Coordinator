@@ -2038,7 +2038,7 @@ mod tests {
             fold_advance(&record, Some("0001")),
             FoldAdvance::PromotePlaceholder {
                 key: "0001".into(),
-                ready: "**Ready - not started**".into(),
+                ready: "**Ready — not started**".into(),
                 observed: PLACEHOLDER_STATUS.into(),
             }
         );
