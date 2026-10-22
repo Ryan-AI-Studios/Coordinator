@@ -216,7 +216,10 @@ pub fn resolve_track_target(
         .ok_or_else(|| RepoResolutionError::new(None, "no track id is pinned on the run"))?;
 
     let rows = super::conductor_md::load_track_rows(record).ok_or_else(|| {
-        RepoResolutionError::new(Some(track_id), "cannot read conductor.md track rows")
+        RepoResolutionError::new(
+            Some(track_id),
+            "cannot read the track registry (store or conductor.md) track rows",
+        )
     })?;
     let matching: Vec<_> = rows
         .iter()

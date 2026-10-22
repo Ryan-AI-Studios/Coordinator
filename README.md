@@ -68,6 +68,60 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 
 Empty `COORDINATOR_HOME` or `COORDINATOR_STATE_DIR` is rejected.
 
+### Track registry store (0109)
+
+A migrated project keeps its track rows in **`{conductor_dir}/track-registry.json`** and treats
+`{conductor_dir}/conductor.md` as a **generated human view**. Both are byte-identical across
+migration, so cron reporters, humans and a pre-0109 binary keep working unchanged. The store is
+`serde_json` + `sha2` only; there is no database.
+
+| Command | What it does |
+|---|---|
+| `coordinator registry import [--project P \| --conductor-dir D] [--dry-run] [--force]` | Lossless import: every row, `render(import(x)) == x`, a hash-verified `conductor.md.pre-store-<UTC>` backup, and a JSON report. Refuses unattributable rows, interior table gaps, CRLF/BOM/non-UTF-8 input, and a view that changed mid-import. Refuses `Running`/`Paused` projects under the run-state lock. |
+| `coordinator registry render [--check] [--force]` | Regenerate the view from the store. `--check` compares only. `--force` archives a drifted view (`conductor.md.bak-<UTC>-<NNN>`, newest 5 kept) and rewrites it. |
+| `coordinator registry verify` | Exit 0 on zero drift; exit 1 + a full diff (view hash, row ids, statuses, order, `nostart` parity, per-row `status` vs `line`) otherwise. |
+| `coordinator registry set-status --track ID --status TEXT [--clear-nostart] [--dry-run]` | The supported **status-only** change after migration. Store-native, provenance `operator`; refuses an absent/drifted store and a `Running`/`Paused` project. |
+
+**Adding a track after migration:** edit `conductor.md`, then `coordinator registry import
+--conductor-dir <dir> --force` (adopt). A status change uses `registry set-status`. Never leave
+the view edited: the next product write refuses.
+
+**Drift contract.** A view edit is never silently authoritative and never silently discarded:
+
+* non-pick readers (`status`, gate probes, prompts) answer from the **store** and log one
+  `registry-view-drift` line (plus one stderr line) per process/project;
+* the **ready pick refuses** (`track registry view drifted; run ... import --force`) and the
+  0103 ticker records `Skipped(RegistryDrift)` — nothing is started from a row set a human
+  cannot see, and no `FAILURE.md` is written;
+* product writers refuse with the same recovery text (`import --force` to adopt,
+  `render --force` to discard);
+* `status --project` renders `registry: { state: ok|drift|invalid|absent, store_path, recovery }`.
+
+Recovery is one command in either direction. `import --force` (adoption) rebuilds every row and
+resets status provenance to `import`.
+
+**Rollback:** delete `{conductor_dir}/track-registry.json`. Readers see an absent store and
+return to the shipped markdown path; the view is byte-identical, so behaviour is exactly
+pre-0109. The pre-migration bytes live at `conductor.md.pre-store-<UTC>` (hash-verified) and the
+previous store at `track-registry.json.bak`.
+
+**Only migrated projects use the store.** The coordinator registry is migrated; the other nine
+registered projects stay on the legacy markdown path — that is the compatibility proof, not a
+gap. A future fleet migration needs its own track.
+
+### `status.md` growth bound (0109)
+
+`{workspace}/status.md` keeps its path and one-line append format. Before an append that would
+grow it past **1 MiB**, the file is renamed to
+**`{state_dir}/status-archive/status-<YYYYMMDDTHHMMSSZ>-<NNN>.md`** and the newest **7**
+archives are kept (oldest deleted first by parsed `(timestamp, sequence)`); the next append
+recreates `status.md` with its header. Retention is bounded at **8 MiB of archives per project**
+(≈2 years at the measured ~3.7 MB/year). Rotation is best-effort: if the rename fails the line
+is appended in place — **no line is ever lost**. The state dir (not the workspace root) is used
+so a repo-root workspace gains no untracked archives; `checkpoint::committable_dirt` also
+excludes `status-<UTC>-<NNN>.md` basenames. Reporters that want history should glob
+`{state_dir}/status-archive/status-*.md`.
+
 ### Layout Profiles (path bindings)
 
 Each registered project has a **layout profile** that tells the Control Plane how to resolve Workspace Root, conductor dir, execution repo(s), and state dir. Session pool key is **`project_id`** (workspace `path` is immutable via `project set`).

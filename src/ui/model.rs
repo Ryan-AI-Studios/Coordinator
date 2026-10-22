@@ -642,6 +642,7 @@ mod tests {
             parked_next: None,
             state_gate: None,
             self_check: None,
+            registry: None,
         }
     }
 

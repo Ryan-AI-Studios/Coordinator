@@ -223,7 +223,7 @@ pub fn is_cancelled(status_raw: &str) -> bool {
 }
 
 /// Vocabulary `Proposed`, including house-style trailing detail (0074).
-fn is_proposed(status_raw: &str) -> bool {
+pub(crate) fn is_proposed(status_raw: &str) -> bool {
     status_token_matches(&status_clean(status_raw), "Proposed")
 }
 
@@ -263,15 +263,62 @@ pub fn is_reasoned_downgrade(status_raw: &str) -> bool {
 }
 
 /// Best-effort `{conductor_dir}/conductor.md` rows. Missing / unreadable → `None`.
+///
+/// 0109: one seam. A present store is authoritative (`Some(rows)`); a drifted view is
+/// reported once and still answers from the store; an absent store falls back to the
+/// shipped markdown parse; a broken store never falls back to markdown.
 pub fn load_track_rows(record: &ProjectRecord) -> Option<Vec<TrackRow>> {
-    let path = crate::layout::resolve(record)
-        .conductor_dir
-        .join("conductor.md");
+    match crate::registry_store::snapshot(record) {
+        Ok(snapshot) => {
+            if let crate::registry_store::StoreView::Drifted { expected, actual } = &snapshot.view {
+                crate::registry_store::report_drift_once(record, expected, actual);
+            }
+            if snapshot.view == crate::registry_store::StoreView::Absent {
+                legacy_load_track_rows(record)
+            } else {
+                Some(snapshot.rows)
+            }
+        }
+        Err(e) => {
+            crate::registry_store::report_store_unreadable_once(record, &e);
+            None
+        }
+    }
+}
+
+fn legacy_load_track_rows(record: &ProjectRecord) -> Option<Vec<TrackRow>> {
+    let path = conductor_md_path(record);
     if !path.is_file() {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = read_view_for_parse(&path).ok()?;
     parse_conductor_md(&text).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static VIEW_PARSE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The one helper for every production **parse** read of the generated view.
+///
+/// `#[cfg(test)]` counts calls so AC-5.3 can prove the decision legs read the store
+/// (counter zero in store mode) instead of grepping for `read_to_string`. The counter is
+/// thread-local so concurrent tests cannot pollute each other's proof.
+pub(crate) fn read_view_for_parse(path: &std::path::Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    VIEW_PARSE_READS.with(|c| c.set(c.get() + 1));
+    std::fs::read_to_string(path)
+}
+
+#[cfg(test)]
+pub(crate) fn view_parse_reads() -> usize {
+    VIEW_PARSE_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_view_parse_reads() {
+    VIEW_PARSE_READS.with(|c| c.set(0));
 }
 
 pub(crate) fn row_matches_track(row: &TrackRow, key: &str) -> bool {
@@ -496,7 +543,7 @@ pub fn width_deviations(text: &str) -> Vec<WidthDeviation> {
 /// Replace the content of the `idx`-th cell (0-based, counting only unescaped `|`
 /// separators) in a single table row line. Returns `None` when the row has too few
 /// cells. Leading/trailing single spaces around the new content are normalized.
-fn replace_cell(line: &str, idx: usize, content: &str) -> Option<String> {
+pub(crate) fn replace_cell(line: &str, idx: usize, content: &str) -> Option<String> {
     let bytes = line.as_bytes();
     let mut boundaries: Vec<usize> = Vec::new();
     let mut i = 0;
@@ -538,9 +585,17 @@ pub fn status_snapshot(text: &str) -> std::collections::BTreeMap<String, String>
 
 /// Snapshot for a record's live registry.
 pub fn status_snapshot_for(record: &ProjectRecord) -> std::collections::BTreeMap<String, String> {
-    std::fs::read_to_string(conductor_md_path(record))
-        .map(|t| status_snapshot(&t))
-        .unwrap_or_default()
+    match crate::registry_store::snapshot(record) {
+        Ok(snapshot) if snapshot.view != crate::registry_store::StoreView::Absent => snapshot
+            .rows
+            .into_iter()
+            .map(|r| (r.id, r.status_raw.trim().to_string()))
+            .collect(),
+        Ok(_) => read_view_for_parse(&conductor_md_path(record))
+            .map(|t| status_snapshot(&t))
+            .unwrap_or_default(),
+        Err(_) => std::collections::BTreeMap::new(),
+    }
 }
 
 /// Undo a non-terminal `Ready` downgrade an `advance`/`fold` session wrote into the
@@ -620,7 +675,10 @@ pub fn restore_ready_rows(
                 {
                     // The status cell index in the *original* line: header cell 0 is the
                     // text before the first pipe, so the cell index equals `status_col`.
-                    if let Some(new_line) = replace_cell(&lines[i], sc, prev) {
+                    // 0109: preserve a cell-terminating marker the row already carries.
+                    if let Some(new_line) =
+                        replace_status_cell_preserving_marker(&lines[i], sc, prev)
+                    {
                         lines[i] = new_line;
                         if !restored.iter().any(|e| track_ids_match(e, id)) {
                             restored.push(id.clone());
@@ -646,7 +704,7 @@ pub fn restore_ready_rows(
 /// `Proposed - placeholder, needs full spec/plan pass`.
 ///
 /// A deliberate `Proposed - gated on ...` hold does not match, so it keeps its withhold.
-fn status_names_placeholder(status_raw: &str) -> bool {
+pub(crate) fn status_names_placeholder(status_raw: &str) -> bool {
     status_clean(status_raw)
         .to_ascii_lowercase()
         .contains("placeholder")
@@ -670,10 +728,36 @@ fn placeholder_pass_complete(record: &ProjectRecord, key: &str) -> bool {
     }
 }
 
+/// Replace the content of the `status_col`-th cell, preserving a cell-terminating
+/// `<!-- nostart -->` that the row already carried in that cell (0109 spec §3.2 rule 9).
+///
+/// Shared by the store mutation core and the legacy markdown writers so store mode and
+/// markdown mode produce identical bytes for a marker-bearing row.
+pub(crate) fn replace_status_cell_preserving_marker(
+    line: &str,
+    status_col: usize,
+    content: &str,
+) -> Option<String> {
+    let (stripped, _) = strip_nostart_literal(content);
+    let content = stripped.trim();
+    let cells = split_unescaped_pipes(line);
+    let keep_marker = cells
+        .get(status_col)
+        .map(|c| c.trim_end().ends_with(NOSTART_LITERAL))
+        .unwrap_or(false);
+    let cell = if keep_marker {
+        format!("{content} {NOSTART_LITERAL}")
+    } else {
+        content.to_string()
+    };
+    replace_cell(line, status_col, &cell)
+}
+
 /// Set the Status cell of the row matching `key` to `ready`, returning the new registry.
 ///
 /// Pure, mirroring [`restore_ready_rows`]: the caller writes the body. `None` when no row
-/// matched, so a vanished row can never be reported as promoted.
+/// matched, so a vanished row can never be reported as promoted. A status-cell
+/// `<!-- nostart -->` is preserved (0109).
 fn promote_placeholder_in(text: &str, key: &str, ready: &str) -> Option<String> {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let owned: Vec<String> = lines.clone();
@@ -711,7 +795,7 @@ fn promote_placeholder_in(text: &str, key: &str, ready: &str) -> Option<String> 
             });
             if matched
                 && let Some(sc) = status_col
-                && let Some(new_line) = replace_cell(&lines[i], sc, ready)
+                && let Some(new_line) = replace_status_cell_preserving_marker(&lines[i], sc, ready)
             {
                 let trailing_newline = text.ends_with('\n');
                 lines[i] = new_line;
@@ -780,23 +864,77 @@ pub(crate) fn promote_placeholders_in(
 }
 
 /// Promote `key`'s row to `ready` in the live registry. `Ok(false)` when no row matched.
+///
+/// 0109: one lock for both arms. Store mode promotes the first matching row and then
+/// re-renders the view; `NoStore` keeps the shipped markdown writer under the same lock.
 pub fn promote_placeholder(
     record: &ProjectRecord,
     key: &str,
     ready: &str,
 ) -> std::io::Result<bool> {
-    let path = conductor_md_path(record);
-    let text = std::fs::read_to_string(&path)?;
-    let (promoted, body) = promote_placeholders_in(&text, &[(key.to_string(), ready.to_string())]);
-    if let Some(body) = body {
-        std::fs::write(&path, body)?;
-    }
-    Ok(!promoted.is_empty())
+    promote_placeholder_inner(record, key, ready, None)
+}
+
+/// Promote only while the row still carries the exact status the fold gate observed.
+///
+/// Closes the read→lock race: a concurrent writer that changed the row wins the write and
+/// this call reports `Ok(false)` (the fold then withholds instead of advancing).
+pub fn promote_placeholder_observed(
+    record: &ProjectRecord,
+    key: &str,
+    ready: &str,
+    observed: &str,
+) -> std::io::Result<bool> {
+    promote_placeholder_inner(record, key, ready, Some(observed))
+}
+
+fn promote_placeholder_inner(
+    record: &ProjectRecord,
+    key: &str,
+    ready: &str,
+    observed: Option<&str>,
+) -> std::io::Result<bool> {
+    let dir = crate::layout::resolve(record).conductor_dir;
+    let promotions = vec![(key.to_string(), ready.to_string())];
+    crate::registry_store::with_registry_lock(&dir, || {
+        let store_outcome = match observed {
+            Some(observed) => crate::registry_store::promote_placeholders_observed_locked(
+                &dir,
+                &[(key.to_string(), observed.to_string(), ready.to_string())],
+                "fold",
+            )?,
+            None => crate::registry_store::promote_placeholders_locked(&dir, &promotions, "fold")?,
+        };
+        match store_outcome {
+            crate::registry_store::WriteOutcome::NoStore => {
+                let path = dir.join("conductor.md");
+                let text = read_view_for_parse(&path)?;
+                if let Some(observed) = observed {
+                    let current = parse_conductor_md(&text).ok().and_then(|rows| {
+                        rows.into_iter()
+                            .find(|r| row_matches_track(r, key))
+                            .map(|r| r.status_raw)
+                    });
+                    if current.as_deref() != Some(observed) {
+                        return Ok(false);
+                    }
+                }
+                let (promoted, body) = promote_placeholders_in(&text, &promotions);
+                if let Some(body) = body {
+                    std::fs::write(&path, body)?;
+                }
+                Ok(!promoted.is_empty())
+            }
+            crate::registry_store::WriteOutcome::Changed(ids) => Ok(!ids.is_empty()),
+            crate::registry_store::WriteOutcome::Unchanged => Ok(false),
+        }
+    })
+    .map_err(std::io::Error::other)
 }
 
 /// [`width_deviations`] for a record's live registry.
 pub fn width_deviations_for(record: &ProjectRecord) -> Vec<WidthDeviation> {
-    std::fs::read_to_string(conductor_md_path(record))
+    read_view_for_parse(&conductor_md_path(record))
         .map(|t| width_deviations(&t))
         .unwrap_or_default()
 }
@@ -857,20 +995,20 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
     Ok(rows)
 }
 
-fn is_track_or_id_header(h: &str) -> bool {
+pub(crate) fn is_track_or_id_header(h: &str) -> bool {
     h.eq_ignore_ascii_case("track") || h.eq_ignore_ascii_case("id")
 }
 
-fn is_status_header(h: &str) -> bool {
+pub(crate) fn is_status_header(h: &str) -> bool {
     h.eq_ignore_ascii_case("status")
 }
 
-fn is_summary_header(h: &str) -> bool {
+pub(crate) fn is_summary_header(h: &str) -> bool {
     h.eq_ignore_ascii_case("summary")
 }
 
 /// Case/punctuation/whitespace-insensitive execution header match.
-fn is_execution_header(h: &str) -> bool {
+pub(crate) fn is_execution_header(h: &str) -> bool {
     let norm: String = h
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -882,7 +1020,7 @@ fn is_execution_header(h: &str) -> bool {
     )
 }
 
-fn unwrap_md_link(cell: &str) -> String {
+pub(crate) fn unwrap_md_link(cell: &str) -> String {
     let t = cell.trim();
     if let Some(rest) = t.strip_prefix('[')
         && let Some(end) = rest.find("](")
@@ -893,7 +1031,7 @@ fn unwrap_md_link(cell: &str) -> String {
     t.to_string()
 }
 
-fn parse_leading_id(text: &str) -> Option<(String, String)> {
+pub(crate) fn parse_leading_id(text: &str) -> Option<(String, String)> {
     let t = text.trim();
     let b = t.as_bytes();
     // Registries in the wild prefix the numeric id with an alpha marker (`| T374 | ... |`)
@@ -927,7 +1065,7 @@ fn parse_leading_id(text: &str) -> Option<(String, String)> {
 }
 
 /// Split on unescaped `|`. Drop wrapping empty cells from leading/trailing pipes.
-fn split_unescaped_pipes(line: &str) -> Vec<String> {
+pub(crate) fn split_unescaped_pipes(line: &str) -> Vec<String> {
     let mut cells = Vec::new();
     let mut cur = String::new();
     let mut chars = line.chars().peekable();
@@ -951,14 +1089,14 @@ fn split_unescaped_pipes(line: &str) -> Vec<String> {
     cells
 }
 
-fn is_delimiter_cell(cell: &str) -> bool {
+pub(crate) fn is_delimiter_cell(cell: &str) -> bool {
     let t = cell.trim();
     let t = t.strip_prefix(':').unwrap_or(t);
     let t = t.strip_suffix(':').unwrap_or(t);
     t.len() >= 3 && t.chars().all(|c| c == '-')
 }
 
-fn looks_like_row(line: &str) -> bool {
+pub(crate) fn looks_like_row(line: &str) -> bool {
     let t = line.trim();
     !t.is_empty() && t.contains('|') && !t.starts_with("```") && !t.starts_with("~~~")
 }
@@ -966,7 +1104,7 @@ fn looks_like_row(line: &str) -> bool {
 /// CommonMark 0.31.2 / GFM §4.1 thematic break, and not a pipe row.
 /// Indent is at most three spaces (four-space / tab-indented lines stay
 /// non-separators so a code-block `---` still ends the table).
-fn is_thematic_break(line: &str) -> bool {
+pub(crate) fn is_thematic_break(line: &str) -> bool {
     if line.contains('|') {
         return false;
     }
@@ -998,7 +1136,7 @@ fn is_thematic_break(line: &str) -> bool {
     n >= 3
 }
 
-fn is_table_start(lines: &[&str], i: usize) -> bool {
+pub(crate) fn is_table_start(lines: &[&str], i: usize) -> bool {
     if i + 1 >= lines.len() || !looks_like_row(lines[i]) || !looks_like_row(lines[i + 1]) {
         return false;
     }
@@ -1159,11 +1297,7 @@ fn is_id_lookahead(rest: &str) -> bool {
 /// Track+Status rows `parse_conductor_md` can see. `None` if the file is
 /// missing or not a parseable registry (honest empty vs parser-blind).
 pub fn parsed_track_row_count(record: &ProjectRecord) -> Option<usize> {
-    let path = crate::layout::resolve(record)
-        .conductor_dir
-        .join("conductor.md");
-    let text = std::fs::read_to_string(path).ok()?;
-    parse_conductor_md(&text).ok().map(|rows| rows.len())
+    load_track_rows(record).map(|rows| rows.len())
 }
 
 fn empty_ready_pick_error(record: &ProjectRecord) -> String {
@@ -1219,15 +1353,33 @@ pub fn pick_next_ready_excluding_sticky(
     let path = crate::layout::resolve(record)
         .conductor_dir
         .join("conductor.md");
-    if !path.is_file() {
-        return Err(CoordinatorError::Message(format!(
-            "no conductor.md at {}; pass --track <id>",
-            path.display()
-        )));
-    }
-    let text = std::fs::read_to_string(&path)?;
-    let rows = parse_conductor_md(&text)?;
-    let order = parse_execution_order(&text);
+    let snapshot = crate::registry_store::snapshot(record)?;
+    let (rows, order) = match &snapshot.view {
+        crate::registry_store::StoreView::Absent => {
+            if !path.is_file() {
+                return Err(CoordinatorError::Message(format!(
+                    "no conductor.md at {}; pass --track <id>",
+                    path.display()
+                )));
+            }
+            let text = read_view_for_parse(&path)?;
+            (parse_conductor_md(&text)?, parse_execution_order(&text))
+        }
+        crate::registry_store::StoreView::Drifted { expected, actual } => {
+            let dir = crate::layout::resolve(record).conductor_dir;
+            return Err(CoordinatorError::Message(format!(
+                "{} (store {expected}, view {actual}); run \
+                 `coordinator registry import --conductor-dir {} --force` to adopt the edit \
+                 or `coordinator registry render --conductor-dir {} --force` to discard it",
+                crate::registry_store::VIEW_DRIFT_PREFIX,
+                dir.display(),
+                dir.display(),
+            )));
+        }
+        crate::registry_store::StoreView::Ok => {
+            (snapshot.rows.clone(), snapshot.execution_order.clone())
+        }
+    };
     let aliases = ready_aliases_for(record);
     let mut eligible: Vec<&TrackRow> = rows
         .iter()
@@ -1360,6 +1512,9 @@ pub enum FoldAdvance {
     PromotePlaceholder {
         key: String,
         ready: String,
+        /// The raw status this gate observed. The writer promotes only while the row still
+        /// carries exactly this status (a concurrent writer wins; no silent overwrite).
+        observed: String,
     },
 }
 
@@ -1394,6 +1549,7 @@ pub fn fold_advance(record: &ProjectRecord, track_id: Option<&str>) -> FoldAdvan
             return FoldAdvance::PromotePlaceholder {
                 key: key.to_string(),
                 ready,
+                observed: row.status_raw.clone(),
             };
         }
         return FoldAdvance::Withhold {
@@ -1883,6 +2039,7 @@ mod tests {
             FoldAdvance::PromotePlaceholder {
                 key: "0001".into(),
                 ready: "**Ready — not started**".into(),
+                observed: PLACEHOLDER_STATUS.into(),
             }
         );
     }
@@ -3348,5 +3505,642 @@ mod tests_0103 {
         // (5) An Io read error is never benign by construction.
         let io = crate::error::CoordinatorError::Io(std::io::Error::other("share"));
         assert!(!ready_pick_miss_is_benign(&io));
+    }
+}
+// 0109 read-seam tests: the decision legs read the store, never a stale view.
+
+#[cfg(test)]
+mod tests_0109 {
+    use super::*;
+    use crate::error::CoordinatorError;
+    use crate::layout::LayoutProfile;
+    use crate::registry::AutoStartPolicy;
+    use crate::state::RunState;
+    use crate::workflow::shipped::MergedTrackProbe;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use tempfile::{TempDir, tempdir};
+
+    const READY: &str = "**Ready — not started**";
+    const PROPOSED_PLACEHOLDER: &str = "**Proposed — placeholder, needs full spec/plan pass**";
+
+    fn rec(ws: &Path, id: &str) -> ProjectRecord {
+        ProjectRecord {
+            id: id.to_string(),
+            path: ws.to_path_buf(),
+            display_name: None,
+            layout_profile: LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: BTreeMap::new(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: AutoStartPolicy::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            skill_aliases: BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    struct Fx {
+        _ws: TempDir,
+        record: ProjectRecord,
+    }
+
+    impl Fx {
+        fn dir(&self) -> PathBuf {
+            self.record.path.join("conductor")
+        }
+        fn view(&self) -> PathBuf {
+            self.dir().join("conductor.md")
+        }
+        fn write_view(&self, body: &str) {
+            std::fs::create_dir_all(self.dir()).unwrap();
+            std::fs::write(self.view(), body).unwrap();
+        }
+        fn read_view(&self) -> String {
+            std::fs::read_to_string(self.view()).unwrap()
+        }
+        fn import(&self) -> crate::registry_store::ImportReport {
+            crate::registry_store::import_at(
+                &self.dir(),
+                crate::registry_store::ImportOpts::default(),
+            )
+            .unwrap()
+        }
+        fn import_force(&self) -> crate::registry_store::ImportReport {
+            crate::registry_store::import_at(
+                &self.dir(),
+                crate::registry_store::ImportOpts {
+                    dry_run: false,
+                    force: true,
+                },
+            )
+            .unwrap()
+        }
+        fn track(&self, dir_name: &str) {
+            let dir = self.dir().join(dir_name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("spec.md"), b"# spec\n").unwrap();
+            std::fs::write(dir.join("plan.md"), b"# real plan\n").unwrap();
+        }
+        fn status_log(&self) -> String {
+            std::fs::read_to_string(self.record.path.join("status.md")).unwrap_or_default()
+        }
+    }
+
+    fn fixture(id: &str) -> Fx {
+        let ws = tempdir().unwrap();
+        let record = rec(ws.path(), id);
+        std::fs::create_dir_all(ws.path().join("conductor")).unwrap();
+        Fx { _ws: ws, record }
+    }
+
+    fn row(key: &str, status: &str, summary: &str) -> String {
+        format!("| [{key}]({key}/spec.md) | `.` | {status} | {summary} |\n")
+    }
+
+    fn registry(rows: &[String]) -> String {
+        let mut body = String::from(
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n",
+        );
+        for r in rows {
+            body.push_str(r);
+        }
+        body
+    }
+
+    struct FixedProbe {
+        merged: Vec<String>,
+    }
+
+    impl MergedTrackProbe for FixedProbe {
+        fn merged_pr_for_track(
+            &self,
+            _cwd: &Path,
+            numeric_id: &str,
+        ) -> crate::error::Result<Option<u64>> {
+            Ok(self
+                .merged
+                .iter()
+                .any(|id| id == numeric_id)
+                .then_some(1u64))
+        }
+    }
+
+    struct FeatureHome {
+        _home: TempDir,
+        _guard: crate::config::TestEnvGuard,
+    }
+
+    fn isolate_features() -> FeatureHome {
+        let names = crate::features::test_feature_env_names();
+        let guard = crate::config::TestEnvGuard::capture(&names);
+        let home = tempdir().unwrap();
+        for name in &names {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        crate::features::reset_feature_warnings_for_tests();
+        crate::registry_store::reset_drift_warnings_for_tests();
+        FeatureHome {
+            _home: home,
+            _guard: guard,
+        }
+    }
+
+    #[test]
+    fn pick_answers_from_store_with_a_synced_view() {
+        let fx = fixture("p-17");
+        fx.write_view(&registry(&[row("0001", READY, "go")]));
+        fx.track("0001");
+        fx.import();
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap(),
+            "0001"
+        );
+        let store = crate::registry_store::load(&fx.record).unwrap().unwrap();
+        assert_eq!(crate::registry_store::render(&store), fx.read_view());
+    }
+
+    #[test]
+    fn pick_succeeds_with_no_view() {
+        let fx = fixture("p-18");
+        fx.write_view(&registry(&[row("0001", READY, "go")]));
+        fx.track("0001");
+        fx.import();
+        std::fs::remove_file(fx.view()).unwrap();
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap(),
+            "0001"
+        );
+    }
+
+    #[test]
+    fn pick_follows_store_execution_order() {
+        let fx = fixture("p-19");
+        fx.write_view(
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-One](0001-One/spec.md) | `.` | **Ready — not started** | a |\n\
+             | [0002-Two](0002-Two/spec.md) | `.` | **Ready — not started** | b |\n\
+             \n## Suggested execution order\n\n```\n0002 Two\n0001 One\n```\n",
+        );
+        fx.track("0001-One");
+        fx.track("0002-Two");
+        fx.import();
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap(),
+            "0002"
+        );
+        // Mutating only the store's order changes the answer, proving the store is read.
+        let mut store = crate::registry_store::load(&fx.record).unwrap().unwrap();
+        store.execution_order = vec!["0001".into(), "0002".into()];
+        std::fs::write(
+            crate::registry_store::store_path_for(&fx.record),
+            serde_json::to_vec_pretty(&store).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap(),
+            "0001"
+        );
+    }
+
+    fn pick_case(body: &str, configure: impl Fn(&mut Fx)) -> (String, String) {
+        let md = fixture("p-20-md");
+        md.write_view(body);
+        let mut md = md;
+        configure(&mut md);
+        let md_result = pick_next_ready_excluding_sticky(&md.record, &[], None, &[]);
+        let md_text = match &md_result {
+            Ok(id) => format!("ok:{id}"),
+            Err(e) => format!("err:{e}"),
+        };
+
+        let mut stored = fixture("p-20-store");
+        stored.write_view(body);
+        configure(&mut stored);
+        let report = stored.import();
+        assert_eq!(report.status, "ok", "{report:?}");
+        let store_result = pick_next_ready_excluding_sticky(&stored.record, &[], None, &[]);
+        let store_text = match &store_result {
+            Ok(id) => format!("ok:{id}"),
+            Err(e) => format!("err:{e}"),
+        };
+        (md_text, store_text)
+    }
+
+    #[test]
+    fn pick_parity_matrix_markdown_vs_store() {
+        struct Case {
+            name: &'static str,
+            body: String,
+            configure: fn(&mut Fx),
+        }
+        fn none(_: &mut Fx) {}
+        fn ready_dir(fx: &mut Fx) {
+            fx.track("0001");
+        }
+        let cases: Vec<Case> = vec![
+            Case {
+                name: "exact_ready",
+                body: registry(&[row("0001", READY, "go")]),
+                configure: ready_dir,
+            },
+            Case {
+                name: "custom_alias",
+                body: registry(&[row("0001", "**Pending**", "go")]),
+                configure: |fx| {
+                    fx.record.ready_aliases = vec!["Pending".into()];
+                    fx.track("0001");
+                },
+            },
+            Case {
+                name: "proposed",
+                body: registry(&[row("0001", "**Proposed**", "go")]),
+                configure: none,
+            },
+            Case {
+                name: "blocked",
+                body: registry(&[row("0001", "**Blocked**", "go")]),
+                configure: none,
+            },
+            Case {
+                name: "completed",
+                body: registry(&[row("0001", "**Completed**", "go")]),
+                configure: none,
+            },
+            Case {
+                name: "absorbed",
+                body: registry(&[row("0001", "**Absorbed — 0058**", "go")]),
+                configure: none,
+            },
+            Case {
+                name: "cancelled",
+                body: registry(&[row("0001", "**Cancelled**", "go")]),
+                configure: none,
+            },
+            Case {
+                name: "in_progress",
+                body: registry(&[row("0001", "**In progress**", "go")]),
+                configure: none,
+            },
+            Case {
+                name: "nostart",
+                body: registry(&[row("0001", READY, "go <!-- nostart -->")]),
+                configure: ready_dir,
+            },
+            Case {
+                name: "hitl",
+                body: registry(&[row("0001", READY, "needs HITL")]),
+                configure: ready_dir,
+            },
+            Case {
+                name: "skip_list",
+                body: registry(&[row("0001", READY, "a"), row("0002", READY, "b")]),
+                configure: none,
+            },
+            Case {
+                name: "missing_dir",
+                body: registry(&[row("0001", READY, "a")]),
+                configure: none,
+            },
+            Case {
+                name: "duplicate",
+                body: registry(&[row("0040", READY, "a"), row("0040", READY, "b")]),
+                configure: |fx| fx.track("0040"),
+            },
+            Case {
+                name: "alpha_prefixed",
+                body: registry(&[row("T0374", READY, "a")]),
+                configure: |fx| fx.track("0374-T"),
+            },
+        ];
+        for case in cases {
+            let (md, stored) = pick_case(&case.body, case.configure);
+            assert_eq!(md, stored, "case {}", case.name);
+        }
+
+        // Sticky overlay: a non-token status kept live by the sticky list.
+        let md = fixture("p-20-sticky-md");
+        md.write_view(&registry(&[row("0001", "**Queued**", "a")]));
+        md.track("0001");
+        let md_text =
+            pick_next_ready_excluding_sticky(&md.record, &[], None, &["0001".into()]).unwrap();
+        let stored = fixture("p-20-sticky-store");
+        stored.write_view(&registry(&[row("0001", "**Queued**", "a")]));
+        stored.track("0001");
+        stored.import();
+        let store_text =
+            pick_next_ready_excluding_sticky(&stored.record, &[], None, &["0001".into()]).unwrap();
+        assert_eq!(md_text, store_text);
+        assert_eq!(store_text, "0001");
+
+        // Skip list.
+        let body = registry(&[row("0001", READY, "a"), row("0002", READY, "b")]);
+        let md = fixture("p-20-skip-md");
+        md.write_view(&body);
+        md.track("0001");
+        md.track("0002");
+        let md_text =
+            pick_next_ready_excluding_sticky(&md.record, &["0001".into()], None, &[]).unwrap();
+        let stored = fixture("p-20-skip-store");
+        stored.write_view(&body);
+        stored.track("0001");
+        stored.track("0002");
+        stored.import();
+        let store_text =
+            pick_next_ready_excluding_sticky(&stored.record, &["0001".into()], None, &[]).unwrap();
+        assert_eq!(md_text, store_text);
+        assert_eq!(store_text, "0002");
+
+        // Merged-PR probe skip, then the next Ready row.
+        let md = fixture("p-20-probe-md");
+        md.write_view(&body);
+        md.track("0001");
+        md.track("0002");
+        let mut md = md;
+        md.record.execution_repo = Some(md.record.path.join("exec"));
+        let probe = FixedProbe {
+            merged: vec!["0001".into()],
+        };
+        let md_text = pick_next_ready_excluding_sticky(&md.record, &[], Some(&probe), &[]).unwrap();
+        let mut stored = fixture("p-20-probe-store");
+        stored.write_view(&body);
+        stored.track("0001");
+        stored.track("0002");
+        stored.record.execution_repo = Some(stored.record.path.join("exec"));
+        stored.import();
+        let store_text =
+            pick_next_ready_excluding_sticky(&stored.record, &[], Some(&probe), &[]).unwrap();
+        assert_eq!(md_text, store_text);
+        assert_eq!(store_text, "0002");
+    }
+
+    #[test]
+    fn fold_advance_parity_matrix_markdown_vs_store() {
+        fn fold_case(body: &str, track: Option<&str>, configure: impl Fn(&Fx)) -> (String, String) {
+            let md = fixture("p-21-md");
+            md.write_view(body);
+            configure(&md);
+            let md_result = format!("{:?}", fold_advance(&md.record, track));
+
+            let stored = fixture("p-21-store");
+            stored.write_view(body);
+            configure(&stored);
+            assert_eq!(stored.import().status, "ok");
+            let store_result = format!("{:?}", fold_advance(&stored.record, track));
+            (md_result, store_result)
+        }
+        let none = |_: &Fx| {};
+        let cases = [
+            ("allow", registry(&[row("0001", READY, "a")]), Some("0001")),
+            (
+                "proposed",
+                registry(&[row("0001", "**Proposed**", "a")]),
+                Some("0001"),
+            ),
+            (
+                "blocked",
+                registry(&[row("0001", "**Blocked**", "a")]),
+                Some("0001"),
+            ),
+            (
+                "completed",
+                registry(&[row("0001", "**Completed**", "a")]),
+                Some("0001"),
+            ),
+            (
+                "row_missing",
+                registry(&[row("0002", READY, "a")]),
+                Some("0001"),
+            ),
+        ];
+        for (name, body, track) in cases {
+            let (md, stored) = fold_case(&body, track, none);
+            assert_eq!(md, stored, "case {name}");
+        }
+        let body = registry(&[row("0020", PROPOSED_PLACEHOLDER, "a")]);
+        let (md, stored) = fold_case(&body, Some("0020"), |fx| fx.track("0020"));
+        assert_eq!(md, stored);
+        assert!(md.contains("PromotePlaceholder"), "{md}");
+    }
+
+    #[test]
+    fn store_error_is_not_a_benign_pick_miss() {
+        let _lock = crate::config::test_env_lock();
+        let _home = isolate_features();
+        let fx = fixture("p-22");
+        fx.write_view(&registry(&[row("0001", READY, "a")]));
+        fx.track("0001");
+        fx.import();
+        std::fs::write(
+            crate::registry_store::store_path_for(&fx.record),
+            b"{not json",
+        )
+        .unwrap();
+        let err = pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap_err();
+        assert!(!ready_pick_miss_is_benign(&err), "{err}");
+        assert!(matches!(err, CoordinatorError::Message(_)));
+
+        let mut record = fx.record.clone();
+        record.auto_start = AutoStartPolicy::Full;
+        let attempt = crate::watch::try_auto_start(&record);
+        assert!(
+            matches!(attempt, crate::watch::AutoStartAttempt::Failed { .. }),
+            "{attempt:?}"
+        );
+        assert_eq!(
+            crate::state::load_run_state(&record).unwrap().failure_class,
+            Some(crate::outcome::FailureClass::HarnessCrash),
+            "a broken store is recorded as a durable failure, not a silent no-op"
+        );
+    }
+
+    #[test]
+    fn view_drift_reports_once_and_the_pick_fails_closed() {
+        let fx = fixture("p-23");
+        fx.write_view(&registry(&[row("0001", READY, "a")]));
+        fx.track("0001");
+        fx.import();
+        crate::registry_store::reset_drift_warnings_for_tests();
+        fx.write_view(&fx.read_view().replace("| a |", "| a hand edit |"));
+
+        let rows = load_track_rows(&fx.record).unwrap();
+        assert_eq!(rows.len(), 1, "the store still answers the display legs");
+        let _ = load_track_rows(&fx.record).unwrap();
+        let log = fx.status_log();
+        assert_eq!(
+            log.matches("registry-view-drift").count(),
+            1,
+            "one line per process/project: {log}"
+        );
+        let err = pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap_err();
+        assert!(
+            err.to_string().starts_with("track registry view drifted"),
+            "{err}"
+        );
+        assert!(!ready_pick_miss_is_benign(&err));
+    }
+
+    #[test]
+    fn hand_added_ready_row_is_not_picked_until_import() {
+        let _lock = crate::config::test_env_lock();
+        let _home = isolate_features();
+        let fx = fixture("p-49");
+        fx.write_view(&registry(&[row("0002", "**In progress**", "a")]));
+        fx.import();
+        fx.track("0003");
+        fx.write_view(&format!(
+            "{}{}",
+            fx.read_view(),
+            row("0003", READY, "hand added")
+        ));
+        let view = crate::registry_store::status_view_for(&fx.record);
+        assert_eq!(view.state, "drift");
+        assert!(view.recovery.unwrap().contains("import"));
+
+        let err = pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap_err();
+        assert!(err.to_string().starts_with("track registry view drifted"));
+
+        let mut record = fx.record.clone();
+        record.auto_start = AutoStartPolicy::Full;
+        let attempt = crate::watch::try_auto_start(&record);
+        assert_eq!(
+            attempt,
+            crate::watch::AutoStartAttempt::Skipped(crate::watch::AutoStartSkip::RegistryDrift)
+        );
+        assert!(
+            crate::notify::artifact::existing_path(&record).is_none(),
+            "a drift is not a harness crash"
+        );
+
+        fx.import_force();
+        assert_eq!(
+            pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap(),
+            "0003"
+        );
+        assert_eq!(
+            crate::registry_store::status_view_for(&fx.record).state,
+            "ok"
+        );
+    }
+
+    #[test]
+    fn status_reports_registry_view_state() {
+        let fx = fixture("p-50");
+        fx.write_view(&registry(&[row("0001", READY, "a")]));
+        assert_eq!(
+            crate::registry_store::status_view_for(&fx.record).state,
+            "absent"
+        );
+        fx.import();
+        assert_eq!(
+            crate::registry_store::status_view_for(&fx.record).state,
+            "ok"
+        );
+        fx.write_view(&fx.read_view().replace("| a |", "| b |"));
+        let drift = crate::registry_store::status_view_for(&fx.record);
+        assert_eq!(drift.state, "drift");
+        assert!(drift.recovery.unwrap().contains("render"));
+        std::fs::write(crate::registry_store::store_path_for(&fx.record), b"[]").unwrap();
+        let invalid = crate::registry_store::status_view_for(&fx.record);
+        assert_eq!(invalid.state, "invalid");
+        assert!(invalid.recovery.is_some());
+    }
+
+    #[test]
+    fn retain_refuses_when_store_present_but_unreadable() {
+        let fx = fixture("p-51");
+        fx.write_view(&registry(&[row("0001", READY, "a")]));
+        fx.import();
+        std::fs::write(
+            crate::registry_store::store_path_for(&fx.record),
+            b"{not json",
+        )
+        .unwrap();
+        let mut state = RunState::idle(&fx.record.id);
+        state.track_id = Some("0001".into());
+        assert_eq!(
+            crate::api::refused_retain_id(&fx.record, &state, None),
+            Some("0001".to_string())
+        );
+
+        std::fs::remove_file(crate::registry_store::store_path_for(&fx.record)).unwrap();
+        fx.write_view("not a registry\n");
+        assert_eq!(
+            crate::api::refused_retain_id(&fx.record, &state, None),
+            None
+        );
+    }
+
+    #[test]
+    fn view_parse_reads_zero_in_store_mode() {
+        let fx = fixture("p-52");
+        fx.write_view(&registry(&[row("0001", READY, "a")]));
+        fx.track("0001");
+        fx.import();
+        let mut state = RunState::idle(&fx.record.id);
+        state.track_id = Some("0001".into());
+        reset_view_parse_reads();
+
+        let rows = load_track_rows(&fx.record).unwrap();
+        let _ = pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]);
+        let _ = status_snapshot_for(&fx.record);
+        let _ = parsed_track_row_count(&fx.record);
+        let _ = fold_advance(&fx.record, Some("0001"));
+        let _ = track_row_proposed(&fx.record, Some("0001"));
+        let _ = track_row_nostart(&fx.record, "0001");
+        let _ = track_row_completed(&rows, "0001");
+        let _ = failure_superseded(&fx.record, &state, None);
+        let _ = capture_sticky_ready_ids(&fx.record, &[]);
+        let _ = overlay_file_status(&fx.record, "0001");
+        let _ = crate::api::refused_retain_id(&fx.record, &state, None);
+        let _ = crate::workflow::track_is_shipped_local(&fx.record, &state, "0001");
+        let _ =
+            crate::workflow::execution_repo::resolve_track_target(&fx.record, &state, "implement");
+        assert_eq!(
+            view_parse_reads(),
+            0,
+            "decision legs must not parse the view in store mode"
+        );
+
+        std::fs::remove_file(crate::registry_store::store_path_for(&fx.record)).unwrap();
+        reset_view_parse_reads();
+        let _ = load_track_rows(&fx.record);
+        let _ = width_deviations_for(&fx.record);
+        assert!(view_parse_reads() >= 2, "{}", view_parse_reads());
+    }
+
+    #[test]
+    fn repair_keeps_both_rows_invisible_until_escaped() {
+        let broken = "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0102-X](0102-X/spec.md) | `.` | **Completed** | `default|config|env` |\n\
+             | [0115-Y](0115-Y/spec.md) | `.` | **Proposed** | /(\\w|\\s)/ |\n\
+             | [0003-Z](0003-Z/spec.md) | `.` | **Ready — not started** | visible |\n";
+        let rows = parse_conductor_md(broken).unwrap();
+        assert_eq!(rows.len(), 1, "6-cell rows are dropped: {rows:?}");
+        assert_eq!(rows[0].id, "0003");
+
+        let escaped = broken
+            .replace("`default|config|env`", "`default\\|config\\|env`")
+            .replace("/(\\w|\\s)/", "/(\\w\\|\\s)/");
+        let rows = parse_conductor_md(&escaped).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].summary, "`default|config|env`");
+        assert_eq!(rows[1].summary, "/(\\w|\\s)/");
     }
 }

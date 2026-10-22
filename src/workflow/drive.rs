@@ -1061,34 +1061,122 @@ pub fn restore_ready_rows_after_phase(record: &crate::registry::ProjectRecord) -
     if state.registry_status_before.is_empty() {
         return keep();
     }
-    let path = crate::layout::resolve(record)
-        .conductor_dir
-        .join("conductor.md");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return keep();
-    };
-    if crate::workflow::conductor_md::parse_conductor_md(&text).is_err() {
-        return keep();
-    }
-    let aliases = crate::workflow::conductor_md::ready_aliases_for(record);
-    let (restored, body) = crate::workflow::conductor_md::restore_ready_rows(
-        &text,
-        &state.registry_status_before,
-        &aliases,
-    );
-    if let Some(body) = body {
-        if std::fs::write(&path, body).is_err() {
-            return keep();
+    let dir = crate::layout::resolve(record).conductor_dir;
+    let result =
+        crate::registry_store::with_registry_lock(&dir, || restore_locked(record, &state, &dir));
+    match result {
+        Ok(restore) => restore,
+        Err(e) => {
+            crate::progress_log::append(
+                record,
+                "registry-write-refused",
+                &format!("restore withheld: {e}"),
+            );
+            keep()
         }
-        crate::progress_log::append(
-            record,
-            "advance-downgrade-restored",
-            &format!("restored Ready: {}", restored.join(", ")),
-        );
     }
-    ReadyRestore {
-        restored,
-        consumed: true,
+}
+
+fn restore_locked(
+    record: &crate::registry::ProjectRecord,
+    state: &crate::state::RunState,
+    dir: &std::path::Path,
+) -> crate::error::Result<ReadyRestore> {
+    use crate::registry_store::StoreView;
+    let keep = || ReadyRestore {
+        restored: Vec::new(),
+        consumed: false,
+    };
+    let snapshot = crate::registry_store::snapshot_at(dir)?;
+    match &snapshot.view {
+        StoreView::Absent => {
+            let path = dir.join("conductor.md");
+            let Ok(text) = crate::workflow::conductor_md::read_view_for_parse(&path) else {
+                return Ok(keep());
+            };
+            if crate::workflow::conductor_md::parse_conductor_md(&text).is_err() {
+                return Ok(keep());
+            }
+            let aliases = crate::workflow::conductor_md::ready_aliases_for(record);
+            let (restored, body) = crate::workflow::conductor_md::restore_ready_rows(
+                &text,
+                &state.registry_status_before,
+                &aliases,
+            );
+            if let Some(body) = body {
+                if std::fs::write(&path, body).is_err() {
+                    return Ok(keep());
+                }
+                crate::progress_log::append(
+                    record,
+                    "advance-downgrade-restored",
+                    &format!("restored Ready: {}", restored.join(", ")),
+                );
+            }
+            Ok(ReadyRestore {
+                restored,
+                consumed: true,
+            })
+        }
+        StoreView::Drifted { expected, actual } => {
+            // A view edit made during the phase is the defect. Withhold; never rewrite,
+            // never report success while a silent downgrade could survive.
+            crate::registry_store::report_drift_once(record, expected, actual);
+            Ok(ReadyRestore {
+                restored: Vec::new(),
+                consumed: false,
+            })
+        }
+        StoreView::Ok => {
+            let aliases = crate::workflow::conductor_md::ready_aliases_for(record);
+            let mut changes: Vec<(String, String)> = Vec::new();
+            for row in &snapshot.rows {
+                let Some(prev) = state.registry_status_before.get(&row.id) else {
+                    continue;
+                };
+                let was_ready = crate::workflow::conductor_md::is_eligible_ready_in(prev, &aliases);
+                let now_ready =
+                    crate::workflow::conductor_md::is_eligible_ready_in(&row.status_raw, &aliases);
+                if was_ready
+                    && !now_ready
+                    && !crate::workflow::conductor_md::is_terminal(&row.status_raw)
+                    && !crate::workflow::conductor_md::is_reasoned_downgrade(&row.status_raw)
+                {
+                    changes.push((row.id.clone(), prev.clone()));
+                }
+            }
+            if changes.is_empty() {
+                return Ok(ReadyRestore {
+                    restored: Vec::new(),
+                    consumed: true,
+                });
+            }
+            match crate::registry_store::set_statuses_locked(dir, &changes, "advance", false) {
+                Ok(crate::registry_store::WriteOutcome::Changed(ids)) => {
+                    crate::progress_log::append(
+                        record,
+                        "advance-downgrade-restored",
+                        &format!("restored Ready: {}", ids.join(", ")),
+                    );
+                    Ok(ReadyRestore {
+                        restored: ids,
+                        consumed: true,
+                    })
+                }
+                Ok(_) => Ok(ReadyRestore {
+                    restored: Vec::new(),
+                    consumed: true,
+                }),
+                Err(e) => {
+                    crate::progress_log::append(
+                        record,
+                        "registry-write-refused",
+                        &format!("restore withheld: {e}"),
+                    );
+                    Ok(keep())
+                }
+            }
+        }
     }
 }
 

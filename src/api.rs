@@ -452,7 +452,9 @@ fn attach_operator_view(mut view: StatusView) -> StatusView {
 /// Resolve project selector then return status view.
 pub fn status(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
-    Ok(attach_operator_view(run::status(&rec)?))
+    let mut view = attach_operator_view(run::status(&rec)?);
+    view.registry = Some(crate::registry_store::status_view_for(&rec));
+    Ok(view)
 }
 
 /// Status for all projects (aggregate). One health probe and one feature
@@ -514,7 +516,7 @@ pub fn resolve_run_track(
 /// Local terminal state and `track_is_shipped_local` refuse without `gh`.
 /// A probe `Err` fail-opens (same as the picker). Explicit `--track` never
 /// reaches here.
-fn refused_retain_id(
+pub(crate) fn refused_retain_id(
     record: &crate::registry::ProjectRecord,
     state: &crate::state::RunState,
     probe: Option<&dyn crate::workflow::MergedTrackProbe>,
@@ -525,9 +527,16 @@ fn refused_retain_id(
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
     let local = crate::workflow::track_is_shipped_local(record, state, id);
-    let terminal = crate::workflow::conductor_md::load_track_rows(record)
-        .is_some_and(|rows| crate::workflow::conductor_md::track_row_terminal(&rows, id));
+    let rows = crate::workflow::conductor_md::load_track_rows(record);
+    let terminal = rows
+        .as_ref()
+        .is_some_and(|rows| crate::workflow::conductor_md::track_row_terminal(rows, id));
     if local || terminal {
+        return Some(id.to_string());
+    }
+    // 0109: a store that exists but cannot be read is not "row absent". Refuse the
+    // retain instead of failing open onto a stale or hand-added row.
+    if rows.is_none() && crate::registry_store::store_path_for(record).is_file() {
         return Some(id.to_string());
     }
     let merged = probe.is_some_and(|probe| {

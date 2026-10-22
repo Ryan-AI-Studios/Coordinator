@@ -11,8 +11,7 @@ use crate::features::{Duty, is_enabled};
 use crate::registry::ProjectRecord;
 use crate::state::{RunStatus, load_run_state, with_run_state_lock};
 use crate::workflow::conductor_md::{
-    conductor_md_path, parse_conductor_md, placeholder_ready, promote_placeholders_in,
-    ready_aliases_for,
+    parse_conductor_md, placeholder_ready, promote_placeholders_in, ready_aliases_for,
 };
 
 pub const PROMOTED_KIND: &str = "placeholder-promoted";
@@ -49,6 +48,8 @@ pub enum BackstopSkip {
     NoCandidate,
     Unreadable,
     Crlf,
+    /// 0109: the store exists but the generated view was edited outside it.
+    DriftRefused,
     LockFailed,
     WriteFailed,
 }
@@ -114,47 +115,122 @@ fn tick_locked(record: &ProjectRecord) -> BackstopOutcome {
     if matches!(state.status, RunStatus::Running | RunStatus::Paused) {
         return BackstopOutcome::Skipped(BackstopSkip::Active);
     }
-    // D5: exactly ONE registry read. Parse and rewrite the same `text` — do not call
-    // `load_track_rows` here (it would read the file a second time and reopen the
-    // check-then-write gap the lock does not cover).
-    let path = conductor_md_path(record);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => return BackstopOutcome::Skipped(BackstopSkip::Unreadable),
-    };
-    if text.contains('\r') {
-        return BackstopOutcome::Skipped(BackstopSkip::Crlf);
-    }
-    let rows = match parse_conductor_md(&text) {
-        Ok(rows) => rows,
-        Err(_) => return BackstopOutcome::Skipped(BackstopSkip::Unreadable),
-    };
-    let aliases = ready_aliases_for(record);
-    let promotions: Vec<(String, String)> = rows
-        .iter()
-        .filter(|row| !row.nostart)
-        .filter_map(|row| {
-            placeholder_ready(record, row, &row.id, &aliases).map(|ready| (row.id.clone(), ready))
-        })
-        .collect();
-    if promotions.is_empty() {
-        return BackstopOutcome::Skipped(BackstopSkip::NoCandidate);
-    }
-    let (promoted, body) = promote_placeholders_in(&text, &promotions);
-    let Some(body) = body else {
-        return BackstopOutcome::Skipped(BackstopSkip::NoCandidate);
-    };
-    match crate::persist::atomic_write(&path, body.as_bytes()) {
-        Ok(()) => BackstopOutcome::Promoted(promoted),
+    let dir = crate::layout::resolve(record).conductor_dir;
+    match crate::registry_store::with_registry_lock(&dir, || Ok(backstop_locked(record, &dir))) {
+        Ok(outcome) => outcome,
         Err(e) => {
             warn_once(
-                format!("write:{}", record.id),
+                format!("lock:{}", record.id),
                 &format!(
-                    "coordinator: placeholder backstop: write failed for {}: {e}",
+                    "coordinator: placeholder backstop: registry lock failed for {}: {e}",
                     record.id
                 ),
             );
-            BackstopOutcome::Skipped(BackstopSkip::WriteFailed)
+            BackstopOutcome::Skipped(BackstopSkip::LockFailed)
+        }
+    }
+}
+
+fn backstop_locked(record: &ProjectRecord, dir: &std::path::Path) -> BackstopOutcome {
+    use crate::registry_store::StoreView;
+    let snapshot = match crate::registry_store::snapshot_at(dir) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return BackstopOutcome::Skipped(BackstopSkip::Unreadable),
+    };
+    match &snapshot.view {
+        StoreView::Drifted { expected, actual } => {
+            crate::registry_store::report_drift_once(record, expected, actual);
+            warn_once(
+                format!("drift:{}", record.id),
+                &format!(
+                    "coordinator: placeholder backstop: {} drifted from the track store; \
+                     run `coordinator registry import --conductor-dir {} --force` to adopt it \
+                     or `coordinator registry render --conductor-dir {} --force` to discard it",
+                    dir.join("conductor.md").display(),
+                    dir.display(),
+                    dir.display()
+                ),
+            );
+            BackstopOutcome::Skipped(BackstopSkip::DriftRefused)
+        }
+        StoreView::Ok => {
+            let aliases = ready_aliases_for(record);
+            let promotions: Vec<(String, String, String)> = snapshot
+                .rows
+                .iter()
+                .filter(|row| !row.nostart)
+                .filter_map(|row| {
+                    placeholder_ready(record, row, &row.id, &aliases)
+                        .map(|ready| (row.id.clone(), row.status_raw.clone(), ready))
+                })
+                .collect();
+            if promotions.is_empty() {
+                return BackstopOutcome::Skipped(BackstopSkip::NoCandidate);
+            }
+            match crate::registry_store::promote_placeholders_observed_locked(
+                dir,
+                &promotions,
+                "backstop",
+            ) {
+                Ok(crate::registry_store::WriteOutcome::Changed(ids)) => {
+                    BackstopOutcome::Promoted(ids)
+                }
+                Ok(_) => BackstopOutcome::Skipped(BackstopSkip::NoCandidate),
+                Err(e) => {
+                    warn_once(
+                        format!("write:{}", record.id),
+                        &format!(
+                            "coordinator: placeholder backstop: store write failed for {}: {e}",
+                            record.id
+                        ),
+                    );
+                    BackstopOutcome::Skipped(BackstopSkip::WriteFailed)
+                }
+            }
+        }
+        StoreView::Absent => {
+            // D5: exactly ONE registry read. Parse and rewrite the same `text`.
+            let path = dir.join("conductor.md");
+            let text = match crate::workflow::conductor_md::read_view_for_parse(&path) {
+                Ok(text) => text,
+                Err(_) => return BackstopOutcome::Skipped(BackstopSkip::Unreadable),
+            };
+            if text.contains('\r') {
+                return BackstopOutcome::Skipped(BackstopSkip::Crlf);
+            }
+            let rows = match parse_conductor_md(&text) {
+                Ok(rows) => rows,
+                Err(_) => return BackstopOutcome::Skipped(BackstopSkip::Unreadable),
+            };
+            let aliases = ready_aliases_for(record);
+            let promotions: Vec<(String, String)> = rows
+                .iter()
+                .filter(|row| !row.nostart)
+                .filter_map(|row| {
+                    placeholder_ready(record, row, &row.id, &aliases)
+                        .map(|ready| (row.id.clone(), ready))
+                })
+                .collect();
+            if promotions.is_empty() {
+                return BackstopOutcome::Skipped(BackstopSkip::NoCandidate);
+            }
+            let (promoted, body) = promote_placeholders_in(&text, &promotions);
+            let Some(body) = body else {
+                return BackstopOutcome::Skipped(BackstopSkip::NoCandidate);
+            };
+            match crate::persist::atomic_write(&path, body.as_bytes()) {
+                Ok(()) => BackstopOutcome::Promoted(promoted),
+                Err(e) => {
+                    warn_once(
+                        format!("write:{}", record.id),
+                        &format!(
+                            "coordinator: placeholder backstop: write failed for {}: {e}",
+                            record.id
+                        ),
+                    );
+                    BackstopOutcome::Skipped(BackstopSkip::WriteFailed)
+                }
+            }
         }
     }
 }
@@ -312,6 +388,7 @@ mod tests {
             crate::workflow::conductor_md::FoldAdvance::PromotePlaceholder {
                 key: "0020".into(),
                 ready: READY.into(),
+                observed: PROPOSED.into(),
             }
         );
 

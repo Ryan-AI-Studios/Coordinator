@@ -432,9 +432,17 @@ pub(crate) fn committable_dirt(cwd: &Path) -> Result<Vec<String>> {
     push_nul_paths(&mut paths, &worktree);
     push_nul_paths(&mut paths, &index);
     push_nul_paths(&mut paths, &untracked);
+    // 0109: rotated `status.md` archives are a bound on a log, not work. Filter them by
+    // their final component (the shipped pattern), wherever the state dir put them.
+    paths.retain(|path| !is_status_archive_path(path));
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+fn is_status_archive_path(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    crate::progress_log::parse_archive_name(name).is_some()
 }
 
 fn push_nul_paths(paths: &mut Vec<String>, stdout: &str) {

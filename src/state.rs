@@ -483,6 +483,21 @@ pub struct StatusView {
     /// Bounded self-check snap (0070). Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_check: Option<SelfCheckState>,
+    /// 0109: track store vs generated view state (`ok|drift|invalid|absent`). Filled
+    /// only by `api::status`; the poll path leaves it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryView>,
+}
+
+/// 0109 status evidence for a project whose registry may have a structured store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistryView {
+    /// `ok` | `drift` | `invalid` | `absent`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<String>,
 }
 
 /// Status JSON `ticker` object (0023). `owner` is `serve` or `none` — never `cli`.
@@ -597,6 +612,7 @@ impl StatusView {
             features: None,
             state_gate: state.state_gate.clone(),
             self_check: state.self_check.clone(),
+            registry: None,
         }
     }
 }
