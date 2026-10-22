@@ -738,6 +738,47 @@ fn fixture_provider_is_data_and_run_argv_carries_the_selector_byte_exact() {
 }
 
 #[test]
+fn prove_expected_bin_fails_closed_when_the_command_is_missing() {
+    let binding = RoleBinding {
+        harness: "codex".into(),
+        command: "C:\\nope\\codex-acp.exe".into(),
+        model: None,
+    };
+    assert!(prove_expected_bin(&binding).is_err());
+}
+
+#[test]
+fn a_cancel_before_the_boundary_prevents_the_apply() {
+    let home = SwapHome::enter();
+    let (_shim, _companion) = codex_planner(&home, Some("model-a"));
+    let _probe = install_test_probe(ready_probe());
+    let current = home.binding(ROLE_PLANNER);
+    let proposed = RoleBinding {
+        model: Some("model-b".into()),
+        ..current.clone()
+    };
+    let receipt =
+        crate::harness::preflight::probe_target(ROLE_PLANNER, &proposed).expect("probe ok");
+    let mut ledger = new_ledger();
+    ledger.pending.insert(
+        ROLE_PLANNER.into(),
+        PendingSwap {
+            role: ROLE_PLANNER.into(),
+            previous: current.clone(),
+            proposed,
+            receipt,
+            requested_at: Utc::now(),
+        },
+    );
+    save_ledger(&ledger).unwrap();
+    cancel(ROLE_PLANNER).unwrap();
+    let before = home.config_bytes();
+    assert!(apply_pending_for_phase("plan").is_empty());
+    assert_eq!(home.config_bytes(), before);
+    assert_eq!(home.binding(ROLE_PLANNER), current);
+}
+
+#[test]
 fn phase_mapping_applies_only_the_phases_single_role_key() {
     let home = SwapHome::enter();
     let (_shim, _companion) = codex_planner(&home, Some("model-a"));

@@ -1298,6 +1298,12 @@ pub fn status() -> Result<StatusView> {
     Ok(StatusView { ledger, lock })
 }
 
+/// Resolve the expected binding binary for `roles prove`; an error must make the proof fail.
+pub(crate) fn prove_expected_bin(binding: &RoleBinding) -> std::result::Result<PathBuf, String> {
+    crate::harness::preflight::resolve_runtime_bin(RoleClass::Adapter, "prove", binding)
+        .map_err(|e| e.to_string())
+}
+
 /// Read-only live identity proof for an adapter role (DoD-1).
 ///
 /// Never mutates: no `last-used.json` write (read-only project resolve), no snapshot, no
@@ -1378,8 +1384,15 @@ pub fn prove(role: &str, project: Option<&str>) -> Result<ProveView> {
             });
         }
     };
-    let resolved_bin =
-        crate::harness::preflight::resolve_runtime_bin(RoleClass::Adapter, role, &expected).ok();
+    let resolved_bin = match prove_expected_bin(&expected) {
+        Ok(bin) => Some(bin),
+        Err(e) => {
+            // Fail closed: never claim `proven` when the binding's runtime binary cannot be
+            // resolved. Skipping the bin comparison here would accept any live holder.
+            reason = Some(format!("expected binding binary not resolvable: {e}"));
+            None
+        }
+    };
     if reason.is_none()
         && !crate::harness::pool::identity_matches(&live, &expected, resolved_bin.as_deref())
     {
@@ -1461,7 +1474,7 @@ fn apply_pending_roles(
     if roles.is_empty() {
         return outcomes;
     }
-    let mut ledger = match load_ledger() {
+    let ledger = match load_ledger() {
         Ok(ledger) => ledger,
         Err(e) => {
             // Fail open to the previous binding. Never fail the run.
@@ -1474,9 +1487,9 @@ fn apply_pending_roles(
     }
 
     for role in roles {
-        let Some(pending) = ledger.pending.get(*role).cloned() else {
+        if !ledger.pending.contains_key(*role) {
             continue;
-        };
+        }
         if !boundary_apply_gate_open() {
             eprintln!(
                 "coordinator: role-swap: model_swap disabled; pending {role} kept for a later tick"
@@ -1497,6 +1510,18 @@ fn apply_pending_roles(
                 eprintln!("coordinator: role-swap: lock error ({e}); pending {role} kept");
                 continue;
             }
+        };
+
+        // Re-read under the lock: a concurrent `--cancel` (or another swap) must win.
+        let mut ledger = match load_ledger() {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                eprintln!("coordinator: role-swap: ledger unreadable ({e}); pending kept");
+                continue;
+            }
+        };
+        let Some(pending) = ledger.pending.get(*role).cloned() else {
+            continue;
         };
 
         let current_cfg = match config::load_machine_config() {
