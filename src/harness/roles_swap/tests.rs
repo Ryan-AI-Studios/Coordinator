@@ -277,9 +277,12 @@ fn opencode_variant_probe_matches_the_base_and_fails_when_absent() {
     }
 
     // Base absent -> Fail -> refusal.
+    let opencode_s = opencode.to_string_lossy().to_string();
     home.write_bindings(|b| {
-        b.get_mut(ROLE_REVIEWER_OPENCODE).unwrap().model =
-            Some("fixture-provider/absent#high".into());
+        let slot = b.get_mut(ROLE_REVIEWER_OPENCODE).unwrap();
+        slot.harness = "opencode".into();
+        slot.command = opencode_s;
+        slot.model = Some("fixture-provider/absent#high".into());
     });
     let receipt = crate::harness::preflight::probe_target(
         "plan_reviewer_opencode",
