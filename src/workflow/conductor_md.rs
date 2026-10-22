@@ -5,6 +5,7 @@ use crate::notify::artifact::{numeric_track_id, track_ids_match};
 use crate::outcome::FailureClass;
 use crate::registry::{AutoStartPolicy, ProjectRecord};
 use crate::state::{RunState, RunStatus, StatusView};
+use serde::{Deserialize, Serialize};
 
 use super::LAST_EVENT_BACKLOG_CLEAR;
 use super::graph::resolve_track_dir;
@@ -131,8 +132,12 @@ pub struct TrackRow {
 }
 
 /// Trim → unwrap wrapping emphasis → strip leading emoji/punct (stop at alnum or
-/// emphasis markers) until stable, then dash-normalize. Eligible iff the result
-/// equals `Ready - not started`.
+/// emphasis markers) until stable, then fold the dash and space families.
+///
+/// This is the **comparison** seam only: the registry text is never rewritten.
+/// Eligible iff the result equals an alias after cleaning (`Ready - not started`
+/// for the default alias). The dash set is a compatibility set, not the whole
+/// Unicode `Dash` property (0115).
 pub fn status_clean(raw: &str) -> String {
     let mut cur = raw.to_string();
     loop {
@@ -144,7 +149,46 @@ pub fn status_clean(raw: &str) -> String {
         }
         cur = stripped.to_string();
     }
-    cur.replace(['\u{2014}', '\u{2013}', '\u{2212}'], "-")
+    collapse_unicode_space(&fold_dash_family(&cur))
+}
+
+/// Named supported dash set: `U+002D`, `U+2010`–`U+2015`, `U+2212`, `U+FE58`,
+/// `U+FE63`, `U+FF0D` → `-`.
+///
+/// A compatibility set, not the Unicode `Dash` property. `NFKC` is deliberately
+/// not used: it folds compatibility characters generally and does not fold
+/// `Pd`/`U+2212` consistently (0115, spec §8).
+fn fold_dash_family(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' | '\u{FE58}' | '\u{FE63}' | '\u{FF0D}' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+/// Collapse every run of Unicode `White_Space` (`char::is_whitespace`) to one
+/// `U+0020`. Does not trim: the caller already did.
+///
+/// The 25-code-point property includes tabs, VT, FF, a lone CR, NEL, `Zs`, LS
+/// and PS. LF cannot occur inside a `str::lines()` element and CRLF's CR is
+/// stripped, so those two are the only exclusions and they are structural.
+fn collapse_unicode_space(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out
 }
 
 fn unwrap_emphasis(s: &str) -> Option<&str> {
@@ -228,7 +272,7 @@ pub(crate) fn is_proposed(status_raw: &str) -> bool {
 }
 
 /// Vocabulary `Blocked`, including house-style trailing detail (0074).
-fn is_blocked(status_raw: &str) -> bool {
+pub(crate) fn is_blocked(status_raw: &str) -> bool {
     status_token_matches(&status_clean(status_raw), "Blocked")
 }
 
@@ -396,7 +440,26 @@ pub fn failure_superseded(
 
 /// Skip even exact Ready when id, slug, cleaned status, or summary matches HITL.
 pub fn is_hitl_marked(id: &str, slug: &str, status: &str, summary: &str) -> bool {
-    [id, slug, status, summary].iter().any(|p| field_is_hitl(p))
+    hitl_field(id, slug, status, summary).is_some()
+}
+
+/// The first field (in `id`, `slug`, `status`, `summary` order) that carries the
+/// HITL marker. Exposed so the 0115 report can name the cause (`detail:
+/// "summary"` for Printer) without re-implementing the gate.
+pub(crate) fn hitl_field(
+    id: &str,
+    slug: &str,
+    status: &str,
+    summary: &str,
+) -> Option<&'static str> {
+    [
+        ("id", id),
+        ("slug", slug),
+        ("status", status),
+        ("summary", summary),
+    ]
+    .into_iter()
+    .find_map(|(name, value)| field_is_hitl(value).then_some(name))
 }
 
 fn field_is_hitl(s: &str) -> bool {
@@ -995,6 +1058,160 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
     Ok(rows)
 }
 
+/// Why a row never reached [`TrackRow`] (0115).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropReason {
+    /// Cell count differs from the table header (GFM allows either; the product drops).
+    CellCount,
+    /// `parse_leading_id` rejected the (link-unwrapped) track cell.
+    IdUnparseable,
+}
+
+/// One row `parse_conductor_md` silently drops, with its physical source line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroppedRow {
+    /// 1-based physical line in `conductor.md`.
+    pub line: usize,
+    pub line_cells: usize,
+    pub header_cells: usize,
+    pub track_cell: String,
+    pub status_cell: String,
+    pub reason: DropReason,
+}
+
+/// Diagnostic mirror of the parser's drop decisions (0115).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DroppedScan {
+    /// Tables that carry both a Track/Id and a Status column.
+    pub tables: usize,
+    /// Rows in those tables (header excluded).
+    pub data_rows: usize,
+    /// Rows `parse_conductor_md` returns.
+    pub parsed_rows: usize,
+    /// `data_rows - parsed_rows`; always exact.
+    pub dropped_total: usize,
+    /// Up to [`DROPPED_SAMPLE_CAP`] samples; totals above stay exact.
+    pub dropped: Vec<DroppedRow>,
+    /// Raw trimmed status text → count over **all** data rows (parsed and dropped).
+    ///
+    /// Present so `ready_hits` can stay exact when `dropped` is capped.
+    pub status_counts: std::collections::BTreeMap<String, usize>,
+}
+
+/// Keep the sample list bounded; `dropped_total` is the exact count.
+pub(crate) const DROPPED_SAMPLE_CAP: usize = 50;
+
+/// Walk the same tables and rows as [`parse_conductor_md`] and record what it drops.
+///
+/// Mirrors the parser **exactly**, in this order: BOM strip, the same header
+/// rules, the same cell-count check, then `unwrap_md_link` before
+/// `parse_leading_id`. Every markdown-linked track cell (the dominant live form)
+/// must be unwrapped first or it would be misclassified `id_unparseable`.
+///
+/// Read-only: it names the live drops the picker cannot see (0115).
+pub(crate) fn scan_dropped_rows(text: &str) -> DroppedScan {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut scan = DroppedScan::default();
+    for table in collect_pipe_tables_lines(text) {
+        if table.len() < 2 {
+            continue;
+        }
+        let headers: Vec<String> = table[0]
+            .0
+            .cells
+            .iter()
+            .map(|c| c.trim().to_string())
+            .collect();
+        let Some(track_col) = headers.iter().position(|h| is_track_or_id_header(h)) else {
+            continue;
+        };
+        let Some(status_col) = headers.iter().position(|h| is_status_header(h)) else {
+            continue;
+        };
+        scan.tables += 1;
+        let ncols = headers.len();
+        for (row, line) in table.iter().skip(1) {
+            scan.data_rows += 1;
+            let status_cell = row
+                .cells
+                .get(status_col)
+                .map(|c| c.trim())
+                .unwrap_or_default();
+            if !status_cell.is_empty() {
+                *scan
+                    .status_counts
+                    .entry(status_cell.to_string())
+                    .or_insert(0) += 1;
+            }
+            if row.cells.len() != ncols {
+                scan.dropped_total += 1;
+                push_dropped(
+                    &mut scan,
+                    *line,
+                    row,
+                    track_col,
+                    status_col,
+                    ncols,
+                    DropReason::CellCount,
+                );
+                continue;
+            }
+            // `track_col < ncols` here because the cell count matches the header.
+            let track_cell = unwrap_md_link(row.cells[track_col].trim());
+            if parse_leading_id(&track_cell).is_none() {
+                scan.dropped_total += 1;
+                push_dropped(
+                    &mut scan,
+                    *line,
+                    row,
+                    track_col,
+                    status_col,
+                    ncols,
+                    DropReason::IdUnparseable,
+                );
+                continue;
+            }
+            scan.parsed_rows += 1;
+        }
+    }
+    scan
+}
+
+fn push_dropped(
+    scan: &mut DroppedScan,
+    line: usize,
+    row: &PipeRow,
+    track_col: usize,
+    status_col: usize,
+    header_cells: usize,
+    reason: DropReason,
+) {
+    if scan.dropped.len() >= DROPPED_SAMPLE_CAP {
+        return;
+    }
+    // `get` never indexes: GFM allows a short data row, and two live coordinated
+    // rows are one cell short of the header.
+    let track_cell = row
+        .cells
+        .get(track_col)
+        .map(|c| unwrap_md_link(c.trim()))
+        .unwrap_or_default();
+    let status_cell = row
+        .cells
+        .get(status_col)
+        .map(|c| c.trim().to_string())
+        .unwrap_or_default();
+    scan.dropped.push(DroppedRow {
+        line,
+        line_cells: row.cells.len(),
+        header_cells,
+        track_cell,
+        status_cell,
+        reason,
+    });
+}
+
 pub(crate) fn is_track_or_id_header(h: &str) -> bool {
     h.eq_ignore_ascii_case("track") || h.eq_ignore_ascii_case("id")
 }
@@ -1146,6 +1363,17 @@ pub(crate) fn is_table_start(lines: &[&str], i: usize) -> bool {
 }
 
 fn collect_pipe_tables(text: &str) -> Vec<Vec<PipeRow>> {
+    collect_pipe_tables_lines(text)
+        .into_iter()
+        .map(|table| table.into_iter().map(|(row, _)| row).collect())
+        .collect()
+}
+
+/// [`collect_pipe_tables`] with each row's **1-based physical source line**.
+///
+/// The line number comes from this one walk (never a second scan), so a dropped
+/// row can name its source line without risking a different view of the text.
+fn collect_pipe_tables_lines(text: &str) -> Vec<Vec<(PipeRow, usize)>> {
     let lines: Vec<&str> = text.lines().collect();
     let mut tables = Vec::new();
     let mut i = 0;
@@ -1156,10 +1384,13 @@ fn collect_pipe_tables(text: &str) -> Vec<Vec<PipeRow>> {
         }
         let (header_line, header_nostart) = strip_nostart_literal(lines[i]);
         let header = split_unescaped_pipes(&header_line);
-        let mut rows = vec![PipeRow {
-            cells: header,
-            nostart: header_nostart,
-        }];
+        let mut rows = vec![(
+            PipeRow {
+                cells: header,
+                nostart: header_nostart,
+            },
+            i + 1,
+        )];
         i += 2;
         while i < lines.len() {
             if lines[i].trim().is_empty() || is_thematic_break(lines[i]) {
@@ -1170,10 +1401,13 @@ fn collect_pipe_tables(text: &str) -> Vec<Vec<PipeRow>> {
                 break;
             }
             let (stripped, nostart) = strip_nostart_literal(lines[i]);
-            rows.push(PipeRow {
-                cells: split_unescaped_pipes(&stripped),
-                nostart,
-            });
+            rows.push((
+                PipeRow {
+                    cells: split_unescaped_pipes(&stripped),
+                    nostart,
+                },
+                i + 1,
+            ));
             i += 1;
         }
         tables.push(rows);
@@ -1426,7 +1660,7 @@ pub fn pick_next_ready_excluding_sticky(
     )))
 }
 
-fn row_overlay_eligible(row: &TrackRow, aliases: &[String], sticky: &[String]) -> bool {
+pub(crate) fn row_overlay_eligible(row: &TrackRow, aliases: &[String], sticky: &[String]) -> bool {
     if is_hitl_marked(&row.id, &row.slug, &row.status_raw, &row.summary) || row.nostart {
         return false;
     }
@@ -1443,7 +1677,7 @@ fn row_overlay_eligible(row: &TrackRow, aliases: &[String], sticky: &[String]) -
 ///
 /// `In progress` and `is_terminal` (Completed, Absorbed, Cancelled) were
 /// already exempt. `Proposed` and `Blocked` are the explicit withholds.
-fn explicit_non_ready(status_raw: &str) -> bool {
+pub(crate) fn explicit_non_ready(status_raw: &str) -> bool {
     is_in_progress(status_raw)
         || is_terminal(status_raw)
         || is_proposed(status_raw)
@@ -4142,5 +4376,141 @@ mod tests_0109 {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].summary, "`default|config|env`");
         assert_eq!(rows[1].summary, "/(\\w|\\s)/");
+    }
+
+    // ---- 0115 comparison seam + dropped-row diagnostics -------------------
+
+    #[test]
+    fn status_clean_folds_every_dash_form() {
+        for dash in [
+            '-', '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}',
+            '\u{2212}', '\u{FE58}', '\u{FE63}', '\u{FF0D}',
+        ] {
+            let raw = format!("**Ready {dash} not started**");
+            assert_eq!(status_clean(&raw), READY_NORMALIZED, "{dash:?}");
+            assert!(is_eligible_ready(&raw), "{dash:?}");
+        }
+    }
+
+    #[test]
+    fn status_clean_collapses_space_forms() {
+        let mut forms: Vec<char> = vec![
+            '\t', '\u{000B}', '\u{000C}', '\u{000D}', ' ', '\u{0085}', '\u{00A0}', '\u{1680}',
+            '\u{2028}', '\u{2029}', '\u{202F}', '\u{205F}', '\u{3000}',
+        ];
+        forms.extend('\u{2000}'..='\u{200A}');
+        for w in forms {
+            let raw = format!("Ready{w}-{w}not started");
+            assert_eq!(status_clean(&raw), READY_NORMALIZED, "{w:?}");
+            assert!(is_eligible_ready(&raw), "{w:?}");
+        }
+        for raw in [
+            "Ready  —  not started",
+            "Ready  - not started",
+            "Ready \u{00A0}\u{2009}- \t not\u{3000}started",
+        ] {
+            assert_eq!(status_clean(raw), READY_NORMALIZED, "{raw:?}");
+            assert!(is_eligible_ready(raw), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn ready_gate_still_rejects_the_vocabulary() {
+        for raw in [
+            "**Proposed**",
+            "**Proposed - placeholder**",
+            "**Blocked**",
+            "**Pending**",
+            "**In progress**",
+            "**Completed**",
+            "Ready - not started — note",
+            "Ready - not start",
+            "Ready - not started extra",
+        ] {
+            assert!(!is_eligible_ready(raw), "{raw:?}");
+        }
+        assert!(is_eligible_ready_in("**Pending**", &["Pending"]));
+    }
+
+    #[test]
+    fn status_clean_is_idempotent() {
+        for raw in [
+            "**Ready — not started**",
+            "Ready\u{00A0}-\u{00A0}not started",
+            "Ready  -  not started",
+            "**Proposed - placeholder**",
+            "Ready - not started — note",
+        ] {
+            let once = status_clean(raw);
+            assert_eq!(status_clean(&once), once, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn scan_dropped_rows_counts_and_lines() {
+        let text = "| Track | Execution | Status | Summary |\n\
+                    | --- | --- | --- | --- |\n\
+                    | [0001-Foo](0001-Foo/spec.md) | `.` | **Ready — not started** | ok |\n\
+                    | track12 | `.` | **Ready — not started** | x |\n\
+                    | AI-T572-SafetySyncHotspotDelta | `.` | **Ready — not started** | y |\n\
+                    | 0002-Extra | `.` | **Completed** | z | extra |\n\
+                    | 0003-Short | `.` | **Ready — not started** |\n\
+                    | 0004-Short2 | `.` |\n";
+        let scan = scan_dropped_rows(text);
+        assert_eq!(scan.tables, 1);
+        assert_eq!(scan.data_rows, 6);
+        assert_eq!(scan.parsed_rows, 1);
+        assert_eq!(scan.dropped_total, 5);
+        assert_eq!(scan.data_rows, scan.parsed_rows + scan.dropped_total);
+        assert_eq!(scan.dropped.len(), 5);
+        let ai = scan
+            .dropped
+            .iter()
+            .find(|d| d.track_cell == "AI-T572-SafetySyncHotspotDelta")
+            .expect("AI-T572 dropped");
+        assert_eq!(ai.line, 5);
+        assert_eq!(ai.reason, DropReason::IdUnparseable);
+        let extra = scan
+            .dropped
+            .iter()
+            .find(|d| d.track_cell == "0002-Extra")
+            .expect("extra pipe dropped");
+        assert_eq!(extra.line, 6);
+        assert_eq!(extra.reason, DropReason::CellCount);
+        let short = scan
+            .dropped
+            .iter()
+            .find(|d| d.track_cell == "0003-Short")
+            .expect("short row dropped");
+        assert_eq!(short.line, 7);
+        assert_eq!(short.reason, DropReason::CellCount);
+        assert_eq!(short.status_cell, "**Ready — not started**");
+        let short2 = scan
+            .dropped
+            .iter()
+            .find(|d| d.track_cell == "0004-Short2")
+            .expect("second short row dropped");
+        assert_eq!(short2.line, 8);
+        assert_eq!(short2.status_cell, "", "omitted Status must not index");
+        // The parser agrees on the parsed count.
+        assert_eq!(parse_conductor_md(text).unwrap().len(), scan.parsed_rows);
+    }
+
+    #[test]
+    fn scan_dropped_rows_cap_keeps_totals() {
+        let mut text = String::from(
+            "| Track | Status | Summary |\n\
+             | --- | --- | --- |\n\
+             | [0001-Foo](0001-Foo/spec.md) | **Ready — not started** | ok |\n",
+        );
+        for n in 0..60 {
+            text.push_str(&format!("| trackx{n} | Active | row {n} |\n"));
+        }
+        let scan = scan_dropped_rows(&text);
+        assert_eq!(scan.data_rows, 61);
+        assert_eq!(scan.parsed_rows, 1);
+        assert_eq!(scan.dropped_total, 60);
+        assert_eq!(scan.dropped.len(), DROPPED_SAMPLE_CAP);
+        assert_eq!(scan.data_rows, scan.parsed_rows + scan.dropped_total);
     }
 }

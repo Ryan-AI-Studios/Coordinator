@@ -56,6 +56,8 @@
 //! Operator-invoked build/smoke/swap of the installed binary behind the 0102 gate: track **0108**.
 //! `track-registry.json` as the row source of truth with `conductor.md` as its generated
 //! view (drift fails the pick closed), plus bounded `status.md` rotation: track **0109**.
+//! Read-only `ready` preview (ticker + operator decision, per-row reasons, dash/space comparison
+//! seam) and CLI-only `status.ready`: track **0115**.
 
 pub mod api;
 pub mod checkpoint;

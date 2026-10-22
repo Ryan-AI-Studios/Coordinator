@@ -51,6 +51,22 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Show what the ready pick would start (read-only; starts nothing)
+    ///
+    /// One report per project, or `--all` for the fleet. `decision` is the
+    /// ticker's ordered gate walk; `operator_omit_pick` is what an operator
+    /// `run` would choose from the same run state. The decision is data, not an
+    /// exit code: this command exits 0 whenever it produced a report.
+    Ready {
+        #[arg(long)]
+        project: Option<String>,
+        /// Every registered project (read-only fleet report)
+        #[arg(long, conflicts_with = "project")]
+        all: bool,
+        /// Emit every row's reason, not just the ambiguous set
+        #[arg(long)]
+        all_rows: bool,
+    },
     /// Track-registry store: import, render, verify, set-status
     Registry {
         #[command(subcommand)]
@@ -801,8 +817,21 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             }
         },
         Commands::Status { project } => {
-            let view = api::status(project.as_deref(), true)?;
+            let view = api::status_with_ready(project.as_deref(), true)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
+        }
+        Commands::Ready {
+            project,
+            all,
+            all_rows,
+        } => {
+            if all {
+                let fleet = api::ready_all(all_rows)?;
+                println!("{}", serde_json::to_string_pretty(&fleet)?);
+            } else {
+                let report = api::ready(project.as_deref(), true, all_rows)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
         }
         Commands::Registry { action } => match action {
             RegistryCommands::Import {
@@ -1709,6 +1738,89 @@ mod tests {
     fn run_detach_conflicts_with_serve_port() {
         let err = Cli::try_parse_from(["coordinator", "run", "--detach", "--serve-port", "7500"]);
         assert!(err.is_err(), "detach + serve-port must conflict");
+    }
+
+    #[test]
+    fn ready_subcommand_has_project_all_and_all_rows() {
+        let parsed =
+            Cli::try_parse_from(["coordinator", "ready", "--project", "abc", "--all-rows"])
+                .expect("ready parse");
+        match parsed.command {
+            Commands::Ready {
+                project,
+                all,
+                all_rows,
+            } => {
+                assert_eq!(project.as_deref(), Some("abc"));
+                assert!(!all);
+                assert!(all_rows);
+            }
+            other => panic!("expected ready, got {other:?}"),
+        }
+        let parsed = Cli::try_parse_from(["coordinator", "ready", "--all"]).expect("ready --all");
+        assert!(matches!(parsed.command, Commands::Ready { all: true, .. }));
+        assert!(
+            Cli::try_parse_from(["coordinator", "ready", "--all", "--project", "abc"]).is_err(),
+            "--all and --project must conflict"
+        );
+        let cmd = Cli::command();
+        assert!(cmd.find_subcommand("ready").is_some(), "ready in --help");
+    }
+
+    #[test]
+    fn ready_dispatch_returns_zero_for_a_report() {
+        use crate::config::{TestEnvGuard, test_env_lock};
+        let _guard = test_env_lock();
+        let _env = TestEnvGuard::capture(&crate::features::test_feature_env_names());
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        let body = serde_json::json!({
+            "version": 1,
+            "scan_roots": [],
+            "features": {"auto_start": false},
+        });
+        std::fs::write(home.path().join("config.json"), body.to_string()).unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let mut reg = crate::registry::Registry::default();
+        let rec = reg
+            .add(
+                ws.path(),
+                crate::registry::ProjectAddOptions {
+                    auto_start: Some(AutoStartPolicy::Full),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        let cond = ws.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0020-Fixture")).unwrap();
+        std::fs::write(cond.join("0020-Fixture/spec.md"), b"spec\n").unwrap();
+        std::fs::write(cond.join("0020-Fixture/plan.md"), b"plan\n").unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Status | Summary |\n\
+             | --- | --- | --- |\n\
+             | 0020-Fixture | **Ready — not started** | fixture |\n",
+        )
+        .unwrap();
+
+        let result = dispatch(Cli {
+            command: Commands::Ready {
+                project: Some(rec.id.clone()),
+                all: false,
+                all_rows: true,
+            },
+        });
+        assert!(
+            result.is_ok(),
+            "ready dispatch must exit 0 with a report: {result:?}"
+        );
+        assert!(
+            !home.path().join("last-used.json").exists(),
+            "read-only ready must not write last-used.json"
+        );
     }
 
     #[test]

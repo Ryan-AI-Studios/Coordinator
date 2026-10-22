@@ -268,7 +268,26 @@ pub fn evaluate_loaded(loaded: &crate::error::Result<MachineConfig>) -> FeatureS
 
 /// Load the machine config once and resolve every duty (live re-read).
 pub fn resolve_all() -> FeatureSnapshot {
+    #[cfg(test)]
+    RESOLVE_ALL_CALLS.with(|c| c.set(c.get() + 1));
     evaluate_loaded(&crate::config::load_machine_config())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Thread-local resolve counter (the `VIEW_PARSE_READS` precedent) so DoD-4's
+    /// "one `resolve_all` per call" can fail when the code resolves twice.
+    static RESOLVE_ALL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_all_calls() -> usize {
+    RESOLVE_ALL_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_resolve_all_calls() {
+    RESOLVE_ALL_CALLS.with(|c| c.set(0));
 }
 
 /// Convenience for one duty (always a fresh read; never cached).

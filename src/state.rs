@@ -483,10 +483,16 @@ pub struct StatusView {
     /// Bounded self-check snap (0070). Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_check: Option<SelfCheckState>,
-    /// 0109: track store vs generated view state (`ok|drift|invalid|absent`). Filled
-    /// only by `api::status`; the poll path leaves it `None`.
+    /// 0109: track store vs generated view state (`ok|drift|invalid|absent`). Filled by
+    /// `api::status` (HTTP single-project route and UI Run precheck) and by the CLI
+    /// `status` path (`api::status_with_ready`); the poll path leaves it `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry: Option<RegistryView>,
+    /// 0115: effective ready policy, duty gate and pick decision. CLI `status
+    /// --project` only (`api::status_with_ready`); `api::status` (HTTP/UI),
+    /// `status_all`, and the poll path omit it (0102/0109 precedent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<ReadyStatusView>,
 }
 
 /// 0109 status evidence for a project whose registry may have a structured store.
@@ -498,6 +504,23 @@ pub struct RegistryView {
     pub store_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<String>,
+}
+
+/// 0115: trimmed ready projection for CLI `status --project`.
+///
+/// Carries no row list; `coordinator ready` is the full report. `policy`,
+/// `feature` and `ticker_effective` come from the same `FeatureSnapshot` the
+/// view already carries, so one JSON cannot disagree with itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadyStatusView {
+    pub policy: crate::registry::AutoStartPolicy,
+    pub feature: crate::workflow::readiness::FeatureGate,
+    pub ticker_effective: crate::workflow::readiness::TickerEffective,
+    pub operator_omit_pick: crate::workflow::readiness::OperatorPick,
+    /// Always `"none"` (the preview is probeless).
+    pub probe: String,
+    pub pickable: usize,
+    pub decision: crate::workflow::readiness::ReadyDecision,
 }
 
 /// Status JSON `ticker` object (0023). `owner` is `serve` or `none` — never `cli`.
@@ -613,6 +636,7 @@ impl StatusView {
             state_gate: state.state_gate.clone(),
             self_check: state.self_check.clone(),
             registry: None,
+            ready: None,
         }
     }
 }
