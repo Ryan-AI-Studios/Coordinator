@@ -265,10 +265,10 @@ fn begin_fresh_run(
     state.stall_recycles = 0;
     state.aborted_session_id = None;
     state.acp_stdout_retries = 0;
-    state.plan_review_spawned.clear();
     state.registry_status_before.clear();
-    state.plan_review_join_retries = 0;
-    state.plan_review_slot_ran.clear();
+    state.clear_plan_review_books();
+    // 0119: a new epoch starts a new entry-id space.
+    state.plan_review_entry = None;
     state.address_findings_attempts = 0;
     state.ci_fix_attempts = 0;
     state.ci_fix_request = None;
@@ -369,9 +369,9 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.stall_recycles = 0;
                 state.aborted_session_id = None;
                 state.acp_stdout_retries = 0;
-                state.plan_review_spawned.clear();
-                state.plan_review_join_retries = 0;
-                state.plan_review_slot_ran.clear();
+                state.clear_plan_review_books();
+                // 0119: a new epoch starts a new entry-id space.
+                state.plan_review_entry = None;
                 state.last_event = "run: started stub".into();
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);

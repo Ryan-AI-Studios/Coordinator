@@ -306,6 +306,7 @@ pub fn on_success(
         state.phase = next.to_string();
         reset_phase_clock(state);
         if next == graph::PHASE_PLAN_REVIEW {
+            drive::purge_plan_review_entry_artifacts(record);
             state.pending_roles = graph::review_slugs()
                 .iter()
                 .map(|s| (*s).to_string())
@@ -541,9 +542,11 @@ pub fn reset_phase_clock(state: &mut RunState) {
     state.stall_recycles = 0;
     state.aborted_session_id = None;
     state.acp_stdout_retries = 0;
-    state.plan_review_spawned.clear();
-    state.plan_review_join_retries = 0;
-    state.plan_review_slot_ran.clear();
+    if state.phase == graph::PHASE_PLAN_REVIEW {
+        state.begin_plan_review_entry();
+    } else {
+        state.leave_plan_review();
+    }
     if state.status == RunStatus::Paused {
         state.pause_started_at = Some(now);
     } else {
@@ -904,6 +907,8 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
         return;
     }
     state.run_epoch = state.run_epoch.saturating_add(1);
+    // 0119: a new epoch starts a new entry-id space; the retained entry is never inherited.
+    state.plan_review_entry = None;
     state.track_id = Some(track_id.to_string());
     state.next_track = None;
     state.parked_next = None;
@@ -1222,6 +1227,18 @@ mod tests {
         }
     }
 
+    /// 0119: stamp a fixture role outcome with the live `(run_epoch, entry_id)` pair.
+    fn stamp_live(state: &crate::state::RunState, mut o: PhaseOutcome) -> PhaseOutcome {
+        let Some(entry) = state.plan_review_entry_current() else {
+            return o;
+        };
+        o.run_epoch = Some(entry.run_epoch);
+        let mut meta = o.metadata.take().unwrap_or_default();
+        meta.entry_id = Some(entry.entry_id);
+        o.metadata = Some(meta);
+        o
+    }
+
     #[test]
     fn blocked_hold_helpers_cannot_release_or_mutate_the_held_state() {
         let dir = tempdir().unwrap();
@@ -1323,7 +1340,17 @@ mod tests {
         std::fs::write(&skill, b"skill-v1").unwrap();
         std::fs::write(track.join("agy-review.md"), b"agy body\n").unwrap();
         std::fs::write(track.join("opencode-review.md"), b"oc body\n").unwrap();
-        reuse::write_join_receipt(&r, id);
+        // 0119: the receipt writer now filters slots by this entry's mailbox evidence.
+        let mut state = crate::state::RunState::idle(&r.id);
+        state.track_id = Some(id.to_string());
+        state.run_epoch = 1;
+        for slug in graph::review_slugs() {
+            let src = track.join(format!("{slug}-review.md"));
+            let dest = crate::workflow::bundle::review_file(&r, slug).unwrap();
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, std::fs::read(src).unwrap()).unwrap();
+        }
+        reuse::write_join_receipt(&r, &state);
         r
     }
 
@@ -2773,6 +2800,54 @@ mod tests {
         assert_eq!(resumed.track_id.as_deref(), Some("0001"));
     }
 
+    /// 0119: a fold re-entry in the same epoch mints a new entry id; the id is never reused.
+    /// This is a unit test of the transition helper, not of `on_success`.
+    #[test]
+    fn entry_id_is_monotone_across_a_fold_reentry() {
+        let mut s = crate::state::RunState::idle("p");
+        s.run_epoch = 9;
+        s.phase = graph::PHASE_PLAN_REVIEW.into();
+        reset_phase_clock(&mut s);
+        assert_eq!(
+            s.plan_review_entry,
+            Some(crate::state::PlanReviewEntry {
+                run_epoch: 9,
+                entry_id: 1
+            })
+        );
+        s.plan_review_spawned = vec!["agy".into()];
+        s.plan_review_slot_ran = vec!["agy".into()];
+        s.plan_review_verdicts
+            .insert("agy".into(), "ran; produced no review".into());
+
+        // Advance out of plan-review: the books clear, the entry is kept.
+        s.phase = graph::PHASE_FOLD.into();
+        reset_phase_clock(&mut s);
+        assert_eq!(
+            s.plan_review_entry,
+            Some(crate::state::PlanReviewEntry {
+                run_epoch: 9,
+                entry_id: 1
+            }),
+            "the entry survives the phase exit"
+        );
+        assert!(s.plan_review_spawned.is_empty());
+        assert!(s.plan_review_slot_ran.is_empty());
+        assert!(s.plan_review_verdicts.is_empty());
+
+        // Re-enter the same epoch: a new id, never a reset.
+        s.phase = graph::PHASE_PLAN_REVIEW.into();
+        reset_phase_clock(&mut s);
+        assert_eq!(
+            s.plan_review_entry,
+            Some(crate::state::PlanReviewEntry {
+                run_epoch: 9,
+                entry_id: 2
+            })
+        );
+        assert_eq!(s.run_epoch, 9, "a fold re-entry keeps the epoch");
+    }
+
     #[test]
     fn plan_review_bundle_and_degrade() {
         let dir = tempdir().unwrap();
@@ -2782,7 +2857,9 @@ mod tests {
         let mut state = load_run_state(&r).unwrap();
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         state.pending_roles = vec!["agy".into(), "opencode".into()];
+        state.adopt_plan_review_entry();
         save_run_state(&r, &state).unwrap();
+        let live = load_run_state(&r).unwrap();
 
         drive::write_review_markdown(&r, "agy", Some("agy says ok\n")).unwrap();
         let roles = crate::outcome::outcome_roles_dir(&r).unwrap();
@@ -2794,6 +2871,7 @@ mod tests {
             role: Some(graph::ROLE_REVIEWER_AGY.into()),
             ..Default::default()
         });
+        let agy = stamp_live(&live, agy);
         crate::persist::atomic_write_json(&roles.join("agy.json"), &agy).unwrap();
         let oc = PhaseOutcome::failure(
             "plan-review:opencode",
@@ -2802,6 +2880,7 @@ mod tests {
             None,
             None,
         );
+        let oc = stamp_live(&live, oc);
         crate::persist::atomic_write_json(&roles.join("opencode.json"), &oc).unwrap();
 
         let view = tick(&r).unwrap().expect("join");
@@ -2822,7 +2901,9 @@ mod tests {
         let mut state = load_run_state(&r).unwrap();
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         state.pending_roles = vec!["agy".into(), "opencode".into()];
+        state.adopt_plan_review_entry();
         save_run_state(&r, &state).unwrap();
+        let live = load_run_state(&r).unwrap();
         let roles = crate::outcome::outcome_roles_dir(&r).unwrap();
         std::fs::create_dir_all(&roles).unwrap();
         for slug in ["agy", "opencode"] {
@@ -2833,6 +2914,7 @@ mod tests {
                 None,
                 None,
             );
+            let o = stamp_live(&live, o);
             crate::persist::atomic_write_json(&roles.join(format!("{slug}.json")), &o).unwrap();
         }
         let view = tick(&r).unwrap().expect("fail");
@@ -2853,6 +2935,8 @@ mod tests {
         let mut state = load_run_state(&r).unwrap();
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         state.pending_roles = vec!["opencode".into()];
+        // 0119: the leftover is a resolved `ran; produced no review`, not never-spawned.
+        state.plan_review_slot_ran = vec!["opencode".into()];
         state.phase_started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
         save_run_state(&r, &state).unwrap();
         drive::write_review_markdown(&r, "agy", Some("agy done\n")).unwrap();
@@ -2921,6 +3005,8 @@ mod tests {
         let mut state = load_run_state(&r).unwrap();
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         state.pending_roles = vec!["opencode".into()];
+        // 0119: a resolved ran leftover, so the 1200s overlay timeout degrades (not named).
+        state.plan_review_slot_ran = vec!["opencode".into()];
         state.phase_started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1300));
         save_run_state(&r, &state).unwrap();
         drive::write_review_markdown(&r, "agy", Some("agy done\n")).unwrap();

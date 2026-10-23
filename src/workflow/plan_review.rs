@@ -16,7 +16,9 @@ use crate::outcome::{
 };
 use crate::registry::ProjectRecord;
 use crate::review::spawn::{ProcessWait, resolve_review_bin, run_process};
-use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock};
+use crate::state::{
+    PlanReviewEntry, RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock,
+};
 use crate::workflow::drive::write_review_markdown;
 use crate::workflow::graph::{
     PHASE_PLAN_REVIEW, REVIEW_SLUG_AGY, REVIEW_SLUG_OPENCODE, ROLE_REVIEWER_AGY,
@@ -24,7 +26,10 @@ use crate::workflow::graph::{
 };
 use crate::workflow::timeouts::{TIMEOUT_KEY_PLAN_REVIEW_SLOT, timeout_for_phase};
 
-const MIN_SPAWN_BUDGET: Duration = Duration::from_secs(60);
+pub(crate) const MIN_SPAWN_BUDGET: Duration = Duration::from_secs(60);
+/// Maximum stored degraded-cause length (chars), so untrusted reviewer output cannot bloat the
+/// phase event or split a log line.
+pub(crate) const VERDICT_CAP: usize = 160;
 /// Join-level empty/dud re-arm cap this phase (0054). Not a cross-epoch counter.
 pub(crate) const PLAN_REVIEW_JOIN_RETRY_CAP: u32 = 1;
 
@@ -62,7 +67,7 @@ pub struct PlanReviewRequest {
     /// Child-only env (never exported on the Coordinator process).
     pub extra_env: Vec<(String, String)>,
     /// Originating run; apply is dropped if the live run no longer matches.
-    pub spawn_epoch: u64,
+    pub entry: PlanReviewEntry,
     pub spawn_track_id: Option<String>,
 }
 
@@ -555,7 +560,7 @@ fn driver_argv(
     }
 }
 
-fn remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
+pub(crate) fn remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
     timeout_for_phase(record, PHASE_PLAN_REVIEW)
         .saturating_sub(state.effective_running_elapsed(chrono::Utc::now()))
 }
@@ -566,6 +571,211 @@ fn slot_remaining(record: &ProjectRecord, state: &RunState, slug: &str) -> Durat
     } else {
         remaining_budget(record, state)
     }
+}
+
+/// 0119: one slot's classified cause in the live entry. The stored strings are already rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SlotCause {
+    NeverSpawned,
+    AdmissionFailed(String),
+    SpawnedNotRan,
+    RanNoReview,
+    Verdict(String),
+}
+
+impl SlotCause {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::NeverSpawned => "never spawned this entry".into(),
+            Self::AdmissionFailed(cause) => format!("admission failed: {cause}"),
+            Self::SpawnedNotRan => "spawned this entry, never ran".into(),
+            Self::RanNoReview => "ran; produced no review".into(),
+            Self::Verdict(v) => v.clone(),
+        }
+    }
+}
+
+/// Classify `slug` from the **current entry's** books only. Order is decisive: an admission
+/// failure is not an attempt, a verdict is a resolved attempt, then ran, then spawned.
+pub(crate) fn slot_cause(state: &RunState, slug: &str) -> SlotCause {
+    if let Some(cause) = state.plan_review_admission_failure(slug) {
+        return SlotCause::AdmissionFailed(cause.to_string());
+    }
+    if let Some(verdict) = state.plan_review_verdict(slug) {
+        return SlotCause::Verdict(verdict.to_string());
+    }
+    if state.plan_review_slot_ran_now().iter().any(|x| x == slug) {
+        return SlotCause::RanNoReview;
+    }
+    if state.plan_review_spawned_now().iter().any(|x| x == slug) {
+        return SlotCause::SpawnedNotRan;
+    }
+    SlotCause::NeverSpawned
+}
+
+/// Normalize untrusted reviewer text for a verdict / log line: CR/LF -> one space, other control
+/// characters stripped, capped at [`VERDICT_CAP`] chars on a char boundary.
+pub(crate) fn normalize_verdict(raw: &str) -> String {
+    let text = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\n' {
+            out.push(' ');
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.chars().count() <= VERDICT_CAP {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(VERDICT_CAP).collect()
+}
+
+/// 0119: the join's decision for the slots that have no produced artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JoinGate {
+    Degrade,
+    Wait,
+    Rearm(Vec<String>),
+    NoBudget(Vec<String>),
+    FailAdmission(Vec<(String, String)>),
+}
+
+/// Classify every missing slot and return one gate decision.
+///
+/// `TEST_JOIN_REMAINING` is applied **here**: it is a private thread-local in this module while
+/// `try_join` lives in `drive.rs`, so the override must be read by the gate itself.
+pub(crate) fn join_gate(state: &RunState, missing: &[&str], budget: Duration) -> JoinGate {
+    let budget = {
+        #[cfg(test)]
+        {
+            TEST_JOIN_REMAINING.with(|c| c.get()).unwrap_or(budget)
+        }
+        #[cfg(not(test))]
+        {
+            budget
+        }
+    };
+    let mut admission = Vec::new();
+    let mut never_spawned = Vec::new();
+    let mut spawned_not_ran = Vec::new();
+    for slug in missing {
+        match slot_cause(state, slug) {
+            SlotCause::AdmissionFailed(cause) => {
+                admission.push(((*slug).to_string(), cause));
+            }
+            SlotCause::NeverSpawned => never_spawned.push((*slug).to_string()),
+            SlotCause::SpawnedNotRan => spawned_not_ran.push((*slug).to_string()),
+            SlotCause::RanNoReview | SlotCause::Verdict(_) => {}
+        }
+    }
+    if !admission.is_empty() {
+        JoinGate::FailAdmission(admission)
+    } else if !never_spawned.is_empty() {
+        if budget < MIN_SPAWN_BUDGET {
+            JoinGate::NoBudget(never_spawned)
+        } else {
+            JoinGate::Rearm(never_spawned)
+        }
+    } else if !spawned_not_ran.is_empty() {
+        JoinGate::Wait
+    } else {
+        JoinGate::Degrade
+    }
+}
+
+/// 0119: re-arm the join for slugs it never tried. Only the join's own re-arm; spawning stays the
+/// single owner's job (`maybe_spawn_slot` on the next tick).
+///
+/// Returns `true` when the entry was still live and slots were re-armed.
+pub(crate) fn rearm_missing(
+    record: &ProjectRecord,
+    entries: &[String],
+    entry: PlanReviewEntry,
+) -> Result<bool> {
+    let armed = with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if s.status != RunStatus::Running
+            || s.phase != PHASE_PLAN_REVIEW
+            || s.plan_review_entry != Some(entry)
+        {
+            return Ok(None);
+        }
+        let live: Vec<String> = review_slugs()
+            .iter()
+            .copied()
+            .filter(|slug| entries.iter().any(|e| e == slug))
+            .filter(|slug| {
+                s.plan_review_admission_failure(slug).is_none()
+                    && !s.plan_review_spawned_now().iter().any(|x| x == slug)
+                    && !s.plan_review_slot_ran_now().iter().any(|x| x == slug)
+                    && s.plan_review_verdict(slug).is_none()
+            })
+            .map(str::to_string)
+            .collect();
+        if live.is_empty() {
+            return Ok(None);
+        }
+        for slug in &live {
+            if !s.pending_roles.iter().any(|x| x == slug) {
+                s.pending_roles.push(slug.clone());
+            }
+        }
+        let order = review_slugs();
+        s.pending_roles.sort_by_key(|x| {
+            order
+                .iter()
+                .position(|s| *s == x.as_str())
+                .unwrap_or(usize::MAX)
+        });
+        s.last_event = format!(
+            "plan-review: join holds {} (never spawned this entry; re-armed)",
+            live.join(", ")
+        );
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)?;
+        Ok(Some(s.last_event.clone()))
+    })?;
+    if let Some(event) = armed {
+        crate::progress_log::append(record, "plan-review", &event);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// 0119: the degraded message. Prefix and slug order survive; one parenthetical cause per slot.
+pub(crate) fn degrade_message(state: &RunState, missing: &[&str], timed_out: bool) -> String {
+    let parts: Vec<String> = missing
+        .iter()
+        .map(|slug| {
+            let cause = slot_cause(state, slug).describe();
+            if timed_out {
+                format!("{slug} (timeout; {cause})")
+            } else {
+                format!("{slug} ({cause})")
+            }
+        })
+        .collect();
+    format!("plan-review: degraded {}", parts.join(", "))
+}
+
+/// Test-only, RAII-disarmed join budget override (0119). The gate reads it directly.
+#[cfg(test)]
+pub(crate) struct JoinRemainingGuard;
+
+#[cfg(test)]
+impl Drop for JoinRemainingGuard {
+    fn drop(&mut self) {
+        TEST_JOIN_REMAINING.with(|c| c.set(None));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_join_remaining(d: Option<Duration>) -> JoinRemainingGuard {
+    TEST_JOIN_REMAINING.with(|c| c.set(d));
+    JoinRemainingGuard
 }
 
 /// Fire-and-forget spawn of the agy slot. Does not block `poll_once`.
@@ -584,56 +794,20 @@ pub fn maybe_spawn_plan_review(record: &ProjectRecord, state: &RunState) -> Resu
     maybe_spawn_opencode(record, state)
 }
 
-/// Byte-copy a matching track review into the state mailbox and skip the child.
-/// Copy failure returns false so the caller spawns.
-fn try_reuse_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Result<bool> {
-    let Some(track_id) = state.track_id.as_deref() else {
-        return Ok(false);
-    };
-    if !super::reuse::slot_matches(record, track_id, slug) {
-        return Ok(false);
-    }
-    let Some(track_dir) = resolve_track_dir(record, track_id) else {
-        return Ok(false);
-    };
-    let src = track_dir.join(format!("{slug}-review.md"));
-    let dest = match super::bundle::review_file(record, slug) {
-        Ok(path) => path,
-        Err(_) => return Ok(false),
-    };
-    let bytes = match std::fs::read(&src) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(false),
-    };
-    if let Ok(dir) = super::bundle::reviews_dir(record)
-        && std::fs::create_dir_all(&dir).is_err()
-    {
-        return Ok(false);
-    }
-    if crate::persist::atomic_write(&dest, &bytes).is_err() {
-        return Ok(false);
-    }
-    with_run_state_lock(record, || {
-        let mut saved = load_run_state(record)?;
-        saved.pending_roles.retain(|x| x != slug);
-        saved.updated_at = chrono::Utc::now();
-        save_run_state(record, &saved)
-    })?;
-    crate::progress_log::append(record, "plan-review", &format!("plan-review: reuse {slug}"));
-    Ok(true)
-}
+// 0119: `try_reuse_slot` is retired (OD-119-2). After the entry/epoch gate it has no reachable
+// production path, and a review that must count is produced in the current entry. `slot_matches`
+// stays as the public (epoch-gated) reuse predicate for tests and resume wiring.
 
 fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Result<()> {
     let live = load_run_state(record).unwrap_or_else(|_| state.clone());
     if !live.pending_roles.iter().any(|s| s == slug) {
         return Ok(());
     }
-    // Recovery ordering (folded M3): a latched slug with a matching receipt must still be
-    // reused and clear `pending_roles`. Only after that does the latch stop this phase.
-    if try_reuse_slot(record, &live, slug)? {
+    let Some(entry) = live.plan_review_entry_current() else {
+        crate::progress_log::append(record, "plan-review", "plan-review: no current entry");
         return Ok(());
-    }
-    if live.plan_review_spawned.iter().any(|s| s == slug) {
+    };
+    if live.plan_review_spawned_now().iter().any(|s| s == slug) {
         // 0110: a slot that already spawned this phase never applies a pending swap today.
         return Ok(());
     }
@@ -643,11 +817,11 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
 
     let binding = load_slot_binding(slug);
     if binding.command.trim().is_empty() {
-        write_sync_permission_failure(
+        record_admission_failure(
             record,
-            &live,
+            entry,
             slug,
-            format!("plan-review: empty {} command", slot_role(slug)),
+            format!("empty {} command", slot_role(slug)),
         )?;
         return Ok(());
     }
@@ -656,7 +830,7 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
     let driver = match driver_for(slug, &binding.harness) {
         Ok(driver) => driver,
         Err(e) => {
-            write_sync_permission_failure(record, &live, slug, e.to_string())?;
+            record_admission_failure(record, entry, slug, e.to_string())?;
             return Ok(());
         }
     };
@@ -664,9 +838,9 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
     if !has_test_backend(record)
         && let Err(e) = resolve_driver_bin(driver, &binding.command)
     {
-        write_sync_permission_failure(
+        record_admission_failure(
             record,
-            &live,
+            entry,
             slug,
             format!("{slug} driver {} not resolvable: {e}", driver.name()),
         )?;
@@ -675,18 +849,34 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
 
     let should_spawn = with_run_state_lock(record, || {
         let mut s = load_run_state(record)?;
-        if s.status != RunStatus::Running || s.phase != PHASE_PLAN_REVIEW {
+        if s.status != RunStatus::Running || s.plan_review_entry_current() != Some(entry) {
             return Ok(false);
         }
         if remaining_budget(record, &s) < MIN_SPAWN_BUDGET {
             return Ok(false);
         }
-        if s.plan_review_spawned.iter().any(|x| x == slug) {
+        if s.plan_review_spawned_now().iter().any(|x| x == slug) {
             return Ok(false);
         }
         if !s.pending_roles.iter().any(|x| x == slug) {
             return Ok(false);
         }
+        // 0119 evidence provenance: a spawn starts the slot clean. This entry's mailbox review,
+        // the track copy, a superseded verdict and a stale admission record are all dropped in
+        // the same lock/save as the spawn mark, so a stale ticker cannot delete a newer entry's
+        // track file after the lock.
+        if let Ok(path) = super::bundle::review_file(record, slug) {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(track_dir) = s
+            .track_id
+            .as_deref()
+            .and_then(|id| resolve_track_dir(record, id))
+        {
+            let _ = std::fs::remove_file(track_dir.join(format!("{slug}-review.md")));
+        }
+        s.plan_review_verdicts.remove(slug);
+        s.plan_review_admission_failures.remove(slug);
         s.plan_review_spawned.push(slug.into());
         s.updated_at = chrono::Utc::now();
         save_run_state(record, &s)?;
@@ -701,7 +891,6 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
     let remaining = slot_remaining(record, &spawn_state, slug);
     let paths = crate::layout::resolve(record);
     let spawn_track_id = spawn_state.track_id.clone();
-    let spawn_epoch = spawn_state.run_epoch;
     let track_dir = spawn_track_id
         .as_deref()
         .and_then(|id| resolve_track_dir(record, id));
@@ -740,13 +929,9 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
         argv,
         last_message_path,
         extra_env,
-        spawn_epoch,
+        entry,
         spawn_track_id,
     };
-
-    if let Some(ref dir) = req.track_dir {
-        let _ = std::fs::remove_file(dir.join(format!("{slug}-review.md")));
-    }
 
     // Exactly one durable driver line per spawn (DoD-6 evidence; no schema field).
     crate::progress_log::append(
@@ -769,9 +954,9 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
             apply_slot_result(&rec, backend.as_ref(), &req)
         })
     {
-        write_sync_permission_failure(
+        record_admission_failure(
             record,
-            &spawn_state,
+            entry,
             &slug_owned,
             format!("failed to spawn plan-review {slug_owned} thread: {e}"),
         )?;
@@ -779,35 +964,43 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
     Ok(())
 }
 
-fn write_sync_permission_failure(
+/// Record a synchronous admission failure for the live entry.
+///
+/// 0119 / OD-119-7: an empty command, an unresolvable driver or a failed thread creation is **not**
+/// a try - no child ever started. This records the cause, clears the slug's mailbox and verdict,
+/// and removes the slug from pending **and** the spawn ledger in one lock/save. It does **not**
+/// push `spawned` and does **not** write a role outcome; the join fails the phase `Permission`.
+fn record_admission_failure(
     record: &ProjectRecord,
-    expected: &RunState,
+    expected_entry: PlanReviewEntry,
     slug: &str,
     message: String,
 ) -> Result<()> {
+    let cause = normalize_verdict(&message);
     with_run_state_lock(record, || {
         let mut s = load_run_state(record)?;
-        if s.status != RunStatus::Running
-            || s.phase != PHASE_PLAN_REVIEW
-            || s.run_epoch != expected.run_epoch
-            || s.track_id != expected.track_id
+        if !matches!(s.status, RunStatus::Running | RunStatus::Paused)
+            || s.plan_review_entry_current() != Some(expected_entry)
         {
             return Ok(());
         }
-        if !s.plan_review_spawned.iter().any(|x| x == slug) {
-            s.plan_review_spawned.push(slug.into());
-            s.updated_at = chrono::Utc::now();
-            save_run_state(record, &s)?;
+        if let Ok(path) = super::bundle::review_file(record, slug) {
+            let _ = std::fs::remove_file(path);
         }
-        write_role_outcome(
-            record,
-            &s,
-            slug,
-            OutcomeStatus::Failure,
-            Some(FailureClass::Permission),
-            Some(message),
-        )
-    })
+        s.plan_review_verdicts.remove(slug);
+        s.plan_review_admission_failures
+            .insert(slug.to_string(), cause.clone());
+        s.pending_roles.retain(|x| x != slug);
+        s.plan_review_spawned.retain(|x| x != slug);
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)
+    })?;
+    crate::progress_log::append(
+        record,
+        "plan-review",
+        &format!("plan-review: admission failed {slug} ({cause}); phase fails Permission"),
+    );
+    Ok(())
 }
 
 fn apply_slot_result(
@@ -815,16 +1008,25 @@ fn apply_slot_result(
     backend: &dyn PlanReviewBackend,
     req: &PlanReviewRequest,
 ) {
-    if let Err(e) = mark_slot_ran(record, req) {
-        // Never run the backend for an unstamped slot: the phase must degrade with a named cause
-        // instead of silently losing the slug from the join retry set.
-        let msg = format!(
-            "plan-review: {} slot-ran stamp not persisted: {e}",
-            req.slug
-        );
-        crate::progress_log::append(record, "plan-review", &msg);
-        write_stamp_failure_outcome(record, req, &msg);
-        return;
+    match mark_slot_ran(record, req) {
+        Ok(true) => {}
+        Ok(false) => {
+            // The entry moved before this worker stamped: never run the backend for a stale slot.
+            let msg = format!("plan-review: {} stamp refused (stale entry)", req.slug);
+            crate::progress_log::append(record, "plan-review", &msg);
+            return;
+        }
+        Err(e) => {
+            // Never run the backend for an unstamped slot: the phase must degrade with a named
+            // cause instead of silently losing the slug from the join retry set.
+            let msg = format!(
+                "plan-review: {} slot-ran stamp not persisted: {e}",
+                req.slug
+            );
+            crate::progress_log::append(record, "plan-review", &msg);
+            write_stamp_failure_outcome(record, req, &e.to_string());
+            return;
+        }
     }
     let t0 = Instant::now();
     let result = backend.run(req);
@@ -875,11 +1077,15 @@ fn finish_slot(
                             }
                         }
                     };
+                    // 0119: the retry unlink is inside the entry-fenced lock, so a stale worker
+                    // cannot delete the live entry's track review.
+                    if remaining.is_some() {
+                        unlink_track_review(req);
+                    }
                     Ok(remaining)
                 });
                 match retry_remaining {
                     Ok(Some(remaining)) => {
-                        unlink_track_review(req);
                         let mut retry_req = req.clone();
                         retry_req.remaining = remaining;
                         let t1 = Instant::now();
@@ -894,130 +1100,83 @@ fn finish_slot(
                     Err(_) => return,
                 }
             }
-            adopt_or_fail(record, &state, req, &out);
+            adopt_or_fail(record, req, &out);
         }
         Err(e) => {
             let class = classify_spawn_err(&e);
-            let _ = write_role_outcome(
-                record,
-                &state,
-                &req.slug,
-                OutcomeStatus::Failure,
-                Some(class),
-                Some(e.to_string()),
-            );
+            let msg = e.to_string();
+            commit_failure(record, req, class, &msg, None);
         }
     }
 }
 
 fn apply_allowed(state: &RunState, req: &PlanReviewRequest) -> bool {
     matches!(state.status, RunStatus::Running | RunStatus::Paused)
-        && state.phase == PHASE_PLAN_REVIEW
-        && state.run_epoch == req.spawn_epoch
+        && state.plan_review_entry_current() == Some(req.entry)
         && state.track_id == req.spawn_track_id
 }
 
-fn adopt_or_fail(
-    record: &ProjectRecord,
-    state: &RunState,
-    req: &PlanReviewRequest,
-    out: &PlanReviewResult,
-) {
-    let Ok(latest) = load_run_state(record) else {
-        return;
-    };
-    if !apply_allowed(&latest, req) {
-        return;
-    }
+fn adopt_or_fail(record: &ProjectRecord, req: &PlanReviewRequest, out: &PlanReviewResult) {
     if let Some(body) = track_review_body(req.track_dir.as_deref(), &req.slug) {
-        if plan_review_quality_ok(&body, req.spawn_track_id.as_deref()) {
-            let _ = write_review_markdown(record, &req.slug, Some(&body));
-            let _ =
-                write_role_outcome(record, state, &req.slug, OutcomeStatus::Success, None, None);
-            return;
+        match plan_review_quality(&body, req.spawn_track_id.as_deref()) {
+            Ok(()) => commit_success(record, req, &body),
+            Err(dud) => commit_degenerate(record, req, &dud, &body, out),
         }
-        write_degenerate_failure(record, state, req, out, Some(&body));
         return;
     }
     if req.slug == REVIEW_SLUG_OPENCODE {
-        adopt_opencode_stdout(record, state, req, out);
+        adopt_opencode_stdout(record, req, out);
     } else {
-        adopt_agy_stdout(record, state, req, out);
+        adopt_agy_stdout(record, req, out);
     }
 }
 
-fn adopt_agy_stdout(
-    record: &ProjectRecord,
-    state: &RunState,
-    req: &PlanReviewRequest,
-    out: &PlanReviewResult,
-) {
+fn adopt_agy_stdout(record: &ProjectRecord, req: &PlanReviewRequest, out: &PlanReviewResult) {
     match parse_agy_stdout(&out.stdout) {
-        AgyStdout::Success(body) => {
-            adopt_plan_review_body(record, state, req, out, &body);
+        AgyStdout::Success(body) | AgyStdout::Raw(body) => {
+            adopt_plan_review_body(record, req, out, &body);
         }
         AgyStdout::JsonFailure { status, error } => {
             let class = classify_agy_status(&status, error.as_deref(), out.exit);
             let msg = error.unwrap_or(status);
-            let _ = write_role_outcome(
-                record,
-                state,
-                &req.slug,
-                OutcomeStatus::Failure,
-                Some(class),
-                Some(msg),
-            );
-        }
-        AgyStdout::Raw(body) => {
-            adopt_plan_review_body(record, state, req, out, &body);
+            commit_failure(record, req, class, &msg, None);
         }
         AgyStdout::Empty => {
-            write_empty_failure(record, state, req, out);
+            write_empty_failure(record, req, out);
         }
     }
 }
 
-fn adopt_opencode_stdout(
-    record: &ProjectRecord,
-    state: &RunState,
-    req: &PlanReviewRequest,
-    out: &PlanReviewResult,
-) {
+fn adopt_opencode_stdout(record: &ProjectRecord, req: &PlanReviewRequest, out: &PlanReviewResult) {
     match parse_opencode_stdout(&out.stdout) {
-        OpencodeStdout::Text(body) | OpencodeStdout::Raw(body)
-            if plan_review_quality_ok(&body, req.spawn_track_id.as_deref()) =>
-        {
-            let _ = write_review_markdown(record, &req.slug, Some(&body));
-            let _ =
-                write_role_outcome(record, state, &req.slug, OutcomeStatus::Success, None, None);
-        }
         OpencodeStdout::Text(body) | OpencodeStdout::Raw(body) => {
-            write_degenerate_failure(record, state, req, out, Some(&body));
+            adopt_plan_review_body(record, req, out, &body);
         }
         OpencodeStdout::Error(msg) => {
             let class = classify_agy_status("ERROR", Some(&msg), out.exit);
-            let _ = write_role_outcome(
-                record,
-                state,
-                &req.slug,
-                OutcomeStatus::Failure,
-                Some(class),
-                Some(msg),
-            );
+            commit_failure(record, req, class, &msg, None);
         }
         OpencodeStdout::Empty => {
-            write_empty_failure(record, state, req, out);
+            write_empty_failure(record, req, out);
         }
     }
 }
 
-fn plan_review_quality_ok(body: &str, track_id: Option<&str>) -> bool {
+/// The quality gate's exact reason. The boolean wrapper serves the pure decision call sites; the
+/// writers bind the `Dud` so the stored verdict carries `slot_quality`'s reason.
+fn plan_review_quality(
+    body: &str,
+    track_id: Option<&str>,
+) -> std::result::Result<(), crate::review::slot_quality::Dud> {
     crate::review::slot_quality::check(
         crate::review::slot_quality::SlotFamily::PlanReview,
         body,
         track_id,
     )
-    .is_ok()
+}
+
+fn plan_review_quality_ok(body: &str, track_id: Option<&str>) -> bool {
+    plan_review_quality(body, track_id).is_ok()
 }
 
 #[cfg(test)]
@@ -1027,17 +1186,133 @@ fn opencode_review_looks_complete(body: &str, track_id: Option<&str>) -> bool {
 
 fn adopt_plan_review_body(
     record: &ProjectRecord,
-    state: &RunState,
     req: &PlanReviewRequest,
     out: &PlanReviewResult,
     body: &str,
 ) {
-    if plan_review_quality_ok(body, req.spawn_track_id.as_deref()) {
-        let _ = write_review_markdown(record, &req.slug, Some(body));
-        let _ = write_role_outcome(record, state, &req.slug, OutcomeStatus::Success, None, None);
-        return;
+    match plan_review_quality(body, req.spawn_track_id.as_deref()) {
+        Ok(()) => commit_success(record, req, body),
+        Err(dud) => commit_degenerate(record, req, &dud, body, out),
     }
-    write_degenerate_failure(record, state, req, out, Some(body));
+}
+
+/// Entry-fenced success commit (0119 C7): the mailbox, the role outcome and the verdict clear
+/// share one run-state lock, re-checked against `apply_allowed` **inside** it.
+///
+/// The mailbox is written first; only a mailbox failure is a failed attempt. The track copy is
+/// best effort (the receipt omits a slot whose track file is missing).
+fn commit_success(record: &ProjectRecord, req: &PlanReviewRequest, body: &str) {
+    let _ = with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if !apply_allowed(&s, req) {
+            return Ok(());
+        }
+        if let Err(e) = write_review_markdown(record, &req.slug, Some(body)) {
+            let msg = format!("plan-review: {} review write failed: {e}", req.slug);
+            write_role_outcome(
+                record,
+                &req.slug,
+                req.entry,
+                OutcomeStatus::Failure,
+                Some(FailureClass::HarnessCrash),
+                Some(msg),
+            )?;
+            return Ok(());
+        }
+        s.plan_review_verdicts.remove(&req.slug);
+        write_role_outcome(
+            record,
+            &req.slug,
+            req.entry,
+            OutcomeStatus::Success,
+            None,
+            None,
+        )?;
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)
+    });
+}
+
+/// Entry-fenced failure commit. `rendered_verdict` is the already-rendered cause; an existing
+/// verdict wins (first writer within an attempt).
+fn commit_failure(
+    record: &ProjectRecord,
+    req: &PlanReviewRequest,
+    class: FailureClass,
+    msg: &str,
+    rendered_verdict: Option<&str>,
+) {
+    let _ = with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if !apply_allowed(&s, req) {
+            return Ok(());
+        }
+        write_role_outcome(
+            record,
+            &req.slug,
+            req.entry,
+            OutcomeStatus::Failure,
+            Some(class),
+            Some(msg.to_string()),
+        )?;
+        if let Some(v) = rendered_verdict {
+            s.plan_review_verdicts
+                .entry(req.slug.clone())
+                .or_insert_with(|| normalize_verdict(v));
+        }
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)
+    });
+}
+
+/// Entry-fenced degenerate commit: the `.dud1.md` write, the track-review unlink, the failure
+/// outcome and the `ran; dud: {reason}` verdict share one lock.
+fn commit_degenerate(
+    record: &ProjectRecord,
+    req: &PlanReviewRequest,
+    dud: &crate::review::slot_quality::Dud,
+    body: &str,
+    out: &PlanReviewResult,
+) {
+    let class = if out.exit == 124 {
+        FailureClass::Timeout
+    } else {
+        FailureClass::Permission
+    };
+    let reason = dud.reason;
+    let bytes = dud.bytes;
+    let msg = format!(
+        "plan-review: {} review rejected: {reason} ({bytes} B)",
+        req.slug
+    );
+    let verdict = format!("ran; dud: {reason}");
+    let file = format!("{}-review.md", req.slug);
+    let _ = with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if !apply_allowed(&s, req) {
+            return Ok(());
+        }
+        if let Some(dir) = req.track_dir.as_deref() {
+            let _ = std::fs::write(dir.join(format!("{}-review.dud1.md", req.slug)), body);
+            let _ = std::fs::remove_file(dir.join(format!("{}-review.md", req.slug)));
+        }
+        write_role_outcome(
+            record,
+            &req.slug,
+            req.entry,
+            OutcomeStatus::Failure,
+            Some(class),
+            Some(msg),
+        )?;
+        s.plan_review_verdicts
+            .entry(req.slug.clone())
+            .or_insert_with(|| normalize_verdict(&verdict));
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)
+    });
+    // Diagnostic note only (the verdict is the cause); it takes the run-state lock itself, so it
+    // is called outside the commit closure.
+    let _ = crate::review::record_slot_dud_if(record, req.entry, &file, bytes);
 }
 
 fn plan_review_should_retry(req: &PlanReviewRequest, out: &PlanReviewResult) -> bool {
@@ -1119,7 +1394,12 @@ fn is_transient_save_err(e: &CoordinatorError) -> bool {
 /// epoch. If the mailbox cannot be written at all, clear the pending slug so the phase degrades
 /// through the normal join path (the progress line names the cause) instead of hanging on a role
 /// file that will never appear.
-fn write_stamp_failure_outcome(record: &ProjectRecord, req: &PlanReviewRequest, msg: &str) {
+fn write_stamp_failure_outcome(record: &ProjectRecord, req: &PlanReviewRequest, err: &str) {
+    let msg = format!(
+        "plan-review: {} slot-ran stamp not persisted: {err}",
+        req.slug
+    );
+    let mut wrote = false;
     for attempt in 0..STAMP_SAVE_ATTEMPTS {
         // Re-load and re-check under the run-state lock on every attempt: an epoch transition
         // takes the same lock, so the write cannot land in a newer epoch even if the retry ladder
@@ -1131,17 +1411,20 @@ fn write_stamp_failure_outcome(record: &ProjectRecord, req: &PlanReviewRequest, 
             }
             write_role_outcome(
                 record,
-                &state,
                 &req.slug,
+                req.entry,
                 OutcomeStatus::Failure,
                 Some(FailureClass::HarnessCrash),
-                Some(msg.to_string()),
+                Some(msg.clone()),
             )?;
             Ok(true)
         });
         match outcome {
-            Ok(true) => return,
-            Ok(false) => return, // a newer epoch/track owns this slot; never write a stale mailbox
+            Ok(true) => {
+                wrote = true;
+                break;
+            }
+            Ok(false) => return, // a newer entry/track owns this slot; never write a stale mailbox
             Err(e) if is_transient_save_err(&e) => {
                 if attempt + 1 < STAMP_SAVE_ATTEMPTS {
                     std::thread::sleep(STAMP_SAVE_BACKOFF);
@@ -1150,11 +1433,19 @@ fn write_stamp_failure_outcome(record: &ProjectRecord, req: &PlanReviewRequest, 
             Err(_) => break,
         }
     }
-    let _ = crate::workflow::drive::remove_pending_if_epoch(
+    if wrote {
+        return;
+    }
+    // Only a final failure of the outcome write removes the slot: the removal and the rendered
+    // verdict are one lock/save, bound to this request's entry (OD-119). `remove_pending_if_entry`
+    // takes the lock itself and is never called from inside one.
+    let verdict = format!("failed: stamp not persisted: {err}");
+    let _ = crate::workflow::drive::remove_pending_if_entry(
         record,
         &req.slug,
-        req.spawn_epoch,
+        req.entry,
         req.spawn_track_id.as_deref(),
+        Some(&verdict),
     );
 }
 
@@ -1162,14 +1453,15 @@ fn write_stamp_failure_outcome(record: &ProjectRecord, req: &PlanReviewRequest, 
 ///
 /// The stamp feeds `maybe_rearm_join_retry`'s retry set; losing it silently drops a slot that did
 /// run from the join retry. Each attempt re-loads inside the lock so a concurrent tick cannot be
-/// clobbered, and the `apply_allowed` epoch/track gate is unchanged.
-fn mark_slot_ran(record: &ProjectRecord, req: &PlanReviewRequest) -> Result<()> {
+/// clobbered, and `apply_allowed` (now entry-scoped) gates it. `Ok(false)` means the entry moved:
+/// the caller must **not** run the backend.
+fn mark_slot_ran(record: &ProjectRecord, req: &PlanReviewRequest) -> Result<bool> {
     let mut last: Option<CoordinatorError> = None;
     for attempt in 0..STAMP_SAVE_ATTEMPTS {
         let outcome = with_run_state_lock(record, || {
             let mut s = load_run_state(record)?;
             if !apply_allowed(&s, req) {
-                return Ok(());
+                return Ok(false);
             }
             if !s.plan_review_slot_ran.iter().any(|x| x == &req.slug) {
                 s.plan_review_slot_ran.push(req.slug.clone());
@@ -1180,10 +1472,11 @@ fn mark_slot_ran(record: &ProjectRecord, req: &PlanReviewRequest) -> Result<()> 
                 }
                 save_run_state(record, &s)?;
             }
-            Ok(())
+            Ok(true)
         });
         match outcome {
-            Ok(()) => return Ok(()),
+            Ok(true) => return Ok(true),
+            Ok(false) => return Ok(false),
             Err(e) if is_transient_save_err(&e) => {
                 last = Some(e);
                 if attempt + 1 < STAMP_SAVE_ATTEMPTS {
@@ -1208,11 +1501,14 @@ pub(crate) fn maybe_rearm_join_retry(record: &ProjectRecord) -> Result<bool> {
             // Another tick already left plan-review; do not fail_phase.
             return Ok(true);
         }
+        if s.plan_review_entry_current().is_none() {
+            return Ok(false);
+        }
         if !s.pending_roles.is_empty() {
             // Concurrent ticker already re-armed this join. Stay Running.
             return Ok(true);
         }
-        if s.plan_review_join_retries >= PLAN_REVIEW_JOIN_RETRY_CAP {
+        if s.plan_review_join_retries_now() >= PLAN_REVIEW_JOIN_RETRY_CAP {
             return Ok(false);
         }
         let join_budget = {
@@ -1239,7 +1535,7 @@ pub(crate) fn maybe_rearm_join_retry(record: &ProjectRecord) -> Result<bool> {
             .iter()
             .copied()
             .filter(|slug| {
-                s.plan_review_slot_ran.iter().any(|x| x == slug)
+                s.plan_review_slot_ran_now().iter().any(|x| x == slug)
                     && !stalled.iter().any(|x| x == slug)
             })
             .map(str::to_string)
@@ -1251,6 +1547,10 @@ pub(crate) fn maybe_rearm_join_retry(record: &ProjectRecord) -> Result<bool> {
         s.pending_roles.clone_from(&retryable);
         s.plan_review_spawned
             .retain(|x| !retryable.iter().any(|r| r == x));
+        // The ran stamp stays: it is the cause evidence if the retry is refused admission.
+        for slug in &retryable {
+            s.plan_review_verdicts.remove(slug);
+        }
         let event = format!(
             "plan-review: retrying join {} ({}/{})",
             retryable.join(","),
@@ -1271,69 +1571,28 @@ fn unlink_track_review(req: &PlanReviewRequest) {
     }
 }
 
-fn write_degenerate_failure(
-    record: &ProjectRecord,
-    state: &RunState,
-    req: &PlanReviewRequest,
-    out: &PlanReviewResult,
-    body: Option<&str>,
-) {
-    let file = format!("{}-review.md", req.slug);
-    let bytes = body
-        .map(|b| crate::workflow::bundle::normalize_newlines(b).len())
-        .unwrap_or(0);
-    if let (Some(dir), Some(text)) = (req.track_dir.as_deref(), body) {
-        let _ = std::fs::write(dir.join(format!("{}-review.dud1.md", req.slug)), text);
-    }
-    unlink_track_review(req);
-    let _ = crate::review::record_slot_dud(record, &file, bytes);
+/// Empty stdout (no file, no body): a resolved attempt with `ran; produced no review`.
+fn write_empty_failure(record: &ProjectRecord, req: &PlanReviewRequest, out: &PlanReviewResult) {
     let class = if out.exit == 124 {
         FailureClass::Timeout
     } else {
         FailureClass::Permission
     };
-    let msg = format!(
-        "plan-review: {} review missing required '# Track review:' header or track id; {}",
-        req.slug,
-        crate::review::slot_quality::dud_message(&file, bytes)
-    );
-    let _ = write_role_outcome(
-        record,
-        state,
-        &req.slug,
-        OutcomeStatus::Failure,
-        Some(class),
-        Some(msg),
-    );
-}
-
-fn write_empty_failure(
-    record: &ProjectRecord,
-    state: &RunState,
-    req: &PlanReviewRequest,
-    out: &PlanReviewResult,
-) {
-    let class = if out.exit == 124 {
-        FailureClass::Timeout
+    let has_stderr = !out.stderr.trim().is_empty();
+    let msg = if has_stderr {
+        out.stderr.clone()
     } else {
-        FailureClass::Permission
-    };
-    let msg = if out.stderr.trim().is_empty() {
         format!(
             "plan-review: {} produced no review file and no stdout",
             req.slug
         )
-    } else {
-        out.stderr.clone()
     };
-    let _ = write_role_outcome(
-        record,
-        state,
-        &req.slug,
-        OutcomeStatus::Failure,
-        Some(class),
-        Some(msg),
-    );
+    let verdict = if has_stderr {
+        format!("ran; produced no review: {}", out.stderr.trim())
+    } else {
+        "ran; produced no review".to_string()
+    };
+    commit_failure(record, req, class, &msg, Some(&verdict));
 }
 
 fn track_review_body(track_dir: Option<&Path>, slug: &str) -> Option<String> {
@@ -1503,8 +1762,8 @@ fn classify_spawn_err(e: &CoordinatorError) -> FailureClass {
 
 fn write_role_outcome(
     record: &ProjectRecord,
-    state: &RunState,
     slug: &str,
+    entry: PlanReviewEntry,
     status: OutcomeStatus,
     class: Option<FailureClass>,
     message: Option<String>,
@@ -1517,19 +1776,20 @@ fn write_role_outcome(
             OutcomeSource::Adapter,
             message,
             None,
-            Some(state.run_epoch),
+            Some(entry.run_epoch),
         ),
         OutcomeStatus::Failure => PhaseOutcome::failure(
             role_phase(slug),
             class.unwrap_or(FailureClass::HarnessCrash),
             OutcomeSource::Adapter,
             message,
-            Some(state.run_epoch),
+            Some(entry.run_epoch),
         ),
     };
     outcome.metadata = Some(OutcomeMetadata {
         next_track: None,
         role: Some(slot_role(slug).into()),
+        entry_id: Some(entry.entry_id),
         ..Default::default()
     });
     crate::persist::atomic_write_json(&roles.join(format!("{slug}.json")), &outcome)
@@ -2244,7 +2504,36 @@ mod tests {
         let mut state = load_run_state(r).unwrap();
         state.phase = graph::PHASE_PLAN_REVIEW.into();
         state.pending_roles = vec!["agy".into(), "opencode".into()];
+        // 0119: a direct fixture enters plan-review, so it owns one live entry.
+        state.adopt_plan_review_entry();
         save_run_state(r, &state).unwrap();
+    }
+
+    /// 0119: stamp a fixture role outcome with the live `(run_epoch, entry_id)` pair.
+    ///
+    /// Every manual `roles/<slug>.json` seed uses this; a fixture that deliberately writes an
+    /// epoch/entry-less outcome is the fail-closed negative test and must not.
+    fn stamp_role_outcome(state: &RunState, mut o: PhaseOutcome) -> PhaseOutcome {
+        let Some(entry) = state.plan_review_entry_current() else {
+            return o;
+        };
+        o.run_epoch = Some(entry.run_epoch);
+        let mut meta = o.metadata.take().unwrap_or_default();
+        meta.entry_id = Some(entry.entry_id);
+        o.metadata = Some(meta);
+        o
+    }
+
+    /// 0119: a direct book seed is inert without a current entry.
+    fn seed_current_entry(s: &mut RunState) {
+        s.adopt_plan_review_entry();
+    }
+
+    /// 0119: write a role outcome file for `slug`.
+    fn write_role_file(r: &ProjectRecord, slug: &str, outcome: &PhaseOutcome) {
+        let roles = outcome_roles_dir(r).unwrap();
+        std::fs::create_dir_all(&roles).unwrap();
+        crate::persist::atomic_write_json(&roles.join(format!("{slug}.json")), outcome).unwrap();
     }
 
     fn is_transient_lock_err(e: &crate::error::CoordinatorError) -> bool {
@@ -2368,11 +2657,14 @@ mod tests {
     fn plan_review_diag(s: &crate::state::RunState) -> String {
         format!(
             "pending_roles={:?} plan_review_spawned={:?} join_retries={} \
-             slot_ran={:?} status={:?} last_event={:?}",
+             slot_ran={:?} entry={:?} verdicts={:?} admission={:?} status={:?} last_event={:?}",
             s.pending_roles,
             s.plan_review_spawned,
             s.plan_review_join_retries,
             s.plan_review_slot_ran,
+            s.plan_review_entry,
+            s.plan_review_verdicts,
+            s.plan_review_admission_failures,
             s.status,
             s.last_event
         )
@@ -2434,6 +2726,29 @@ mod tests {
         panic!(
             "run did not stop: status={:?} event={} pending={:?}",
             s.status, s.last_event, s.pending_roles
+        );
+    }
+
+    /// Drive ticks until the plan-review phase resolves, returning that view.
+    ///
+    /// `tick` returns `Some` only when the phase applies an outcome, so a fold-leg failure caused
+    /// by the fixture's missing fold skill cannot overwrite the join view being asserted.
+    fn tick_until_phase_change(r: &ProjectRecord) -> crate::state::StatusView {
+        for _ in 0..400 {
+            if inflight_count(&r.id) > 0 && !wait_inflight_idle(&r.id, WORKER_CEILING) {
+                panic!(
+                    "worker wave did not quiesce: {}",
+                    plan_review_diag(&load_run_state(r).unwrap())
+                );
+            }
+            if let Some(v) = tick_retry(r).unwrap() {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "plan-review did not resolve: {}",
+            plan_review_diag(&load_run_state(r).unwrap())
         );
     }
 
@@ -2644,17 +2959,43 @@ mod tests {
         assert_eq!(resolved, pin);
     }
 
+    /// OD-119-7 (round-3 M1 rewrite): a refused slot/harness pair is a synchronous admission
+    /// failure - no child ever started, so the phase stops `Permission` naming the slot and the
+    /// cause instead of writing a Permission role file the join would consume and degrade.
+    ///
+    /// Replaces `refused_slot_harness_pair_writes_permission_and_spawns_nothing`; the
+    /// `allowed: antigravity, codex` diagnostic is preserved (now against the admission message).
     #[test]
-    fn refused_slot_harness_pair_writes_permission_and_spawns_nothing() {
+    fn refused_slot_harness_pair_records_admission_and_stops() {
         let _env = IsolatedHome::enter();
         let dir = tempdir().unwrap();
         setup_track(dir.path(), "0001");
         let r = rec(dir.path());
         enter_plan_review(&r, "0001");
-        let mut state = load_run_state(&r).unwrap();
-        state.pending_roles = vec!["agy".into()];
-        state.plan_review_spawned = vec!["opencode".into()];
-        save_run_state(&r, &state).unwrap();
+        // A produced peer slot proves the admission stop beats a would-be degrade.
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        let roles = outcome_roles_dir(&r).unwrap();
+        std::fs::create_dir_all(&roles).unwrap();
+        let live = load_run_state(&r).unwrap();
+        let mut oc = PhaseOutcome::success(
+            "plan-review:opencode",
+            OutcomeSource::File,
+            None,
+            None,
+            None,
+        );
+        oc.metadata = Some(OutcomeMetadata {
+            next_track: None,
+            role: Some(graph::ROLE_REVIEWER_OPENCODE.into()),
+            ..Default::default()
+        });
+        let oc = stamp_role_outcome(&live, oc);
+        crate::persist::atomic_write_json(&roles.join("opencode.json"), &oc).unwrap();
+        {
+            let mut state = load_run_state(&r).unwrap();
+            state.plan_review_spawned = vec!["opencode".into()];
+            save_run_state(&r, &state).unwrap();
+        }
         // The agy slot has no adoption path for opencode (research block + stdout path
         // are slot-specific).
         let mut cfg = crate::config::load_machine_config().unwrap();
@@ -2663,24 +3004,27 @@ mod tests {
         binding.command = "opencode".into();
         crate::config::save_machine_config(&cfg).unwrap();
 
-        let state = load_run_state(&r).unwrap();
-        maybe_spawn_slot(&r, &state, "agy").unwrap();
-        let mut last = String::new();
-        for _ in 0..80 {
-            let path = outcome_roles_dir(&r).unwrap().join("agy.json");
-            if let Ok(text) = std::fs::read_to_string(&path)
-                && let Ok(o) = serde_json::from_str::<PhaseOutcome>(&text)
-                && o.status == OutcomeStatus::Failure
-            {
-                assert_eq!(o.failure_class, Some(FailureClass::Permission));
-                last = o.message.unwrap_or_default();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let view = tick_retry(&r).unwrap().expect("admission stop");
+        assert_eq!(view.status, crate::state::RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert_eq!(view.phase, graph::PHASE_PLAN_REVIEW);
         assert!(
-            last.contains("allowed: antigravity, codex"),
-            "refusal must name the allowed set: {last}"
+            view.last_event.contains("admission failed: ")
+                && view.last_event.contains("agy")
+                && view.last_event.contains("allowed: antigravity, codex"),
+            "refusal must name the slot, the cause and the allowed set: {}",
+            view.last_event
+        );
+        let state = load_run_state(&r).unwrap();
+        let cause = state
+            .plan_review_admission_failure("agy")
+            .expect("admission record");
+        assert!(cause.contains("allowed: antigravity, codex"), "{cause}");
+        assert!(!state.pending_roles.iter().any(|s| s == "agy"));
+        assert!(!state.plan_review_spawned.iter().any(|s| s == "agy"));
+        assert!(
+            !roles.join("agy.json").exists(),
+            "an admission failure must not write a role outcome"
         );
         let track = dir.path().join("conductor").join("0001-Example");
         assert!(
@@ -2837,8 +3181,13 @@ mod tests {
         );
     }
 
+    /// DoD-5(c): the crash-after-receipt shape. The receipt was written and the outcome was not
+    /// applied; the resumed phase joins from the **mailbox** with no re-spawn and rewrites the
+    /// receipt (dropping the sentinel `pr` the join writer omits).
+    ///
+    /// This replaces the retired in-phase reuse test `matching_receipt_does_not_spawn_and_joins`.
     #[test]
-    fn matching_receipt_does_not_spawn_and_joins() {
+    fn crash_after_receipt_resumes_to_join_without_reuse_or_respawn() {
         let dir = tempdir().unwrap();
         setup_track(dir.path(), "0083");
         let r = rec(dir.path());
@@ -2857,21 +3206,53 @@ mod tests {
         let oc = b"oc\r\nreview\r\n";
         std::fs::write(track.join("agy-review.md"), agy).unwrap();
         std::fs::write(track.join("opencode-review.md"), oc).unwrap();
-        super::super::reuse::write_join_receipt(&r, "0083");
+
+        enter_plan_review(&r, "0083");
+        let mut state = load_run_state(&r).unwrap();
+        state.pending_roles.clear();
+        // The producer writes the mailbox (canonical evidence) and the track copy.
+        for (slug, bytes) in [("agy", &agy[..]), ("opencode", &oc[..])] {
+            std::fs::write(track.join(format!("{slug}-review.md")), bytes).unwrap();
+            let dest = crate::workflow::bundle::review_file(&r, slug).unwrap();
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, bytes).unwrap();
+        }
+        save_run_state(&r, &state).unwrap();
+        let state = load_run_state(&r).unwrap();
+        super::super::reuse::write_join_receipt(&r, &state);
+
+        // A sentinel `pr` is the field the join writer omits; its disappearance proves the tick
+        // rewrote the seed instead of passing on the seeded bytes.
+        let receipt_path = track.join("reuse.json");
+        let mut seeded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        seeded["pr"] = serde_json::json!({
+            "number": 424242u64,
+            "head_sha": "deadbeef",
+            "head_ref": "track/sentinel"
+        });
+        std::fs::write(&receipt_path, serde_json::to_vec(&seeded).unwrap()).unwrap();
+
         let backend = RecordingBackend::wrap(Arc::new(ScriptedBackend::empty()));
         let counts = backend.counts.clone();
         let _guard = install_test_backend(&r.id, Arc::new(backend));
-        enter_plan_review(&r, "0083");
         let view = tick_retry(&r).unwrap().expect("joined");
-        assert_eq!(counts.n(), 0);
+        assert_eq!(counts.n(), 0, "no slot is re-spawned after a receipt");
         assert_eq!(view.phase, graph::PHASE_FOLD);
         let state = load_run_state(&r).unwrap();
         assert!(state.plan_review_spawned.is_empty());
-        let copied = crate::workflow::bundle::review_file(&r, "agy").unwrap();
-        assert_eq!(std::fs::read(copied).unwrap(), agy);
+
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        assert!(rewritten.get("pr").is_none(), "{rewritten}");
+        assert_eq!(rewritten["epoch"], state.run_epoch);
+        assert!(rewritten["slots"]["agy"]["review_sha256"].is_string());
+        assert!(rewritten["slots"]["opencode"]["review_sha256"].is_string());
         let log = std::fs::read_to_string(dir.path().join("status.md")).unwrap();
-        assert!(log.contains("plan-review: reuse agy"), "{log}");
-        assert!(log.contains("plan-review: reuse opencode"), "{log}");
+        assert!(
+            !log.contains("plan-review: reuse"),
+            "in-phase reuse is retired: {log}"
+        );
     }
 
     #[test]
@@ -3440,6 +3821,492 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------------------
+    // 0119: entry identity, admission, join proof, evidence provenance, receipts.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn stale_entry_admission_failure_is_not_recorded() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let live = load_run_state(&r).unwrap();
+        let stale = PlanReviewEntry {
+            run_epoch: live.run_epoch,
+            entry_id: 1,
+        };
+        {
+            let mut s = live.clone();
+            s.plan_review_entry = Some(PlanReviewEntry {
+                run_epoch: live.run_epoch,
+                entry_id: 2,
+            });
+            save_run_state(&r, &s).unwrap();
+        }
+        record_admission_failure(&r, stale, "agy", "empty plan_reviewer_agy command".into())
+            .unwrap();
+        let s = load_run_state(&r).unwrap();
+        assert!(
+            s.plan_review_admission_failures.is_empty(),
+            "a stale entry must not record an admission failure"
+        );
+        assert!(s.pending_roles.iter().any(|x| x == "agy"));
+        assert!(s.pending_roles.iter().any(|x| x == "opencode"));
+        assert!(
+            !outcome_roles_dir(&r).unwrap().join("agy.json").exists(),
+            "an admission failure writes no role outcome"
+        );
+        assert!(s.plan_review_verdict("agy").is_none());
+        assert!(
+            !crate::workflow::bundle::review_file(&r, "agy")
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[test]
+    fn stale_entry_worker_cannot_stamp_or_run() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let live = load_run_state(&r).unwrap();
+        {
+            let mut s = live.clone();
+            s.plan_review_entry = Some(PlanReviewEntry {
+                run_epoch: live.run_epoch,
+                entry_id: 2,
+            });
+            save_run_state(&r, &s).unwrap();
+        }
+        let backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            ok_review_body("0001"),
+        ))));
+        let counts = backend.counts.clone();
+        let req = PlanReviewRequest {
+            slug: "agy".into(),
+            command: "agy".into(),
+            model: None,
+            last_message_path: None,
+            workspace_root: dir.path().to_path_buf(),
+            execution_repo: None,
+            track_dir: Some(dir.path().join("conductor").join("0001-Example")),
+            prompt: String::new(),
+            remaining: Duration::from_secs(120),
+            argv: Vec::new(),
+            extra_env: Vec::new(),
+            entry: PlanReviewEntry {
+                run_epoch: live.run_epoch,
+                entry_id: 1,
+            },
+            spawn_track_id: Some("0001".into()),
+        };
+        apply_slot_result(&r, backend.as_ref(), &req);
+        assert_eq!(counts.n(), 0, "a stale worker must not run the backend");
+        let s = load_run_state(&r).unwrap();
+        assert!(
+            s.plan_review_slot_ran_now().is_empty(),
+            "a stale worker must not stamp slot_ran"
+        );
+        assert!(
+            !crate::workflow::bundle::review_file(&r, "agy")
+                .unwrap()
+                .exists()
+        );
+        assert!(!outcome_roles_dir(&r).unwrap().join("agy.json").exists());
+    }
+
+    #[test]
+    fn legacy_mid_phase_state_adopts_one_entry_without_clearing_books() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        run::run_with_driver(&r, Some("0001".into()), WorkflowDriver::Adapter).unwrap();
+        let mut s = load_run_state(&r).unwrap();
+        s.phase = graph::PHASE_PLAN_REVIEW.into();
+        s.pending_roles = vec!["agy".into(), "opencode".into()];
+        s.plan_review_spawned = vec!["opencode".into()];
+        s.plan_review_entry = None;
+        let epoch = s.run_epoch;
+        save_run_state(&r, &s).unwrap();
+
+        let backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            ok_review_body("0001"),
+        ))));
+        let counts = backend.counts.clone();
+        let _hook = install_test_backend(&r.id, backend);
+        tick_retry(&r).unwrap();
+        wait_slots_consumed(&r, &["agy"]);
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(
+            s.plan_review_entry,
+            Some(PlanReviewEntry {
+                run_epoch: epoch,
+                entry_id: 1
+            }),
+            "an untouched legacy phase adopts exactly one entry"
+        );
+        assert!(
+            s.plan_review_spawned.iter().any(|x| x == "opencode"),
+            "adoption must not clear the spawn ledger"
+        );
+        assert_eq!(
+            counts.slugs().into_iter().filter(|s| s == "agy").count(),
+            1,
+            "agy spawns once"
+        );
+        assert_eq!(
+            counts
+                .slugs()
+                .into_iter()
+                .filter(|s| s == "opencode")
+                .count(),
+            0,
+            "opencode was already spawned and is not re-spawned"
+        );
+    }
+
+    #[test]
+    fn join_rearm_reaches_the_gate_then_spawns() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        let live = load_run_state(&r).unwrap();
+        let roles = outcome_roles_dir(&r).unwrap();
+        std::fs::create_dir_all(&roles).unwrap();
+        let mut oc = PhaseOutcome::success(
+            "plan-review:opencode",
+            OutcomeSource::File,
+            None,
+            None,
+            None,
+        );
+        oc.metadata = Some(OutcomeMetadata {
+            next_track: None,
+            role: Some(graph::ROLE_REVIEWER_OPENCODE.into()),
+            ..Default::default()
+        });
+        let oc = stamp_role_outcome(&live, oc);
+        crate::persist::atomic_write_json(&roles.join("opencode.json"), &oc).unwrap();
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["opencode".into()];
+            s.plan_review_spawned = vec!["opencode".into()];
+            s.plan_review_slot_ran = vec!["opencode".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+
+        let view = tick_retry(&r).unwrap();
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running, "{}", plan_review_diag(&s));
+        assert!(
+            s.pending_roles.iter().any(|x| x == "agy"),
+            "the never-tried slot is re-armed: {}",
+            plan_review_diag(&s)
+        );
+        assert!(!s.last_event.contains("degraded"), "{}", s.last_event);
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(
+            log.contains("plan-review: join holds agy (never spawned this entry; re-armed)"),
+            "{log}"
+        );
+        assert!(
+            view.is_none()
+                || view
+                    .as_ref()
+                    .is_some_and(|v| v.phase == graph::PHASE_PLAN_REVIEW)
+        );
+
+        let backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            ok_review_body("0001"),
+        ))));
+        let _hook = install_test_backend(&r.id, backend);
+        wait_slots_consumed(&r, &["agy"]);
+        let view = tick_retry(&r).unwrap().expect("joined after re-arm");
+        assert_eq!(view.phase, graph::PHASE_FOLD, "{}", view.last_event);
+        assert!(!view.last_event.contains("degraded"), "{}", view.last_event);
+        assert!(track_file(dir.path(), "0001", "agy").exists());
+    }
+
+    #[test]
+    fn join_never_tried_without_budget_fails_named() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        let live = load_run_state(&r).unwrap();
+        let roles = outcome_roles_dir(&r).unwrap();
+        std::fs::create_dir_all(&roles).unwrap();
+        let mut oc = PhaseOutcome::success(
+            "plan-review:opencode",
+            OutcomeSource::File,
+            None,
+            None,
+            None,
+        );
+        oc.metadata = Some(OutcomeMetadata {
+            next_track: None,
+            role: Some(graph::ROLE_REVIEWER_OPENCODE.into()),
+            ..Default::default()
+        });
+        let oc = stamp_role_outcome(&live, oc);
+        crate::persist::atomic_write_json(&roles.join("opencode.json"), &oc).unwrap();
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["opencode".into()];
+            s.plan_review_spawned = vec!["opencode".into()];
+            s.plan_review_slot_ran = vec!["opencode".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let backend = Arc::new(RecordingBackend::wrap(Arc::new(ScriptedBackend::ok_file(
+            ok_review_body("0001"),
+        ))));
+        let counts = backend.counts.clone();
+        let _hook = install_test_backend(&r.id, backend);
+        let _budget = set_test_join_remaining(Some(Duration::from_secs(10)));
+
+        let view = tick_retry(&r).unwrap().expect("named no-budget failure");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(
+            view.last_event.contains("agy")
+                && view
+                    .last_event
+                    .contains("never spawned (no remaining spawn budget)"),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(
+            counts.slugs().into_iter().filter(|s| s == "agy").count(),
+            0,
+            "no budget, no spawn"
+        );
+        assert!(
+            load_run_state(&r).unwrap().pending_roles.is_empty(),
+            "the fixture did not re-arm"
+        );
+    }
+
+    #[test]
+    fn join_with_a_spawned_slot_that_has_not_run_waits() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles.clear();
+            s.plan_review_spawned = vec!["agy".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let view = tick_retry(&r).unwrap();
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Running, "{}", plan_review_diag(&s));
+        assert!(
+            s.pending_roles.is_empty(),
+            "the current-entry refill guard must not poison Wait: {}",
+            plan_review_diag(&s)
+        );
+        assert!(!s.last_event.contains("degraded"), "{}", s.last_event);
+        assert!(
+            s.last_event.contains(
+                "plan-review: join waits agy (spawned this entry; phase clock bounds it)"
+            ),
+            "{}",
+            s.last_event
+        );
+        assert!(
+            s.plan_review_entry_current().is_some(),
+            "a missing entry cannot satisfy this test"
+        );
+        assert!(
+            view.is_none()
+                || view
+                    .as_ref()
+                    .is_some_and(|v| v.phase == graph::PHASE_PLAN_REVIEW)
+        );
+    }
+
+    #[test]
+    fn two_pending_leftovers_are_named() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let mut s = load_run_state(&r).unwrap();
+        s.plan_review_slot_ran = vec!["opencode".into()];
+        save_run_state(&r, &s).unwrap();
+        let decision = crate::workflow::drive::timeout_plan_review_outcome(&r, &s).unwrap();
+        let outcome = match decision {
+            crate::workflow::drive::TimeoutDecision::Apply(o) => o,
+            other => panic!("expected a named timeout failure, got {other:?}"),
+        };
+        assert_eq!(outcome.status, OutcomeStatus::Failure);
+        assert_eq!(outcome.failure_class, Some(FailureClass::Timeout));
+        let msg = outcome.message.unwrap_or_default();
+        assert!(msg.contains("agy never spawned this entry"), "{msg}");
+        assert!(msg.contains("opencode ran; produced no review"), "{msg}");
+        assert!(!msg.contains("phase budget exceeded"), "{msg}");
+    }
+
+    #[test]
+    fn produced_leftover_is_not_degraded() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        std::fs::write(
+            dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("spec.md"),
+            b"spec",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("plan.md"),
+            b"plan",
+        )
+        .unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        write_review_markdown(&r, "agy", Some(&ok_review_body("0001"))).unwrap();
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["agy".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let s = load_run_state(&r).unwrap();
+        let outcome = match crate::workflow::drive::timeout_plan_review_outcome(&r, &s).unwrap() {
+            crate::workflow::drive::TimeoutDecision::Apply(o) => o,
+            other => panic!("expected the produced-leftover success, got {other:?}"),
+        };
+        assert_eq!(outcome.status, OutcomeStatus::Success);
+        assert!(
+            outcome
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .find("produced no review")
+                .is_none(),
+            "{:?}",
+            outcome.message
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                dir.path()
+                    .join("conductor")
+                    .join("0001-Example")
+                    .join("reuse.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            parsed["slots"]["agy"]["review_sha256"].is_string(),
+            "a produced leftover is in the receipt: {parsed}"
+        );
+    }
+
+    #[test]
+    fn timeout_never_spawned_leftover_fails_named() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["agy".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let s = load_run_state(&r).unwrap();
+        let outcome = match crate::workflow::drive::timeout_plan_review_outcome(&r, &s).unwrap() {
+            crate::workflow::drive::TimeoutDecision::Apply(o) => o,
+            other => panic!("expected a timeout failure, got {other:?}"),
+        };
+        assert_eq!(outcome.status, OutcomeStatus::Failure);
+        assert_eq!(outcome.failure_class, Some(FailureClass::Timeout));
+        let msg = outcome.message.unwrap_or_default();
+        assert!(msg.contains("agy never spawned this entry"), "{msg}");
+    }
+
+    #[test]
+    fn timeout_nothing_missing_lets_the_join_own_it() {
+        let _guard = crate::config::test_env_lock();
+        unsafe {
+            std::env::set_var(crate::workflow::ENV_PHASE_TIMEOUT_SECS, "1");
+        }
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        std::fs::write(
+            dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("spec.md"),
+            b"spec",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("plan.md"),
+            b"plan",
+        )
+        .unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        let r = rec(dir.path());
+        run::run_with_driver(&r, Some("0001".into()), WorkflowDriver::FileWait).unwrap();
+        let mut s = load_run_state(&r).unwrap();
+        s.phase = graph::PHASE_PLAN_REVIEW.into();
+        seed_current_entry(&mut s);
+        s.pending_roles.clear();
+        s.phase_started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+        save_run_state(&r, &s).unwrap();
+        write_review_markdown(&r, "agy", Some(&ok_review_body("0001"))).unwrap();
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+
+        let none = crate::outcome::try_timeout_under_lock(&r).unwrap();
+        assert!(
+            none.is_none(),
+            "nothing missing must not synthesize the generic timeout: {none:?}"
+        );
+        let view = tick_retry(&r).unwrap().expect("join owns the state");
+        assert_eq!(view.phase, graph::PHASE_FOLD, "{}", view.last_event);
+        unsafe {
+            std::env::remove_var(crate::workflow::ENV_PHASE_TIMEOUT_SECS);
+        }
+    }
+
     #[test]
     fn agy_dud_retries_then_pass() {
         let _env = IsolatedHome::enter();
@@ -3470,8 +4337,11 @@ mod tests {
         assert!(body.contains("0001"));
     }
 
+    /// OD-119-7 (round-3 M1 rewrite): an unresolvable driver is an **admission failure**, not a
+    /// degrade. The phase stops `Permission` naming agy; the produced opencode slot does not make
+    /// it a reviewed/degraded phase. Replaces `missing_binary_permission_degrades_when_opencode_present`.
     #[test]
-    fn missing_binary_permission_degrades_when_opencode_present() {
+    fn missing_binary_permission_stops_the_phase_named() {
         let _env = IsolatedHome::enter();
         unsafe {
             std::env::set_var(
@@ -3483,14 +4353,10 @@ mod tests {
         setup_track(dir.path(), "0001");
         let r = rec(dir.path());
         enter_plan_review(&r, "0001");
-        {
-            let mut state = load_run_state(&r).unwrap();
-            state.plan_review_spawned = vec!["opencode".into()];
-            save_run_state(&r, &state).unwrap();
-        }
-        write_review_markdown(&r, "opencode", Some("opencode already done\n")).unwrap();
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
         let roles = outcome_roles_dir(&r).unwrap();
         std::fs::create_dir_all(&roles).unwrap();
+        let live = load_run_state(&r).unwrap();
         let mut oc = PhaseOutcome::success(
             "plan-review:opencode",
             OutcomeSource::File,
@@ -3503,22 +4369,43 @@ mod tests {
             role: Some(graph::ROLE_REVIEWER_OPENCODE.into()),
             ..Default::default()
         });
+        let oc = stamp_role_outcome(&live, oc);
         crate::persist::atomic_write_json(&roles.join("opencode.json"), &oc).unwrap();
+        {
+            let mut state = load_run_state(&r).unwrap();
+            state.plan_review_spawned = vec!["opencode".into()];
+            save_run_state(&r, &state).unwrap();
+        }
 
-        let view = tick_retry(&r).unwrap().expect("degrade join");
-        assert_eq!(view.phase, graph::PHASE_FOLD);
-        assert!(view.last_event.contains("degraded"));
-        let agy_json = crate::outcome::outcome_roles_dir(&r)
-            .unwrap()
-            .join("agy.json");
+        let view = tick_retry(&r).unwrap().expect("admission stop");
+        assert_eq!(view.status, crate::state::RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert_eq!(view.phase, graph::PHASE_PLAN_REVIEW);
         assert!(
-            !agy_json.exists(),
-            "consumed role file should be gone after join"
+            view.last_event.contains("admission failed: ") && view.last_event.contains("agy"),
+            "{}",
+            view.last_event
         );
+        let state = load_run_state(&r).unwrap();
+        assert!(
+            state
+                .plan_review_admission_failure("agy")
+                .is_some_and(|c| c.contains("not resolvable")),
+            "admission record must name the resolvability cause"
+        );
+        assert!(!state.pending_roles.iter().any(|s| s == "agy"));
+        assert!(!state.plan_review_spawned.iter().any(|s| s == "agy"));
+        assert!(
+            !roles.join("agy.json").exists(),
+            "no role outcome for a slot that never started"
+        );
+        assert!(!track_file(dir.path(), "0001", "agy").exists());
     }
 
+    /// OD-119-7 (round-3 M1 rewrite): the opencode sibling of the fixture above. Replaces
+    /// `missing_opencode_binary_degrades_when_agy_present`.
     #[test]
-    fn missing_opencode_binary_degrades_when_agy_present() {
+    fn missing_opencode_binary_stops_the_phase_named() {
         let _env = IsolatedHome::enter();
         unsafe {
             std::env::set_var(
@@ -3530,14 +4417,10 @@ mod tests {
         setup_track(dir.path(), "0001");
         let r = rec(dir.path());
         enter_plan_review(&r, "0001");
-        {
-            let mut state = load_run_state(&r).unwrap();
-            state.plan_review_spawned = vec!["agy".into()];
-            save_run_state(&r, &state).unwrap();
-        }
-        write_review_markdown(&r, "agy", Some("agy already done\n")).unwrap();
+        write_review_markdown(&r, "agy", Some(&ok_review_body("0001"))).unwrap();
         let roles = outcome_roles_dir(&r).unwrap();
         std::fs::create_dir_all(&roles).unwrap();
+        let live = load_run_state(&r).unwrap();
         let mut agy =
             PhaseOutcome::success("plan-review:agy", OutcomeSource::File, None, None, None);
         agy.metadata = Some(OutcomeMetadata {
@@ -3545,11 +4428,878 @@ mod tests {
             role: Some(graph::ROLE_REVIEWER_AGY.into()),
             ..Default::default()
         });
+        let agy = stamp_role_outcome(&live, agy);
         crate::persist::atomic_write_json(&roles.join("agy.json"), &agy).unwrap();
+        {
+            let mut state = load_run_state(&r).unwrap();
+            state.plan_review_spawned = vec!["agy".into()];
+            save_run_state(&r, &state).unwrap();
+        }
 
-        let view = tick_retry(&r).unwrap().expect("degrade join");
-        assert_eq!(view.phase, graph::PHASE_FOLD);
-        assert!(view.last_event.contains("degraded"));
+        let view = tick_retry(&r).unwrap().expect("admission stop");
+        assert_eq!(view.status, crate::state::RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert_eq!(view.phase, graph::PHASE_PLAN_REVIEW);
+        assert!(
+            view.last_event.contains("admission failed: ") && view.last_event.contains("opencode"),
+            "{}",
+            view.last_event
+        );
+        let state = load_run_state(&r).unwrap();
+        assert!(
+            state
+                .plan_review_admission_failure("opencode")
+                .is_some_and(|c| c.contains("not resolvable"))
+        );
+        assert!(!state.pending_roles.iter().any(|s| s == "opencode"));
+        assert!(!state.plan_review_spawned.iter().any(|s| s == "opencode"));
+        assert!(!roles.join("opencode.json").exists());
+        assert!(!track_file(dir.path(), "0001", "opencode").exists());
+    }
+
+    #[test]
+    fn sync_admission_failure_stops_the_phase_named() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        let live = load_run_state(&r).unwrap();
+        let mut oc = PhaseOutcome::success(
+            "plan-review:opencode",
+            OutcomeSource::File,
+            None,
+            None,
+            None,
+        );
+        oc.metadata = Some(OutcomeMetadata {
+            next_track: None,
+            role: Some(graph::ROLE_REVIEWER_OPENCODE.into()),
+            ..Default::default()
+        });
+        let oc = stamp_role_outcome(&live, oc);
+        write_role_file(&r, "opencode", &oc);
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.plan_review_spawned = vec!["opencode".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let mut cfg = crate::config::load_machine_config().unwrap();
+        let binding = cfg.role_bindings.get_mut("plan_reviewer_agy").unwrap();
+        binding.harness = "antigravity".into();
+        binding.command = String::new();
+        crate::config::save_machine_config(&cfg).unwrap();
+
+        let view = tick_retry(&r).unwrap().expect("admission stop");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Permission));
+        assert_eq!(view.phase, graph::PHASE_PLAN_REVIEW);
+        assert!(
+            view.last_event.contains("agy")
+                && view.last_event.contains("admission failed: ")
+                && view.last_event.contains("empty plan_reviewer_agy command"),
+            "{}",
+            view.last_event
+        );
+        assert!(!view.last_event.contains("degraded"), "{}", view.last_event);
+        let s = load_run_state(&r).unwrap();
+        assert!(
+            s.pending_roles.is_empty(),
+            "opencode was consumed; the admission stop must not refill pending: {}",
+            plan_review_diag(&s)
+        );
+        assert!(s.plan_review_admission_failure("agy").is_some());
+    }
+
+    #[test]
+    fn consume_refuses_an_outcome_from_an_earlier_epoch() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let live = load_run_state(&r).unwrap();
+        {
+            let mut s = live.clone();
+            s.pending_roles = vec!["agy".into()];
+            s.plan_review_spawned = vec!["agy".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let stale_epoch = live.run_epoch.saturating_sub(1);
+        let mut stale = PhaseOutcome::failure(
+            role_phase("agy"),
+            FailureClass::Permission,
+            OutcomeSource::File,
+            Some("stale boom".into()),
+            Some(stale_epoch),
+        );
+        stale.metadata = Some(OutcomeMetadata {
+            role: Some(graph::ROLE_REVIEWER_AGY.into()),
+            entry_id: live.plan_review_entry.map(|e| e.entry_id),
+            ..Default::default()
+        });
+        write_role_file(&r, "agy", &stale);
+
+        tick_retry(&r).unwrap();
+        let roles = outcome_roles_dir(&r).unwrap();
+        assert!(
+            roles.join("agy.json").is_file(),
+            "a stale-epoch outcome is left in place"
+        );
+        let s = load_run_state(&r).unwrap();
+        assert!(s.pending_roles.iter().any(|x| x == "agy"));
+        assert!(s.plan_review_verdict("agy").is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(
+            log.contains(&format!(
+                "plan-review: ignored agy outcome from epoch {stale_epoch} (live {})",
+                live.run_epoch
+            )),
+            "{log}"
+        );
+
+        // Rewriting with the live epoch is consumed.
+        let mut fresh = stale.clone();
+        fresh.run_epoch = Some(live.run_epoch);
+        write_role_file(&r, "agy", &fresh);
+        tick_retry(&r).unwrap();
+        assert!(
+            !load_run_state(&r)
+                .unwrap()
+                .pending_roles
+                .iter()
+                .any(|x| x == "agy")
+        );
+    }
+
+    #[test]
+    fn consume_refuses_an_outcome_from_an_earlier_entry() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let mut live = load_run_state(&r).unwrap();
+        live.plan_review_entry = Some(PlanReviewEntry {
+            run_epoch: live.run_epoch,
+            entry_id: 2,
+        });
+        live.pending_roles = vec!["agy".into()];
+        live.plan_review_spawned = vec!["agy".into()];
+        save_run_state(&r, &live).unwrap();
+        let mut earlier = PhaseOutcome::failure(
+            role_phase("agy"),
+            FailureClass::HarnessCrash,
+            OutcomeSource::File,
+            Some("boom".into()),
+            Some(live.run_epoch),
+        );
+        earlier.metadata = Some(OutcomeMetadata {
+            role: Some(graph::ROLE_REVIEWER_AGY.into()),
+            entry_id: Some(1),
+            ..Default::default()
+        });
+        write_role_file(&r, "agy", &earlier);
+
+        tick_retry(&r).unwrap();
+        assert!(outcome_roles_dir(&r).unwrap().join("agy.json").is_file());
+        let s = load_run_state(&r).unwrap();
+        assert!(s.pending_roles.iter().any(|x| x == "agy"));
+        assert!(s.plan_review_verdict("agy").is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(
+            log.contains("plan-review: ignored agy outcome from entry 1 (live 2)"),
+            "{log}"
+        );
+
+        let mut fresh = earlier.clone();
+        fresh.metadata.as_mut().unwrap().entry_id = Some(2);
+        write_role_file(&r, "agy", &fresh);
+        tick_retry(&r).unwrap();
+        assert!(
+            !load_run_state(&r)
+                .unwrap()
+                .pending_roles
+                .iter()
+                .any(|x| x == "agy")
+        );
+    }
+
+    #[test]
+    fn consume_refuses_an_epoch_less_outcome() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["agy".into()];
+            s.plan_review_spawned = vec!["agy".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let bare = {
+            let mut o = PhaseOutcome::failure(
+                role_phase("agy"),
+                FailureClass::Permission,
+                OutcomeSource::File,
+                Some("no pair".into()),
+                None,
+            );
+            // The entry pair is live; only the epoch is missing (the fail-closed arm under test).
+            let live = load_run_state(&r).unwrap();
+            o.metadata = Some(OutcomeMetadata {
+                role: Some(graph::ROLE_REVIEWER_AGY.into()),
+                entry_id: live.plan_review_entry.map(|e| e.entry_id),
+                ..Default::default()
+            });
+            o
+        };
+        write_role_file(&r, "agy", &bare);
+        tick_retry(&r).unwrap();
+        assert!(outcome_roles_dir(&r).unwrap().join("agy.json").is_file());
+        let s = load_run_state(&r).unwrap();
+        assert!(s.pending_roles.iter().any(|x| x == "agy"));
+        assert!(s.plan_review_verdict("agy").is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&r)).unwrap();
+        assert!(
+            log.contains("plan-review: ignored agy outcome with no epoch/entry"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn success_outcome_without_an_artifact_degrades_named() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let live = load_run_state(&r).unwrap();
+        // A track-only copy is not evidence: no mailbox artifact exists.
+        std::fs::write(track_file(dir.path(), "0001", "agy"), b"track only\n").unwrap();
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        let mut agy =
+            PhaseOutcome::success("plan-review:agy", OutcomeSource::File, None, None, None);
+        agy.metadata = Some(OutcomeMetadata {
+            next_track: None,
+            role: Some(graph::ROLE_REVIEWER_AGY.into()),
+            ..Default::default()
+        });
+        let agy = stamp_role_outcome(&live, agy);
+        write_role_file(&r, "agy", &agy);
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["agy".into()];
+            s.plan_review_spawned = vec!["agy".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+
+        let view = tick_retry(&r).unwrap().expect("degrade named");
+        assert_eq!(view.phase, graph::PHASE_FOLD, "{}", view.last_event);
+        assert!(
+            view.last_event
+                .contains("agy (resolved: success outcome without a review artifact)"),
+            "{}",
+            view.last_event
+        );
+        assert!(
+            !crate::workflow::bundle::review_file(&r, "agy")
+                .unwrap()
+                .exists(),
+            "no adoption from the track copy"
+        );
+        assert!(!crate::workflow::bundle::review_produced(
+            &r,
+            &load_run_state(&r).unwrap(),
+            "agy"
+        ));
+    }
+
+    #[test]
+    fn stale_mailbox_review_is_not_produced_after_a_reentry() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        write_review_markdown(&r, "agy", Some(&ok_review_body("0001"))).unwrap();
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        // A real transition: leave, re-enter (begin), then purge the entry artifacts. Not a bare
+        // `reset_phase_clock`.
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.phase = graph::PHASE_FOLD.into();
+            reset_phase_clock(&mut s);
+            s.phase = graph::PHASE_PLAN_REVIEW.into();
+            reset_phase_clock(&mut s);
+            s.pending_roles = vec!["agy".into(), "opencode".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        crate::workflow::drive::purge_plan_review_entry_artifacts(&r);
+        let state = load_run_state(&r).unwrap();
+        assert!(
+            !crate::workflow::bundle::review_produced(&r, &state, "agy"),
+            "entry-1 mailbox bytes are not entry-2 evidence"
+        );
+        assert!(!crate::workflow::bundle::review_produced(
+            &r, &state, "opencode"
+        ));
+
+        let seq = PerSlugSequenceBackend {
+            agy: Mutex::new(vec![
+                ScriptedBackend::ok_file(degenerate_review_body()),
+                ScriptedBackend::ok_file(degenerate_review_body()),
+                ScriptedBackend::ok_file(degenerate_review_body()),
+                ScriptedBackend::ok_file(degenerate_review_body()),
+            ]),
+            opencode: Mutex::new(vec![
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+                ScriptedBackend::empty(),
+            ]),
+        };
+        let _hook = install_test_backend(&r.id, Arc::new(RecordingBackend::wrap(Arc::new(seq))));
+        tick_retry(&r).unwrap();
+        wait_stopped(&r);
+        let s = load_run_state(&r).unwrap();
+        assert_eq!(s.status, RunStatus::Stopped);
+        assert!(
+            s.last_event.contains("zero reviewers produced output"),
+            "{}",
+            s.last_event
+        );
+        assert!(
+            !crate::workflow::bundle::review_produced(&r, &s, "agy")
+                && !crate::workflow::bundle::review_produced(&r, &s, "opencode")
+        );
+        assert!(
+            !dir.path().join("AI-review.md").exists(),
+            "the bundle must not carry entry-1 bytes"
+        );
+    }
+
+    #[test]
+    fn failed_respawn_does_not_count_as_produced() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        // Entry 2 begins with an agy mailbox file left behind (simulated after the begin).
+        let stale_mailbox = crate::workflow::bundle::review_file(&r, "agy").unwrap();
+        std::fs::create_dir_all(stale_mailbox.parent().unwrap()).unwrap();
+        std::fs::write(&stale_mailbox, b"stale entry-1 bytes\n").unwrap();
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["agy".into()];
+            save_run_state(&r, &s).unwrap();
+        }
+        let _hook = install_test_backend(
+            &r.id,
+            Arc::new(RecordingBackend::wrap(Arc::new(AgySequenceBackend {
+                agy: Mutex::new(vec![
+                    ScriptedBackend::ok_file(degenerate_review_body()),
+                    ScriptedBackend::ok_file(degenerate_review_body()),
+                ]),
+                other: ScriptedBackend::empty(),
+            }))),
+        );
+        tick_retry(&r).unwrap();
+        wait_slots_consumed(&r, &["agy"]);
+        let s = load_run_state(&r).unwrap();
+        assert!(
+            !crate::workflow::bundle::review_produced(&r, &s, "agy"),
+            "a failed re-spawn cannot inherit the earlier review: {}",
+            plan_review_diag(&s)
+        );
+        assert!(
+            !crate::workflow::bundle::review_file(&r, "agy")
+                .unwrap()
+                .exists(),
+            "the spawn unlink removed the stale mailbox"
+        );
+    }
+
+    #[test]
+    fn dud_verdict_survives_consume_and_reaches_the_join() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        std::fs::write(
+            dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("spec.md"),
+            b"spec",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("plan.md"),
+            b"plan",
+        )
+        .unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let seq = AgySequenceBackend {
+            agy: Mutex::new(vec![
+                ScriptedBackend::ok_file(degenerate_review_body()),
+                ScriptedBackend::ok_file(degenerate_review_body()),
+            ]),
+            other: ScriptedBackend::ok_file(ok_review_body("0001")),
+        };
+        let _hook = install_test_backend(&r.id, Arc::new(RecordingBackend::wrap(Arc::new(seq))));
+        let view = tick_until_phase_change(&r);
+        assert_eq!(view.phase, graph::PHASE_FOLD, "{}", view.last_event);
+        assert!(
+            view.last_event
+                .contains("degraded agy (ran; dud: missing # Track review:)"),
+            "{}",
+            view.last_event
+        );
+        assert!(
+            !view.last_event.contains("failed: permission"),
+            "a quality dud must not be relabelled a transport failure: {}",
+            view.last_event
+        );
+    }
+
+    #[test]
+    fn stale_entry_track_unlink_does_not_delete_the_new_track_review() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        // The live entry is {E,2}; bytes written here belong to it.
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.plan_review_entry = Some(PlanReviewEntry {
+                run_epoch: s.run_epoch,
+                entry_id: 2,
+            });
+            save_run_state(&r, &s).unwrap();
+        }
+        std::fs::write(track_file(dir.path(), "0001", "agy"), b"entry two bytes\n").unwrap();
+        let live = load_run_state(&r).unwrap();
+        let stale = PlanReviewRequest {
+            slug: "agy".into(),
+            command: "agy".into(),
+            model: None,
+            last_message_path: None,
+            workspace_root: dir.path().to_path_buf(),
+            execution_repo: None,
+            track_dir: Some(dir.path().join("conductor").join("0001-Example")),
+            prompt: String::new(),
+            remaining: Duration::from_secs(60),
+            argv: Vec::new(),
+            extra_env: Vec::new(),
+            entry: PlanReviewEntry {
+                run_epoch: live.run_epoch,
+                entry_id: 1,
+            },
+            spawn_track_id: Some("0001".into()),
+        };
+        let dud = crate::review::slot_quality::Dud {
+            bytes: 5,
+            reason: "too small",
+        };
+        let out = PlanReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        commit_degenerate(&r, &stale, &dud, "body", &out);
+        assert_eq!(
+            std::fs::read(track_file(dir.path(), "0001", "agy")).unwrap(),
+            b"entry two bytes\n",
+            "a stale entry's dud path must not delete or overwrite the live track review"
+        );
+        assert!(
+            !dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("agy-review.dud1.md")
+                .exists()
+        );
+        // Positive control: the live entry's commit does own the unlink/write.
+        let mut live_req = stale.clone();
+        live_req.entry = live.plan_review_entry.unwrap();
+        commit_degenerate(&r, &live_req, &dud, "dud body", &out);
+        assert!(!track_file(dir.path(), "0001", "agy").exists());
+        assert!(
+            dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("agy-review.dud1.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn stale_epoch_receipt_does_not_satisfy_the_slot() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let track = dir.path().join("conductor").join("0001-Example");
+        std::fs::write(track.join("spec.md"), b"spec").unwrap();
+        std::fs::write(track.join("plan.md"), b"plan").unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        // The writer filters by mailbox evidence, so seed both mailboxes with the track bytes.
+        write_review_markdown(&r, "agy", Some(&ok_review_body("0001"))).unwrap();
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        let live = load_run_state(&r).unwrap();
+        let epoch = live.run_epoch;
+        crate::workflow::reuse::write_join_receipt(&r, &live);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(track.join("reuse.json")).unwrap()).unwrap();
+        assert!(
+            parsed["slots"]["agy"]["review_sha256"].is_string(),
+            "the receipt must not be empty: {parsed}"
+        );
+
+        // The next epoch keeps the artifacts and receipt (no `clear_plan_review_artifacts`).
+        let mut next = live.clone();
+        next.run_epoch = epoch + 1;
+        next.plan_review_entry = None;
+        next.adopt_plan_review_entry();
+        save_run_state(&r, &next).unwrap();
+
+        assert!(crate::workflow::reuse::slot_matches(
+            &r, "0001", "agy", epoch
+        ));
+        assert!(
+            !crate::workflow::reuse::slot_matches(&r, "0001", "agy", epoch + 1),
+            "a stale-epoch receipt must not satisfy the slot"
+        );
+    }
+
+    #[test]
+    fn receipt_without_an_epoch_is_refused_for_slot_reuse_but_still_resumes() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0083");
+        let track = dir.path().join("conductor").join("0083-Example");
+        std::fs::write(track.join("spec.md"), b"spec").unwrap();
+        std::fs::write(track.join("plan.md"), b"plan").unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        let r = rec(dir.path());
+        let mut state = RunState::idle(&r.id);
+        state.track_id = Some("0083".into());
+        state.run_epoch = 5;
+        save_run_state(&r, &state).unwrap();
+        write_review_markdown(&r, "agy", Some(&ok_review_body("0083"))).unwrap();
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0083"))).unwrap();
+        crate::workflow::reuse::write_join_receipt(&r, &state);
+        crate::workflow::reuse::note_pr(&r, "0083", 80, "sha", "track/x", None);
+        assert!(matches!(
+            crate::workflow::reuse::decide_resume(&r, Some("0083")),
+            crate::workflow::reuse::ResumeChoice::Probe { .. }
+        ));
+
+        let path = track.join("reuse.json");
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("epoch");
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        assert!(
+            !crate::workflow::reuse::slot_matches(&r, "0083", "agy", 5),
+            "a pre-0119 receipt with no epoch cannot satisfy a slot"
+        );
+        assert!(
+            matches!(
+                crate::workflow::reuse::decide_resume(&r, Some("0083")),
+                crate::workflow::reuse::ResumeChoice::Probe { .. }
+            ),
+            "decide_resume is deliberately not epoch-gated"
+        );
+    }
+
+    #[test]
+    fn join_receipt_records_the_producing_epoch_and_only_produced_slots() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let track = dir.path().join("conductor").join("0001-Example");
+        std::fs::write(track.join("spec.md"), b"spec").unwrap();
+        std::fs::write(track.join("plan.md"), b"plan").unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        write_review_markdown(&r, "agy", Some(&ok_review_body("0001"))).unwrap();
+        // A leftover track file for a degraded slot must not be blessed into the receipt.
+        std::fs::write(track.join("opencode-review.md"), b"stale track copy\n").unwrap();
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles.clear();
+            s.plan_review_spawned = vec!["opencode".into()];
+            s.plan_review_slot_ran = vec!["opencode".into()];
+            s.plan_review_verdicts
+                .insert("opencode".into(), "ran; produced no review".into());
+            save_run_state(&r, &s).unwrap();
+        }
+        let epoch = load_run_state(&r).unwrap().run_epoch;
+        let view = tick_retry(&r).unwrap().expect("degraded join");
+        assert_eq!(view.phase, graph::PHASE_FOLD, "{}", view.last_event);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(track.join("reuse.json")).unwrap()).unwrap();
+        assert_eq!(parsed["epoch"], epoch);
+        assert!(parsed["slots"]["agy"]["review_sha256"].is_string());
+        assert!(
+            parsed["slots"].get("opencode").is_none(),
+            "a degraded slot's leftover track file is not in the receipt: {parsed}"
+        );
+        crate::workflow::reuse::note_pr(&r, "0001", 42, "sha", "track/0001", None);
+        let round: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(track.join("reuse.json")).unwrap()).unwrap();
+        assert_eq!(round["epoch"], epoch, "note_pr preserves the epoch");
+    }
+
+    #[test]
+    fn note_pr_does_not_rewrite_the_producing_epoch() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0083");
+        let track = dir.path().join("conductor").join("0083-Example");
+        std::fs::write(track.join("spec.md"), b"spec").unwrap();
+        std::fs::write(track.join("plan.md"), b"plan").unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        let r = rec(dir.path());
+        let mut state = RunState::idle(&r.id);
+        state.track_id = Some("0083".into());
+        state.run_epoch = 5;
+        save_run_state(&r, &state).unwrap();
+        write_review_markdown(&r, "agy", Some(&ok_review_body("0083"))).unwrap();
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0083"))).unwrap();
+        crate::workflow::reuse::write_join_receipt(&r, &state);
+        crate::workflow::reuse::note_pr(&r, "0083", 1, "a", "track/a", None);
+        // The live run epoch moved; `note_pr` must preserve the producing epoch.
+        state.run_epoch = 9;
+        save_run_state(&r, &state).unwrap();
+        crate::workflow::reuse::note_pr(&r, "0083", 2, "b", "track/b", None);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(track.join("reuse.json")).unwrap()).unwrap();
+        assert_eq!(parsed["epoch"], 5);
+    }
+
+    #[test]
+    fn slot_cause_describe_table() {
+        let mut s = RunState::idle("p");
+        s.run_epoch = 2;
+        s.phase = graph::PHASE_PLAN_REVIEW.into();
+        seed_current_entry(&mut s);
+        assert_eq!(slot_cause(&s, "none"), SlotCause::NeverSpawned);
+        s.plan_review_spawned.push("spawned".into());
+        assert_eq!(slot_cause(&s, "spawned"), SlotCause::SpawnedNotRan);
+        s.plan_review_slot_ran.push("ran".into());
+        assert_eq!(slot_cause(&s, "ran"), SlotCause::RanNoReview);
+        s.plan_review_verdicts
+            .insert("verdict".into(), "ran; dud: too small".into());
+        assert_eq!(
+            slot_cause(&s, "verdict"),
+            SlotCause::Verdict("ran; dud: too small".into())
+        );
+        s.plan_review_admission_failures
+            .insert("admission".into(), "empty command".into());
+        assert_eq!(
+            slot_cause(&s, "admission"),
+            SlotCause::AdmissionFailed("empty command".into())
+        );
+        for (cause, expect) in [
+            (SlotCause::NeverSpawned, "never spawned this entry"),
+            (SlotCause::SpawnedNotRan, "spawned this entry, never ran"),
+            (SlotCause::RanNoReview, "ran; produced no review"),
+            (
+                SlotCause::AdmissionFailed("empty command".into()),
+                "admission failed: empty command",
+            ),
+            (
+                SlotCause::Verdict("ran; dud: too small".into()),
+                "ran; dud: too small",
+            ),
+        ] {
+            assert_eq!(cause.describe(), expect);
+        }
+        assert_eq!(
+            degrade_message(&s, &["verdict"], true),
+            "plan-review: degraded verdict (timeout; ran; dud: too small)"
+        );
+        assert_eq!(
+            degrade_message(&s, &["spawned"], false),
+            "plan-review: degraded spawned (spawned this entry, never ran)"
+        );
+    }
+
+    #[test]
+    fn admission_failure_names_the_slot_and_cause() {
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        write_review_markdown(&r, "opencode", Some(&ok_review_body("0001"))).unwrap();
+        {
+            let mut s = load_run_state(&r).unwrap();
+            s.pending_roles = vec!["agy".into()];
+            s.plan_review_admission_failures
+                .insert("agy".into(), "empty command".into());
+            save_run_state(&r, &s).unwrap();
+        }
+        let s = load_run_state(&r).unwrap();
+        let outcome = match crate::workflow::drive::timeout_plan_review_outcome(&r, &s).unwrap() {
+            crate::workflow::drive::TimeoutDecision::Apply(o) => o,
+            other => panic!("expected an admission failure, got {other:?}"),
+        };
+        assert_eq!(outcome.status, OutcomeStatus::Failure);
+        assert_eq!(outcome.failure_class, Some(FailureClass::Permission));
+        let msg = outcome.message.unwrap_or_default();
+        assert!(msg.contains("agy admission failed: empty command"), "{msg}");
+        assert!(!msg.contains("degraded"), "{msg}");
+    }
+
+    #[test]
+    fn dud_reason_is_plumbed_from_slot_quality_check() {
+        struct MinGuard;
+        impl Drop for MinGuard {
+            fn drop(&mut self) {
+                crate::review::slot_quality::set_test_min_body_bytes(None);
+            }
+        }
+        let _g = MinGuard;
+        crate::review::slot_quality::set_test_min_body_bytes(Some(512));
+        let short = plan_review_quality("hi", Some("0001")).unwrap_err();
+        assert_eq!(short.reason, "too small");
+        let no_heading = "x".repeat(600);
+        let dud = plan_review_quality(&no_heading, Some("0001")).unwrap_err();
+        assert_eq!(dud.reason, "missing # Track review:");
+        let no_id = format!("# Track review:\n{}", "x".repeat(600));
+        let dud = plan_review_quality(&no_id, Some("0001")).unwrap_err();
+        assert_eq!(dud.reason, "missing track id");
+        assert!(plan_review_quality(&no_id, None).is_ok());
+    }
+
+    #[test]
+    fn degraded_message_names_the_slot_and_the_quality_reason() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        std::fs::write(
+            dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("spec.md"),
+            b"spec",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("conductor")
+                .join("0001-Example")
+                .join("plan.md"),
+            b"plan",
+        )
+        .unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill").unwrap();
+        let r = rec(dir.path());
+        enter_plan_review(&r, "0001");
+        let seq = AgySequenceBackend {
+            agy: Mutex::new(vec![
+                ScriptedBackend::ok_file(degenerate_review_body()),
+                ScriptedBackend::ok_file(degenerate_review_body()),
+            ]),
+            other: ScriptedBackend::ok_file(ok_review_body("0001")),
+        };
+        let _hook = install_test_backend(&r.id, Arc::new(RecordingBackend::wrap(Arc::new(seq))));
+        let view = tick_until_phase_change(&r);
+        assert_eq!(view.phase, graph::PHASE_FOLD, "{}", view.last_event);
+        assert!(
+            view.last_event
+                .contains("degraded agy (ran; dud: missing # Track review:)"),
+            "{}",
+            view.last_event
+        );
+        assert!(!view.last_event.contains("opencode"), "{}", view.last_event);
+    }
+
+    #[test]
+    fn degraded_message_names_never_spawned_and_failed_causes() {
+        let mut s = RunState::idle("p");
+        s.run_epoch = 2;
+        s.phase = graph::PHASE_PLAN_REVIEW.into();
+        seed_current_entry(&mut s);
+        s.plan_review_spawned.push("agy".into());
+        s.plan_review_verdicts
+            .insert("opencode".into(), "failed: permission: boom".into());
+        let msg = degrade_message(&s, &["agy", "opencode"], false);
+        assert_eq!(
+            msg,
+            "plan-review: degraded agy (spawned this entry, never ran), \
+             opencode (failed: permission: boom)"
+        );
+    }
+
+    #[test]
+    fn verdict_text_cannot_split_a_log_line() {
+        let dirty = format!("crlf\r\nbell\u{7}text {}", "x".repeat(300));
+        let clean = normalize_verdict(&dirty);
+        assert!(!clean.contains('\n') && !clean.contains('\r'));
+        assert!(!clean.chars().any(char::is_control), "{clean:?}");
+        assert_eq!(clean.chars().count(), VERDICT_CAP);
+        assert_eq!(normalize_verdict("a\r\nb\u{7}c"), "a bc");
+
+        let mut s = RunState::idle("p");
+        s.run_epoch = 2;
+        s.phase = graph::PHASE_PLAN_REVIEW.into();
+        seed_current_entry(&mut s);
+        s.plan_review_verdicts
+            .insert("agy".into(), normalize_verdict(&dirty));
+        let msg = degrade_message(&s, &["agy"], false);
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
     }
 
     #[test]
@@ -3672,7 +5422,10 @@ mod tests {
             remaining: Duration::from_secs(60),
             argv: Vec::new(),
             extra_env: Vec::new(),
-            spawn_epoch: first_epoch,
+            entry: PlanReviewEntry {
+                run_epoch: first_epoch,
+                entry_id: 1,
+            },
             spawn_track_id: Some("0001".into()),
         };
         mark_slot_ran(&r, &stale).unwrap();
@@ -3711,15 +5464,14 @@ mod tests {
             remaining: Duration::from_secs(60),
             argv: Vec::new(),
             extra_env: Vec::new(),
-            spawn_epoch: first_epoch,
+            entry: PlanReviewEntry {
+                run_epoch: first_epoch,
+                entry_id: 1,
+            },
             spawn_track_id: Some("0001".into()),
         };
 
-        write_stamp_failure_outcome(
-            &r,
-            &stale,
-            "plan-review: opencode slot-ran stamp not persisted: injected",
-        );
+        write_stamp_failure_outcome(&r, &stale, "injected");
         assert!(
             !outcome_roles_dir(&r)
                 .unwrap()
@@ -3736,13 +5488,17 @@ mod tests {
             "the newer run still owns the slot"
         );
 
-        // The last-resort removal is epoch-guarded too.
+        // The last-resort removal is entry-guarded too.
         assert!(
-            !crate::workflow::drive::remove_pending_if_epoch(
+            !crate::workflow::drive::remove_pending_if_entry(
                 &r,
                 "opencode",
-                first_epoch,
-                Some("0001")
+                PlanReviewEntry {
+                    run_epoch: first_epoch,
+                    entry_id: 1,
+                },
+                Some("0001"),
+                None,
             )
             .unwrap(),
             "a stale worker must not clear a newer epoch's slot"
@@ -3754,13 +5510,14 @@ mod tests {
                 .iter()
                 .any(|x| x == "opencode")
         );
-        // The live epoch may remove it.
+        // The live entry may remove it.
         assert!(
-            crate::workflow::drive::remove_pending_if_epoch(
+            crate::workflow::drive::remove_pending_if_entry(
                 &r,
                 "opencode",
-                live.run_epoch,
-                Some("0002")
+                live.plan_review_entry.unwrap(),
+                Some("0002"),
+                None,
             )
             .unwrap()
         );
@@ -4339,7 +6096,7 @@ mod tests {
             remaining: Duration::from_secs(1200),
             argv: opencode_argv(None, None),
             extra_env: Vec::new(),
-            spawn_epoch: state.run_epoch,
+            entry: state.plan_review_entry.unwrap(),
             spawn_track_id: Some("0001".into()),
         };
         apply_slot_result(&r, rec_backend.as_ref(), &req);
@@ -4793,6 +6550,21 @@ mod tests {
         setup_track(dir.path(), "0001");
         let r = rec(dir.path());
         enter_plan_review(&r, "0001");
+        // 0119 seeding: both attempts resolved with a recorded failure and neither ever ran, so
+        // the gate degrades and the zero-output ladder has no retry set. (A synchronous admission
+        // failure is now a `Permission` stop, tested by the admission fixtures.)
+        {
+            let mut state = load_run_state(&r).unwrap();
+            state.pending_roles.clear();
+            state.plan_review_spawned = vec!["agy".into(), "opencode".into()];
+            state
+                .plan_review_verdicts
+                .insert("agy".into(), "failed: harness_crash: fixture".into());
+            state
+                .plan_review_verdicts
+                .insert("opencode".into(), "failed: harness_crash: fixture".into());
+            save_run_state(&r, &state).unwrap();
+        }
         let view = tick_retry(&r).unwrap().expect("fail-fast join");
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
@@ -5069,6 +6841,7 @@ mod tests {
         }
         let roles = outcome_roles_dir(&r).unwrap();
         std::fs::create_dir_all(&roles).unwrap();
+        let live = load_run_state(&r).unwrap();
         for (slug, role) in [
             ("agy", graph::ROLE_REVIEWER_AGY),
             ("opencode", graph::ROLE_REVIEWER_OPENCODE),
@@ -5085,6 +6858,7 @@ mod tests {
                 role: Some(role.into()),
                 ..Default::default()
             });
+            let outcome = stamp_role_outcome(&live, outcome);
             crate::persist::atomic_write_json(&roles.join(format!("{slug}.json")), &outcome)
                 .unwrap();
         }

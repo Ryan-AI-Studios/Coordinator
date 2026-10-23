@@ -6429,7 +6429,17 @@ mod tests {
         std::fs::write(&skill, b"skill\n").unwrap();
         let mut r = rec(dir.path(), true);
         r.execution_repo = Some(repo.clone());
-        crate::workflow::reuse::write_join_receipt(&r, "0010");
+        // 0119: slots are filtered by this entry's mailbox evidence.
+        let mut receipt_state = crate::state::RunState::idle(&r.id);
+        receipt_state.track_id = Some("0010".into());
+        receipt_state.run_epoch = 1;
+        for slug in graph::review_slugs() {
+            let src = track.join(format!("{slug}-review.md"));
+            let dest = crate::workflow::bundle::review_file(&r, slug).unwrap();
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, std::fs::read(src).unwrap()).unwrap();
+        }
+        crate::workflow::reuse::write_join_receipt(&r, &receipt_state);
         run_with_driver(&r, Some("0010".into()), WorkflowDriver::Adapter).unwrap();
         let mut st = load_run_state(&r).unwrap();
         st.phase = graph::PHASE_CI_WAIT.into();

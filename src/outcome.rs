@@ -195,6 +195,13 @@ pub struct OutcomeMetadata {
     pub pr_number: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    /// 0119: the plan-review entry that produced this outcome.
+    ///
+    /// Additive and internal: it is not a Status-JSON or HTTP key. A plan-review role outcome must
+    /// carry both the live `run_epoch` and this entry id; an absent pair is refused by the
+    /// consumer (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<u64>,
 }
 
 /// Phase Outcome File schema v1.
@@ -987,12 +994,16 @@ pub fn try_timeout_under_lock(record: &ProjectRecord) -> Result<Option<StatusVie
                 let _ = save_current_outcome(record, &outcome);
                 return apply_locked(record, outcome).map(Some);
             }
-            if state.phase == crate::workflow::graph::PHASE_PLAN_REVIEW
-                && let Ok(Some(outcome)) =
-                    crate::workflow::drive::timeout_plan_review_outcome(record, &state)
-            {
-                let _ = save_current_outcome(record, &outcome);
-                return apply_locked(record, outcome).map(Some);
+            if state.phase == crate::workflow::graph::PHASE_PLAN_REVIEW {
+                match crate::workflow::drive::timeout_plan_review_outcome(record, &state)? {
+                    crate::workflow::drive::TimeoutDecision::Apply(outcome) => {
+                        let _ = save_current_outcome(record, &outcome);
+                        return apply_locked(record, outcome).map(Some);
+                    }
+                    // 0119: pending empty and nothing missing - the join owns that state; do not
+                    // synthesize the generic "phase budget exceeded".
+                    crate::workflow::drive::TimeoutDecision::LetJoin => return Ok(None),
+                }
             }
             let outcome = PhaseOutcome::failure(
                 state.phase.clone(),
