@@ -13,6 +13,7 @@ pub mod plan_review;
 pub mod prompts;
 pub mod readiness;
 pub mod reuse;
+pub mod run_guard;
 pub mod self_check;
 pub mod shipped;
 pub mod stall_paging;

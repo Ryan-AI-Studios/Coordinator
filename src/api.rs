@@ -552,7 +552,30 @@ pub fn cmd_run(
     skip_preflight: bool,
     infer_cwd: bool,
 ) -> Result<StatusView> {
+    cmd_run_request(
+        project,
+        track,
+        driver,
+        skip_preflight,
+        infer_cwd,
+        RunRequest::control_plane(),
+    )
+}
+
+/// [`cmd_run`] with the 0120 request carrier (`--replay` + actor).
+///
+/// The terminal-row guard is the **first** check after `resolve_selected` (spec OD-120-7):
+/// before `settle_if_conductor_completed`, the 0098 hold, driver resolution and preflight.
+pub(crate) fn cmd_run_request(
+    project: Option<&str>,
+    track: Option<String>,
+    driver: Option<&str>,
+    skip_preflight: bool,
+    infer_cwd: bool,
+    req: RunRequest,
+) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
+    crate::workflow::run_guard::check_explicit_run(&rec, track.as_deref(), req.replay, req.actor)?;
     let _ = settle_if_conductor_completed(&rec);
     // 0098: the durable Blocked hold refuses every fresh run (any driver / track)
     // before driver resolution, `gh` omit-pick and machine preflight.
@@ -917,6 +940,32 @@ pub struct RunCliOpts {
     pub skip_preflight: bool,
 }
 
+/// 0120: `--replay` + which surface asked. `pub(crate)`: the public run surface stays
+/// [`cmd_run`] + [`cmd_run_cli`]; only the CLI dispatch can set `replay`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunRequest {
+    pub(crate) replay: bool,
+    pub(crate) actor: crate::workflow::run_guard::RunActor,
+}
+
+impl RunRequest {
+    /// HTTP `POST /v1/run`, UI Start, and every existing [`cmd_run`] caller.
+    pub(crate) const fn control_plane() -> Self {
+        Self {
+            replay: false,
+            actor: crate::workflow::run_guard::RunActor::Http,
+        }
+    }
+
+    /// CLI `run` (with or without `--replay`).
+    pub(crate) const fn cli(replay: bool) -> Self {
+        Self {
+            replay,
+            actor: crate::workflow::run_guard::RunActor::Cli,
+        }
+    }
+}
+
 /// Start a run, then tick until Idle/Stopped unless detached or serve owns the loop.
 pub fn cmd_run_cli(
     project: Option<&str>,
@@ -924,12 +973,26 @@ pub fn cmd_run_cli(
     driver: Option<&str>,
     opts: RunCliOpts,
 ) -> Result<StatusView> {
+    cmd_run_cli_request(project, track, driver, opts, RunRequest::cli(false))
+}
+
+/// [`cmd_run_cli`] with the 0120 request carrier.
+///
+/// The `timeout_secs == Some(0)` validation lives here so the `--replay` dispatch, which
+/// calls this sibling directly, cannot bypass it.
+pub(crate) fn cmd_run_cli_request(
+    project: Option<&str>,
+    track: Option<String>,
+    driver: Option<&str>,
+    opts: RunCliOpts,
+    req: RunRequest,
+) -> Result<StatusView> {
     if opts.timeout_secs == Some(0) {
         return Err(CoordinatorError::Message(
             "timeout-secs must be > 0; omit the flag to tick until Idle/Stopped".into(),
         ));
     }
-    let view = cmd_run(project, track, driver, opts.skip_preflight, true)?;
+    let view = cmd_run_request(project, track, driver, opts.skip_preflight, true, req)?;
     if opts.detach {
         return Ok(attach_operator_view(view));
     }
@@ -3029,6 +3092,47 @@ mod tests {
         }
     }
 
+    /// 0120: one parsed row for an explicit-id fixture, with its track dir on disk.
+    fn write_explicit_row(proj: &std::path::Path, id: &str, status: &str) {
+        let cond = proj.join("conductor");
+        let dir = cond.join(format!("{id}-Fixture"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("spec.md"), b"fixture spec\n").unwrap();
+        std::fs::write(dir.join("plan.md"), b"fixture plan\n").unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            format!(
+                "| Track | Execution path | Status | Summary |\n\
+                 | --- | --- | --- | --- |\n\
+                 | [{id}-Fixture]({id}-Fixture/spec.md) | `.` | {status} | fixture |\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn assert_terminal_run_track(err: CoordinatorError, id: &str, token: &str) {
+        match err {
+            CoordinatorError::TerminalRunTrack { track, status } => {
+                assert_eq!(track, id);
+                assert_eq!(status, token, "canonical terminal token");
+            }
+            other => panic!("expected TerminalRunTrack, got {other:?}"),
+        }
+    }
+
+    fn detach_opts() -> RunCliOpts {
+        RunCliOpts {
+            detach: true,
+            timeout_secs: None,
+            probe: ServeProbe::Skip,
+            skip_preflight: false,
+        }
+    }
+
+    fn status_log(rec: &ProjectRecord) -> String {
+        std::fs::read_to_string(crate::progress_log::path(rec)).unwrap_or_default()
+    }
+
     #[test]
     fn blocked_hold_refuses_cmd_run_for_every_driver_and_track_before_probe() {
         let _guard = test_env_lock();
@@ -3080,7 +3184,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_row_does_not_release_a_blocked_hold() {
+    fn completed_row_stays_terminal_under_a_blocked_hold() {
         let _guard = test_env_lock();
         let (_home, proj, rec) = blocked_fixture("0098");
         write_blocked_row(proj.path(), "0098", "**Completed**");
@@ -3093,6 +3197,7 @@ mod tests {
             shown.superseded.is_none(),
             "a Blocked failure is not SUPERSEDED by a Completed row"
         );
+        // 0120 precedence: the terminal refusal wins over the Blocked hold.
         let err = cmd_run(
             Some(&rec.id),
             Some("0098".into()),
@@ -3101,20 +3206,457 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert_blocked_hold(err, "0098", "Completed");
+        assert_terminal_run_track(err, "0098", "Completed");
+        assert_eq!(
+            crate::state::load_run_state(&rec).unwrap().failure_class,
+            Some(crate::outcome::FailureClass::Blocked),
+            "the hold is untouched by the refusal"
+        );
 
         let view = cmd_failure_resolve(Some(&rec.id), false).unwrap();
         assert!(view.failure_class.is_none());
         assert!(artifact::existing_path(&rec).is_none());
-        let running = cmd_run(
+        // Recovery is --replay or a new id, never `failure resolve` + plain retry.
+        let err = cmd_run(
             Some(&rec.id),
             Some("0098".into()),
             Some("stub"),
             false,
             false,
         )
+        .unwrap_err();
+        assert_terminal_run_track(err, "0098", "Completed");
+        assert_eq!(
+            crate::state::load_run_state(&rec).unwrap().status,
+            RunStatus::Stopped,
+            "a plain retry after resolve starts nothing"
+        );
+
+        let running = cmd_run_cli_request(
+            Some(&rec.id),
+            Some("0098".into()),
+            Some("stub"),
+            detach_opts(),
+            RunRequest::cli(true),
+        )
         .unwrap();
         assert_eq!(running.status, RunStatus::Running);
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
+        assert_eq!(log.matches("run-replay").count(), 1, "{log}");
+        assert!(
+            log.contains(
+                "actor=cli track=0098 row=Completed override=--replay result=override-authorized"
+            ),
+            "{log}"
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_explicit_completed_refuses_before_state() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_explicit_row(
+            proj.path(),
+            "0099",
+            "**Completed** 2026-10-23 - PR **#135** squash `018a8ef`",
+        );
+        let before = status_log(&rec);
+        let err = cmd_run(
+            Some(&rec.id),
+            Some("0099".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.http_status(), 409);
+        let msg = err.to_string();
+        assert!(msg.contains("0099"), "{msg}");
+        assert!(msg.contains("terminal (Completed)"), "{msg}");
+        assert!(msg.contains("new track id"), "{msg}");
+        assert!(msg.contains("--replay --track 0099"), "{msg}");
+        assert!(matches!(err, CoordinatorError::TerminalRunTrack { .. }));
+
+        assert!(
+            !crate::state::run_state_path(&rec).unwrap().exists(),
+            "a refusal must not write run state"
+        );
+        assert_eq!(
+            status(Some(&rec.id), false).unwrap().status,
+            RunStatus::Idle
+        );
+        assert!(artifact::existing_path(&rec).is_none());
+
+        let after = status_log(&rec);
+        let events = |log: &str| log.lines().filter(|line| line.starts_with("- ")).count();
+        assert_eq!(
+            events(&after),
+            events(&before) + 1,
+            "exactly one new event line: {after}"
+        );
+        assert_eq!(
+            after.matches("run-refused").count(),
+            before.matches("run-refused").count() + 1,
+            "{after}"
+        );
+        assert_eq!(
+            after.matches(" start ").count(),
+            before.matches(" start ").count(),
+            "no start line: {after}"
+        );
+        assert!(!after.contains(crate::notify::SETTLED_DETAIL), "{after}");
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_explicit_terminal_leaves_stored_failure_unsettled() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        stopped_failure(&rec, "0045", 3);
+        write_explicit_row(proj.path(), "0045", "**Completed**");
+        let err = cmd_run(
+            Some(&rec.id),
+            Some("0045".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_terminal_run_track(err, "0045", "Completed");
+        assert!(artifact::existing_path(&rec).is_some(), "artifact remains");
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(
+            state.failure_class,
+            Some(crate::outcome::FailureClass::Timeout),
+            "the guard precedes settle_if_conductor_completed"
+        );
+        assert_eq!(state.track_id.as_deref(), Some("0045"));
+        let log = status_log(&rec);
+        assert!(!log.contains(crate::notify::SETTLED_DETAIL), "{log}");
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_explicit_terminal_beats_blocked_hold() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = blocked_fixture("0098");
+        write_blocked_row(proj.path(), "0098", "**Completed**");
+        let err = cmd_run(
+            Some(&rec.id),
+            Some("0098".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_terminal_run_track(err, "0098", "Completed");
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(
+            state.failure_class,
+            Some(crate::outcome::FailureClass::Blocked)
+        );
+        assert_eq!(state.status, RunStatus::Stopped);
+        assert_eq!(state.run_epoch, 2);
+        assert!(artifact::existing_path(&rec).is_some());
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_replay_does_not_release_blocked_hold() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = blocked_fixture("0098");
+        write_blocked_row(proj.path(), "0098", "**Completed**");
+        let err = cmd_run_request(
+            Some(&rec.id),
+            Some("0098".into()),
+            Some("stub"),
+            false,
+            false,
+            RunRequest::cli(true),
+        )
+        .unwrap_err();
+        assert_blocked_hold(err, "0098", "Completed");
+        let state = crate::state::load_run_state(&rec).unwrap();
+        assert_eq!(
+            state.status,
+            RunStatus::Stopped,
+            "the override starts nothing"
+        );
+        assert_eq!(
+            state.failure_class,
+            Some(crate::outcome::FailureClass::Blocked)
+        );
+        assert_eq!(state.run_epoch, 2);
+        assert!(artifact::existing_path(&rec).is_some());
+        // The receipt is an authorization, not a start (R10).
+        let log = status_log(&rec);
+        assert_eq!(log.matches("run-replay").count(), 1, "{log}");
+        assert_eq!(
+            status(Some(&rec.id), false).unwrap().status,
+            RunStatus::Stopped
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_explicit_non_terminal_rows_still_start() {
+        let _guard = test_env_lock();
+        for row_status in [
+            "**Ready - not started**",
+            "**Proposed** - placeholder",
+            "**Blocked** - prerequisite",
+            "**In progress**",
+        ] {
+            let (_home, proj, rec) = add_isolated_project();
+            write_explicit_row(proj.path(), "0099", row_status);
+            let view = cmd_run(
+                Some(&rec.id),
+                Some("0099".into()),
+                Some("stub"),
+                false,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{row_status} must start, got {e}"));
+            assert_eq!(view.status, RunStatus::Running, "{row_status}");
+            assert_eq!(view.track_id.as_deref(), Some("0099"), "{row_status}");
+            assert_eq!(
+                status_log(&rec).matches("run-refused").count(),
+                0,
+                "{row_status}"
+            );
+            clear_home();
+        }
+        // Absent row and absent view keep explicit-wins (R6).
+        let (_home, proj, rec) = add_isolated_project();
+        write_explicit_row(proj.path(), "0001", "**Completed**");
+        let view = cmd_run(
+            Some(&rec.id),
+            Some("0120".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0120"));
+
+        let (_home2, _proj2, rec2) = add_isolated_project();
+        let view = cmd_run(
+            Some(&rec2.id),
+            Some("0120".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0120"));
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_explicit_zero_row_registry_starts() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        std::fs::create_dir_all(proj.path().join("conductor")).unwrap();
+        std::fs::write(
+            proj.path().join("conductor").join("conductor.md"),
+            b"# tracks\n",
+        )
+        .unwrap();
+        let view = cmd_run(
+            Some(&rec.id),
+            Some("0120".into()),
+            Some("stub"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0120"));
+        assert_eq!(status_log(&rec).matches("run-refused").count(), 0);
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_replay_explicit_completed_starts_and_receipts() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_explicit_row(
+            proj.path(),
+            "0099",
+            "**Completed** 2026-10-23 - PR **#135** squash `018a8ef`",
+        );
+        let view = cmd_run_cli_request(
+            Some(&rec.id),
+            Some("0099".into()),
+            Some("stub"),
+            detach_opts(),
+            RunRequest::cli(true),
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("0099"));
+        let log = status_log(&rec);
+        assert_eq!(log.matches("run-replay").count(), 1, "{log}");
+        assert_eq!(log.matches("run-refused").count(), 0, "{log}");
+        assert!(
+            log.contains(
+                "actor=cli track=0099 row=Completed override=--replay result=override-authorized"
+            ),
+            "{log}"
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_replay_without_flag_still_refuses() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_explicit_row(proj.path(), "0099", "**Completed**");
+        let err = cmd_run_cli(
+            Some(&rec.id),
+            Some("0099".into()),
+            Some("stub"),
+            detach_opts(),
+        )
+        .unwrap_err();
+        assert_terminal_run_track(err, "0099", "Completed");
+        assert_eq!(
+            crate::state::load_run_state(&rec).unwrap().status,
+            RunStatus::Idle
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_replay_non_terminal_writes_no_receipt() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_explicit_row(proj.path(), "0099", "**Ready - not started**");
+        let view = cmd_run_cli_request(
+            Some(&rec.id),
+            Some("0099".into()),
+            Some("stub"),
+            detach_opts(),
+            RunRequest::cli(true),
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(status_log(&rec).matches("run-replay").count(), 0);
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_replay_leaves_registry_bytes_unchanged() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_explicit_row(proj.path(), "0099", "**Completed**");
+        crate::registry_store::import_at(
+            &crate::registry_store::conductor_dir_for(&rec),
+            crate::registry_store::ImportOpts {
+                dry_run: false,
+                force: false,
+            },
+        )
+        .unwrap();
+        let view_path = proj.path().join("conductor").join("conductor.md");
+        let store_path = crate::registry_store::store_path_for(&rec);
+        let view_before = std::fs::read(&view_path).unwrap();
+        let store_before = std::fs::read(&store_path).unwrap();
+        let source_before = crate::registry_store::load(&rec)
+            .unwrap()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| row.id == "0099")
+            .and_then(|row| row.status_source.clone());
+
+        let view = cmd_run_cli_request(
+            Some(&rec.id),
+            Some("0099".into()),
+            Some("stub"),
+            detach_opts(),
+            RunRequest::cli(true),
+        )
+        .unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(std::fs::read(&view_path).unwrap(), view_before);
+        assert_eq!(std::fs::read(&store_path).unwrap(), store_before);
+        let source_after = crate::registry_store::load(&rec)
+            .unwrap()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| row.id == "0099")
+            .and_then(|row| row.status_source.clone());
+        assert_eq!(source_after, source_before, "provenance is untouched");
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_replay_env_does_not_default() {
+        let _guard = test_env_lock();
+        let _driver_env = crate::config::TestEnvGuard::capture(&["COORDINATOR_WORKFLOW_DRIVER"]);
+        let (_home, proj, rec) = add_isolated_project();
+        write_explicit_row(proj.path(), "0099", "**Completed**");
+        unsafe {
+            std::env::set_var("COORDINATOR_WORKFLOW_DRIVER", "stub");
+        }
+        let err = cmd_run_request(
+            Some(&rec.id),
+            Some("0099".into()),
+            None,
+            false,
+            false,
+            RunRequest::control_plane(),
+        )
+        .unwrap_err();
+        assert_terminal_run_track(err, "0099", "Completed");
+        assert_eq!(
+            crate::state::load_run_state(&rec).unwrap().status,
+            RunStatus::Idle
+        );
+        // Source-level: no env reader can default replay.
+        let guard_src = include_str!("workflow/run_guard.rs");
+        assert!(!guard_src.contains("std::env::var"), "guard reads env");
+        let api_src = include_str!("api.rs");
+        let start = api_src
+            .find("pub(crate) fn cmd_run_request")
+            .expect("cmd_run_request");
+        let body = &api_src[start..];
+        let end = body.find("run::run_with_origin").expect("run call");
+        assert!(
+            !body[..end].contains("std::env::var"),
+            "the run request path reads env"
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn cmd_run_cli_request_timeout_zero_rejected() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let err = cmd_run_cli_request(
+            Some(&rec.id),
+            None,
+            Some("stub"),
+            RunCliOpts {
+                detach: false,
+                timeout_secs: Some(0),
+                probe: ServeProbe::Skip,
+                skip_preflight: false,
+            },
+            RunRequest::cli(false),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("timeout-secs must be > 0"),
+            "{err}"
+        );
+        assert!(!crate::state::run_state_path(&rec).unwrap().exists());
         clear_home();
     }
 

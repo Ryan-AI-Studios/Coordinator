@@ -100,6 +100,10 @@ pub enum Commands {
         /// Skip harness preflight (adapter still starts). Does not conflict with --detach.
         #[arg(long)]
         skip_preflight: bool,
+        /// Deliberate override: re-run an explicit --track whose registry row is terminal.
+        /// CLI-only; requires --track; writes one run-replay authorization receipt.
+        #[arg(long, requires = "track")]
+        replay: bool,
     },
     /// Pause a running workflow
     Pause {
@@ -908,6 +912,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             timeout_secs,
             serve_port,
             skip_preflight,
+            replay,
         } => {
             let probe = if detach {
                 api::ServeProbe::Skip
@@ -916,7 +921,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             } else {
                 api::ServeProbe::Auto
             };
-            let view = api::cmd_run_cli(
+            let view = api::cmd_run_cli_request(
                 project.as_deref(),
                 track,
                 driver.as_deref(),
@@ -926,6 +931,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     probe,
                     skip_preflight,
                 },
+                api::RunRequest::cli(replay),
             )?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
@@ -1731,6 +1737,31 @@ mod tests {
             help.contains("--skip-preflight"),
             "run --help should mention --skip-preflight: {help}"
         );
+    }
+
+    #[test]
+    fn run_replay_requires_track() {
+        let err = Cli::try_parse_from(["coordinator", "run", "--replay"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--track"), "clap requires --track: {msg}");
+    }
+
+    #[test]
+    fn run_replay_defaults_false() {
+        let parsed = Cli::try_parse_from(["coordinator", "run", "--track", "0099"]).unwrap();
+        match parsed.command {
+            Commands::Run { replay, .. } => assert!(!replay),
+            other => panic!("expected run, got {other:?}"),
+        }
+        let parsed =
+            Cli::try_parse_from(["coordinator", "run", "--replay", "--track", "0099"]).unwrap();
+        match parsed.command {
+            Commands::Run { replay, track, .. } => {
+                assert!(replay);
+                assert_eq!(track.as_deref(), Some("0099"));
+            }
+            other => panic!("expected run, got {other:?}"),
+        }
     }
 
     #[test]

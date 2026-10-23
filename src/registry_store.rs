@@ -364,12 +364,14 @@ pub fn store_path_for(record: &ProjectRecord) -> PathBuf {
     store_path_at(&crate::layout::resolve(record).conductor_dir)
 }
 
-fn conductor_dir_for(record: &ProjectRecord) -> PathBuf {
-    crate::layout::resolve(record).conductor_dir
-}
-
 fn view_path_at(conductor_dir: &Path) -> PathBuf {
     conductor_dir.join(VIEW_FILE)
+}
+
+/// `{conductor_dir}` for a record; shared with the 0120 guard so drift text and store
+/// lookups name the same directory the picker does.
+pub(crate) fn conductor_dir_for(record: &ProjectRecord) -> PathBuf {
+    crate::layout::resolve(record).conductor_dir
 }
 
 fn stored_to_row(row: &StoredRow) -> TrackRow {
@@ -637,6 +639,23 @@ pub(crate) fn reset_drift_warnings_for_tests() {
 
 pub(crate) fn is_view_drift_error(err: &CoordinatorError) -> bool {
     matches!(err, CoordinatorError::Message(m) if m.starts_with(VIEW_DRIFT_PREFIX))
+}
+
+/// The one 0109 drift refusal text; the picker and the 0120 explicit-run guard must agree
+/// byte-for-byte, so both build the error here.
+pub(crate) fn view_drift_error(
+    conductor_dir: &Path,
+    expected: &str,
+    actual: &str,
+) -> CoordinatorError {
+    CoordinatorError::Message(format!(
+        "{} (store {expected}, view {actual}); run \
+         `coordinator registry import --conductor-dir {} --force` to adopt the edit \
+         or `coordinator registry render --conductor-dir {} --force` to discard it",
+        VIEW_DRIFT_PREFIX,
+        conductor_dir.display(),
+        conductor_dir.display(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3004,6 +3023,28 @@ mod tests {
             &repaired_dir.record,
             "0115"
         ));
+    }
+
+    #[test]
+    fn view_drift_error_names_both_recoveries() {
+        let dir = std::path::Path::new(r"C:\dev\example\conductor");
+        let err = view_drift_error(dir, "storeabc", "viewdef");
+        let msg = err.to_string();
+        assert!(msg.starts_with(VIEW_DRIFT_PREFIX), "{msg}");
+        assert!(msg.contains("(store storeabc, view viewdef)"), "{msg}");
+        assert!(
+            msg.contains(
+                "coordinator registry import --conductor-dir C:\\dev\\example\\conductor --force"
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "coordinator registry render --conductor-dir C:\\dev\\example\\conductor --force"
+            ),
+            "{msg}"
+        );
+        assert!(is_view_drift_error(&err), "{msg}");
     }
 
     #[test]
