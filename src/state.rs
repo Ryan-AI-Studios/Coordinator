@@ -1209,6 +1209,7 @@ mod tests {
 
     #[test]
     fn status_project_renders_holder_candidate() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let path = holder_persist(
@@ -1243,6 +1244,7 @@ mod tests {
 
     #[test]
     fn status_project_renders_holder_kept_dead_persist_no_address() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let state = stale_state(&rec);
@@ -1306,6 +1308,7 @@ mod tests {
 
     #[test]
     fn status_project_renders_holder_absent() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let state = stale_state(&rec);
@@ -1318,6 +1321,7 @@ mod tests {
 
     #[test]
     fn status_project_renders_holder_names_the_persist_path() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let path = holder_persist(&rec, holder_body(&rec, None, false, None, None, None));
@@ -1329,6 +1333,7 @@ mod tests {
 
     #[test]
     fn status_view_additive_holder_field() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let state = stale_state(&rec);
@@ -1452,6 +1457,7 @@ mod tests {
 
     #[test]
     fn state_dir_record_override() {
+        let _env = crate::config::test_env_lock();
         let proj = tempdir().unwrap();
         let over = tempdir().unwrap();
         let mut rec = sample_record(proj.path());
