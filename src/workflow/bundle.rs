@@ -24,8 +24,8 @@ pub fn review_file(record: &ProjectRecord, slug: &str) -> Result<PathBuf> {
 
 /// Assemble `{workspace_root}/AI-review.md` (+ track copy when resolvable).
 pub fn assemble(record: &ProjectRecord, state: &RunState) -> Result<PathBuf> {
-    let agy = read_review(record, REVIEW_SLUG_AGY)?;
-    let oc = read_review(record, REVIEW_SLUG_OPENCODE)?;
+    let agy = read_review(record, state, REVIEW_SLUG_AGY)?;
+    let oc = read_review(record, state, REVIEW_SLUG_OPENCODE)?;
     let body = assemble_body(agy.as_deref(), oc.as_deref());
     let paths = crate::layout::resolve(record);
     let dest = paths.workspace_root.join("AI-review.md");
@@ -59,11 +59,28 @@ fn append_section(out: &mut String, slug: &str, body: Option<&str>) {
     }
 }
 
-fn read_review(record: &ProjectRecord, slug: &str) -> Result<Option<String>> {
-    let path = review_file(record, slug)?;
-    if !path.is_file() {
+/// 0119: the single "this entry produced this slot" predicate.
+///
+/// True only when the mailbox review exists and reads non-empty **and** the live entry has no
+/// verdict for the slug. The mailbox is purged on a real entry transition and unlinked on spawn,
+/// so a present file during entry `E` was written by `E`; a current-entry failure/dud verdict
+/// wins over a leftover file.
+pub fn review_produced(record: &ProjectRecord, state: &RunState, slug: &str) -> bool {
+    if state.plan_review_verdict(slug).is_some() {
+        return false;
+    }
+    review_file(record, slug).ok().is_some_and(|p| {
+        p.is_file() && std::fs::read_to_string(p).is_ok_and(|t| !t.trim().is_empty())
+    })
+}
+
+fn read_review(record: &ProjectRecord, state: &RunState, slug: &str) -> Result<Option<String>> {
+    // Read through `review_produced`, so assembly can neither count nor bundle an earlier
+    // entry's bytes or a slot this entry degraded. Bundle format unchanged.
+    if !review_produced(record, state, slug) {
         return Ok(None);
     }
+    let path = review_file(record, slug)?;
     Ok(Some(std::fs::read_to_string(path)?))
 }
 

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{ENV_COORDINATOR_AGY_BIN, ENV_COORDINATOR_OPENCODE_BIN, RoleBinding};
 use crate::error::{CoordinatorError, Result};
 use crate::registry::ProjectRecord;
-use crate::state::{RunStatus, load_run_state};
+use crate::state::{RunState, RunStatus, load_run_state};
 
 use super::graph::{
     REVIEW_SLUG_OPENCODE, ROLE_REVIEWER_AGY, ROLE_REVIEWER_OPENCODE, resolve_track_dir,
@@ -82,6 +82,13 @@ struct Receipt {
     plan_sha256: String,
     skill_sha256: String,
     slots: BTreeMap<String, SlotReceipt>,
+    /// 0119: the `run_epoch` that **produced** `slots` - not the live epoch.
+    ///
+    /// `note_pr` round-trips the struct and must never rewrite it. Additive and defaulted;
+    /// `RECEIPT_VERSION` stays 1 so pre-0119 receipts stay readable (they simply fail the
+    /// same-epoch predicate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pr: Option<PrReceipt>,
 }
@@ -509,22 +516,36 @@ pub fn decide_resume(record: &ProjectRecord, track_id: Option<&str>) -> ResumeCh
     }
 }
 
-/// True when this slot's binding and track review bytes match the receipt.
-pub fn slot_matches(record: &ProjectRecord, track_id: &str, slug: &str) -> bool {
+/// True when this slot's binding and track review bytes match the receipt for `run_epoch`.
+///
+/// 0119: the receipt must record the epoch that produced its slots. No production path calls this
+/// after in-phase reuse was retired; it stays as the public reuse predicate (a pre-0119 receipt
+/// with no epoch is refused).
+pub fn slot_matches(record: &ProjectRecord, track_id: &str, slug: &str, run_epoch: u64) -> bool {
     let Some(track_dir) = resolve_track_dir(record, track_id) else {
         return false;
     };
     let LoadedReceipt::Ready(receipt) = load_receipt(&track_dir) else {
         return false;
     };
-    shared_match(record, &track_dir, &receipt) && slot_ok(&track_dir, slug, &receipt)
+    receipt.epoch == Some(run_epoch)
+        && shared_match(record, &track_dir, &receipt)
+        && slot_ok(&track_dir, slug, &receipt)
 }
 
-/// Replace `reuse.json` from the reviews this join actually produced.
+/// Replace `reuse.json` from the reviews this entry actually produced.
 ///
-/// Omits `pr` (ci-wait `note_pr` attaches it later). A write failure is ignored
-/// so the join still succeeds; the next run re-reviews.
-pub fn write_join_receipt(record: &ProjectRecord, track_id: &str) {
+/// The hash store is still the **track dir** (the store `slot_ok`/`decide_resume` verify), so
+/// writer and verifier never split. The slot set is filtered by this entry's mailbox evidence
+/// (`review_produced`), so a leftover track file for a degraded slot is not blessed, and `epoch`
+/// records the producing epoch.
+///
+/// Omits `pr` (ci-wait `note_pr` attaches it later). A write failure is ignored so the join still
+/// succeeds; the next run re-reviews.
+pub fn write_join_receipt(record: &ProjectRecord, state: &RunState) {
+    let Some(track_id) = state.track_id.as_deref() else {
+        return;
+    };
     let Some(track_dir) = resolve_track_dir(record, track_id) else {
         return;
     };
@@ -533,6 +554,9 @@ pub fn write_join_receipt(record: &ProjectRecord, track_id: &str) {
     };
     let mut slots = BTreeMap::new();
     for slug in review_slugs() {
+        if !super::bundle::review_produced(record, state, slug) {
+            continue;
+        }
         let Some(bytes) = review_bytes(&track_dir, slug) else {
             continue;
         };
@@ -547,6 +571,7 @@ pub fn write_join_receipt(record: &ProjectRecord, track_id: &str) {
         plan_sha256: hashes.plan,
         skill_sha256: hashes.skill,
         slots,
+        epoch: Some(state.run_epoch),
         pr: None,
     };
     let _ = write_receipt(&receipt_path(&track_dir), &receipt);
@@ -838,6 +863,8 @@ mod tests {
         home: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
         record: ProjectRecord,
+        /// 0119: the epoch recorded by the fixture receipt.
+        epoch: u64,
     }
 
     impl ReuseFixture {
@@ -852,6 +879,27 @@ mod tests {
         fn home(&self) -> &Path {
             self.home.path()
         }
+
+        fn epoch(&self) -> u64 {
+            self.epoch
+        }
+    }
+
+    /// 0119: seed the mailbox copies the receipt writer filters on and build a matching state.
+    fn join_state(r: &ProjectRecord, id: &str) -> RunState {
+        let track = resolve_track_dir(r, id).expect("fixture track dir");
+        let mut state = RunState::idle(&r.id);
+        state.track_id = Some(id.to_string());
+        state.run_epoch = 1;
+        for slug in review_slugs() {
+            let src = track.join(format!("{slug}-review.md"));
+            if let Ok(bytes) = std::fs::read(&src) {
+                let dest = crate::workflow::bundle::review_file(r, slug).unwrap();
+                std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                std::fs::write(dest, bytes).unwrap();
+            }
+        }
+        state
     }
 
     fn matching_fixture(id: &str) -> ReuseFixture {
@@ -878,7 +926,8 @@ mod tests {
         write_skill(root.path(), b"skill-v1");
         std::fs::write(dir.join("agy-review.md"), b"agy body\n").unwrap();
         std::fs::write(dir.join("opencode-review.md"), b"oc body\n").unwrap();
-        write_join_receipt(&r, id);
+        let state = join_state(&r, id);
+        write_join_receipt(&r, &state);
 
         ReuseFixture {
             _restore_agy: restore_agy,
@@ -887,6 +936,7 @@ mod tests {
             home,
             _lock: lock,
             record: r,
+            epoch: state.run_epoch,
         }
     }
 
@@ -894,11 +944,11 @@ mod tests {
     fn byte_change_refuses_the_slot() {
         let f = matching_fixture("0083");
         let r = f.record();
-        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY, f.epoch()));
         let review = track_dir_of(f.root(), "0083").join("agy-review.md");
         std::fs::write(&review, b"agy body!\n").unwrap();
-        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY));
-        assert!(slot_matches(r, "0083", REVIEW_SLUG_OPENCODE));
+        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY, f.epoch()));
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_OPENCODE, f.epoch()));
     }
 
     #[test]
@@ -906,24 +956,24 @@ mod tests {
         // The fixture owns the non-reentrant env lock and the AGY_BIN restore.
         let f = matching_fixture("0083");
         let r = f.record();
-        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY, f.epoch()));
         let skill = write_skill(f.root(), b"skill-v1-changed");
-        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY, f.epoch()));
         std::fs::write(&skill, b"skill-v1").unwrap();
-        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY, f.epoch()));
         let receipt = track_dir_of(f.root(), "0083").join("reuse.json");
         let mut v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
         v["slots"]["agy"]["model"] = serde_json::json!("other-model");
         std::fs::write(&receipt, serde_json::to_vec(&v).unwrap()).unwrap();
-        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY, f.epoch()));
         v["slots"]["agy"]["model"] = serde_json::Value::Null;
         std::fs::write(&receipt, serde_json::to_vec(&v).unwrap()).unwrap();
-        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        assert!(slot_matches(r, "0083", REVIEW_SLUG_AGY, f.epoch()));
         unsafe {
             std::env::set_var(ENV_COORDINATOR_AGY_BIN, r"C:\custom\agy.exe");
         }
-        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY));
+        assert!(!slot_matches(r, "0083", REVIEW_SLUG_AGY, f.epoch()));
     }
 
     #[test]
@@ -983,7 +1033,12 @@ mod tests {
             r#"{"version":1,"scan_roots":[],"role_bindings":{"plan_reviewer_agy":{"harness":"antigravity","command":"agy","model":"host-model"}}}"#,
         )
         .unwrap();
-        assert!(!slot_matches(f.record(), "0083", REVIEW_SLUG_AGY));
+        assert!(!slot_matches(
+            f.record(),
+            "0083",
+            REVIEW_SLUG_AGY,
+            f.epoch()
+        ));
     }
 
     #[test]
@@ -1020,9 +1075,9 @@ mod tests {
             review_track_skill_file(&r).as_deref(),
             Some(skill.as_path())
         );
-        write_join_receipt(&r, "0083");
-        assert!(slot_matches(&r, "0083", REVIEW_SLUG_AGY));
-        assert!(slot_matches(&r, "0083", REVIEW_SLUG_OPENCODE));
+        write_join_receipt(&r, &join_state(&r, "0083"));
+        assert!(slot_matches(&r, "0083", REVIEW_SLUG_AGY, 1));
+        assert!(slot_matches(&r, "0083", REVIEW_SLUG_OPENCODE, 1));
     }
 
     #[test]

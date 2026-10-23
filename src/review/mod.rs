@@ -399,6 +399,29 @@ pub(crate) fn record_slot_dud(record: &ProjectRecord, file: &str, bytes: usize) 
     })
 }
 
+/// 0119: record a plan-review dud note only for the entry that produced it.
+///
+/// The entry check lives **inside** `persist_review_state`'s closure (which already owns the
+/// run-state lock), so this helper never nests a second lock. It is called outside the commit
+/// closure that writes the verdict/outcome: the note is diagnostic, the verdict is the cause.
+pub(crate) fn record_slot_dud_if(
+    record: &ProjectRecord,
+    entry: crate::state::PlanReviewEntry,
+    file: &str,
+    bytes: usize,
+) -> Result<()> {
+    let note = format!("{file} ({bytes})");
+    persist_review_state(record, |s, rv| {
+        if s.plan_review_entry_current() != Some(entry) {
+            return;
+        }
+        if !rv.duds.iter().any(|d| d == &note) {
+            rv.duds.push(note);
+        }
+        s.last_event = truncate_msg(&slot_quality::dud_message(file, bytes));
+    })
+}
+
 fn unlink_cross_model_reports(record: &ProjectRecord, state: &RunState, slug: &str) {
     if let Ok(dir) = crate::workflow::bundle::reviews_dir(record) {
         let _ = std::fs::remove_file(dir.join(format!("cross-model-{slug}.md")));

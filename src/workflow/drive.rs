@@ -6,7 +6,9 @@ use crate::outcome::{
     FailureClass, OutcomeSource, OutcomeStatus, PhaseOutcome, outcome_roles_dir, write_and_apply,
 };
 use crate::registry::ProjectRecord;
-use crate::state::{RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock};
+use crate::state::{
+    PlanReviewEntry, RunState, RunStatus, load_run_state, save_run_state, with_run_state_lock,
+};
 
 use super::bundle::{self, review_file, reviews_dir};
 use super::graph::{
@@ -678,6 +680,9 @@ fn drive_plan_review(
         }
     }
     ensure_plan_review_pending(record, state)?;
+    // 0119: re-load after adoption so the stub (which stamps the entry on its role outcomes)
+    // and the spawn path both see the live entry, not the pre-adoption snapshot.
+    let state = &load_run_state(record).unwrap_or_else(|_| state.clone());
     match state.driver {
         WorkflowDriver::Stub => write_stub_reviews(record, state)?,
         WorkflowDriver::Adapter => super::plan_review::maybe_spawn_plan_review(record, state)?,
@@ -687,18 +692,40 @@ fn drive_plan_review(
     try_join(record)
 }
 
+/// 0119: the single adoption point for a `plan-review` phase that is already in flight.
+///
+/// A **current** entry owns its pending set: refilling an empty pending here would make the
+/// join's `Wait` arm unobservable and re-add a produced/consumed slug on the next tick. A missing
+/// entry is adopted and refilled only for a genuinely untouched legacy phase.
 fn ensure_plan_review_pending(record: &ProjectRecord, state: &RunState) -> Result<()> {
-    if !state.pending_roles.is_empty() {
+    if state.plan_review_entry_current().is_some() {
         return Ok(());
     }
     with_run_state_lock(record, || {
         let mut s = load_run_state(record)?;
-        if s.phase == PHASE_PLAN_REVIEW && s.pending_roles.is_empty() {
-            s.pending_roles = review_slugs().iter().map(|x| (*x).to_string()).collect();
-            s.updated_at = chrono::Utc::now();
-            save_run_state(record, &s)?;
+        if s.phase != PHASE_PLAN_REVIEW {
+            return Ok(());
         }
-        Ok(())
+        if s.plan_review_entry_current().is_some() {
+            // Another ticker won the adoption.
+            return Ok(());
+        }
+        // Never `begin()` here: a mid-phase resume must keep the books and must not re-spawn
+        // live children.
+        s.adopt_plan_review_entry();
+        let untouched = s.plan_review_spawned.is_empty()
+            && s.plan_review_slot_ran.is_empty()
+            && s.plan_review_verdicts.is_empty()
+            && s.plan_review_admission_failures.is_empty();
+        if s.pending_roles.is_empty()
+            && untouched
+            && super::plan_review::remaining_budget(record, &s)
+                >= super::plan_review::MIN_SPAWN_BUDGET
+        {
+            s.pending_roles = review_slugs().iter().map(|x| (*x).to_string()).collect();
+        }
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)
     })
 }
 
@@ -706,6 +733,7 @@ fn write_stub_reviews(record: &ProjectRecord, state: &RunState) -> Result<()> {
     let roles_dir = outcome_roles_dir(record)?;
     std::fs::create_dir_all(&roles_dir)?;
     std::fs::create_dir_all(reviews_dir(record)?)?;
+    let entry = state.plan_review_entry_current();
     for slug in review_slugs() {
         write_review_markdown(record, slug, Some(&format!("stub review ({slug})\n")))?;
         let mut outcome = PhaseOutcome::success(
@@ -721,6 +749,9 @@ fn write_stub_reviews(record: &ProjectRecord, state: &RunState) -> Result<()> {
                 "agy" => super::graph::ROLE_REVIEWER_AGY.into(),
                 _ => super::graph::ROLE_REVIEWER_OPENCODE.into(),
             }),
+            // 0119: a stub role outcome is a role outcome like any other; the consumer fails
+            // closed on a missing pair.
+            entry_id: entry.map(|e| e.entry_id),
             ..Default::default()
         });
         crate::persist::atomic_write_json(&roles_dir.join(format!("{slug}.json")), &outcome)?;
@@ -744,11 +775,25 @@ pub fn write_review_markdown(
         && let Some(track_dir) = resolve_track_dir(record, track_id)
     {
         let copy = track_dir.join(format!("{slug}-review.md"));
-        crate::persist::atomic_write(&copy, text.as_bytes())?;
+        // Best effort: the mailbox is the canonical evidence. A track-copy failure only makes
+        // the receipt omit the slot (safe direction); it must never turn a produced review into
+        // a failed attempt.
+        if let Err(e) = crate::persist::atomic_write(&copy, text.as_bytes()) {
+            crate::progress_log::append(
+                record,
+                "plan-review",
+                &format!("plan-review: {slug} track review copy failed: {e}"),
+            );
+        }
     }
     Ok(dest)
 }
 
+/// Consume role outcomes for the live entry, one run-state lock per slug.
+///
+/// 0119: an outcome must carry **both** the live `run_epoch` and `metadata.entry_id`; an absent or
+/// differing pair is journalled and the file is left in place (fail closed, OD-119-8). A Success
+/// without a mailbox artifact is a named degrade - there is no track-copy adoption.
 fn consume_role_files(record: &ProjectRecord) -> Result<()> {
     let state = load_run_state(record)?;
     if state.phase != PHASE_PLAN_REVIEW {
@@ -777,20 +822,90 @@ fn consume_role_files(record: &ProjectRecord) -> Result<()> {
         {
             continue;
         }
-        if outcome.status == OutcomeStatus::Success {
-            adopt_track_review_if_missing(record, &slug)?;
+        let mut consumed = false;
+        with_run_state_lock(record, || {
+            let mut s = load_run_state(record)?;
+            if s.phase != PHASE_PLAN_REVIEW {
+                return Ok(());
+            }
+            let Some(live) = s.plan_review_entry_current() else {
+                return Ok(());
+            };
+            if outcome.run_epoch != Some(live.run_epoch) {
+                let detail = match outcome.run_epoch {
+                    Some(epoch) => format!(
+                        "plan-review: ignored {slug} outcome from epoch {epoch} (live {})",
+                        live.run_epoch
+                    ),
+                    None => format!("plan-review: ignored {slug} outcome with no epoch/entry"),
+                };
+                crate::progress_log::append(record, "plan-review", &detail);
+                return Ok(());
+            }
+            if outcome.metadata.as_ref().and_then(|m| m.entry_id) != Some(live.entry_id) {
+                let detail = match outcome.metadata.as_ref().and_then(|m| m.entry_id) {
+                    Some(entry) => format!(
+                        "plan-review: ignored {slug} outcome from entry {entry} (live {})",
+                        live.entry_id
+                    ),
+                    None => format!("plan-review: ignored {slug} outcome with no epoch/entry"),
+                };
+                crate::progress_log::append(record, "plan-review", &detail);
+                return Ok(());
+            }
+            let verdict = match outcome.status {
+                OutcomeStatus::Success => {
+                    if bundle::review_produced(record, &s, &slug) {
+                        None
+                    } else {
+                        Some("resolved: success outcome without a review artifact".to_string())
+                    }
+                }
+                _ => {
+                    let class = outcome.failure_class.unwrap_or(FailureClass::HarnessCrash);
+                    let msg = outcome.message.as_deref().unwrap_or("");
+                    Some(format!(
+                        "failed: {}: {}",
+                        class.as_str(),
+                        super::plan_review::normalize_verdict(msg)
+                    ))
+                }
+            };
+            apply_pending_and_verdict(&mut s, &slug, verdict.as_deref());
+            s.updated_at = chrono::Utc::now();
+            #[cfg(test)]
+            if take_pending_save_failure(&record.id, &slug) {
+                return Err(CoordinatorError::Message(
+                    "injected remove_pending failure".into(),
+                ));
+            }
+            save_run_state(record, &s)?;
+            consumed = true;
+            Ok(())
+        })?;
+        // Save the acknowledgment BEFORE deleting the mailbox (0088 follow-up): a failed save
+        // keeps the file, so the retry is idempotent.
+        if consumed {
+            let _ = std::fs::remove_file(&path);
         }
-        // Save the acknowledgment BEFORE deleting the mailbox (0088 follow-up).
-        //
-        // The reverse order is unrecoverable: if `remove_pending` fails to persist, the
-        // mailbox is already gone, so the retry finds nothing to read, the slug stays in
-        // `pending_roles` forever, and the join never completes. Observed as
-        // `slots still pending: ["agy"]` in `join_zero_output_retries_then_pass`.
-        // Retaining the mailbox on a failed save makes the retry idempotent.
-        remove_pending(record, &slug)?;
-        let _ = std::fs::remove_file(&path);
     }
     Ok(())
+}
+
+/// Every removal leaves a verdict, a produced mailbox artifact, or an admission-failure record.
+///
+/// Lock-free by design: the caller owns the single run-state lock for the path. `consume_role_files`
+/// owns it per slug; `remove_pending_if_entry` takes it itself. No path nests the two.
+fn apply_pending_and_verdict(s: &mut RunState, slug: &str, verdict: Option<&str>) -> bool {
+    let before = s.pending_roles.len();
+    s.pending_roles.retain(|x| x != slug);
+    if let Some(v) = verdict {
+        // First writer within an attempt wins: consume must not overwrite a worker's `ran; dud:`.
+        s.plan_review_verdicts
+            .entry(slug.to_string())
+            .or_insert_with(|| super::plan_review::normalize_verdict(v));
+    }
+    s.pending_roles.len() != before
 }
 
 #[cfg(test)]
@@ -835,40 +950,24 @@ fn take_pending_save_failure(project_id: &str, slug: &str) -> bool {
     }
 }
 
-fn remove_pending(record: &ProjectRecord, slug: &str) -> Result<()> {
-    with_run_state_lock(record, || {
-        let mut s = load_run_state(record)?;
-        s.pending_roles.retain(|x| x != slug);
-        s.updated_at = chrono::Utc::now();
-        #[cfg(test)]
-        if take_pending_save_failure(&record.id, slug) {
-            return Err(CoordinatorError::Message(
-                "injected remove_pending failure".into(),
-            ));
-        }
-        save_run_state(record, &s)
-    })
-}
-
-/// Remove a pending slug only while the live run still matches `run_epoch` / `track_id`.
+/// Remove a pending slug only while the live entry and track still match, recording the verdict
+/// in the same save. Takes the run-state lock itself and is **never** called from inside a lock.
 ///
-/// 0113: the stamp-failure fallback must not let a stale worker clear a slot that a newer run owns.
-/// Returns `true` when the slug was actually removed.
-pub(crate) fn remove_pending_if_epoch(
+/// 0119: `remove_pending` is deleted. `consume_role_files` uses the lock-free
+/// `apply_pending_and_verdict` inside its own single lock; this is the only other removal.
+pub(crate) fn remove_pending_if_entry(
     record: &ProjectRecord,
     slug: &str,
-    run_epoch: u64,
+    entry: PlanReviewEntry,
     track_id: Option<&str>,
+    verdict: Option<&str>,
 ) -> Result<bool> {
     with_run_state_lock(record, || {
         let mut s = load_run_state(record)?;
-        if s.phase != PHASE_PLAN_REVIEW
-            || s.run_epoch != run_epoch
-            || s.track_id.as_deref() != track_id
-        {
+        if s.plan_review_entry_current() != Some(entry) || s.track_id.as_deref() != track_id {
             return Ok(false);
         }
-        s.pending_roles.retain(|x| x != slug);
+        apply_pending_and_verdict(&mut s, slug, verdict);
         s.updated_at = chrono::Utc::now();
         #[cfg(test)]
         if take_pending_save_failure(&record.id, slug) {
@@ -881,37 +980,20 @@ pub(crate) fn remove_pending_if_epoch(
     })
 }
 
-fn review_produced(record: &ProjectRecord, slug: &str) -> bool {
-    review_file(record, slug).ok().is_some_and(|p| {
-        p.is_file() && std::fs::read_to_string(p).is_ok_and(|t| !t.trim().is_empty())
-    })
-}
-
-fn adopt_track_review_if_missing(record: &ProjectRecord, slug: &str) -> Result<()> {
-    let dest = review_file(record, slug)?;
-    if dest.is_file() {
-        return Ok(());
-    }
-    let Ok(state) = load_run_state(record) else {
-        return Ok(());
-    };
-    let Some(ref track_id) = state.track_id else {
-        return Ok(());
-    };
-    let Some(track_dir) = resolve_track_dir(record, track_id) else {
-        let event = format!("plan-review: cannot resolve track dir for id '{track_id}'");
-        crate::progress_log::append(record, "plan-review", &event);
-        return Ok(());
-    };
-    let src = track_dir.join(format!("{slug}-review.md"));
-    if src.is_file() {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+/// 0119: purge one entry transition's plan-review mailboxes and role outcomes.
+///
+/// Removes only `{state}/reviews/<slug>-review.md` and `{outcomes}/roles/<slug>.json` for
+/// `review_slugs()`. Cross-model files and the directories are left alone.
+pub(crate) fn purge_plan_review_entry_artifacts(record: &ProjectRecord) {
+    let roles_dir = outcome_roles_dir(record).ok();
+    for slug in review_slugs() {
+        if let Ok(path) = bundle::review_file(record, slug) {
+            let _ = std::fs::remove_file(path);
         }
-        let text = std::fs::read_to_string(&src)?;
-        crate::persist::atomic_write(&dest, bundle::normalize_newlines(&text).as_bytes())?;
+        if let Some(ref dir) = roles_dir {
+            let _ = std::fs::remove_file(dir.join(format!("{slug}.json")));
+        }
     }
-    Ok(())
 }
 
 /// Which track reviews to archive before a fresh start deletes mailboxes.
@@ -965,13 +1047,24 @@ pub fn clear_plan_review_artifacts(record: &ProjectRecord, clear: &ArtifactClear
     }
 }
 
-fn degrade_message(missing: &[&str], duds: &[String]) -> String {
-    let mut msg = format!("plan-review: degraded {}", missing.join(","));
-    if !duds.is_empty() {
-        msg.push_str("; slot: dud ");
-        msg.push_str(&duds.join(", "));
+fn log_join_wait_once(record: &ProjectRecord, state: &RunState, missing: &[&str]) {
+    let msg = format!(
+        "plan-review: join waits {} (spawned this entry; phase clock bounds it)",
+        missing.join(", ")
+    );
+    if state.last_event == msg {
+        return;
     }
-    msg
+    let _ = with_run_state_lock(record, || {
+        let mut s = load_run_state(record)?;
+        if s.phase != PHASE_PLAN_REVIEW || s.last_event == msg {
+            return Ok(());
+        }
+        s.last_event = msg.clone();
+        s.updated_at = chrono::Utc::now();
+        save_run_state(record, &s)
+    });
+    crate::progress_log::append(record, "plan-review", &msg);
 }
 
 fn try_join(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> {
@@ -979,26 +1072,102 @@ fn try_join(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
     if state.phase != PHASE_PLAN_REVIEW {
         return Ok(None);
     }
+    // 0119: a synchronous admission failure stops the phase **before** the pending guard, so a
+    // still-running sibling cannot mask it and nothing is degraded.
+    let admission: Vec<(String, String)> = review_slugs()
+        .iter()
+        .filter_map(|slug| {
+            state
+                .plan_review_admission_failure(slug)
+                .map(|cause| ((*slug).to_string(), cause.to_string()))
+        })
+        .collect();
+    if !admission.is_empty() {
+        let msg = admission
+            .iter()
+            .map(|(slug, cause)| format!("{slug} admission failed: {cause}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return fail_phase(
+            record,
+            &state,
+            FailureClass::Permission,
+            format!("plan-review: {msg}"),
+            OutcomeSource::Test,
+        );
+    }
     if !state.pending_roles.is_empty() {
         return Ok(None);
     }
+    let Some(entry) = state.plan_review_entry_current() else {
+        let msg = "plan-review: join without an entry";
+        if state.last_event != msg {
+            crate::progress_log::append(record, "plan-review", msg);
+        }
+        return Ok(None);
+    };
     let produced: Vec<&'static str> = review_slugs()
         .iter()
         .copied()
-        .filter(|slug| review_produced(record, slug))
+        .filter(|slug| bundle::review_produced(record, &state, slug))
         .collect();
-    if produced.is_empty() {
-        if let Some(id) = state.track_id.as_deref()
-            && resolve_track_dir(record, id).is_none()
-        {
+    let missing: Vec<&'static str> = review_slugs()
+        .iter()
+        .copied()
+        .filter(|slug| !bundle::review_produced(record, &state, slug))
+        .collect();
+    if produced.is_empty()
+        && let Some(id) = state.track_id.as_deref()
+        && resolve_track_dir(record, id).is_none()
+    {
+        return fail_phase(
+            record,
+            &state,
+            FailureClass::HarnessCrash,
+            format!("plan-review: cannot resolve track dir for id '{id}'"),
+            OutcomeSource::Test,
+        );
+    }
+    let budget = super::plan_review::remaining_budget(record, &state);
+    match super::plan_review::join_gate(&state, &missing, budget) {
+        super::plan_review::JoinGate::FailAdmission(v) => {
+            let msg = v
+                .iter()
+                .map(|(slug, cause)| format!("{slug} admission failed: {cause}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return fail_phase(
+                record,
+                &state,
+                FailureClass::Permission,
+                format!("plan-review: {msg}"),
+                OutcomeSource::Test,
+            );
+        }
+        super::plan_review::JoinGate::Rearm(v) => {
+            super::plan_review::rearm_missing(record, &v, entry)?;
+            return Ok(None);
+        }
+        super::plan_review::JoinGate::Wait => {
+            log_join_wait_once(record, &state, &missing);
+            return Ok(None);
+        }
+        super::plan_review::JoinGate::NoBudget(v) => {
             return fail_phase(
                 record,
                 &state,
                 FailureClass::HarnessCrash,
-                format!("plan-review: cannot resolve track dir for id '{id}'"),
+                format!(
+                    "plan-review: {} never spawned (no remaining spawn budget)",
+                    v.join(", ")
+                ),
                 OutcomeSource::Test,
             );
         }
+        super::plan_review::JoinGate::Degrade => {}
+    }
+    if produced.is_empty() {
+        // Only ran/failed slots reach here; the existing zero-output ladder is unchanged.
         if super::plan_review::maybe_rearm_join_retry(record)? {
             return Ok(None);
         }
@@ -1014,68 +1183,128 @@ fn try_join(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
             OutcomeSource::Test,
         );
     }
-    if let Some(id) = state.track_id.as_deref() {
-        super::reuse::write_join_receipt(record, id);
-    }
+    super::reuse::write_join_receipt(record, &state);
     bundle::assemble(record, &state)?;
-    let missing: Vec<&'static str> = review_slugs()
-        .iter()
-        .copied()
-        .filter(|slug| !review_produced(record, slug))
-        .collect();
     let msg = if missing.is_empty() {
         None
     } else {
-        Some(degrade_message(
-            &missing,
-            state
-                .review
-                .as_ref()
-                .map(|r| r.duds.as_slice())
-                .unwrap_or(&[]),
-        ))
+        Some(super::plan_review::degrade_message(&state, &missing, false))
     };
     synth_success(record, &state, msg, OutcomeSource::Test)
 }
 
+/// What the plan-review timeout exit decided.
+#[derive(Debug)]
+pub enum TimeoutDecision {
+    /// Apply this outcome (a success with named degradations, or a named failure).
+    Apply(PhaseOutcome),
+    /// Nothing is missing and pending is empty: the join owns that state.
+    LetJoin,
+}
+
 /// Join-timeout helper (caller already holds apply + run-state locks).
 ///
-/// Returns a parent success outcome when one reviewer finished and the leftover
-/// slot can be degraded. Does not apply (avoids lock re-entry).
+/// 0119 spec §3.1.1: adopt a missing entry first, then classify **every** pending and missing
+/// slug. A never-tried or admission-failed slot fails the phase (named), a produced leftover is
+/// not degraded and is in the receipt, and an empty pending with nothing missing returns
+/// `LetJoin` instead of the generic "phase budget exceeded". The failure/`LetJoin` paths perform
+/// no pending clear, no receipt write and no assembly.
 pub fn timeout_plan_review_outcome(
     record: &ProjectRecord,
     state: &RunState,
-) -> Result<Option<PhaseOutcome>> {
-    if state.pending_roles.len() != 1 {
-        return Ok(None);
+) -> Result<TimeoutDecision> {
+    let mut snap = state.clone();
+    if snap.phase == PHASE_PLAN_REVIEW && snap.plan_review_entry_current().is_none() {
+        // A pre-0119 mid-phase state at the budget must not be classified from empty books.
+        snap.adopt_plan_review_entry();
+        snap.updated_at = chrono::Utc::now();
+        save_run_state(record, &snap)?;
     }
-    let leftover = state.pending_roles[0].clone();
-    let other_done = review_slugs()
+    if snap.phase != PHASE_PLAN_REVIEW {
+        return Ok(TimeoutDecision::LetJoin);
+    }
+    let mut missing: Vec<(String, super::plan_review::SlotCause)> = Vec::new();
+    let mut produced_any = false;
+    for slug in review_slugs() {
+        if bundle::review_produced(record, &snap, slug) {
+            produced_any = true;
+            continue;
+        }
+        missing.push((
+            (*slug).to_string(),
+            super::plan_review::slot_cause(&snap, slug),
+        ));
+    }
+    let never: Vec<&(String, super::plan_review::SlotCause)> = missing
         .iter()
-        .any(|slug| *slug != leftover.as_str() && review_produced(record, slug));
-    if !other_done {
-        return Ok(None);
+        .filter(|(_, cause)| {
+            matches!(
+                cause,
+                super::plan_review::SlotCause::NeverSpawned
+                    | super::plan_review::SlotCause::AdmissionFailed(_)
+            )
+        })
+        .collect();
+    if !never.is_empty() {
+        let class = if never
+            .iter()
+            .any(|(_, c)| matches!(c, super::plan_review::SlotCause::AdmissionFailed(_)))
+        {
+            FailureClass::Permission
+        } else {
+            FailureClass::Timeout
+        };
+        // Name every cause, not only the never-tried ones: the phase failure is the operator's
+        // only record of the attempt, and the ran/failed leftovers explain why nothing produced.
+        let parts = missing
+            .iter()
+            .map(|(slug, cause)| format!("{slug} {}", cause.describe()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(TimeoutDecision::Apply(PhaseOutcome::failure(
+            snap.phase.clone(),
+            class,
+            OutcomeSource::Timeout,
+            Some(format!("plan-review: {parts}")),
+            Some(snap.run_epoch),
+        )));
     }
-    let mut cleared = state.clone();
+    if snap.pending_roles.is_empty() && missing.is_empty() {
+        return Ok(TimeoutDecision::LetJoin);
+    }
+    if !produced_any {
+        let parts = missing
+            .iter()
+            .map(|(slug, cause)| format!("{slug} {}", cause.describe()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(TimeoutDecision::Apply(PhaseOutcome::failure(
+            snap.phase.clone(),
+            FailureClass::Timeout,
+            OutcomeSource::Timeout,
+            Some(format!(
+                "plan-review: no reviewer produced output ({parts})"
+            )),
+            Some(snap.run_epoch),
+        )));
+    }
+    let mut cleared = snap.clone();
     cleared.pending_roles.clear();
     save_run_state(record, &cleared)?;
-    if let Some(id) = state.track_id.as_deref() {
-        super::reuse::write_join_receipt(record, id);
-    }
+    super::reuse::write_join_receipt(record, &cleared);
     bundle::assemble(record, &cleared)?;
-    Ok(Some(PhaseOutcome::success(
-        state.phase.clone(),
+    let degraded: Vec<&str> = missing.iter().map(|(slug, _)| slug.as_str()).collect();
+    let msg = if degraded.is_empty() {
+        None
+    } else {
+        Some(super::plan_review::degrade_message(&snap, &degraded, true))
+    };
+    Ok(TimeoutDecision::Apply(PhaseOutcome::success(
+        snap.phase.clone(),
         OutcomeSource::Timeout,
-        Some(degrade_message(
-            &[leftover.as_str()],
-            state
-                .review
-                .as_ref()
-                .map(|r| r.duds.as_slice())
-                .unwrap_or(&[]),
-        )),
+        msg,
         None,
-        Some(state.run_epoch),
+        Some(snap.run_epoch),
     )))
 }
 
@@ -2807,15 +3036,26 @@ mod tests {
         state.track_id = Some("0083".into());
         state.pending_roles = vec!["opencode".into()];
         state.run_epoch = 1;
+        state.adopt_plan_review_entry();
+        // The leftover resolves as `ran; produced no review` (not never-spawned), so the timeout
+        // helper takes the degrade-success arm.
+        state.plan_review_slot_ran = vec!["opencode".into()];
         crate::state::save_run_state(&r, &state).unwrap();
-        let outcome = timeout_plan_review_outcome(&r, &state)
-            .unwrap()
-            .expect("degraded join");
+        let outcome = match timeout_plan_review_outcome(&r, &state).unwrap() {
+            TimeoutDecision::Apply(outcome) => outcome,
+            other => panic!("expected a timeout decision, got {other:?}"),
+        };
         assert_eq!(outcome.source, crate::outcome::OutcomeSource::Timeout);
+        let msg = outcome.message.unwrap_or_default();
+        assert!(
+            msg.contains("opencode (timeout; ran; produced no review)"),
+            "{msg}"
+        );
         let parsed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(track.join("reuse.json")).unwrap()).unwrap();
         assert!(parsed["slots"]["agy"]["review_sha256"].is_string());
         assert!(parsed["slots"].get("opencode").is_none());
+        assert_eq!(parsed["epoch"], 1);
         assert!(parsed.get("pr").is_none());
     }
 
@@ -3190,18 +3430,26 @@ mod tests {
         let mut state = plan_state(&record, PHASE_PLAN_REVIEW, "0001");
         state.status = RunStatus::Running;
         state.pending_roles = vec!["agy".into()];
+        state.adopt_plan_review_entry();
         crate::state::save_run_state(&record, &state).unwrap();
+        let entry = state.plan_review_entry.unwrap();
 
         let roles = outcome_roles_dir(&record).unwrap();
         std::fs::create_dir_all(&roles).unwrap();
         let mailbox = roles.join("agy.json");
-        let outcome = PhaseOutcome::failure(
+        let mut outcome = PhaseOutcome::failure(
             role_phase("agy"),
             FailureClass::Permission,
             OutcomeSource::Adapter,
             None,
             Some(state.run_epoch),
         );
+        // 0119: the consumer fails closed on a missing epoch/entry pair.
+        outcome.metadata = Some(crate::outcome::OutcomeMetadata {
+            role: Some(crate::workflow::graph::ROLE_REVIEWER_AGY.into()),
+            entry_id: Some(entry.entry_id),
+            ..Default::default()
+        });
         crate::persist::atomic_write_json(&mailbox, &outcome).unwrap();
 
         let _fail = fail_pending_save_once(&record.id, "agy");

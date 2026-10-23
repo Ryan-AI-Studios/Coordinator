@@ -171,6 +171,19 @@ pub struct RunState {
     /// Slugs whose child actually ran `backend.run` this phase (0054). Additive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan_review_slot_ran: Vec<String>,
+    /// 0119: the persisted plan-review entry identity.
+    ///
+    /// `(run_epoch, entry_id)` is minted on every transition **into** `plan-review`, survives the
+    /// phase exit (monotonicity), and is adopted - never re-minted - when a process resumes a
+    /// phase already in flight. Absent on pre-0119 files (`None`), which adopt `{run_epoch, 1}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_review_entry: Option<PlanReviewEntry>,
+    /// 0119: per-slug, entry-scoped degraded cause (`ran; dud: ...`, `failed: ...`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plan_review_verdicts: BTreeMap<String, String>,
+    /// 0119: per-slug synchronous admission failures (no child ever started).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plan_review_admission_failures: BTreeMap<String, String>,
     /// Address-findings entries this `run_epoch` (0031). Cap 2. Always serialized on disk.
     #[serde(default)]
     pub address_findings_attempts: u32,
@@ -378,6 +391,9 @@ impl RunState {
             plan_review_spawned: Vec::new(),
             plan_review_join_retries: 0,
             plan_review_slot_ran: Vec::new(),
+            plan_review_entry: None,
+            plan_review_verdicts: BTreeMap::new(),
+            plan_review_admission_failures: BTreeMap::new(),
             address_findings_attempts: 0,
             sticky_ready_ids: Vec::new(),
             checkpoint_branch: None,
@@ -407,6 +423,121 @@ impl RunState {
         }
         Duration::from_millis(wall.saturating_sub(paused))
     }
+
+    /// 0119: mint the entry for a transition **into** `plan-review` and clear its books.
+    ///
+    /// `entry_id` is previous same-epoch id + 1, else 1. Only a real transition calls this; an
+    /// in-flight phase is adopted, never re-minted.
+    pub fn begin_plan_review_entry(&mut self) {
+        let entry_id = match self.plan_review_entry {
+            Some(e) if e.run_epoch == self.run_epoch => e.entry_id.saturating_add(1),
+            _ => 1,
+        };
+        self.plan_review_entry = Some(PlanReviewEntry {
+            run_epoch: self.run_epoch,
+            entry_id,
+        });
+        self.clear_plan_review_books();
+        // A stall from an earlier entry must not suppress this entry's retry. `review.duds` stays
+        // diagnostic (it is not a join cause).
+        let slugs = crate::workflow::graph::review_slugs();
+        if let Some(rv) = self.review.as_mut() {
+            rv.stalled.retain(|s| !slugs.contains(&s.as_str()));
+        }
+    }
+
+    /// 0119: adopt the in-flight entry for a phase that is already `plan-review`.
+    ///
+    /// Keeps a same-epoch entry; otherwise starts `{run_epoch, 1}`. **Never** clears the books,
+    /// verdicts or admission failures: a mid-phase resume must not re-spawn live children.
+    ///
+    /// This assumes the kept entry is exactly the in-flight one. Production sets the phase only
+    /// through `on_success`, so a same-epoch retained entry can only be that entry; a hand-edited
+    /// state that keeps an older same-epoch id is not a supported state.
+    pub fn adopt_plan_review_entry(&mut self) {
+        if !matches!(self.plan_review_entry, Some(e) if e.run_epoch == self.run_epoch) {
+            self.plan_review_entry = Some(PlanReviewEntry {
+                run_epoch: self.run_epoch,
+                entry_id: 1,
+            });
+        }
+    }
+
+    /// 0119: clear the entry's books on the way out, keeping the entry for monotonicity.
+    ///
+    /// The retained entry is inert because [`Self::plan_review_entry_current`] also requires the
+    /// phase to be `plan-review`.
+    pub fn leave_plan_review(&mut self) {
+        self.clear_plan_review_books();
+    }
+
+    /// 0119: clear the plan-review books, verdicts and admission records only.
+    pub fn clear_plan_review_books(&mut self) {
+        self.plan_review_spawned.clear();
+        self.plan_review_slot_ran.clear();
+        self.plan_review_join_retries = 0;
+        self.plan_review_verdicts.clear();
+        self.plan_review_admission_failures.clear();
+    }
+
+    /// 0119: the read fence. `Some` only for the live epoch while the phase is `plan-review`.
+    pub fn plan_review_entry_current(&self) -> Option<PlanReviewEntry> {
+        self.plan_review_entry.filter(|e| {
+            e.run_epoch == self.run_epoch && self.phase == crate::workflow::graph::PHASE_PLAN_REVIEW
+        })
+    }
+
+    /// 0119: spawn ledger for the current entry (empty when no entry is live).
+    pub fn plan_review_spawned_now(&self) -> &[String] {
+        if self.plan_review_entry_current().is_some() {
+            &self.plan_review_spawned
+        } else {
+            &[]
+        }
+    }
+
+    /// 0119: ran ledger for the current entry (empty when no entry is live).
+    pub fn plan_review_slot_ran_now(&self) -> &[String] {
+        if self.plan_review_entry_current().is_some() {
+            &self.plan_review_slot_ran
+        } else {
+            &[]
+        }
+    }
+
+    /// 0119: join retry counter for the current entry (0 when no entry is live).
+    pub fn plan_review_join_retries_now(&self) -> u32 {
+        if self.plan_review_entry_current().is_some() {
+            self.plan_review_join_retries
+        } else {
+            0
+        }
+    }
+
+    /// 0119: this entry's recorded verdict for `slug`, if any.
+    pub fn plan_review_verdict(&self, slug: &str) -> Option<&str> {
+        self.plan_review_entry_current()?;
+        self.plan_review_verdicts.get(slug).map(String::as_str)
+    }
+
+    /// 0119: this entry's synchronous admission failure for `slug`, if any.
+    pub fn plan_review_admission_failure(&self, slug: &str) -> Option<&str> {
+        self.plan_review_entry_current()?;
+        self.plan_review_admission_failures
+            .get(slug)
+            .map(String::as_str)
+    }
+}
+
+/// One adapter plan-review entry: the identity of the phase attempt that owns every book.
+///
+/// Persisted in `run-state.json`, minted on entry into `plan-review`, **never reset within an
+/// epoch**, and adopted on resume. A worker from an earlier `entry_id` cannot stamp, write a
+/// review, or write a role outcome into the live entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanReviewEntry {
+    pub run_epoch: u64,
+    pub entry_id: u64,
 }
 
 /// Status JSON fields (CLI + GET /v1/status). Additive layout fields from 0006.
@@ -868,6 +999,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_review_entry_is_additive_and_defaults_to_none() {
+        let mut s = RunState::idle("p");
+        s.run_epoch = 4;
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(!text.contains("plan_review_entry"), "{text}");
+        s.plan_review_entry = Some(PlanReviewEntry {
+            run_epoch: 4,
+            entry_id: 2,
+        });
+        let back: RunState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(
+            back.plan_review_entry,
+            Some(PlanReviewEntry {
+                run_epoch: 4,
+                entry_id: 2
+            })
+        );
+        let mut v = serde_json::to_value(RunState::idle("p")).unwrap();
+        v["run_epoch"] = serde_json::json!(4);
+        v.as_object_mut().unwrap().remove("plan_review_entry");
+        let legacy: RunState = serde_json::from_value(v).unwrap();
+        assert!(legacy.plan_review_entry.is_none());
+    }
+
+    #[test]
+    fn new_entry_clears_a_plan_review_stall() {
+        let mut s = RunState::idle("p");
+        s.run_epoch = 7;
+        s.phase = crate::workflow::graph::PHASE_PLAN_REVIEW.into();
+        s.review = Some(ReviewWatchState {
+            stalled: vec!["agy".into(), "codex".into()],
+            ..Default::default()
+        });
+        s.begin_plan_review_entry();
+        let rv = s.review.as_ref().unwrap();
+        assert!(
+            !rv.stalled.iter().any(|x| x == "agy"),
+            "a plan-review slug must not carry across entries: {:?}",
+            rv.stalled
+        );
+        assert!(
+            rv.stalled.iter().any(|x| x == "codex"),
+            "only plan-review slugs are entry-scoped: {:?}",
+            rv.stalled
+        );
+        assert_eq!(
+            s.plan_review_entry,
+            Some(PlanReviewEntry {
+                run_epoch: 7,
+                entry_id: 1
+            })
+        );
+    }
+
+    #[test]
+    fn entry_books_are_inert_for_another_entry() {
+        let mut s = RunState::idle("p");
+        s.run_epoch = 3;
+        s.phase = crate::workflow::graph::PHASE_PLAN_REVIEW.into();
+        s.begin_plan_review_entry();
+        s.plan_review_spawned = vec!["agy".into()];
+        s.plan_review_slot_ran = vec!["agy".into()];
+        s.plan_review_join_retries = 1;
+        s.plan_review_verdicts
+            .insert("opencode".into(), "ran; produced no review".into());
+        s.plan_review_admission_failures
+            .insert("opencode".into(), "empty command".into());
+        assert_eq!(s.plan_review_spawned_now(), ["agy".to_string()]);
+        assert_eq!(s.plan_review_slot_ran_now(), ["agy".to_string()]);
+        assert_eq!(s.plan_review_join_retries_now(), 1);
+        assert_eq!(
+            s.plan_review_verdict("opencode"),
+            Some("ran; produced no review")
+        );
+        assert_eq!(
+            s.plan_review_admission_failure("opencode"),
+            Some("empty command")
+        );
+        // The read fence is keyed by `(run_epoch, entry_id)`: the only stored entry owns the
+        // books, and a different **epoch** cannot observe them even if a writer forgot to clear.
+        s.run_epoch = 4;
+        assert!(s.plan_review_entry_current().is_none());
+        assert!(s.plan_review_spawned_now().is_empty());
+        assert!(s.plan_review_slot_ran_now().is_empty());
+        assert_eq!(s.plan_review_join_retries_now(), 0);
+        assert!(s.plan_review_verdict("opencode").is_none());
+        assert!(s.plan_review_admission_failure("opencode").is_none());
+        // Restoring the live epoch restores the values (they were never cleared).
+        s.run_epoch = 3;
+        assert_eq!(s.plan_review_spawned_now(), ["agy".to_string()]);
+        assert_eq!(s.plan_review_slot_ran_now(), ["agy".to_string()]);
+        assert_eq!(s.plan_review_join_retries_now(), 1);
+        assert_eq!(
+            s.plan_review_verdict("opencode"),
+            Some("ran; produced no review")
+        );
+    }
+
+    #[test]
     fn review_reviewed_oid_is_additive() {
         let old: ReviewWatchState = serde_json::from_str(r#"{"verdict":"PASS"}"#).unwrap();
         assert!(old.reviewed_oid.is_none());
@@ -979,6 +1209,7 @@ mod tests {
 
     #[test]
     fn status_project_renders_holder_candidate() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let path = holder_persist(
@@ -1013,6 +1244,7 @@ mod tests {
 
     #[test]
     fn status_project_renders_holder_kept_dead_persist_no_address() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let state = stale_state(&rec);
@@ -1076,6 +1308,7 @@ mod tests {
 
     #[test]
     fn status_project_renders_holder_absent() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let state = stale_state(&rec);
@@ -1088,6 +1321,7 @@ mod tests {
 
     #[test]
     fn status_project_renders_holder_names_the_persist_path() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let path = holder_persist(&rec, holder_body(&rec, None, false, None, None, None));
@@ -1099,6 +1333,7 @@ mod tests {
 
     #[test]
     fn status_view_additive_holder_field() {
+        let _env = crate::config::test_env_lock();
         let dir = tempdir().unwrap();
         let rec = holder_record(dir.path());
         let state = stale_state(&rec);
@@ -1222,6 +1457,7 @@ mod tests {
 
     #[test]
     fn state_dir_record_override() {
+        let _env = crate::config::test_env_lock();
         let proj = tempdir().unwrap();
         let over = tempdir().unwrap();
         let mut rec = sample_record(proj.path());
