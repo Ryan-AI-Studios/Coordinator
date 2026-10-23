@@ -11466,8 +11466,27 @@ mod tests {
         assert_eq!(identity.holder_pid, None);
         assert_eq!(identity.pid, None);
         assert!(!identity.prompt_in_flight);
-        let bytes = file_bytes(rec);
-        assert_eq!(bytes, file_bytes(rec), "B's bytes are unchanged");
+        // (c) Capture B, then run the stale writers that lost the interleaving: neither
+        // may rewrite a byte of the retry's claim.
+        let b_bytes = file_bytes(rec);
+        let stale = PersistRef::new(
+            attempt_identity(rec, "grok"),
+            SystemTime::now() - Duration::from_secs(3600),
+        );
+        assert!(
+            !mark_start_error(rec, Some(&stale), "stale merge writer"),
+            "a stale attempt cannot rewrite B"
+        );
+        let stale_session = mock_session_for(rec, "sess-stale");
+        assert!(
+            !write_holder_ready(rec, &stale_session, None, Some(&stale)),
+            "a stale ready write cannot publish over B"
+        );
+        assert_eq!(
+            b_bytes,
+            file_bytes(rec),
+            "B's bytes are unchanged after the stale writers"
+        );
     }
 
     #[test]
