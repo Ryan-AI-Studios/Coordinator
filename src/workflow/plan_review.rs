@@ -5555,19 +5555,24 @@ mod tests {
 
         enter_plan_review(&r, "0001");
         tick_retry(&r).unwrap();
+        // The join can finish inside this same tick when both scripted workers are fast; in that
+        // case the advance already cleared the spawn ledger. Assert the marks only while the phase
+        // is still plan-review, then prove both slots ran.
         let after_spawn = load_run_state(&r).unwrap();
-        assert!(
-            after_spawn
-                .plan_review_spawned
-                .iter()
-                .any(|s| s == REVIEW_SLUG_AGY)
-        );
-        assert!(
-            after_spawn
-                .plan_review_spawned
-                .iter()
-                .any(|s| s == REVIEW_SLUG_OPENCODE)
-        );
+        if after_spawn.phase == graph::PHASE_PLAN_REVIEW {
+            assert!(
+                after_spawn
+                    .plan_review_spawned
+                    .iter()
+                    .any(|s| s == REVIEW_SLUG_AGY)
+            );
+            assert!(
+                after_spawn
+                    .plan_review_spawned
+                    .iter()
+                    .any(|s| s == REVIEW_SLUG_OPENCODE)
+            );
+        }
         wait_both_consumed(&r);
         assert_eq!(counts.n(), 2);
 
