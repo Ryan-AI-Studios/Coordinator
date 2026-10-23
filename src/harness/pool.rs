@@ -3334,10 +3334,15 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
     let session = match started {
         Ok(s) => s,
         Err(e) => {
-            if !mark_start_error(&rec, stamp.as_ref(), &e.to_string()) {
-                eprintln!(
+            match mark_start_error_outcome(&rec, stamp.as_ref(), &e.to_string()) {
+                PersistAct::Ok => {}
+                PersistAct::Refused => eprintln!(
                     "coordinator: holder child refused to publish its error record (persist changed)"
-                );
+                ),
+                // A fence failure is named, never reported as a record change.
+                PersistAct::Unavailable(lock_err) => eprintln!(
+                    "coordinator: holder child could not publish its error record: {lock_err}"
+                ),
             }
             return Err(e);
         }
