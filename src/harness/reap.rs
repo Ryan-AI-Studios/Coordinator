@@ -8,14 +8,17 @@
 //! `Shutdown` RPC. Every unknown or unreadable state keeps the holder.
 
 use std::collections::BTreeSet;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{CoordinatorError, Result};
 use crate::features::{self, Duty};
-use crate::harness::pool::{self, HolderReapRpc, PersistIdentity};
+use crate::harness::pool::{
+    self, HolderTermination, Intent, NoSocketWhy, PersistClass, PersistIdentity,
+};
 use crate::registry::ProjectRecord;
 use crate::state::{
     RunStatus, load_run_state, resolve_state_dir, run_state_path, with_run_state_lock,
@@ -59,7 +62,10 @@ pub enum ReapSkip {
     RecentlyActive,
     MissingPersist,
     UnreadablePersist,
-    NotAlive,
+    /// An evidence-free record (all three producers): kept with a stated reason.
+    DeadPersistNoAddress,
+    /// The holder wrote its own dead record between the Ping and the delivery.
+    AlreadyDead,
     PromptInFlight,
     NoHolderPid,
     SelfPid,
@@ -122,6 +128,311 @@ pub(crate) fn tick_project(record: &ProjectRecord, now: DateTime<Utc>) -> ReapOu
     }
 }
 
+/// Additive read-only holder lifecycle view (`status.holder`, spec §7.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HolderLifecycle {
+    /// `gate-off` | `active` | `absent` | `candidate` | `kept`.
+    pub state: String,
+    /// The stable §7.2 token (`dead-persist-no-address`, `pre-rpc-eligible`, …).
+    pub reason: String,
+    /// Pre-RPC eligibility — never an identity verdict.
+    pub candidate: bool,
+    pub run_terminal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_alive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_path: Option<PathBuf>,
+    pub age_secs: u64,
+}
+
+/// The persist the sweep should prove (file-only eligibility already passed).
+#[derive(Debug, Clone)]
+pub(crate) struct Candidate {
+    pub identity: PersistIdentity,
+    /// The load-time mtime; the sweep's delivery re-read compares against it.
+    #[allow(dead_code)]
+    pub mtime: std::time::SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Decision {
+    pub lifecycle: HolderLifecycle,
+    pub candidate: Option<Candidate>,
+}
+
+fn kept(mut view: HolderLifecycle, state: &str, reason: &str) -> Decision {
+    view.state = state.into();
+    view.reason = reason.into();
+    view.candidate = false;
+    Decision {
+        lifecycle: view,
+        candidate: None,
+    }
+}
+
+/// The one file-only gate list (§7.2 steps 1-8): no run-state lock, no RPC, no re-read.
+/// A no-address record is classified **before** the `session_id`/`cwd` gates, so both
+/// attempt shapes reach the shared `dead-persist-no-address` producer reason.
+pub(crate) fn decide(
+    record: &ProjectRecord,
+    now: DateTime<Utc>,
+    state: &crate::state::RunState,
+    state_present: bool,
+    gate_on: bool,
+) -> Decision {
+    let age = age_secs(now, state.updated_at);
+    let run_terminal =
+        state_present && matches!(state.status, RunStatus::Idle | RunStatus::Stopped);
+    let view = HolderLifecycle {
+        state: "absent".into(),
+        reason: "missing-run-state".into(),
+        candidate: false,
+        run_terminal,
+        persist_alive: None,
+        holder_pid: None,
+        session_id: None,
+        // §7.5: the resolved path is reported whenever a persist exists, even when an
+        // earlier gate (gate-off/absent/active/too-young) stopped the walk — the
+        // recovery steps must be executable from `status --project` in every state.
+        persist_path: pool::persist_path(record).ok().filter(|path| path.exists()),
+        age_secs: age,
+    };
+    if !gate_on {
+        return kept(view, "gate-off", "gate-off");
+    }
+    if !state_present {
+        return kept(view, "absent", "missing-run-state");
+    }
+    if matches!(state.status, RunStatus::Running | RunStatus::Paused) {
+        return kept(view, "active", "active");
+    }
+    if !old_enough(now, state.updated_at) {
+        return kept(view, "active", "too-young");
+    }
+    let (identity, mtime) = match pool::persist_identity(record) {
+        Ok(Some(found)) => found,
+        Ok(None) => return kept(view, "absent", "missing-persist"),
+        Err(_) => return kept(view, "kept", "unreadable-persist"),
+    };
+    let mut view = view;
+    view.persist_alive = Some(identity.alive);
+    view.holder_pid = identity.holder_pid;
+    view.session_id = identity.session_id.clone();
+    view.persist_path = pool::persist_path(record).ok();
+    if identity.project_id != record.id {
+        return kept(view, "kept", "identity-unproven:project-id");
+    }
+    match pool::classify_persist(&identity) {
+        PersistClass::NoAddress(why) => {
+            let (state, reason) = match why {
+                NoSocketWhy::DeadAfterExit
+                | NoSocketWhy::FailedStart
+                | NoSocketWhy::PendingStart => ("kept", "dead-persist-no-address"),
+                NoSocketWhy::AliveSelfNoAddress => ("kept", "self-pid"),
+                NoSocketWhy::AliveForeignNoAddress => ("kept", "no-control-addr"),
+                NoSocketWhy::AliveUnknownNoAddress => ("kept", "no-holder-pid"),
+            };
+            return kept(view, state, reason);
+        }
+        PersistClass::Addressed { .. } => {}
+    }
+    match identity.holder_pid {
+        None | Some(0) => return kept(view, "kept", "no-holder-pid"),
+        Some(pid) if pid == std::process::id() => return kept(view, "kept", "self-pid"),
+        Some(_) => {}
+    }
+    if identity.session_id.is_none() {
+        return kept(view, "kept", "no-session");
+    }
+    if identity.cwd.is_none() {
+        return kept(view, "kept", "no-cwd");
+    }
+    if identity.prompt_in_flight {
+        return kept(view, "kept", "prompt-in-flight");
+    }
+    if !old_enough(now, DateTime::<Utc>::from(mtime)) {
+        return kept(view, "kept", "recently-active");
+    }
+    if !cwd_is_owned(record, &identity) {
+        return kept(view, "kept", "cwd-not-owned");
+    }
+    view.state = "candidate".into();
+    view.reason = "pre-rpc-eligible".into();
+    view.candidate = true;
+    Decision {
+        lifecycle: view,
+        candidate: Some(Candidate { identity, mtime }),
+    }
+}
+
+fn warn(record: &ProjectRecord, key: &str, session: &str, line: &str) {
+    warn_once(format!("{}:{}:{}", record.id, key, session), line);
+}
+
+fn skip_for_reason(
+    record: &ProjectRecord,
+    reason: &str,
+    state: &crate::state::RunState,
+) -> ReapSkip {
+    match reason {
+        "gate-off" => ReapSkip::FeatureOff,
+        "missing-run-state" => ReapSkip::MissingRunState,
+        "unreadable-state" => ReapSkip::UnreadableState,
+        "active" => ReapSkip::Active,
+        "too-young" => ReapSkip::TooYoung,
+        "missing-persist" => ReapSkip::MissingPersist,
+        "unreadable-persist" => {
+            warn(
+                record,
+                "unreadable-persist",
+                "",
+                &format!(
+                    "coordinator: holder-reap: project {} persist unreadable; keeping holder",
+                    record.id
+                ),
+            );
+            ReapSkip::UnreadablePersist
+        }
+        "dead-persist-no-address" => ReapSkip::DeadPersistNoAddress,
+        "self-pid" => ReapSkip::SelfPid,
+        "no-control-addr" => {
+            warn(
+                record,
+                "no-control-addr",
+                "",
+                &format!(
+                    "coordinator: holder-reap: project {} holder has no control address; keeping",
+                    record.id
+                ),
+            );
+            ReapSkip::NoControlAddr
+        }
+        "no-holder-pid" => ReapSkip::NoHolderPid,
+        "no-session" => ReapSkip::NoSession,
+        "no-cwd" => ReapSkip::NoCwd,
+        "prompt-in-flight" => ReapSkip::PromptInFlight,
+        "recently-active" => ReapSkip::RecentlyActive,
+        "cwd-not-owned" => ReapSkip::CwdNotOwned,
+        other => {
+            let why = other
+                .strip_prefix("identity-unproven:")
+                .unwrap_or(other)
+                .to_string();
+            warn(
+                record,
+                "identity-unproven",
+                state.track_id.as_deref().unwrap_or(""),
+                &format!(
+                    "coordinator: holder-reap: project {} identity unproven ({why}); keeping holder",
+                    record.id
+                ),
+            );
+            ReapSkip::IdentityUnproven(why)
+        }
+    }
+}
+
+fn map_proof_failure(
+    record: &ProjectRecord,
+    identity: &PersistIdentity,
+    termination: HolderTermination,
+) -> ReapOutcome {
+    let session = identity.session_id.as_deref().unwrap_or("");
+    match termination {
+        HolderTermination::NoListener { .. } => {
+            warn(
+                record,
+                "identity",
+                session,
+                &format!(
+                    "coordinator: holder-reap: project {} identity unproven (connect-refused); \
+                     keeping holder",
+                    record.id
+                ),
+            );
+            ReapOutcome::Skipped(ReapSkip::IdentityUnproven("connect-refused".into()))
+        }
+        HolderTermination::NoSocket { why } => ReapOutcome::Skipped(no_socket_skip(why)),
+        HolderTermination::Unproven { why } => {
+            warn(
+                record,
+                "identity",
+                session,
+                &format!(
+                    "coordinator: holder-reap: project {} identity unproven ({why}); keeping holder",
+                    record.id
+                ),
+            );
+            ReapOutcome::Skipped(ReapSkip::IdentityUnproven(why))
+        }
+        // The proof phase cannot produce these two.
+        other => map_delivery(record, identity, other),
+    }
+}
+
+fn no_socket_skip(why: NoSocketWhy) -> ReapSkip {
+    match why {
+        NoSocketWhy::DeadAfterExit | NoSocketWhy::FailedStart | NoSocketWhy::PendingStart => {
+            ReapSkip::DeadPersistNoAddress
+        }
+        NoSocketWhy::AliveSelfNoAddress => ReapSkip::SelfPid,
+        NoSocketWhy::AliveForeignNoAddress => ReapSkip::NoControlAddr,
+        NoSocketWhy::AliveUnknownNoAddress => ReapSkip::NoHolderPid,
+    }
+}
+
+fn map_delivery(
+    record: &ProjectRecord,
+    identity: &PersistIdentity,
+    termination: HolderTermination,
+) -> ReapOutcome {
+    let session = identity.session_id.as_deref().unwrap_or("");
+    match termination {
+        HolderTermination::Delivered { .. } => ReapOutcome::Skipped(ReapSkip::ShutdownUnproven(
+            "unexpected-double-delivery".into(),
+        )),
+        HolderTermination::Exited { .. } => ReapOutcome::Skipped(ReapSkip::AlreadyDead),
+        HolderTermination::NoListener { .. } => {
+            warn(
+                record,
+                "identity",
+                session,
+                &format!(
+                    "coordinator: holder-reap: project {} identity unproven (connect-refused); \
+                     keeping holder",
+                    record.id
+                ),
+            );
+            ReapOutcome::Skipped(ReapSkip::IdentityUnproven("connect-refused".into()))
+        }
+        HolderTermination::NoSocket { why } => ReapOutcome::Skipped(no_socket_skip(why)),
+        HolderTermination::Unproven { why } => ReapOutcome::Skipped(match why.as_str() {
+            "persist-missing" => ReapSkip::MissingPersist,
+            "persist-unreadable" => ReapSkip::UnreadablePersist,
+            "prompt-in-flight" => ReapSkip::PromptInFlight,
+            "recently-active" => ReapSkip::RecentlyActive,
+            "persist-changed" => ReapSkip::IdentityUnproven("persist-changed".into()),
+            other => {
+                warn(
+                    record,
+                    "shutdown",
+                    session,
+                    &format!(
+                        "coordinator: holder-reap: project {} shutdown unproven ({other}); \
+                         keeping holder",
+                        record.id
+                    ),
+                );
+                ReapSkip::ShutdownUnproven(other.to_string())
+            }
+        }),
+    }
+}
+
 fn tick_locked(record: &ProjectRecord, now: DateTime<Utc>) -> ReapOutcome {
     let state = match load_run_state(record) {
         Ok(state) => state,
@@ -136,172 +447,43 @@ fn tick_locked(record: &ProjectRecord, now: DateTime<Utc>) -> ReapOutcome {
             return ReapOutcome::Skipped(ReapSkip::UnreadableState);
         }
     };
-    match state.status {
-        RunStatus::Running | RunStatus::Paused => return ReapOutcome::Skipped(ReapSkip::Active),
-        RunStatus::Idle | RunStatus::Stopped => {}
-    }
-    if !old_enough(now, state.updated_at) {
-        return ReapOutcome::Skipped(ReapSkip::TooYoung);
-    }
-
-    let (identity, mtime) = match pool::persist_identity(record) {
-        Ok(Some(found)) => found,
-        Ok(None) => return ReapOutcome::Skipped(ReapSkip::MissingPersist),
-        Err(e) => {
-            warn_once(
-                format!("{}:unreadable-persist", record.id),
-                &format!(
-                    "coordinator: holder-reap: project {} persist unreadable: {e}",
-                    record.id
-                ),
-            );
-            return ReapOutcome::Skipped(ReapSkip::UnreadablePersist);
-        }
+    let state_present = run_state_path(record).is_ok_and(|path| path.exists());
+    let gate_on = features::is_enabled(Duty::SelfReap);
+    let decision = decide(record, now, &state, state_present, gate_on);
+    let Some(candidate) = decision.candidate else {
+        return ReapOutcome::Skipped(skip_for_reason(record, &decision.lifecycle.reason, &state));
     };
-    if identity.project_id != record.id {
-        return ReapOutcome::Skipped(ReapSkip::IdentityUnproven("project-id".into()));
-    }
-    if !identity.alive {
-        return ReapOutcome::Skipped(ReapSkip::NotAlive);
-    }
-    if identity.prompt_in_flight {
-        return ReapOutcome::Skipped(ReapSkip::PromptInFlight);
-    }
-    match identity.holder_pid {
-        None | Some(0) => return ReapOutcome::Skipped(ReapSkip::NoHolderPid),
-        Some(pid) if pid == std::process::id() => {
-            return ReapOutcome::Skipped(ReapSkip::SelfPid);
-        }
-        Some(_) => {}
-    }
-    if identity.session_id.is_none() {
-        return ReapOutcome::Skipped(ReapSkip::NoSession);
-    }
-    if identity.cwd.is_none() {
-        return ReapOutcome::Skipped(ReapSkip::NoCwd);
-    }
-    if identity.control_addr.is_none() {
-        return ReapOutcome::Skipped(ReapSkip::NoControlAddr);
-    }
-    if !old_enough(now, DateTime::<Utc>::from(mtime)) {
-        return ReapOutcome::Skipped(ReapSkip::RecentlyActive);
-    }
-    if !cwd_is_owned(record, &identity) {
-        return ReapOutcome::Skipped(ReapSkip::CwdNotOwned);
-    }
-
-    match pool::verify_holder_identity(&identity, RPC_TIMEOUT) {
-        HolderReapRpc::Verified => {}
-        HolderReapRpc::IdentityUnproven(why) => {
-            warn_once(
-                format!(
-                    "{}:identity:{}",
-                    record.id,
-                    identity.session_id.as_deref().unwrap_or("")
-                ),
-                &format!(
-                    "coordinator: holder-reap: project {} identity unproven ({why}); keeping holder",
-                    record.id
-                ),
-            );
-            return ReapOutcome::Skipped(ReapSkip::IdentityUnproven(why));
-        }
-        HolderReapRpc::ShutdownUnproven(why) => {
-            warn_once(
-                format!(
-                    "{}:shutdown:{}",
-                    record.id,
-                    identity.session_id.as_deref().unwrap_or("")
-                ),
-                &format!(
-                    "coordinator: holder-reap: project {} shutdown unproven ({why}); keeping holder",
-                    record.id
-                ),
-            );
-            return ReapOutcome::Skipped(ReapSkip::ShutdownUnproven(why));
-        }
-    }
-
-    // Gate 6: re-read the persist immediately before termination. Classify in a
-    // fixed order so the manual-use double-check is deterministic.
-    let (again, mtime_again) = match pool::persist_identity(record) {
-        Ok(Some(found)) => found,
-        Ok(None) => return ReapOutcome::Skipped(ReapSkip::MissingPersist),
-        Err(e) => {
-            warn_once(
-                format!("{}:unreadable-persist", record.id),
-                &format!(
-                    "coordinator: holder-reap: project {} persist unreadable on re-read: {e}",
-                    record.id
-                ),
-            );
-            return ReapOutcome::Skipped(ReapSkip::UnreadablePersist);
-        }
-    };
-    if !again.alive {
-        return ReapOutcome::Skipped(ReapSkip::NotAlive);
-    }
-    if again.prompt_in_flight {
-        return ReapOutcome::Skipped(ReapSkip::PromptInFlight);
-    }
-    if mtime_again != mtime {
-        return ReapOutcome::Skipped(ReapSkip::RecentlyActive);
-    }
-    if again != identity {
-        return ReapOutcome::Skipped(ReapSkip::IdentityUnproven("persist-changed".into()));
-    }
-
-    match pool::request_holder_shutdown(&identity, RPC_TIMEOUT) {
-        HolderReapRpc::Verified => {
-            let holder_pid = identity.holder_pid.unwrap_or_default();
-            let session_id = identity.session_id.clone().unwrap_or_default();
-            let status = state.status.as_str();
-            let age_secs = age_secs(now, state.updated_at);
-            let age_h = age_secs / 3600;
-            crate::progress_log::append(
-                record,
-                "holder-reap",
-                &format!("pid={holder_pid} session={session_id} status={status} age_h={age_h}"),
-            );
-            eprintln!(
-                "coordinator: holder-reap: project={} pid={holder_pid} adapter={} status={status} age_h={age_h}",
-                record.id, identity.adapter
-            );
-            ReapOutcome::Reaped {
+    let identity = candidate.identity;
+    match pool::prove_holder(record, &identity, RPC_TIMEOUT) {
+        Err(termination) => map_proof_failure(record, &identity, termination),
+        Ok(verified) => match pool::terminate_verified(verified, Intent::Sweep) {
+            HolderTermination::Delivered {
                 holder_pid,
                 session_id,
-                status,
-                age_secs,
+            } => {
+                let holder_pid = holder_pid.unwrap_or_default();
+                let session_id = session_id.unwrap_or_default();
+                let status = state.status.as_str();
+                let age_secs = age_secs(now, state.updated_at);
+                let age_h = age_secs / 3600;
+                crate::progress_log::append(
+                    record,
+                    "holder-reap",
+                    &format!("pid={holder_pid} session={session_id} status={status} age_h={age_h}"),
+                );
+                eprintln!(
+                    "coordinator: holder-reap: project={} pid={holder_pid} adapter={} status={status} age_h={age_h}",
+                    record.id, identity.adapter
+                );
+                ReapOutcome::Reaped {
+                    holder_pid,
+                    session_id,
+                    status,
+                    age_secs,
+                }
             }
-        }
-        HolderReapRpc::ShutdownUnproven(why) => {
-            warn_once(
-                format!(
-                    "{}:shutdown:{}",
-                    record.id,
-                    identity.session_id.as_deref().unwrap_or("")
-                ),
-                &format!(
-                    "coordinator: holder-reap: project {} shutdown unproven ({why}); keeping holder",
-                    record.id
-                ),
-            );
-            ReapOutcome::Skipped(ReapSkip::ShutdownUnproven(why))
-        }
-        HolderReapRpc::IdentityUnproven(why) => {
-            warn_once(
-                format!(
-                    "{}:identity:{}",
-                    record.id,
-                    identity.session_id.as_deref().unwrap_or("")
-                ),
-                &format!(
-                    "coordinator: holder-reap: project {} identity unproven ({why}); keeping holder",
-                    record.id
-                ),
-            );
-            ReapOutcome::Skipped(ReapSkip::IdentityUnproven(why))
-        }
+            other => map_delivery(record, &identity, other),
+        },
     }
 }
 
@@ -322,7 +504,7 @@ fn age_secs(now: DateTime<Utc>, then: DateTime<Utc>) -> u64 {
 
 /// True when the persist `cwd` is equal to or under one of the project roots.
 /// Equality is the normal nested/multi-sibling shape, so it is mandatory.
-fn cwd_is_owned(record: &ProjectRecord, identity: &PersistIdentity) -> bool {
+pub(crate) fn cwd_is_owned(record: &ProjectRecord, identity: &PersistIdentity) -> bool {
     let Some(cwd) = identity.cwd.as_deref() else {
         return false;
     };
@@ -430,6 +612,7 @@ mod tests {
     use crate::config::{
         ENV_COORDINATOR_HOME, ENV_COORDINATOR_STATE_DIR, TestEnvGuard, test_env_lock,
     };
+    use crate::harness::pool::{NoAddressAction, NoSocketWhy};
     use crate::layout::LayoutProfile;
     use crate::registry::{AutoStartPolicy, ProjectRecord, Registry};
     use crate::state::RunState;
@@ -469,6 +652,7 @@ mod tests {
         ShutdownNoResponse,
         NoResponse,
         MutatePersistOnPing,
+        DeadAfterPing,
     }
 
     struct HolderSpec {
@@ -540,6 +724,13 @@ mod tests {
                             }
                             if spec.behaviour == HolderBehaviour::MutatePersistOnPing {
                                 mutate_persist(&spec);
+                            }
+                            if spec.behaviour == HolderBehaviour::DeadAfterPing
+                                && let Some(path) = &spec.persist_path
+                            {
+                                // Write before replying: the delivery re-read must see the
+                                // holder's own exit record deterministically.
+                                write_dead_persist(path);
                             }
                             respond(&mut stream, &ping_body(&spec));
                         }
@@ -1090,17 +1281,45 @@ mod tests {
         holder.stop();
     }
 
+    /// DoD-2 **defensive** positive: the product no longer writes `alive:false` *with* a
+    /// control address, so this shape can only come from an external rewrite or a
+    /// pre-track persist. A reachable holder behind it is still reaped by proof.
     #[test]
-    fn reap_keeps_dead_persist() {
+    fn reap_reaps_reachable_holder_behind_a_dead_persist() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
+        let holder = fixture.holder(HolderBehaviour::Normal);
+        let mut spec = PersistSpec::matching(&holder);
+        spec.alive = false;
+        fixture.write_persist(&holder, spec, persist_old());
+
+        let outcome = tick_project(&fixture.record, now);
+        assert_reaped(&outcome, &holder);
+        assert_eq!(holder.seen_ops(), vec!["ping", "shutdown"]);
+        holder.finish();
+        let (dead, _) = pool::persist_identity(&fixture.record).unwrap().unwrap();
+        assert!(!dead.alive);
+        assert!(dead.control_addr.is_none());
+    }
+
+    /// The incident shape (15512): dead persist, **no** control address → kept with a
+    /// named reason. No socket, no identity, no kill.
+    #[test]
+    fn reap_keeps_dead_persist_without_control_addr() {
         let _guard = test_env_lock();
         let now = Utc::now();
         let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
         let mut holder = fixture.holder(HolderBehaviour::Normal);
         let mut spec = PersistSpec::matching(&holder);
         spec.alive = false;
+        spec.control_addr = None;
         fixture.write_persist(&holder, spec, persist_old());
 
-        assert_skipped(tick_project(&fixture.record, now), ReapSkip::NotAlive);
+        assert_skipped(
+            tick_project(&fixture.record, now),
+            ReapSkip::DeadPersistNoAddress,
+        );
         assert!(holder.seen_ops().is_empty());
         holder.stop();
     }
@@ -1580,7 +1799,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_holder_identity_requires_identity() {
+    fn prove_holder_identity_mismatch_is_unproven() {
         let _guard = test_env_lock();
         let now = Utc::now();
         let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
@@ -1588,16 +1807,18 @@ mod tests {
         fixture.write_persist(&holder, PersistSpec::matching(&holder), persist_old());
 
         let (identity, _) = pool::persist_identity(&fixture.record).unwrap().unwrap();
-        match pool::verify_holder_identity(&identity, RPC_TIMEOUT) {
-            HolderReapRpc::IdentityUnproven(_) => {}
-            other => panic!("expected IdentityUnproven, got {other:?}"),
+        match pool::prove_holder(&fixture.record, &identity, RPC_TIMEOUT) {
+            Err(HolderTermination::Unproven { why }) => {
+                assert_eq!(why, "identity:session", "one identity implementation");
+            }
+            other => panic!("expected Unproven(identity:session), got {other:?}"),
         }
         assert_eq!(holder.seen_ops(), vec!["ping"]);
         holder.stop();
     }
 
     #[test]
-    fn verify_holder_identity_accepts_matching_identity() {
+    fn prove_holder_accepts_matching_identity() {
         let _guard = test_env_lock();
         let now = Utc::now();
         let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
@@ -1605,32 +1826,8 @@ mod tests {
         fixture.write_persist(&holder, PersistSpec::matching(&holder), persist_old());
 
         let (identity, _) = pool::persist_identity(&fixture.record).unwrap().unwrap();
-        assert_eq!(
-            pool::verify_holder_identity(&identity, RPC_TIMEOUT),
-            HolderReapRpc::Verified
-        );
+        assert!(pool::prove_holder(&fixture.record, &identity, RPC_TIMEOUT).is_ok());
         assert_eq!(holder.seen_ops(), vec!["ping"]);
-        holder.stop();
-    }
-
-    #[test]
-    fn request_holder_shutdown_times_out() {
-        let _guard = test_env_lock();
-        let now = Utc::now();
-        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
-        let mut holder = fixture.holder(HolderBehaviour::ShutdownNoResponse);
-        fixture.write_persist(&holder, PersistSpec::matching(&holder), persist_old());
-
-        let (identity, _) = pool::persist_identity(&fixture.record).unwrap().unwrap();
-        assert_eq!(
-            pool::verify_holder_identity(&identity, RPC_TIMEOUT),
-            HolderReapRpc::Verified
-        );
-        match pool::request_holder_shutdown(&identity, RPC_TIMEOUT) {
-            HolderReapRpc::ShutdownUnproven(_) => {}
-            other => panic!("expected ShutdownUnproven, got {other:?}"),
-        }
-        assert!(!holder.is_finished());
         holder.stop();
     }
 
@@ -1644,6 +1841,302 @@ mod tests {
 
         assert_skipped(tick_project(&fixture.record, now), ReapSkip::PromptInFlight);
         assert_eq!(holder.seen_ops(), vec!["ping"]);
+        holder.stop();
+    }
+
+    // ---- 0117: dead-session rule + shared classification ---------------------
+
+    #[test]
+    fn reap_keeps_dead_persist_identity_unproven() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
+        let mut holder = fixture.holder(HolderBehaviour::Normal);
+        let mut spec = PersistSpec::matching(&holder);
+        spec.alive = false;
+        spec.session_id = Some("some-other-session".into());
+        fixture.write_persist(&holder, spec, persist_old());
+
+        match tick_project(&fixture.record, now) {
+            ReapOutcome::Skipped(ReapSkip::IdentityUnproven(why)) => {
+                assert_eq!(why, "identity:session")
+            }
+            other => panic!("expected IdentityUnproven(identity:session), got {other:?}"),
+        }
+        assert_eq!(
+            holder.seen_ops(),
+            vec!["ping"],
+            "no shutdown after a mismatch"
+        );
+        holder.stop();
+    }
+
+    #[test]
+    fn reap_skips_already_dead_after_ping() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
+        let mut holder = fixture.holder(HolderBehaviour::DeadAfterPing);
+        fixture.write_persist(&holder, PersistSpec::matching(&holder), persist_old());
+
+        assert_skipped(tick_project(&fixture.record, now), ReapSkip::AlreadyDead);
+        assert_eq!(holder.seen_ops(), vec!["ping"], "nothing to deliver");
+        holder.stop();
+    }
+
+    #[test]
+    fn reap_reaped_is_delivery_not_exit() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
+        let holder = fixture.holder(HolderBehaviour::Normal);
+        fixture.write_persist(&holder, PersistSpec::matching(&holder), persist_old());
+
+        let outcome = tick_project(&fixture.record, now);
+        assert_reaped(&outcome, &holder);
+        assert_eq!(holder.seen_ops(), vec!["ping", "shutdown"]);
+        holder.finish();
+        // A second tick sees the holder's own dead record and keeps it with a reason.
+        assert_skipped(
+            tick_project(&fixture.record, now),
+            ReapSkip::DeadPersistNoAddress,
+        );
+    }
+
+    #[test]
+    fn reap_keeps_connect_refused() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let mut holder = fixture.holder(HolderBehaviour::Normal);
+        let mut spec = PersistSpec::matching(&holder);
+        spec.control_addr = Some(addr);
+        fixture.write_persist(&holder, spec, persist_old());
+        let before = std::fs::read(&fixture.persist_path).unwrap();
+
+        assert_skipped(
+            tick_project(&fixture.record, now),
+            ReapSkip::IdentityUnproven("connect-refused".into()),
+        );
+        assert!(holder.seen_ops().is_empty(), "no connection was made");
+        assert_eq!(
+            before,
+            std::fs::read(&fixture.persist_path).unwrap(),
+            "no dead write on a closed listener"
+        );
+        holder.stop();
+    }
+
+    #[test]
+    fn no_address_classification_is_shared() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
+        let mut holder = fixture.holder(HolderBehaviour::Normal);
+
+        let shapes: Vec<(PersistSpec, &str, NoSocketWhy)> = vec![
+            (
+                PersistSpec {
+                    alive: false,
+                    session_id: Some("sess-exit".into()),
+                    control_addr: None,
+                    ..PersistSpec::matching(&holder)
+                },
+                "dead-persist-no-address",
+                NoSocketWhy::DeadAfterExit,
+            ),
+            (
+                PersistSpec {
+                    alive: false,
+                    session_id: None,
+                    control_addr: None,
+                    cwd: None,
+                    ..PersistSpec::matching(&holder)
+                },
+                "dead-persist-no-address",
+                NoSocketWhy::FailedStart,
+            ),
+            (
+                PersistSpec {
+                    alive: false,
+                    session_id: None,
+                    control_addr: None,
+                    cwd: None,
+                    ..PersistSpec::matching(&holder)
+                },
+                "dead-persist-no-address",
+                NoSocketWhy::PendingStart,
+            ),
+            (
+                PersistSpec {
+                    alive: true,
+                    control_addr: None,
+                    holder_pid: Some(std::process::id()),
+                    ..PersistSpec::matching(&holder)
+                },
+                "self-pid",
+                NoSocketWhy::AliveSelfNoAddress,
+            ),
+            (
+                PersistSpec {
+                    alive: true,
+                    control_addr: None,
+                    ..PersistSpec::matching(&holder)
+                },
+                "no-control-addr",
+                NoSocketWhy::AliveForeignNoAddress,
+            ),
+            (
+                PersistSpec {
+                    alive: true,
+                    control_addr: None,
+                    holder_pid: None,
+                    ..PersistSpec::matching(&holder)
+                },
+                "no-holder-pid",
+                NoSocketWhy::AliveUnknownNoAddress,
+            ),
+        ];
+
+        for (mut spec, expected_reason, expected_why) in shapes {
+            // Producer discrimination, not age: a failed start carries `error`.
+            if expected_why == NoSocketWhy::FailedStart {
+                spec.session_id = None;
+            }
+            fixture.write_persist(&holder, spec, persist_old());
+            if expected_why == NoSocketWhy::FailedStart {
+                // Write the error field through the raw body (PersistSpec has no error).
+                let text = std::fs::read_to_string(&fixture.persist_path).unwrap();
+                let mut body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                body["error"] = serde_json::Value::String("ACP authenticate: not logged in".into());
+                std::fs::write(&fixture.persist_path, body.to_string()).unwrap();
+                fixture.set_persist_mtime(persist_old());
+            } else if expected_why == NoSocketWhy::PendingStart {
+                let text = std::fs::read_to_string(&fixture.persist_path).unwrap();
+                let mut body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                body.as_object_mut().unwrap().remove("error");
+                std::fs::write(&fixture.persist_path, body.to_string()).unwrap();
+                fixture.set_persist_mtime(persist_old());
+            }
+
+            let state = load_run_state(&fixture.record).unwrap();
+            // A pending start is judged by age: fresh → refuse, aged → discard.
+            if expected_why == NoSocketWhy::PendingStart {
+                fixture.set_persist_mtime(Duration::from_secs(1));
+            }
+            let decision = decide(&fixture.record, now, &state, true, true);
+            assert_eq!(
+                decision.lifecycle.reason, expected_reason,
+                "decide must name the shared producer reason"
+            );
+            assert!(!decision.lifecycle.candidate);
+
+            let (identity, mtime) = pool::persist_identity(&fixture.record).unwrap().unwrap();
+            match pool::prove_holder(&fixture.record, &identity, RPC_TIMEOUT) {
+                Err(HolderTermination::NoSocket { why }) => assert_eq!(why, expected_why),
+                other => panic!("expected NoSocket({expected_why:?}), got {other:?}"),
+            }
+            let action = pool::no_address_decision(&expected_why, mtime, SystemTime::now());
+            match expected_why {
+                NoSocketWhy::DeadAfterExit | NoSocketWhy::FailedStart => {
+                    assert_eq!(action, NoAddressAction::DiscardNow)
+                }
+                NoSocketWhy::PendingStart => {
+                    assert_eq!(action, NoAddressAction::Refuse("start-pending"))
+                }
+                NoSocketWhy::AliveSelfNoAddress => {
+                    assert_eq!(action, NoAddressAction::OwnedInProcess)
+                }
+                NoSocketWhy::AliveForeignNoAddress => {
+                    assert_eq!(action, NoAddressAction::Refuse("foreign-holder"))
+                }
+                NoSocketWhy::AliveUnknownNoAddress => {
+                    assert_eq!(action, NoAddressAction::Refuse("unknown-record"))
+                }
+            }
+        }
+        holder.stop();
+    }
+
+    #[test]
+    fn decide_is_lock_free_and_rpc_free() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
+        let mut holder = fixture.holder(HolderBehaviour::Normal);
+        fixture.write_persist(&holder, PersistSpec::matching(&holder), persist_old());
+
+        let started = Instant::now();
+        let decision = crate::state::with_run_state_lock(&fixture.record, || {
+            let state = load_run_state(&fixture.record)?;
+            Ok(decide(&fixture.record, now, &state, true, true))
+        })
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "decide must not take the run-state lock or block on RPC"
+        );
+        assert!(decision.lifecycle.candidate);
+        assert_eq!(decision.lifecycle.reason, "pre-rpc-eligible");
+        assert!(holder.seen_ops().is_empty(), "no socket was touched");
+        holder.stop();
+    }
+
+    #[test]
+    fn decide_reports_absent_without_a_run_state_file() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
+        let mut holder = fixture.holder(HolderBehaviour::Normal);
+        fixture.write_persist(&holder, PersistSpec::matching(&holder), persist_old());
+        std::fs::remove_file(&fixture.run_state_path).unwrap();
+        let state = RunState::idle(&fixture.record.id);
+
+        let decision = decide(&fixture.record, now, &state, false, true);
+        assert_eq!(decision.lifecycle.state, "absent");
+        assert_eq!(decision.lifecycle.reason, "missing-run-state");
+        assert!(!decision.lifecycle.run_terminal);
+        holder.stop();
+    }
+
+    /// One fixture, two callers: the sweep keeps the evidence-free record, the start
+    /// path discards it after the one grace. Pins the deliberate asymmetry (§7.3/§7.4).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dead_persist_sweep_keeps_pool_discards() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Stopped, persist_old());
+        let mut holder = fixture.holder(HolderBehaviour::Normal);
+        let mut spec = PersistSpec::matching(&holder);
+        spec.alive = false;
+        spec.control_addr = None;
+        fixture.write_persist(&holder, spec, std::time::Duration::from_secs(11));
+        let before = std::fs::read(&fixture.persist_path).unwrap();
+
+        assert_skipped(
+            tick_project(&fixture.record, now),
+            ReapSkip::DeadPersistNoAddress,
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&fixture.persist_path).unwrap(),
+            "the sweep keeps the record"
+        );
+
+        let got = pool::reuse_or_reap_existing(&fixture.record, "grok", None, None)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+        assert!(
+            !fixture.persist_path.exists(),
+            "the start path discards it after the grace"
+        );
+        let log = fixture.status_log();
+        assert!(log.contains("holder-persist-discarded"), "{log}");
         holder.stop();
     }
 }

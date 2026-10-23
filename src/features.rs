@@ -295,6 +295,13 @@ pub fn is_enabled(duty: Duty) -> bool {
     resolve_all().enabled(duty)
 }
 
+/// One duty's gate for a read-only render that must not consume the caller's
+/// "one machine snapshot per status" budget (0115). Same evaluation and same
+/// fail-closed rules as [`resolve_all`], just not surfaced as a snapshot.
+pub fn gate_direct(duty: Duty) -> bool {
+    evaluate_loaded(&crate::config::load_machine_config()).enabled(duty)
+}
+
 fn fail_closed_all(snapshot: &mut FeatureSnapshot, error: String) {
     for duty in Duty::ALL {
         snapshot.duties.insert(

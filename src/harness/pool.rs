@@ -2,8 +2,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -372,9 +374,11 @@ fn load_persist(record: &ProjectRecord) -> Result<Option<PersistedGrokHandle>> {
 
 /// Read-only projection of the durable holder identity used by the 0107 reaper.
 ///
-/// Every listed field maps 1:1 by name to [`PersistedGrokHandle`]. `version`,
-/// `supports_compact`, `error`, `context_usage`, `last_signal` and
-/// `last_tool_title` are not identity fields and are deliberately omitted.
+/// Every identity field maps 1:1 by name to [`PersistedGrokHandle`]. `model`/`bin` are
+/// the 0110 live identity (compared only when both sides carry them) and `error` is the
+/// **non-identity** producer discriminator [`classify_persist`] needs to tell a failed
+/// start from a pending one — it is never compared by [`prove_holder`]. The load-time
+/// mtime travels in [`PersistRef`], not here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PersistIdentity {
     pub project_id: String,
@@ -386,6 +390,9 @@ pub(crate) struct PersistIdentity {
     pub adapter: String,
     pub alive: bool,
     pub prompt_in_flight: bool,
+    pub model: Option<String>,
+    pub bin: Option<PathBuf>,
+    pub error: Option<String>,
 }
 
 impl PersistIdentity {
@@ -400,16 +407,559 @@ impl PersistIdentity {
             adapter: handle.adapter.clone(),
             alive: handle.alive,
             prompt_in_flight: handle.prompt_in_flight,
+            model: handle.model.clone(),
+            bin: handle.bin.clone(),
+            error: handle.error.clone(),
         }
+    }
+
+    /// The 0107/0110 identity fields only — `error` and `prompt_in_flight` are state,
+    /// not identity, so a flag write between Ping and delivery is not "persist-changed".
+    /// `model`/`bin` are compared only when both sides carry them (a pre-upgrade
+    /// persist without them still proves identity).
+    fn same_identity(&self, other: &Self) -> bool {
+        let modelled = match (self.model.as_deref(), other.model.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        let binned = match (self.bin.as_deref(), other.bin.as_deref()) {
+            (Some(a), Some(b)) => crate::worktree::paths_same(a, b),
+            _ => true,
+        };
+        modelled
+            && binned
+            && self.project_id == other.project_id
+            && self.session_id == other.session_id
+            && self.cwd == other.cwd
+            && self.pid == other.pid
+            && self.holder_pid == other.holder_pid
+            && self.control_addr == other.control_addr
+            && self.adapter == other.adapter
+            && self.alive == other.alive
+    }
+
+    /// An attempt record (pre-spawn pending or failed start): no session, no holder,
+    /// no address. `(None, None)` is not a unique key, so attempts are stamped instead.
+    fn is_attempt(&self) -> bool {
+        !self.alive
+            && self.session_id.is_none()
+            && self.holder_pid.is_none()
+            && self.control_addr.is_none()
     }
 }
 
-/// Result of a verified holder control-socket exchange (0107).
+/// Post-delivery wait for the old holder's own exit record.
+pub(crate) const WAIT_GONE: Duration = Duration::from_secs(2);
+/// Grace for the product's own `DeadAfterExit`/`FailedStart` record before a discard.
+pub(crate) const DISCARD_GRACE: Duration = Duration::from_secs(10);
+/// The pre-spawn pending record is never discarded inside this window (45 s budget + margin).
+pub(crate) const PENDING_START_GRACE: Duration = Duration::from_secs(60);
+/// Bounded wait for the in-process pool mutex before an owned-session teardown.
+pub(crate) const POOL_LOCK_BUDGET: Duration = Duration::from_secs(5);
+/// Child-only marker carrying the parent start claim's mtime (nanos since UNIX_EPOCH).
+pub(crate) const ENV_HOLDER_ATTEMPT_MTIME: &str = "COORDINATOR_HOLDER_ATTEMPT_MTIME";
+
+/// Authorization token. Private fields; **only** [`prove_holder`] builds one, so no
+/// `Shutdown` can be sent to an address that has not answered a matching `Ping`.
+#[derive(Debug)]
+pub(crate) struct VerifiedHolder {
+    record: ProjectRecord,
+    /// The identity the Ping answered for.
+    want: PersistIdentity,
+    /// `want.control_addr`, non-empty.
+    addr: String,
+    /// The persist mtime observed *before* the Ping.
+    mtime: SystemTime,
+    /// The Ping's own answer (session/cwd/pid/adapter/model/bin).
+    harness: GrokHarnessStatus,
+}
+
+/// Why a caller terminated a holder. The only knob the delivery seam has: the
+/// automatic sweep must never interrupt a turn; an explicit teardown may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Intent {
+    Sweep,
+    Reap,
+    Operator,
+}
+
+/// Producer-discriminated, not clock-discriminated no-address shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoSocketWhy {
+    /// `alive:false`, `session_id:Some` — a clean exit (or a legacy record).
+    DeadAfterExit,
+    /// `alive:false`, `session_id:None`, `error:Some`.
+    FailedStart,
+    /// `alive:false`, `session_id:None`, `error:None` — the pre-spawn record.
+    PendingStart,
+    /// `alive:true`, `holder_pid == this process` (caller-relative).
+    AliveSelfNoAddress,
+    /// `alive:true`, another pid.
+    AliveForeignNoAddress,
+    /// `alive:true`, `holder_pid` `None`/0.
+    AliveUnknownNoAddress,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HolderReapRpc {
-    Verified,
-    IdentityUnproven(String),
-    ShutdownUnproven(String),
+pub(crate) enum HolderTermination {
+    /// The holder answered `ok` to its own `Shutdown`. A delivery receipt, never exit.
+    Delivered {
+        holder_pid: Option<u32>,
+        session_id: Option<String>,
+    },
+    /// Its own dead, address-less record was re-read still `same_record`.
+    Exited {
+        holder_pid: Option<u32>,
+        session_id: Option<String>,
+    },
+    /// The address accepted no connection: no listener, not "it exited".
+    NoListener { addr: String },
+    /// There is no address to try.
+    NoSocket { why: NoSocketWhy },
+    /// An address existed; proof or delivery failed.
+    Unproven { why: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoneHow {
+    Absent,
+    Exited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitGone {
+    Gone {
+        how: GoneHow,
+    },
+    /// The persist now names a different record: write nothing.
+    Superseded,
+    /// Not success.
+    TimedOut,
+}
+
+/// The two load outcomes are **not** identity classes: `load_persist` returns
+/// `Ok(None)` for absent and `Err` for unreadable, and every caller refuses on `Err`
+/// before classifying. Keeping them out of this enum is what makes "unreadable is not
+/// absent" a type-level rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PersistClass {
+    NoAddress(NoSocketWhy),
+    Addressed { addr: String },
+}
+
+/// The record a caller loaded — identity **plus** the mtime it was read at. The mtime
+/// is what makes one attempt record distinguishable from a different attempt that has
+/// the same empty identity.
+#[derive(Debug, Clone)]
+pub(crate) struct PersistRef {
+    pub identity: PersistIdentity,
+    pub mtime: SystemTime,
+}
+
+impl PersistRef {
+    pub(crate) fn new(identity: PersistIdentity, mtime: SystemTime) -> Self {
+        Self { identity, mtime }
+    }
+}
+
+/// The one discard rule for every caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoAddressAction {
+    DiscardNow,
+    WaitUntil(SystemTime),
+    Refuse(&'static str),
+    /// `AliveSelf`: the caller tears down the session it owns first.
+    OwnedInProcess,
+}
+
+/// `old` is the record the caller must hand to the wait/compare helpers (identity plus
+/// the load's mtime — never a post-Ping re-read, so an attempt stamp survives); it is
+/// `None` only when the persist was already absent at load.
+#[derive(Debug, Clone)]
+pub(crate) struct Terminated {
+    pub old: Option<PersistRef>,
+    pub outcome: HolderTermination,
+}
+
+#[cfg(test)]
+type AfterGoneHook = Arc<dyn Fn(&ProjectRecord) + Send + Sync>;
+#[cfg(test)]
+type PreClaimHook = Arc<dyn Fn(&ProjectRecord) + Send + Sync>;
+#[cfg(test)]
+type SpawnHook = Arc<dyn Fn(&ProjectRecord) -> Result<GrokHarnessStatus> + Send + Sync>;
+
+/// Test-only seam invoked between a `Gone` verdict (or an `AliveSelf` load) and the
+/// compare-and-act, so the `false`-is-a-refusal contract is deterministic.
+#[cfg(test)]
+pub(crate) static AFTER_GONE_HOOK: std::sync::Mutex<Option<AfterGoneHook>> =
+    std::sync::Mutex::new(None);
+/// Test-only seam invoked immediately before `claim_start` in both spawn paths.
+#[cfg(test)]
+pub(crate) static PRE_CLAIM_HOOK: std::sync::Mutex<Option<PreClaimHook>> =
+    std::sync::Mutex::new(None);
+/// Test-only spawn stand-in, invoked immediately after a successful `claim_start`
+/// **instead of** the real spawn/readiness phase.
+#[cfg(test)]
+pub(crate) static SPAWN_HOOK: std::sync::Mutex<Option<SpawnHook>> = std::sync::Mutex::new(None);
+
+pub(crate) fn after_gone(record: &ProjectRecord) {
+    #[cfg(test)]
+    {
+        let hook = AFTER_GONE_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(record);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = record;
+}
+
+/// Whether the in-process pool mutex can be taken right now (no guard retained).
+pub(crate) fn pool_lock_available() -> bool {
+    match POOL.get() {
+        Some(pool) => pool.try_lock().is_ok(),
+        None => true,
+    }
+}
+
+fn pre_claim(record: &ProjectRecord) {
+    #[cfg(test)]
+    {
+        let hook = PRE_CLAIM_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(record);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = record;
+}
+
+/// `Some(result)` means the test stand-in replaced the real spawn for this call.
+fn spawn_stand_in(record: &ProjectRecord) -> Option<Result<GrokHarnessStatus>> {
+    #[cfg(test)]
+    {
+        let hook = SPAWN_HOOK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        hook.map(|hook| hook(record))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = record;
+        None
+    }
+}
+
+/// The §7.4 three-step recovery, in the imperative order.
+pub(crate) fn recovery_hint(record: &ProjectRecord) -> String {
+    let path = persist_path(record)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "{state_dir}/harness-grok.json".into());
+    format!(
+        "end any live `coordinator harness <adapter> hold` process for this project first, \
+         then delete {path}, then retry"
+    )
+}
+
+fn age_since(mtime: SystemTime, now: SystemTime) -> Duration {
+    now.duration_since(mtime).unwrap_or(Duration::ZERO)
+}
+
+/// One classifier, used by `decide` (file-only) and `prove_holder` (needs a Ping), so
+/// `status`, the sweep and the start path cannot disagree on the same file.
+pub(crate) fn classify_persist(identity: &PersistIdentity) -> PersistClass {
+    if let Some(addr) = identity
+        .control_addr
+        .as_deref()
+        .filter(|addr| !addr.trim().is_empty())
+    {
+        return PersistClass::Addressed {
+            addr: addr.to_string(),
+        };
+    }
+    if identity.alive {
+        return match identity.holder_pid {
+            Some(pid) if pid == std::process::id() => {
+                PersistClass::NoAddress(NoSocketWhy::AliveSelfNoAddress)
+            }
+            Some(pid) if pid != 0 => PersistClass::NoAddress(NoSocketWhy::AliveForeignNoAddress),
+            _ => PersistClass::NoAddress(NoSocketWhy::AliveUnknownNoAddress),
+        };
+    }
+    if identity.session_id.is_some() {
+        return PersistClass::NoAddress(NoSocketWhy::DeadAfterExit);
+    }
+    if identity.error.is_some() {
+        PersistClass::NoAddress(NoSocketWhy::FailedStart)
+    } else {
+        PersistClass::NoAddress(NoSocketWhy::PendingStart)
+    }
+}
+
+/// One "is the file still the record I loaded?" predicate.
+///
+/// A record that **names a session or a holder** matches on `(project_id, session_id,
+/// holder_pid)` and ignores mtime (the holder's own later writes keep that identity).
+/// An **attempt** record (no session, no holder, no address) is stamped by
+/// `(error presence, mtime)`. Absent, newer, older or a different error presence is a
+/// different record → `false`. `(None, None)` alone is never compared.
+pub(crate) fn same_record(old: &PersistRef, now: &PersistIdentity, now_mtime: SystemTime) -> bool {
+    if old.identity.is_attempt() {
+        return now.is_attempt()
+            && now.project_id == old.identity.project_id
+            && now.error.is_some() == old.identity.error.is_some()
+            && now_mtime == old.mtime;
+    }
+    now.project_id == old.identity.project_id
+        && now.session_id == old.identity.session_id
+        && now.holder_pid == old.identity.holder_pid
+}
+
+/// The exclusive absent→pending claim: the only way to begin a start.
+pub(crate) fn claim_start(record: &ProjectRecord, harness: &str) -> Result<PersistRef> {
+    use std::io::Write;
+    ensure_state_dir(record)?;
+    let path = persist_path(record)?;
+    let handle = PersistedGrokHandle {
+        version: 1,
+        model: None,
+        bin: None,
+        project_id: record.id.clone(),
+        session_id: None,
+        cwd: None,
+        pid: None,
+        holder_pid: None,
+        control_addr: None,
+        adapter: persist_adapter_name(harness),
+        supports_compact: true,
+        alive: false,
+        prompt_in_flight: false,
+        error: None,
+        context_usage: None,
+        last_signal: None,
+        last_tool_title: None,
+    };
+    // Serialize before touching the file: a create that cannot be filled is worse
+    // than no claim at all.
+    let bytes = serde_json::to_vec(&handle)?;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CoordinatorError::Message(format!(
+                "persist-appeared: another start holds the claim (persist: {})",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(CoordinatorError::Message(format!(
+                "holder persist claim failed (persist: {}): {e}",
+                path.display()
+            )));
+        }
+    };
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let Some((identity, mtime)) = persist_identity(record)? else {
+        return Err(CoordinatorError::Message(format!(
+            "persist-appeared: the claim vanished (persist: {})",
+            path.display()
+        )));
+    };
+    Ok(PersistRef::new(identity, mtime))
+}
+
+/// Fenced attempt-error write. `Some(claim)` writes only while the file is still that
+/// claim; `None` (an unclaimed direct `hold`) writes only when the file is absent —
+/// never over an extant attempt or an identified record. `false` = nothing written.
+pub(crate) fn mark_start_error(
+    record: &ProjectRecord,
+    claim: Option<&PersistRef>,
+    err: &str,
+) -> bool {
+    let adapter = match claim {
+        Some(claim) => claim.identity.adapter.clone(),
+        None => persist_adapter_name(&holder_harness_slug()),
+    };
+    let handle = PersistedGrokHandle {
+        version: 1,
+        model: None,
+        bin: None,
+        project_id: record.id.clone(),
+        session_id: None,
+        cwd: None,
+        pid: None,
+        holder_pid: None,
+        control_addr: None,
+        adapter,
+        supports_compact: true,
+        alive: false,
+        prompt_in_flight: false,
+        error: Some(err.to_string()),
+        context_usage: None,
+        last_signal: None,
+        last_tool_title: None,
+    };
+    match claim {
+        Some(claim) => match persist_identity(record) {
+            Ok(Some((now, mtime))) if same_record(claim, &now, mtime) => {
+                save_persist(record, &handle).is_ok()
+            }
+            _ => false,
+        },
+        None => match persist_identity(record) {
+            Ok(None) => save_persist(record, &handle).is_ok(),
+            _ => false,
+        },
+    }
+}
+
+/// The pending identity shape both `claim_start` and the child's inherited stamp use.
+fn attempt_identity(record: &ProjectRecord, harness: &str) -> PersistIdentity {
+    PersistIdentity {
+        project_id: record.id.clone(),
+        session_id: None,
+        cwd: None,
+        pid: None,
+        holder_pid: None,
+        control_addr: None,
+        adapter: persist_adapter_name(harness),
+        alive: false,
+        prompt_in_flight: false,
+        model: None,
+        bin: None,
+        error: None,
+    }
+}
+
+fn ready_handle(
+    record: &ProjectRecord,
+    session: &GrokSession,
+    control_addr: Option<String>,
+) -> PersistedGrokHandle {
+    PersistedGrokHandle {
+        version: 1,
+        model: session.model.clone(),
+        bin: Some(session.bin.clone()),
+        project_id: record.id.clone(),
+        session_id: Some(session.session_id.clone()),
+        cwd: Some(session.cwd.clone()),
+        pid: session.pid,
+        holder_pid: Some(std::process::id()),
+        control_addr,
+        adapter: session.adapter.clone(),
+        supports_compact: session.supports_compact,
+        alive: true,
+        prompt_in_flight: false,
+        error: None,
+        context_usage: session.context_usage.clone(),
+        last_signal: session.last_signal.clone(),
+        last_tool_title: session.last_tool_title.clone(),
+    }
+}
+
+/// Fenced holder-ready write. `Some(stamp)` publishes only while the file is still the
+/// parent's claim. `None` (a direct `hold`) publishes only over an absent record or a
+/// `DeadAfterExit` no-address record. `false` = nothing written and the holder child
+/// must tear its own ACP session down and exit rather than serve untracked.
+pub(crate) fn write_holder_ready(
+    record: &ProjectRecord,
+    session: &GrokSession,
+    control_addr: Option<String>,
+    stamp: Option<&PersistRef>,
+) -> bool {
+    let handle = ready_handle(record, session, control_addr);
+    match stamp {
+        Some(stamp) => match persist_identity(record) {
+            Ok(Some((now, mtime))) if same_record(stamp, &now, mtime) => {
+                save_persist(record, &handle).is_ok()
+            }
+            _ => false,
+        },
+        None => match persist_identity(record) {
+            Ok(None) => save_persist(record, &handle).is_ok(),
+            Ok(Some((now, _))) => match classify_persist(&now) {
+                PersistClass::NoAddress(NoSocketWhy::DeadAfterExit) => {
+                    save_persist(record, &handle).is_ok()
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        },
+    }
+}
+
+/// Fenced holder-exit write: writes only while the persist still names this holder's
+/// own `session_id` + `holder_pid`. A child whose ready write was refused has no
+/// matching identity on disk, so its exit write is a no-op.
+pub(crate) fn write_holder_exit(record: &ProjectRecord, session: &GrokSession) -> bool {
+    let Ok(Some((now, mtime))) = persist_identity(record) else {
+        return false;
+    };
+    let mut own = ready_handle(record, session, None);
+    own.alive = true;
+    let old = PersistRef::new(PersistIdentity::from_handle(&own), mtime);
+    if !same_record(&old, &now, mtime) {
+        return false;
+    }
+    let dead = PersistedGrokHandle {
+        version: 1,
+        model: session.model.clone(),
+        bin: Some(session.bin.clone()),
+        project_id: record.id.clone(),
+        session_id: Some(session.session_id.clone()),
+        cwd: Some(session.cwd.clone()),
+        pid: session.pid,
+        holder_pid: Some(std::process::id()),
+        control_addr: None,
+        adapter: session.adapter.clone(),
+        supports_compact: session.supports_compact,
+        alive: false,
+        prompt_in_flight: false,
+        error: None,
+        context_usage: session.context_usage.clone(),
+        last_signal: session.last_signal.clone(),
+        last_tool_title: session.last_tool_title.clone(),
+    };
+    save_persist(record, &dead).is_ok()
+}
+
+/// The one discard rule. Only the clock is consulted here; the shape was produced by
+/// [`classify_persist`].
+pub(crate) fn no_address_decision(
+    why: &NoSocketWhy,
+    mtime: SystemTime,
+    now: SystemTime,
+) -> NoAddressAction {
+    match why {
+        NoSocketWhy::DeadAfterExit | NoSocketWhy::FailedStart => {
+            let age = age_since(mtime, now);
+            if age >= DISCARD_GRACE {
+                NoAddressAction::DiscardNow
+            } else {
+                NoAddressAction::WaitUntil(mtime + (DISCARD_GRACE - age))
+            }
+        }
+        NoSocketWhy::PendingStart => {
+            let age = age_since(mtime, now);
+            if age >= PENDING_START_GRACE {
+                NoAddressAction::DiscardNow
+            } else {
+                NoAddressAction::Refuse("start-pending")
+            }
+        }
+        NoSocketWhy::AliveSelfNoAddress => NoAddressAction::OwnedInProcess,
+        NoSocketWhy::AliveForeignNoAddress => NoAddressAction::Refuse("foreign-holder"),
+        NoSocketWhy::AliveUnknownNoAddress => NoAddressAction::Refuse("unknown-record"),
+    }
 }
 
 /// Read-only view of the persist identity plus the file mtime.
@@ -426,101 +976,452 @@ pub(crate) fn persist_identity(
     Ok(Some((PersistIdentity::from_handle(&handle), mtime)))
 }
 
-/// Bounded synchronous holder RPC used by the reaper.
+/// Typed socket fault. "No connection" must stay a typed arm (`NoListener`), not text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcFault {
+    ConnectRefused,
+    Timeout,
+    Closed,
+    Invalid,
+    Io,
+}
+
+#[derive(Debug)]
+struct HolderRpcError {
+    fault: RpcFault,
+    /// Diagnostic only: reason tokens stay stable and never carry OS text.
+    #[allow(dead_code)]
+    detail: String,
+}
+
+impl HolderRpcError {
+    fn reason(&self, op: &str) -> String {
+        let suffix = match self.fault {
+            RpcFault::ConnectRefused => "connect-refused",
+            RpcFault::Timeout => "timeout",
+            RpcFault::Closed => "closed",
+            RpcFault::Invalid => "json",
+            RpcFault::Io => "io",
+        };
+        format!("{op}-{suffix}")
+    }
+}
+
+fn io_fault(e: &std::io::Error) -> RpcFault {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => RpcFault::ConnectRefused,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => RpcFault::Timeout,
+        std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted => RpcFault::Closed,
+        _ => RpcFault::Io,
+    }
+}
+
+/// Bounded synchronous holder RPC used by the seam.
 ///
-/// The async [`holder_rpc`] has no timeout of its own; the reaper runs on a
-/// blocking worker and must bound every socket operation at 750 ms.
+/// The async [`holder_rpc`] has no timeout of its own; this runs on a blocking worker
+/// and bounds every socket operation at `timeout`.
 fn holder_rpc_sync(
     addr: &str,
     req: &HoldRequest,
     timeout: std::time::Duration,
-) -> Result<HoldResponse> {
+) -> std::result::Result<HoldResponse, HolderRpcError> {
     use std::io::{BufRead, BufReader, Write};
 
-    let sock: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| CoordinatorError::Message(format!("holder addr {addr}: {e}")))?;
-    let mut stream = std::net::TcpStream::connect_timeout(&sock, timeout)
-        .map_err(|e| CoordinatorError::Message(format!("holder connect {addr}: {e}")))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let payload = serde_json::to_string(req)?;
-    stream.write_all(payload.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+    let closed = |detail: String| HolderRpcError {
+        fault: RpcFault::Closed,
+        detail,
+    };
+    let io = |e: &std::io::Error| HolderRpcError {
+        fault: io_fault(e),
+        detail: e.to_string(),
+    };
+    let sock: std::net::SocketAddr =
+        addr.parse()
+            .map_err(|e: std::net::AddrParseError| HolderRpcError {
+                fault: RpcFault::Io,
+                detail: format!("holder addr {addr}: {e}"),
+            })?;
+    let mut stream = std::net::TcpStream::connect_timeout(&sock, timeout).map_err(|e| {
+        // A connect-phase timeout is "the address accepted no connection" on Windows:
+        // a listening socket completes the handshake in the kernel even when the app
+        // never calls accept, so only an absent listener leaves the SYN unanswered.
+        match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => HolderRpcError {
+                fault: RpcFault::ConnectRefused,
+                detail: e.to_string(),
+            },
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => HolderRpcError {
+                fault: RpcFault::ConnectRefused,
+                detail: format!("connect timed out: {e}"),
+            },
+            _ => HolderRpcError {
+                fault: RpcFault::Io,
+                detail: e.to_string(),
+            },
+        }
+    })?;
+    stream.set_read_timeout(Some(timeout)).map_err(|e| io(&e))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| io(&e))?;
+    let payload = serde_json::to_string(req).map_err(|e| HolderRpcError {
+        fault: RpcFault::Invalid,
+        detail: e.to_string(),
+    })?;
+    stream.write_all(payload.as_bytes()).map_err(|e| io(&e))?;
+    stream.write_all(b"\n").map_err(|e| io(&e))?;
+    stream.flush().map_err(|e| io(&e))?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Err(CoordinatorError::Message(
-            "holder closed without response".into(),
-        ));
+    if reader.read_line(&mut line).map_err(|e| io(&e))? == 0 {
+        return Err(closed("holder closed without response".into()));
     }
-    Ok(serde_json::from_str(line.trim())?)
+    serde_json::from_str(line.trim()).map_err(|e| HolderRpcError {
+        fault: RpcFault::Invalid,
+        detail: e.to_string(),
+    })
 }
 
-/// Prove the process behind `want.control_addr` is the holder named by the
-/// project's persist record. Any mismatch, timeout, closed connection, non-JSON
-/// response or non-holder service is unproven.
-pub(crate) fn verify_holder_identity(
+/// Prove the process behind `want.control_addr` is the holder named by the project's
+/// persist record. No address → the classifier's `NoSocket`; no connection →
+/// `NoListener`; any mismatch, timeout, closed connection, non-JSON response or
+/// non-holder service is `Unproven`. The persist `alive` flag is never consulted here.
+pub(crate) fn prove_holder(
+    record: &ProjectRecord,
     want: &PersistIdentity,
     timeout: std::time::Duration,
-) -> HolderReapRpc {
-    let Some(addr) = want.control_addr.as_deref() else {
-        return HolderReapRpc::IdentityUnproven("no-control-addr".into());
+) -> std::result::Result<VerifiedHolder, HolderTermination> {
+    let addr = match classify_persist(want) {
+        PersistClass::NoAddress(why) => return Err(HolderTermination::NoSocket { why }),
+        PersistClass::Addressed { addr } => addr,
     };
-    let resp = match holder_rpc_sync(addr, &HoldRequest::Ping, timeout) {
+    let mtime = match persist_identity(record) {
+        Ok(Some((_, mtime))) => mtime,
+        Ok(None) => {
+            return Err(HolderTermination::Unproven {
+                why: "persist-missing".into(),
+            });
+        }
+        Err(_) => {
+            return Err(HolderTermination::Unproven {
+                why: "persist-unreadable".into(),
+            });
+        }
+    };
+    let resp = match holder_rpc_sync(&addr, &HoldRequest::Ping, timeout) {
         Ok(resp) => resp,
-        Err(e) => return HolderReapRpc::IdentityUnproven(format!("ping: {e}")),
+        Err(e) if e.fault == RpcFault::ConnectRefused => {
+            return Err(HolderTermination::NoListener { addr });
+        }
+        Err(e) => {
+            return Err(HolderTermination::Unproven {
+                why: e.reason("ping"),
+            });
+        }
     };
     if !resp.ok {
-        return HolderReapRpc::IdentityUnproven("ping-not-ok".into());
+        return Err(HolderTermination::Unproven {
+            why: "ping-not-ok".into(),
+        });
     }
     let Some(harness) = resp.harness else {
-        return HolderReapRpc::IdentityUnproven("no-harness".into());
+        return Err(HolderTermination::Unproven {
+            why: "no-harness".into(),
+        });
     };
     match (want.session_id.as_deref(), harness.session_id.as_deref()) {
         (Some(a), Some(b)) if a == b => {}
-        _ => return HolderReapRpc::IdentityUnproven("session".into()),
+        _ => {
+            return Err(HolderTermination::Unproven {
+                why: "identity:session".into(),
+            });
+        }
     }
     match (want.cwd.as_deref(), harness.cwd.as_deref()) {
         (Some(a), Some(b)) if crate::worktree::paths_same(a, b) => {}
-        _ => return HolderReapRpc::IdentityUnproven("cwd".into()),
+        _ => {
+            return Err(HolderTermination::Unproven {
+                why: "identity:cwd".into(),
+            });
+        }
     }
     if !harness.adapter.eq_ignore_ascii_case(&want.adapter) {
-        return HolderReapRpc::IdentityUnproven("adapter".into());
+        return Err(HolderTermination::Unproven {
+            why: "identity:adapter".into(),
+        });
     }
     if let (Some(a), Some(b)) = (want.pid, harness.pid)
         && a != b
     {
-        return HolderReapRpc::IdentityUnproven("pid".into());
+        return Err(HolderTermination::Unproven {
+            why: "identity:pid".into(),
+        });
     }
-    HolderReapRpc::Verified
+    if let (Some(a), Some(b)) = (want.model.as_deref(), harness.model.as_deref())
+        && a != b
+    {
+        return Err(HolderTermination::Unproven {
+            why: "identity:model".into(),
+        });
+    }
+    if let (Some(a), Some(b)) = (want.bin.as_deref(), harness.bin.as_deref())
+        && !crate::worktree::paths_same(a, b)
+    {
+        return Err(HolderTermination::Unproven {
+            why: "identity:bin".into(),
+        });
+    }
+    Ok(VerifiedHolder {
+        record: record.clone(),
+        want: want.clone(),
+        addr,
+        mtime,
+        harness,
+    })
 }
 
-/// Ask the identity-verified holder to run its own existing `Shutdown` path.
-/// A timeout or rejection is unproven; there is no fallback termination.
-pub(crate) fn request_holder_shutdown(
-    want: &PersistIdentity,
-    timeout: std::time::Duration,
-) -> HolderReapRpc {
-    let Some(addr) = want.control_addr.as_deref() else {
-        return HolderReapRpc::ShutdownUnproven("no-control-addr".into());
-    };
-    match holder_rpc_sync(addr, &HoldRequest::Shutdown, timeout) {
-        Ok(resp) if resp.ok => HolderReapRpc::Verified,
-        Ok(resp) => {
-            HolderReapRpc::ShutdownUnproven(resp.error.unwrap_or_else(|| "shutdown-not-ok".into()))
+/// **The only function that sends a holder `Shutdown`.** Re-reads the persist in the
+/// sealed 0107 order, then delivers. Takes an unforgeable [`VerifiedHolder`].
+fn deliver_shutdown(v: &VerifiedHolder, intent: Intent) -> HolderTermination {
+    let handle = match load_persist(&v.record) {
+        Ok(Some(handle)) => handle,
+        Ok(None) => {
+            return HolderTermination::Unproven {
+                why: "persist-missing".into(),
+            };
         }
-        Err(e) => HolderReapRpc::ShutdownUnproven(format!("shutdown: {e}")),
+        Err(_) => {
+            return HolderTermination::Unproven {
+                why: "persist-unreadable".into(),
+            };
+        }
+    };
+    let path = match persist_path(&v.record) {
+        Ok(path) => path,
+        Err(_) => {
+            return HolderTermination::Unproven {
+                why: "persist-unreadable".into(),
+            };
+        }
+    };
+    let mtime = match std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+        Ok(mtime) => mtime,
+        Err(_) => {
+            return HolderTermination::Unproven {
+                why: "persist-unreadable".into(),
+            };
+        }
+    };
+    let now = PersistIdentity::from_handle(&handle);
+    match classify_persist(&now) {
+        PersistClass::NoAddress(why) => {
+            let old = PersistRef::new(v.want.clone(), v.mtime);
+            if why == NoSocketWhy::DeadAfterExit && same_record(&old, &now, mtime) {
+                return HolderTermination::Exited {
+                    holder_pid: v.want.holder_pid,
+                    session_id: v.want.session_id.clone(),
+                };
+            }
+            // Any other no-address shape is a different producer's record, never
+            // evidence that *this* holder exited.
+            return HolderTermination::Unproven {
+                why: "persist-changed".into(),
+            };
+        }
+        PersistClass::Addressed { .. } => {}
+    }
+    if now.prompt_in_flight && intent == Intent::Sweep {
+        return HolderTermination::Unproven {
+            why: "prompt-in-flight".into(),
+        };
+    }
+    if mtime != v.mtime {
+        return HolderTermination::Unproven {
+            why: "recently-active".into(),
+        };
+    }
+    if !now.same_identity(&v.want) {
+        return HolderTermination::Unproven {
+            why: "persist-changed".into(),
+        };
+    }
+    match holder_rpc_sync(
+        &v.addr,
+        &HoldRequest::Shutdown,
+        crate::harness::reap::RPC_TIMEOUT,
+    ) {
+        Ok(resp) if resp.ok => HolderTermination::Delivered {
+            holder_pid: now.holder_pid,
+            session_id: now.session_id.clone(),
+        },
+        Ok(_) => HolderTermination::Unproven {
+            why: "shutdown-rejected".into(),
+        },
+        Err(e) if e.fault == RpcFault::ConnectRefused => HolderTermination::NoListener {
+            addr: v.addr.clone(),
+        },
+        Err(e) => HolderTermination::Unproven {
+            why: e.reason("shutdown"),
+        },
     }
 }
 
-/// 0110 `roles prove`: the holder's own bounded `Ping`.
+/// `prove_holder` + `deliver_shutdown`.
+pub(crate) fn terminate_holder(
+    record: &ProjectRecord,
+    want: &PersistIdentity,
+    intent: Intent,
+) -> HolderTermination {
+    match prove_holder(record, want, crate::harness::reap::RPC_TIMEOUT) {
+        Ok(v) => deliver_shutdown(&v, intent),
+        Err(termination) => termination,
+    }
+}
+
+/// The sweep's entry: proof already happened in this tick.
+pub(crate) fn terminate_verified(v: VerifiedHolder, intent: Intent) -> HolderTermination {
+    deliver_shutdown(&v, intent)
+}
+
+/// Load → ownership gate → terminate. `old` is `None` only when the persist was already
+/// absent; the caller must hand it (never a post-Ping re-read) to the wait/compare
+/// helpers so an attempt stamp survives.
+pub(crate) fn terminate_persisted_holder(
+    record: &ProjectRecord,
+    intent: Intent,
+) -> Result<Terminated> {
+    let Some((identity, mtime)) = persist_identity(record)? else {
+        return Ok(Terminated {
+            old: None,
+            outcome: HolderTermination::Unproven {
+                why: "persist-missing".into(),
+            },
+        });
+    };
+    let old = PersistRef::new(identity.clone(), mtime);
+    let outcome = if identity.project_id != record.id {
+        HolderTermination::Unproven {
+            why: "identity:project-id".into(),
+        }
+    } else if matches!(classify_persist(&identity), PersistClass::Addressed { .. })
+        && !crate::harness::reap::cwd_is_owned(record, &identity)
+    {
+        // Only an addressed record can name a holder identity; an attempt/exit record
+        // legitimately has no cwd.
+        HolderTermination::Unproven {
+            why: "identity:cwd-not-owned".into(),
+        }
+    } else {
+        terminate_holder(record, &identity, intent)
+    };
+    Ok(Terminated {
+        old: Some(old),
+        outcome,
+    })
+}
+
+/// Poll for the old holder's own exit record. Expiry is `TimedOut` — never success.
+pub(crate) fn wait_holder_gone(
+    record: &ProjectRecord,
+    old: &PersistRef,
+    budget: Duration,
+) -> WaitGone {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match persist_identity(record) {
+            Ok(None) => {
+                return WaitGone::Gone {
+                    how: GoneHow::Absent,
+                };
+            }
+            Ok(Some((now, mtime))) => {
+                if !same_record(old, &now, mtime) {
+                    return WaitGone::Superseded;
+                }
+                if classify_persist(&now) == PersistClass::NoAddress(NoSocketWhy::DeadAfterExit) {
+                    return WaitGone::Gone {
+                        how: GoneHow::Exited,
+                    };
+                }
+            }
+            // Unreadable is not absent; keep polling and let the budget decide.
+            Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return WaitGone::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Compare-and-act: remove the persist only while it is still `old`.
 ///
-/// Returns the live status only when `verify_holder_identity` is `Verified` **and** the
-/// persisted pid and the Ping pid are both present and equal. The identity contract for
-/// the reaper is deliberately unchanged; this is the stricter read-only proof used by the
-/// swap CLI.
+/// **`false` is a verdict, not a hint** — the caller performs none of its success
+/// effects (no spawn, detach, unregister, tree removal or dead status). Absent means
+/// there is nothing to do (`true`).
+pub(crate) fn clear_persist_if(record: &ProjectRecord, old: &PersistRef) -> bool {
+    match persist_identity(record) {
+        Ok(None) => true,
+        Ok(Some((now, mtime))) if same_record(old, &now, mtime) => match persist_path(record) {
+            Ok(path) => std::fs::remove_file(path).is_ok(),
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
+
+/// Compare-and-act: write the truthful dead record only while it is still `old`.
+///
+/// **`false` is a verdict** (see [`clear_persist_if`]). This is the only path to
+/// [`persist_marked_dead`].
+pub(crate) fn mark_dead_if(record: &ProjectRecord, old: &PersistRef) -> bool {
+    match persist_identity(record) {
+        Ok(None) => true,
+        Ok(Some((now, mtime))) if same_record(old, &now, mtime) => match load_persist(record) {
+            Ok(Some(handle)) => save_persist(record, &persist_marked_dead(&handle)).is_ok(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// One discard receipt naming the identity that is being given up.
+pub(crate) fn discard_line(record: &ProjectRecord, old: &PersistRef) {
+    let holder = old
+        .identity
+        .holder_pid
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "-".into());
+    let session = old.identity.session_id.as_deref().unwrap_or("-");
+    let shape = match classify_persist(&old.identity) {
+        PersistClass::NoAddress(why) => why_token(why).to_string(),
+        PersistClass::Addressed { .. } => "addressed".into(),
+    };
+    crate::progress_log::append(
+        record,
+        "holder-persist-discarded",
+        &format!(
+            "shape={shape} holder_pid={holder} session_id={session} mtime={:?}",
+            old.mtime
+        ),
+    );
+}
+
+pub(crate) fn why_token(why: NoSocketWhy) -> &'static str {
+    match why {
+        NoSocketWhy::DeadAfterExit => "dead-after-exit",
+        NoSocketWhy::FailedStart => "failed-start",
+        NoSocketWhy::PendingStart => "pending-start",
+        NoSocketWhy::AliveSelfNoAddress => "alive-self",
+        NoSocketWhy::AliveForeignNoAddress => "alive-foreign",
+        NoSocketWhy::AliveUnknownNoAddress => "alive-unknown",
+    }
+}
+
+/// 0110 `roles prove`: the holder's own bounded `Ping` (one Ping, one identity proof).
 pub(crate) fn probe_holder(
     record: &ProjectRecord,
     _role: &str,
@@ -531,27 +1432,11 @@ pub(crate) fn probe_holder(
     if !handle.alive || handle.control_addr.is_none() {
         return Ok(None);
     }
-    let timeout = crate::harness::reap::RPC_TIMEOUT;
     let want = PersistIdentity::from_handle(&handle);
-    if !matches!(
-        verify_holder_identity(&want, timeout),
-        HolderReapRpc::Verified
-    ) {
-        return Ok(None);
-    }
-    let Some(addr) = handle.control_addr.as_deref() else {
+    let Ok(verified) = prove_holder(record, &want, crate::harness::reap::RPC_TIMEOUT) else {
         return Ok(None);
     };
-    let resp = match holder_rpc_sync(addr, &HoldRequest::Ping, timeout) {
-        Ok(resp) => resp,
-        Err(_) => return Ok(None),
-    };
-    if !resp.ok {
-        return Ok(None);
-    }
-    let Some(status) = resp.harness else {
-        return Ok(None);
-    };
+    let status = verified.harness;
     let (Some(persisted), Some(pinged)) = (handle.pid, status.pid) else {
         return Ok(None);
     };
@@ -566,71 +1451,12 @@ fn save_persist(record: &ProjectRecord, handle: &PersistedGrokHandle) -> Result<
     atomic_write_json(&persist_path(record)?, handle)
 }
 
-fn write_session_persist(
-    record: &ProjectRecord,
-    session: &GrokSession,
-    control_addr: Option<String>,
-    prompt_in_flight: bool,
-) {
-    let handle = PersistedGrokHandle {
-        version: 1,
-        model: session.model.clone(),
-        bin: Some(session.bin.clone()),
-        project_id: record.id.clone(),
-        session_id: Some(session.session_id.clone()),
-        cwd: Some(session.cwd.clone()),
-        pid: session.pid,
-        holder_pid: Some(std::process::id()),
-        control_addr,
-        adapter: session.adapter.clone(),
-        supports_compact: session.supports_compact,
-        alive: true,
-        prompt_in_flight,
-        error: None,
-        context_usage: session.context_usage.clone(),
-        last_signal: session.last_signal.clone(),
-        last_tool_title: session.last_tool_title.clone(),
-    };
-    let _ = save_persist(record, &handle);
-}
-
 fn persist_adapter_name(harness: &str) -> String {
     if harness.trim().is_empty() {
         default_adapter()
     } else {
         harness.to_string()
     }
-}
-
-fn save_attempt_persist(record: &ProjectRecord, harness: &str, error: Option<String>) {
-    let handle = PersistedGrokHandle {
-        version: 1,
-        model: None,
-        bin: None,
-        project_id: record.id.clone(),
-        session_id: None,
-        cwd: None,
-        pid: None,
-        holder_pid: Some(std::process::id()),
-        control_addr: None,
-        adapter: persist_adapter_name(harness),
-        supports_compact: true,
-        alive: false,
-        prompt_in_flight: false,
-        error,
-        context_usage: None,
-        last_signal: None,
-        last_tool_title: None,
-    };
-    let _ = save_persist(record, &handle);
-}
-
-fn save_pending_start_persist(record: &ProjectRecord, harness: &str) {
-    save_attempt_persist(record, harness, None);
-}
-
-fn save_start_error_persist(record: &ProjectRecord, harness: &str, err: &CoordinatorError) {
-    save_attempt_persist(record, harness, Some(err.to_string()));
 }
 
 pub(crate) fn persist_prompt_in_flight(record: &ProjectRecord) -> bool {
@@ -1253,7 +2079,11 @@ async fn spawn_in_process(
     harness: &str,
 ) -> Result<GrokHarnessStatus> {
     let cwd = grok_cwd(record);
-    save_pending_start_persist(record, harness);
+    pre_claim(record);
+    let claim = claim_start(record, harness)?;
+    if let Some(stand_in) = spawn_stand_in(record) {
+        return stand_in;
+    }
     let started = match bin {
         Some(b) => {
             GrokSession::start_with_harness(
@@ -1270,13 +2100,14 @@ async fn spawn_in_process(
     let mut session = match started {
         Ok(s) => s,
         Err(e) => {
-            save_start_error_persist(record, harness, &e);
+            // `false` = a newer claim owns the file; report the start failure anyway.
+            let _ = mark_start_error(record, Some(&claim), &e.to_string());
             return Err(e);
         }
     };
     session.set_progress_record(record.clone());
     crate::harness::abort::register_cancel_handle(record.id.clone(), session.cancel_handle());
-    write_session_persist(record, &session, None, false);
+    publish_ready_or_teardown(record, &mut session, None, Some(&claim)).await?;
     let status = session_status(&session);
     global_pool()
         .lock()
@@ -1337,8 +2168,44 @@ async fn start_inner(
         }
     }
     if refuse {
-        if let Ok(Some(existing)) = load_persist(&rec) {
-            reap_stale_holder(&rec, &existing);
+        // This arm is inside the async fn: offload the blocking proof/delivery.
+        // An absent persist has nothing to terminate (plan 1b); an unreadable one is
+        // a refusal with the recovery.
+        let existing = match load_persist(&rec) {
+            Ok(found) => found,
+            Err(e) => {
+                return Err(CoordinatorError::Message(format!(
+                    "holder persist unreadable on the refuse path: {e} (persist: {}). {}",
+                    path_display(&rec),
+                    recovery_hint(&rec)
+                )));
+            }
+        };
+        if existing.is_some() {
+            let termination = run_holder_work({
+                let rec = rec.clone();
+                move || terminate_persisted_holder(&rec, Intent::Reap)
+            })
+            .await?;
+            match termination.outcome {
+                // A concurrent vanish after the load is benign: there is nothing left
+                // to terminate, and `claim_start` decides the slot.
+                HolderTermination::Unproven { why } if why == "persist-missing" => {}
+                HolderTermination::Unproven { why } => {
+                    return Err(CoordinatorError::Message(format!(
+                        "holder identity unproven ({why}); refusing to start (persist: {}). {}",
+                        path_display(&rec),
+                        recovery_hint(&rec)
+                    )));
+                }
+                // A successful delivery still fails this start at `claim_start`
+                // (persist-appeared) until the holder's own exit record lands: do **not**
+                // wait-and-clear here (that would be the clobber this track removes).
+                HolderTermination::Delivered { .. } => {}
+                other => {
+                    settle_start_termination(&rec, termination.old.as_ref(), other)?;
+                }
+            }
         }
     } else if let Some(existing) =
         reuse_or_reap_existing(&rec, harness, model.as_deref(), bin.as_deref()).await?
@@ -1353,95 +2220,374 @@ async fn start_inner(
     }
 }
 
-/// Reuse a live holder that still answers Ping. Otherwise treat leftover persist as
-/// dead (kill `pid` then `holder_pid`) so a new start never clobbers a holder file
-/// with an in-process persist (`control_addr: None`).
-async fn reuse_or_reap_existing(
+fn path_display(record: &ProjectRecord) -> String {
+    persist_path(record)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "{state_dir}/harness-grok.json".into())
+}
+
+fn holder_changed(record: &ProjectRecord, detail: &str) -> CoordinatorError {
+    CoordinatorError::Message(format!(
+        "holder-changed: {detail} (persist: {}). {}",
+        path_display(record),
+        recovery_hint(record)
+    ))
+}
+
+fn holder_unproven(record: &ProjectRecord, why: &str) -> CoordinatorError {
+    CoordinatorError::Message(format!(
+        "holder unproven ({why}) (persist: {}). {}",
+        path_display(record),
+        recovery_hint(record)
+    ))
+}
+
+/// One named helper for every async caller of the blocking proof/delivery/wait.
+pub(crate) async fn run_holder_work<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => Err(CoordinatorError::Message(format!(
+            "holder work join failed: {e}"
+        ))),
+    }
+}
+
+fn load_ref(record: &ProjectRecord) -> Result<Option<(PersistedGrokHandle, PersistRef)>> {
+    let Some(handle) = load_persist(record)? else {
+        return Ok(None);
+    };
+    let identity = PersistIdentity::from_handle(&handle);
+    let mtime = std::fs::metadata(persist_path(record)?)?.modified()?;
+    Ok(Some((handle, PersistRef::new(identity, mtime))))
+}
+
+/// Reuse a live holder that still answers a matching Ping. Every other shape goes
+/// through the one termination owner, or refuses.
+pub(crate) async fn reuse_or_reap_existing(
     record: &ProjectRecord,
     harness: &str,
     model: Option<&str>,
     bin: Option<&Path>,
 ) -> Result<Option<GrokHarnessStatus>> {
-    let Some(existing) = load_persist(record)? else {
+    let Some((handle, old)) = load_ref(record)? else {
         return Ok(None);
     };
-    if !existing.alive {
-        return Ok(None);
+    let identity = old.identity.clone();
+    match classify_persist(&identity) {
+        PersistClass::NoAddress(why) => match why {
+            NoSocketWhy::AliveSelfNoAddress => {
+                // A stale record for this process's own dead session: record the
+                // discarded identity, then compare-clear (never over a newer write).
+                after_gone(record);
+                discard_line(record, &old);
+                if !clear_persist_if(record, &old) {
+                    return Err(holder_changed(
+                        record,
+                        "the record changed before the clear",
+                    ));
+                }
+                Ok(None)
+            }
+            NoSocketWhy::AliveForeignNoAddress | NoSocketWhy::AliveUnknownNoAddress => {
+                let token = if why == NoSocketWhy::AliveForeignNoAddress {
+                    "foreign-holder"
+                } else {
+                    "unknown-record"
+                };
+                Err(holder_unproven(record, token))
+            }
+            _ => {
+                settle_start_no_address(record, &old, why).await?;
+                Ok(None)
+            }
+        },
+        PersistClass::Addressed { .. } => {
+            if identity.project_id != record.id {
+                return Err(holder_unproven(record, "identity:project-id"));
+            }
+            if !crate::harness::reap::cwd_is_owned(record, &identity) {
+                return Err(holder_unproven(record, "identity:cwd-not-owned"));
+            }
+            let want = grok_cwd(record);
+            let reuse_ok = identity.alive
+                && identity
+                    .cwd
+                    .as_ref()
+                    .is_some_and(|cwd| crate::worktree::paths_same(cwd, &want))
+                && !crate::harness::abort::should_refuse_reuse(record)
+                && identity_matches_parts(&handle.to_status(), harness, model, bin);
+            if reuse_ok
+                && let Ok(verified) =
+                    prove_holder(record, &identity, crate::harness::reap::RPC_TIMEOUT)
+            {
+                return Ok(Some(verified.harness));
+            }
+            let termination = run_holder_work({
+                let rec = record.clone();
+                move || terminate_persisted_holder(&rec, Intent::Reap)
+            })
+            .await?;
+            settle_start_termination(record, termination.old.as_ref(), termination.outcome)?;
+            Ok(None)
+        }
     }
-    let want = grok_cwd(record);
-    if existing
-        .cwd
-        .as_ref()
-        .is_some_and(|cwd| !crate::worktree::paths_same(cwd, &want))
-    {
-        reap_stale_holder(record, &existing);
-        return Ok(None);
-    }
-    if crate::harness::abort::should_refuse_reuse(record) {
-        reap_stale_holder(record, &existing);
-        return Ok(None);
-    }
-    let status = existing.to_status();
-    if !identity_matches_parts(&status, harness, model, bin) {
-        reap_stale_holder(record, &existing);
-        return Ok(None);
-    }
-    if let Some(addr) = &existing.control_addr
-        && holder_rpc(addr, &HoldRequest::Ping).await.is_ok()
-    {
-        return Ok(Some(existing.to_status()));
-    }
-    reap_stale_holder(record, &existing);
-    Ok(None)
 }
 
-fn reap_stale_holder(record: &ProjectRecord, existing: &PersistedGrokHandle) {
-    kill_persist_pids(existing);
-    let _ = clear_stale_holder_persist(record);
+/// Publish the holder's ready record, or tear its own session down and drop the
+/// registration when a newer writer owns the file. A holder never serves untracked.
+async fn publish_ready_or_teardown(
+    record: &ProjectRecord,
+    session: &mut GrokSession,
+    control_addr: Option<String>,
+    stamp: Option<&PersistRef>,
+) -> Result<()> {
+    if write_holder_ready(record, session, control_addr, stamp) {
+        return Ok(());
+    }
+    let _ = session.shutdown().await;
+    crate::harness::abort::unregister_cancel_handle(&record.id);
+    Err(CoordinatorError::Message(format!(
+        "persist-changed: another writer owns the holder record; session torn down \
+         (persist: {}). {}",
+        path_display(record),
+        recovery_hint(record)
+    )))
 }
 
-/// Drop leftover persist so a retry does not treat a prior start failure as current.
-fn clear_stale_holder_persist(record: &ProjectRecord) -> Result<()> {
-    let path = persist_path(record)?;
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
+/// Table A (an address was present) for the start/reuse caller.
+fn settle_start_termination(
+    record: &ProjectRecord,
+    old: Option<&PersistRef>,
+    outcome: HolderTermination,
+) -> Result<()> {
+    match outcome {
+        HolderTermination::Delivered { .. } => {
+            let Some(old) = old else {
+                return Err(holder_changed(
+                    record,
+                    "the persist vanished after delivery",
+                ));
+            };
+            match wait_holder_gone(record, old, WAIT_GONE) {
+                WaitGone::Gone { .. } => {
+                    after_gone(record);
+                    if clear_persist_if(record, old) {
+                        Ok(())
+                    } else {
+                        Err(holder_changed(
+                            record,
+                            "the record changed before the clear",
+                        ))
+                    }
+                }
+                WaitGone::Superseded => Err(holder_changed(
+                    record,
+                    "a newer holder owns the persist after the wait",
+                )),
+                WaitGone::TimedOut => Err(CoordinatorError::Message(format!(
+                    "delivered; the holder has not written its exit record; retry (persist: {})",
+                    path_display(record)
+                ))),
+            }
+        }
+        HolderTermination::Exited { .. } => {
+            let Some(old) = old else {
+                return Ok(());
+            };
+            after_gone(record);
+            if clear_persist_if(record, old) {
+                Ok(())
+            } else {
+                Err(holder_changed(
+                    record,
+                    "the record changed before the clear",
+                ))
+            }
+        }
+        HolderTermination::NoListener { addr } => {
+            // The start path is the only arm that may act on "no listener".
+            let Some(old) = old else {
+                return Ok(());
+            };
+            discard_line(record, old);
+            if clear_persist_if(record, old) {
+                eprintln!(
+                    "coordinator: holder-persist-discarded: project={} reason=connect-refused addr={addr}",
+                    record.id
+                );
+                Ok(())
+            } else {
+                Err(holder_changed(
+                    record,
+                    "the record changed before the clear",
+                ))
+            }
+        }
+        HolderTermination::NoSocket { why } => settle_no_address_now(record, old, why),
+        HolderTermination::Unproven { why } => Err(holder_unproven(record, &why)),
     }
-    Ok(())
+}
+
+/// Table B for a *loaded* no-address record: wait out the grace, re-read and
+/// re-classify, then one receipt + compare-clear.
+async fn settle_start_no_address(
+    record: &ProjectRecord,
+    old: &PersistRef,
+    why: NoSocketWhy,
+) -> Result<()> {
+    let mut action = no_address_decision(&why, old.mtime, SystemTime::now());
+    loop {
+        match action {
+            NoAddressAction::DiscardNow => return discard_now(record, old),
+            NoAddressAction::WaitUntil(at) => {
+                let now = SystemTime::now();
+                if at > now
+                    && let Ok(wait) = at.duration_since(now)
+                {
+                    tokio::time::sleep(wait).await;
+                }
+                let Some((identity, mtime)) = persist_identity(record)? else {
+                    return Ok(());
+                };
+                if !same_record(old, &identity, mtime) {
+                    return Err(holder_changed(
+                        record,
+                        "a newer record owns the persist during the grace wait",
+                    ));
+                }
+                match classify_persist(&identity) {
+                    PersistClass::NoAddress(next) => {
+                        action = no_address_decision(&next, mtime, SystemTime::now());
+                    }
+                    PersistClass::Addressed { .. } => {
+                        return Err(holder_changed(
+                            record,
+                            "the record gained an address during the grace wait",
+                        ));
+                    }
+                }
+            }
+            NoAddressAction::Refuse(reason) => {
+                return Err(CoordinatorError::Message(format!(
+                    "{reason}: another holder lifecycle owns the persist (persist: {}). Do not \
+                     delete anything; retry in a few seconds. {}",
+                    path_display(record),
+                    recovery_hint(record)
+                )));
+            }
+            NoAddressAction::OwnedInProcess => {
+                return Err(CoordinatorError::Message(format!(
+                    "alive-self: this process still owns a session record (persist: {}). {}",
+                    path_display(record),
+                    recovery_hint(record)
+                )));
+            }
+        }
+    }
+}
+
+fn settle_no_address_now(
+    record: &ProjectRecord,
+    old: Option<&PersistRef>,
+    why: NoSocketWhy,
+) -> Result<()> {
+    match no_address_decision(
+        &why,
+        old.map(|o| o.mtime).unwrap_or(SystemTime::now()),
+        SystemTime::now(),
+    ) {
+        NoAddressAction::DiscardNow => match old {
+            Some(old) => discard_now(record, old),
+            None => Ok(()),
+        },
+        NoAddressAction::Refuse(reason) => Err(CoordinatorError::Message(format!(
+            "{reason}: the record is still authoritative (persist: {}). {}",
+            path_display(record),
+            recovery_hint(record)
+        ))),
+        NoAddressAction::OwnedInProcess => match old {
+            // The start path already dropped its own in-process session above; what is
+            // left is a stale self record: record the identity, then compare-clear.
+            Some(old) => discard_now(record, old),
+            None => Ok(()),
+        },
+        NoAddressAction::WaitUntil(_) => Err(holder_changed(
+            record,
+            "the record is inside its discard grace",
+        )),
+    }
+}
+
+fn discard_now(record: &ProjectRecord, old: &PersistRef) -> Result<()> {
+    discard_line(record, old);
+    if clear_persist_if(record, old) {
+        Ok(())
+    } else {
+        Err(holder_changed(
+            record,
+            "the record changed before the clear",
+        ))
+    }
 }
 
 /// Persist fields the worktree live-check and sync shutdown need.
 #[derive(Debug, Clone)]
 pub(crate) struct PersistLive {
     pub cwd: Option<PathBuf>,
-    pub pid: Option<u32>,
-    pub holder_pid: Option<u32>,
     pub alive: bool,
     pub prompt_in_flight: bool,
 }
 
-pub(crate) fn persist_live(record: &ProjectRecord) -> Option<PersistLive> {
-    let handle = load_persist(record).ok().flatten()?;
-    Some(PersistLive {
+/// `Err` is unreadable/corrupt — **not** absent. `session_bound` treats it as bound.
+pub(crate) fn persist_live(record: &ProjectRecord) -> Result<Option<PersistLive>> {
+    let Some(handle) = load_persist(record)? else {
+        return Ok(None);
+    };
+    Ok(Some(PersistLive {
         cwd: handle.cwd,
-        pid: handle.pid,
-        holder_pid: handle.holder_pid,
         alive: handle.alive,
         prompt_in_flight: handle.prompt_in_flight,
-    })
+    }))
 }
 
-pub(crate) fn clear_persist_file(record: &ProjectRecord) {
-    let _ = clear_stale_holder_persist(record);
-}
-
-pub(crate) fn kill_live_pids(live: &PersistLive) {
-    if let Some(pid) = live.pid {
-        crate::harness::grok::tree_kill_pid(pid);
-    }
-    if let Some(holder) = live.holder_pid
-        && live.pid != Some(holder)
-    {
-        crate::harness::grok::tree_kill_pid(holder);
+/// Bounded pool-lock wait, then the owned session's synchronous teardown.
+/// `false` when no session matches or the lock is not acquired — never a drop.
+pub(crate) fn teardown_pooled_if_cwd(
+    project_id: &str,
+    pred: impl Fn(&std::path::Path) -> bool,
+    budget: Duration,
+) -> bool {
+    let Some(pool) = POOL.get() else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match pool.try_lock() {
+            Ok(mut guard) => {
+                let matches = guard
+                    .status_of(project_id)
+                    .and_then(|status| status.cwd)
+                    .is_some_and(|cwd| pred(&cwd));
+                if !matches {
+                    return false;
+                }
+                let Some(mut session) = guard.remove(project_id) else {
+                    return false;
+                };
+                session.shutdown_blocking();
+                return true;
+            }
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -1498,19 +2644,21 @@ async fn start_holder(
             let _ = resolve_grok_binary()?;
         }
     }
-    // A previous failed start writes `error` into harness-grok.json. Clear it
-    // before spawn so we never return that stale error on retry.
-    clear_stale_holder_persist(record)?;
-    save_pending_start_persist(record, harness);
+    pre_claim(record);
+    let claim = claim_start(record, harness)?;
+    if let Some(stand_in) = spawn_stand_in(record) {
+        return stand_in;
+    }
     let mut child = match spawn_holder_process(
         project.unwrap_or(record.path.to_str().unwrap_or(&record.id)),
         bin.as_deref(),
         model.as_deref(),
         harness,
+        &claim,
     ) {
         Ok(c) => c,
         Err(e) => {
-            save_start_error_persist(record, harness, &e);
+            let _ = mark_start_error(record, Some(&claim), &e.to_string());
             return Err(e);
         }
     };
@@ -1535,13 +2683,13 @@ async fn start_holder(
                 let err = CoordinatorError::Message(format!(
                     "Grok holder exited before ready ({status})"
                 ));
-                save_start_error_persist(record, harness, &err);
+                let _ = mark_start_error(record, Some(&claim), &err.to_string());
                 return Err(err);
             }
             Ok(None) => {}
             Err(e) => {
                 let err = CoordinatorError::Message(format!("failed to wait for Grok holder: {e}"));
-                save_start_error_persist(record, harness, &err);
+                let _ = mark_start_error(record, Some(&claim), &err.to_string());
                 return Err(err);
             }
         }
@@ -1549,7 +2697,7 @@ async fn start_holder(
             let err = CoordinatorError::Message(
                 "timed out waiting for Grok holder to become ready".into(),
             );
-            save_start_error_persist(record, harness, &err);
+            let _ = mark_start_error(record, Some(&claim), &err.to_string());
             return Err(err);
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1598,6 +2746,7 @@ fn spawn_holder_process(
     bin: Option<&std::path::Path>,
     model: Option<&str>,
     harness: &str,
+    stamp: &PersistRef,
 ) -> Result<std::process::Child> {
     let exe = std::env::current_exe().map_err(|e| {
         CoordinatorError::Message(format!("cannot resolve coordinator executable: {e}"))
@@ -1615,6 +2764,12 @@ fn spawn_holder_process(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     apply_holder_child_env(&mut cmd, bin, model, harness);
+    // The child-only attempt stamp. Set unconditionally, so an inherited operator
+    // value cannot forge a claim.
+    cmd.env(
+        ENV_HOLDER_ATTEMPT_MTIME,
+        stamp_nanos(&stamp.mtime).to_string(),
+    );
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1623,6 +2778,22 @@ fn spawn_holder_process(
     }
     cmd.spawn()
         .map_err(|e| CoordinatorError::Message(format!("failed to spawn grok holder: {e}")))
+}
+
+fn stamp_nanos(mtime: &SystemTime) -> u128 {
+    mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// The stamp this holder inherited from its parent's claim, if any. A malformed or
+/// absent marker is "unclaimed" (a direct `harness grok hold`).
+fn inherited_attempt_stamp(record: &ProjectRecord, harness: &str) -> Option<PersistRef> {
+    let raw = std::env::var(ENV_HOLDER_ATTEMPT_MTIME).ok()?;
+    let nanos: u64 = raw.trim().parse().ok()?;
+    let mtime = SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos);
+    Some(PersistRef::new(attempt_identity(record, harness), mtime))
 }
 
 pub async fn hold_loop(project: Option<&str>) -> Result<()> {
@@ -1635,6 +2806,8 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     let harness = holder_harness_slug();
+    // Read the parent claim's stamp once, before the ACP start.
+    let stamp = inherited_attempt_stamp(&rec, &harness);
     let started = async {
         let bin = resolve_holder_binary(&harness)?;
         GrokSession::start_with_harness(
@@ -1650,12 +2823,16 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
     let session = match started {
         Ok(s) => s,
         Err(e) => {
-            save_start_error_persist(&rec, &harness, &e);
+            if !mark_start_error(&rec, stamp.as_ref(), &e.to_string()) {
+                eprintln!(
+                    "coordinator: holder child refused to publish its error record (persist changed)"
+                );
+            }
             return Err(e);
         }
     };
 
-    hold_accept_loop(rec, session).await
+    hold_accept_loop(rec, session, stamp).await
 }
 
 fn holder_harness_slug() -> String {
@@ -1676,17 +2853,22 @@ fn resolve_holder_binary(harness: &str) -> Result<PathBuf> {
 /// Scripted holder for tests (mock ACP session).
 #[cfg(test)]
 pub async fn hold_loop_with_session(record: ProjectRecord, session: GrokSession) -> Result<()> {
-    hold_accept_loop(record, session).await
+    let stamp = inherited_attempt_stamp(&record, &session.adapter);
+    hold_accept_loop(record, session, stamp).await
 }
 
-async fn hold_accept_loop(rec: ProjectRecord, mut session: GrokSession) -> Result<()> {
+async fn hold_accept_loop(
+    rec: ProjectRecord,
+    mut session: GrokSession,
+    stamp: Option<PersistRef>,
+) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| CoordinatorError::Message(format!("holder bind 127.0.0.1:0 failed: {e}")))?;
     let addr = listener.local_addr()?.to_string();
     session.set_progress_record(rec.clone());
     crate::harness::abort::register_cancel_handle(rec.id.clone(), session.cancel_handle());
-    write_session_persist(&rec, &session, Some(addr.clone()), false);
+    publish_ready_or_teardown(&rec, &mut session, Some(addr.clone()), stamp.as_ref()).await?;
 
     let snapshot = std::sync::Mutex::new(session_status(&session));
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1720,26 +2902,11 @@ async fn hold_accept_loop(rec: ProjectRecord, mut session: GrokSession) -> Resul
     crate::harness::abort::unregister_cancel_handle(&rec.id);
     let mut session = shared.session.lock().await;
     let _ = session.shutdown().await;
-    let dead = PersistedGrokHandle {
-        version: 1,
-        model: session.model.clone(),
-        bin: Some(session.bin.clone()),
-        project_id: rec.id.clone(),
-        session_id: Some(session.session_id.clone()),
-        cwd: Some(session.cwd.clone()),
-        pid: session.pid,
-        holder_pid: Some(std::process::id()),
-        control_addr: None,
-        adapter: session.adapter.clone(),
-        supports_compact: session.supports_compact,
-        alive: false,
-        prompt_in_flight: false,
-        error: None,
-        context_usage: session.context_usage.clone(),
-        last_signal: session.last_signal.clone(),
-        last_tool_title: session.last_tool_title.clone(),
-    };
-    let _ = save_persist(&rec, &dead);
+    if !write_holder_exit(&rec, &session) {
+        eprintln!(
+            "coordinator: holder exit record not written: the persist no longer names this holder"
+        );
+    }
     Ok(())
 }
 
@@ -2569,8 +3736,13 @@ fn prepared_failure_after_recycle(
     detail: &str,
 ) -> Result<HarnessPromptView> {
     let message = format!(
-        "prepared prompt unavailable: {detail}. Shut down the harness, run \
-         `coordinator failure resolve`, then `coordinator run --track {}`.",
+        "prepared prompt unavailable: {detail}. Run `coordinator harness grok shutdown` \
+         (if it reports unproven: {} — persist: {}), run `coordinator failure resolve`, then \
+         `coordinator run --track {}`.",
+        crate::harness::pool::recovery_hint(rec),
+        crate::harness::pool::persist_path(rec)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "{state_dir}/harness-grok.json".into()),
         prepared.track_id.as_deref().unwrap_or("(none)")
     );
     let outcome = PhaseOutcome::failure(
@@ -2690,34 +3862,169 @@ async fn current_status(record: &ProjectRecord) -> GrokHarnessStatus {
         .unwrap_or_else(GrokHarnessStatus::missing)
 }
 
-/// Recycle without waiting on `global_pool()` (prompt() holds that mutex).
-/// CancelHandle + persist pid-kill + dead persist. Best-effort pool remove.
+/// The 0110/0027/0035 recycle. **Classifies the persist before any side effect**, so
+/// its addressed-holder branch is pool- and cancel-neutral, and an unreadable persist
+/// is its own refusal before any effect.
 pub(crate) async fn recycle_without_pool_lock(record: &ProjectRecord) -> Result<()> {
-    crate::harness::abort::unregister_cancel_handle(&record.id);
-    if let Ok(mut pool) = global_pool().try_lock()
-        && let Some(mut session) = pool.remove(&record.id)
-    {
-        let _ = session.shutdown().await;
+    let unreadable = |e: CoordinatorError| {
+        CoordinatorError::Message(format!(
+            "persist-unreadable: {e} (persist: {}). {}",
+            path_display(record),
+            recovery_hint(record)
+        ))
+    };
+    let Some((_handle, old)) = load_ref(record).map_err(unreadable)? else {
+        return recycle_pool_only(record).await;
+    };
+    let identity = old.identity.clone();
+    match classify_persist(&identity) {
+        PersistClass::NoAddress(why) => match why {
+            // The record is already dead and this caller has nothing to dispose; the
+            // following start applies the one grace rule.
+            NoSocketWhy::DeadAfterExit | NoSocketWhy::FailedStart => Ok(()),
+            NoSocketWhy::PendingStart => Err(CoordinatorError::Message(format!(
+                "start-pending: a holder start is in progress (persist: {}). Do not delete \
+                 anything; retry in a few seconds.",
+                path_display(record)
+            ))),
+            NoSocketWhy::AliveSelfNoAddress => recycle_in_process(record, &old).await,
+            NoSocketWhy::AliveForeignNoAddress | NoSocketWhy::AliveUnknownNoAddress => {
+                Err(holder_unproven(record, why_token(why)))
+            }
+        },
+        PersistClass::Addressed { .. } => {
+            let termination = run_holder_work({
+                let rec = record.clone();
+                move || terminate_persisted_holder(&rec, Intent::Reap)
+            })
+            .await?;
+            let outcome = termination.outcome;
+            let Some(old) = termination.old else {
+                return Ok(());
+            };
+            match outcome {
+                HolderTermination::Delivered { .. } => {
+                    match wait_holder_gone(record, &old, WAIT_GONE) {
+                        WaitGone::Gone { .. } => {
+                            after_gone(record);
+                            // `false` is a no-op verdict here: the write is this branch's
+                            // only effect, and a benign supersession must not surface a
+                            // spurious HarnessCrash at the prepared-prompt caller.
+                            let _ = mark_dead_if(record, &old);
+                            Ok(())
+                        }
+                        WaitGone::Superseded => Ok(()),
+                        WaitGone::TimedOut => Err(CoordinatorError::Message(format!(
+                            "delivered; the holder has not written its exit record; retry (persist: {})",
+                            path_display(record)
+                        ))),
+                    }
+                }
+                // Already truthful; this caller disposes of nothing.
+                HolderTermination::Exited { .. } => Ok(()),
+                HolderTermination::NoListener { addr } => Err(CoordinatorError::Message(format!(
+                    "no listener at {addr}: the holder control socket accepted no connection. \
+                     This is not evidence the holder exited; the start path is the only arm \
+                     that may clear it (persist: {}). {}",
+                    path_display(record),
+                    recovery_hint(record)
+                ))),
+                HolderTermination::NoSocket { why } => Err(holder_unproven(record, why_token(why))),
+                HolderTermination::Unproven { why } => Err(holder_unproven(record, &why)),
+            }
+        }
     }
-    if let Ok(Some(h)) = load_persist(record) {
-        kill_persist_pids(&h);
-        let dead = persist_marked_dead(&h);
-        let _ = save_persist(record, &dead);
-    }
-    Ok(())
 }
 
-/// How long the CLI will wait for a holder `Shutdown` RPC before falling back to pid-kill.
-const HOLDER_SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_millis(750);
+/// No persist at all: pool-only, teardown **then** unregister, no persist write.
+async fn recycle_pool_only(record: &ProjectRecord) -> Result<()> {
+    let deadline = std::time::Instant::now() + POOL_LOCK_BUDGET;
+    loop {
+        match global_pool().try_lock() {
+            Ok(mut pool) => {
+                if let Some(mut session) = pool.remove(&record.id) {
+                    let _ = session.shutdown().await;
+                }
+                crate::harness::abort::unregister_cancel_handle(&record.id);
+                return Ok(());
+            }
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(CoordinatorError::Message(format!(
+                        "pool lock busy: the live session was not torn down and its cancel \
+                         registration is kept (persist: {}). Retry.",
+                        path_display(record)
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// `AliveSelf`: not a holder. Tear the owned pool session down, **then** unregister,
+/// then the last compare-and-write. A false compare is a refusal.
+async fn recycle_in_process(record: &ProjectRecord, old: &PersistRef) -> Result<()> {
+    let deadline = std::time::Instant::now() + POOL_LOCK_BUDGET;
+    let mut owned = false;
+    loop {
+        match global_pool().try_lock() {
+            Ok(mut pool) => {
+                if let Some(mut session) = pool.remove(&record.id) {
+                    let _ = session.shutdown().await;
+                    owned = true;
+                }
+                break;
+            }
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(CoordinatorError::Message(format!(
+                        "pool lock busy: the owned session is still running and its cancel \
+                         registration is kept; the persist stays honest (persist: {}). Retry.",
+                        path_display(record)
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    crate::harness::abort::unregister_cancel_handle(&record.id);
+    after_gone(record);
+    if owned {
+        if !mark_dead_if(record, old) {
+            return Err(holder_changed(
+                record,
+                "the record changed before the dead write",
+            ));
+        }
+        return Ok(());
+    }
+    if !clear_persist_if(record, old) {
+        return Err(holder_changed(
+            record,
+            "the record changed before the clear",
+        ));
+    }
+    let holder = old
+        .identity
+        .holder_pid
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "-".into());
+    crate::progress_log::append(
+        record,
+        "holder-reap",
+        &format!("pid={holder} reason=stale-self cleared"),
+    );
+    Ok(())
+}
 
 pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarnessStatus> {
     let rec = resolve_record(project, infer_cwd)?;
     if let Some(mut session) = global_pool().lock().await.remove(&rec.id) {
         crate::harness::abort::unregister_cancel_handle(&rec.id);
         let _ = session.shutdown().await;
-        if let Ok(Some(h)) = load_persist(&rec) {
-            kill_persist_pids(&h);
-        }
+        // Test-only in-process exception (DoD-6): derived from the session just torn
+        // down, no persist compare; CLI and HTTP start detached holders.
         let dead = PersistedGrokHandle {
             version: 1,
             model: session.model.clone(),
@@ -2741,26 +4048,84 @@ pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarn
         return Ok(dead.to_status());
     }
 
-    let persist = load_persist(&rec)?;
-    if let Some(h) = &persist
-        && let Some(addr) = &h.control_addr
-    {
-        let _ = tokio::time::timeout(
-            HOLDER_SHUTDOWN_RPC_TIMEOUT,
-            holder_rpc(addr, &HoldRequest::Shutdown),
-        )
-        .await;
-    }
-    if let Some(h) = persist {
-        if h.alive {
-            kill_persist_pids(&h);
+    let termination = run_holder_work({
+        let rec = rec.clone();
+        move || terminate_persisted_holder(&rec, Intent::Operator)
+    })
+    .await?;
+    let outcome = termination.outcome;
+    let Some(old) = termination.old else {
+        return Ok(GrokHarnessStatus::missing());
+    };
+    match outcome {
+        HolderTermination::Delivered { .. } => match wait_holder_gone(&rec, &old, WAIT_GONE) {
+            WaitGone::Gone { .. } => {
+                after_gone(&rec);
+                if !mark_dead_if(&rec, &old) {
+                    return Err(holder_changed(
+                        &rec,
+                        "the record changed before the dead write",
+                    ));
+                }
+                Ok(current_persist_status(&rec))
+            }
+            WaitGone::Superseded => Err(holder_changed(
+                &rec,
+                "a newer holder owns the persist after the wait",
+            )),
+            WaitGone::TimedOut => Err(CoordinatorError::Message(format!(
+                "delivered; the holder has not written its exit record; retry (persist: {})",
+                path_display(&rec)
+            ))),
+        },
+        HolderTermination::Exited { .. } => {
+            after_gone(&rec);
+            if !mark_dead_if(&rec, &old) {
+                return Err(holder_changed(
+                    &rec,
+                    "the record changed before the dead write",
+                ));
+            }
+            Ok(current_persist_status(&rec))
         }
-        let dead = persist_marked_dead(&h);
-        let _ = save_persist(&rec, &dead);
-        return Ok(dead.to_status());
+        HolderTermination::NoListener { addr } => Err(CoordinatorError::Message(format!(
+            "no listener at {addr}: the holder control socket accepted no connection. This is \
+             not evidence the holder exited. Retry the start path, which may clear it; if that \
+             still fails: {} (persist: {}).",
+            recovery_hint(&rec),
+            path_display(&rec)
+        ))),
+        HolderTermination::NoSocket { why } => match why {
+            // Already truthful; no write.
+            NoSocketWhy::DeadAfterExit | NoSocketWhy::FailedStart => {
+                Ok(current_persist_status(&rec))
+            }
+            NoSocketWhy::PendingStart => Err(CoordinatorError::Message(format!(
+                "start-in-progress: a holder start is in progress (persist: {}). Do not delete \
+                 anything; retry in a few seconds.",
+                path_display(&rec)
+            ))),
+            NoSocketWhy::AliveSelfNoAddress => {
+                after_gone(&rec);
+                if !clear_persist_if(&rec, &old) {
+                    return Err(holder_changed(&rec, "the record changed before the clear"));
+                }
+                Ok(GrokHarnessStatus::missing())
+            }
+            NoSocketWhy::AliveForeignNoAddress | NoSocketWhy::AliveUnknownNoAddress => {
+                Err(holder_unproven(&rec, why_token(why)))
+            }
+        },
+        HolderTermination::Unproven { why } => Err(holder_unproven(&rec, &why)),
     }
+}
 
-    Ok(GrokHarnessStatus::missing())
+fn current_persist_status(record: &ProjectRecord) -> GrokHarnessStatus {
+    load_persist(record)
+        .ok()
+        .flatten()
+        .map(|handle| handle.to_status())
+        .unwrap_or_else(GrokHarnessStatus::missing)
 }
 
 fn persist_marked_dead(h: &PersistedGrokHandle) -> PersistedGrokHandle {
@@ -2785,23 +4150,6 @@ fn persist_marked_dead(h: &PersistedGrokHandle) -> PersistedGrokHandle {
     }
 }
 
-/// Best-effort kill of persist `pid` then `holder_pid`. Never kills this process.
-/// `taskkill` missing from PATH, or "process not found", is success.
-fn kill_persist_pids(h: &PersistedGrokHandle) {
-    if let Some(pid) = h.pid {
-        kill_pid_best_effort(pid);
-    }
-    if let Some(holder_pid) = h.holder_pid
-        && h.pid != Some(holder_pid)
-    {
-        kill_pid_best_effort(holder_pid);
-    }
-}
-
-fn kill_pid_best_effort(pid: u32) {
-    crate::harness::grok::tree_kill_pid(pid);
-}
-
 /// Insert a mock session (tests).
 pub async fn insert_test_session(project_id: String, session: GrokSession) {
     crate::harness::abort::register_cancel_handle(project_id.clone(), session.cancel_handle());
@@ -2809,6 +4157,7 @@ pub async fn insert_test_session(project_id: String, session: GrokSession) {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::config::{ENV_COORDINATOR_HOME, test_env_lock};
@@ -3221,11 +4570,56 @@ mod tests {
         let path = persist_path(rec).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let flag = if in_flight { "true" } else { "false" };
+        // The in-process shape names this process as the holder (AliveSelf) and has no
+        // control address, exactly what `spawn_in_process` writes.
         let body = format!(
-            r#"{{"version":1,"project_id":"{id}","adapter":"grok","supports_compact":true,"alive":true,"prompt_in_flight":{flag},"session_id":"{session_id}"}}"#,
+            r#"{{"version":1,"project_id":"{id}","adapter":"grok","supports_compact":true,"alive":true,"prompt_in_flight":{flag},"holder_pid":{pid},"session_id":"{session_id}"}}"#,
             id = rec.id,
+            pid = std::process::id(),
         );
         std::fs::write(path, body).unwrap();
+    }
+
+    /// A port that accepted a listener and then lost it: connecting is refused (the
+    /// typed `NoListener` arm), unlike an unbound low port which can time out on Windows.
+    fn closed_addr() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        addr
+    }
+
+    /// A live, real-protocol in-process holder: it writes its own ready persist and its
+    /// own dead exit record. Returns the join handle.
+    async fn spawn_live_holder(
+        rec: &ProjectRecord,
+        session_id: &str,
+        cwd: Option<PathBuf>,
+        harness: &str,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let session = GrokSession::start_mock_for(
+            cwd.unwrap_or_else(|| crate::harness::grok_cwd(rec)),
+            mock_handshake_ok(session_id),
+            Duration::from_secs(2),
+            harness,
+        )
+        .await
+        .unwrap();
+        let rec_hold = rec.clone();
+        let hold = tokio::spawn(async move { hold_loop_with_session(rec_hold, session).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(Some(h)) = load_persist(rec)
+                && h.control_addr.is_some()
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("live holder never became ready");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        hold
     }
 
     #[tokio::test]
@@ -3671,6 +5065,46 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         crate::state::ensure_state_dir(&rec).unwrap();
+        // An owned but different epoch cwd: the holder is provable and gets terminated.
+        let old_epoch = dir.path().join("old-epoch");
+        std::fs::create_dir_all(&old_epoch).unwrap();
+        let hold = spawn_live_holder(&rec, "sess-old-epoch", Some(old_epoch), "grok").await;
+        let got = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
+        assert!(got.is_none(), "a different epoch cwd is not reusable");
+        assert!(
+            load_persist(&rec).unwrap().is_none(),
+            "the delivered holder's own exit record is cleared"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), hold).await;
+    }
+
+    #[tokio::test]
+    async fn reuse_refuses_a_cwd_outside_the_project_roots() {
+        let dir = tempdir().unwrap();
+        let rec = ProjectRecord {
+            id: "cwd-foreign".into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: Default::default(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+        crate::state::ensure_state_dir(&rec).unwrap();
         let handle = PersistedGrokHandle {
             version: 1,
             model: None,
@@ -3680,7 +5114,7 @@ mod tests {
             cwd: Some(PathBuf::from(r"C:\other\epoch")),
             pid: None,
             holder_pid: None,
-            control_addr: Some("127.0.0.1:1".into()),
+            control_addr: Some(closed_addr()),
             adapter: "grok".into(),
             supports_compact: true,
             alive: true,
@@ -3692,11 +5126,17 @@ mod tests {
             last_tool_title: None,
         };
         save_persist(&rec, &handle).unwrap();
-        let got = reuse_or_reap_existing(&rec, "grok", None, None)
+        let before = std::fs::read(persist_path(&rec).unwrap()).unwrap();
+        let err = reuse_or_reap_existing(&rec, "grok", None, None)
             .await
-            .unwrap();
-        assert!(got.is_none());
-        assert!(load_persist(&rec).unwrap().is_none());
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cwd-not-owned"), "{err}");
+        assert_eq!(
+            before,
+            std::fs::read(persist_path(&rec).unwrap()).unwrap(),
+            "a foreign cwd persist is never touched"
+        );
     }
 
     #[test]
@@ -3796,42 +5236,17 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         crate::state::ensure_state_dir(&rec).unwrap();
-        let cwd = grok_cwd(&rec);
-        let handle = PersistedGrokHandle {
-            version: 1,
-            model: Some("gpt-6.1-sol[medium]".into()),
-            bin: Some(PathBuf::from(r"C:\bin\codex-acp.cmd")),
-            project_id: rec.id.clone(),
-            session_id: Some("sess-model".into()),
-            cwd: Some(cwd),
-            pid: None,
-            holder_pid: None,
-            control_addr: Some("127.0.0.1:1".into()),
-            adapter: "codex".into(),
-            supports_compact: true,
-            alive: true,
-            prompt_in_flight: false,
-            error: None,
-
-            context_usage: None,
-            last_signal: None,
-            last_tool_title: None,
-        };
-        save_persist(&rec, &handle).unwrap();
-        let got = reuse_or_reap_existing(
-            &rec,
-            "codex",
-            Some("gpt-6-luna"),
-            Some(Path::new(r"C:\bin\codex-acp.cmd")),
-        )
-        .await
-        .unwrap();
+        let hold = spawn_live_holder(&rec, "sess-model", None, "grok").await;
+        let got = reuse_or_reap_existing(&rec, "grok", Some("gpt-6-luna"), None)
+            .await
+            .unwrap();
         assert!(got.is_none(), "same adapter + different model must reap");
         assert!(load_persist(&rec).unwrap().is_none());
+        let _ = tokio::time::timeout(Duration::from_secs(2), hold).await;
     }
 
-    #[test]
-    fn retry_after_failed_start_clears_stale_error() {
+    #[tokio::test]
+    async fn retry_after_failed_start_clears_stale_error() {
         let dir = tempdir().unwrap();
         let rec = ProjectRecord {
             id: "p".into(),
@@ -3877,37 +5292,32 @@ mod tests {
         save_persist(&rec, &stale).unwrap();
         assert!(load_persist(&rec).unwrap().unwrap().error.is_some());
 
-        // Stale error would be returned immediately if we did not clear.
+        // Stale error would be returned immediately if we did not discard.
         assert!(matches!(
             interpret_persist_after_spawn(&stale),
             PersistWait::Failed(_)
         ));
-        clear_stale_holder_persist(&rec).unwrap();
+        // Age past DISCARD_GRACE: only the start path may discard it, with one line.
+        let aged = SystemTime::now() - (DISCARD_GRACE + Duration::from_secs(1));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(persist_path(&rec).unwrap())
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+        let got = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
+        assert!(got.is_none(), "an aged failed start is not reusable");
         assert!(
             load_persist(&rec).unwrap().is_none(),
-            "retry must drop the prior failure record"
+            "retry must discard the prior failure record through the one grace rule"
         );
-        let ready = PersistedGrokHandle {
-            version: 1,
-            model: None,
-            bin: None,
-            project_id: rec.id.clone(),
-            session_id: Some("sess-retry".into()),
-            cwd: Some(dir.path().to_path_buf()),
-            pid: Some(9),
-            holder_pid: Some(2),
-            control_addr: Some("127.0.0.1:9".into()),
-            adapter: "grok".into(),
-            supports_compact: true,
-            alive: true,
-            prompt_in_flight: false,
-            error: None,
-
-            context_usage: None,
-            last_signal: None,
-            last_tool_title: None,
-        };
-        assert_eq!(interpret_persist_after_spawn(&ready), PersistWait::Ready);
+        let claim = claim_start(&rec, "grok").unwrap();
+        assert!(
+            claim.identity.is_attempt(),
+            "the claim writes the pending attempt shape"
+        );
     }
 
     #[test]
@@ -4098,15 +5508,6 @@ mod tests {
         assert_eq!(h.adapter, "grok");
     }
 
-    fn taskkill_on_path() -> bool {
-        std::process::Command::new("taskkill")
-            .arg("/?")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-    }
-
     fn wait_child_dead(child: &mut std::process::Child, budget_ms: u64) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_millis(budget_ms);
         loop {
@@ -4123,8 +5524,10 @@ mod tests {
     fn spawn_dummy_long_child() -> std::process::Child {
         #[cfg(windows)]
         {
+            // `timeout` exits immediately when stdin is redirected; `ping` is the
+            // portable long-lived sleeper here.
             std::process::Command::new("cmd")
-                .args(["/C", "timeout", "/T", "300", "/NOBREAK"])
+                .args(["/C", "ping", "-n", "300", "127.0.0.1"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -4140,332 +5543,6 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .expect("spawn dummy child")
-        }
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn shutdown_kills_persist_pid_and_writes_dead() {
-        let _guard = test_env_lock();
-        let home = tempdir().unwrap();
-        let proj = tempdir().unwrap();
-        unsafe {
-            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
-        }
-        let mut reg = Registry::default();
-        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
-        reg.save(&crate::config::registry_path().unwrap()).unwrap();
-
-        let mut child = spawn_dummy_long_child();
-        let pid = child.id();
-        let handle = PersistedGrokHandle {
-            version: 1,
-            model: None,
-            bin: None,
-            project_id: rec.id.clone(),
-            session_id: Some("sess-dummy".into()),
-            cwd: Some(proj.path().to_path_buf()),
-            pid: Some(pid),
-            holder_pid: None,
-            control_addr: None,
-            adapter: "grok".into(),
-            supports_compact: true,
-            alive: true,
-            prompt_in_flight: false,
-            error: None,
-
-            context_usage: None,
-            last_signal: None,
-            last_tool_title: None,
-        };
-        save_persist(&rec, &handle).unwrap();
-        assert!(
-            !global_pool().lock().await.contains(&rec.id),
-            "pool must be empty so shutdown uses persist pid-kill"
-        );
-
-        let st = shutdown(Some(&rec.id), false).await.unwrap();
-        let persist = load_persist(&rec).unwrap().expect("persist written");
-        assert!(!persist.alive, "persist must be written dead");
-        assert!(!st.alive, "status must match persist");
-        assert_eq!(st.alive, persist.alive);
-        assert_eq!(st.session_id.as_deref(), Some("sess-dummy"));
-
-        if taskkill_on_path() {
-            assert!(
-                wait_child_dead(&mut child, 1000),
-                "taskkill is present; persist pid must be dead"
-            );
-        } else if !wait_child_dead(&mut child, 50) {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        unsafe {
-            std::env::remove_var(ENV_COORDINATOR_HOME);
-        }
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ping_fail_reaps_leftover_holder_pids() {
-        let _guard = test_env_lock();
-        let home = tempdir().unwrap();
-        let proj = tempdir().unwrap();
-        unsafe {
-            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
-        }
-        let mut reg = Registry::default();
-        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
-        reg.save(&crate::config::registry_path().unwrap()).unwrap();
-
-        let mut child = spawn_dummy_long_child();
-        let handle = PersistedGrokHandle {
-            version: 1,
-            model: None,
-            bin: None,
-            project_id: rec.id.clone(),
-            session_id: Some("sess-stale".into()),
-            cwd: Some(proj.path().to_path_buf()),
-            pid: Some(child.id()),
-            holder_pid: None,
-            control_addr: Some("127.0.0.1:1".into()),
-            adapter: "grok".into(),
-            supports_compact: true,
-            alive: true,
-            prompt_in_flight: false,
-            error: None,
-
-            context_usage: None,
-            last_signal: None,
-            last_tool_title: None,
-        };
-        save_persist(&rec, &handle).unwrap();
-
-        let reused = reuse_or_reap_existing(&rec, "grok", None, None)
-            .await
-            .unwrap();
-        assert!(reused.is_none(), "dead control_addr must not reuse");
-        assert!(
-            load_persist(&rec).unwrap().is_none(),
-            "stale holder persist must be cleared before a replacement start"
-        );
-        if taskkill_on_path() {
-            assert!(
-                wait_child_dead(&mut child, 1000),
-                "taskkill is present; leftover persist pid must be reaped"
-            );
-        } else if !wait_child_dead(&mut child, 50) {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        unsafe {
-            std::env::remove_var(ENV_COORDINATOR_HOME);
-        }
-    }
-
-    #[test]
-    fn kill_missing_pid_is_success() {
-        kill_pid_best_effort(u32::MAX);
-        kill_pid_best_effort(std::process::id());
-    }
-
-    #[cfg(windows)]
-    fn pid_is_live(pid: u32) -> bool {
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output();
-        match out {
-            Ok(o) => {
-                let s = String::from_utf8_lossy(&o.stdout);
-                s.contains(&pid.to_string()) && !s.to_ascii_lowercase().contains("no tasks")
-            }
-            Err(_) => false,
-        }
-    }
-
-    #[cfg(windows)]
-    fn wait_pid_gone(pid: u32, budget_ms: u64) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_millis(budget_ms);
-        while std::time::Instant::now() < deadline {
-            if !pid_is_live(pid) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        !pid_is_live(pid)
-    }
-
-    #[cfg(windows)]
-    fn spawn_cmd_tree_with_grandchild() -> (tempfile::TempDir, std::process::Child, u32) {
-        let dir = tempdir().unwrap();
-        let pidfile = dir.path().join("grandchild.pid");
-        let vbs = dir.path().join("gc.vbs");
-        std::fs::write(
-            &vbs,
-            "Set sh = CreateObject(\"WScript.Shell\")\r\n\
-Set p = sh.Exec(\"ping -n 120 127.0.0.1\")\r\n\
-Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
-Set f = fso.CreateTextFile(WScript.Arguments(0), True)\r\n\
-f.Write p.ProcessID\r\n\
-f.Close\r\n\
-Do While p.Status = 0\r\n\
-  WScript.Sleep 200\r\n\
-Loop\r\n",
-        )
-        .unwrap();
-        let cmd = dir.path().join("tree.cmd");
-        std::fs::write(
-            &cmd,
-            "@echo off\r\ncscript //nologo \"%~dp0gc.vbs\" \"%COORDINATOR_TEST_PIDFILE%\"\r\n",
-        )
-        .unwrap();
-        let parent = std::process::Command::new("cmd.exe")
-            .arg("/C")
-            .arg(&cmd)
-            .env("COORDINATOR_TEST_PIDFILE", &pidfile)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn cmd tree");
-        // cmd.exe plus a grandchild can exceed 20 s on a loaded runner.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let mut pid = None;
-        while std::time::Instant::now() < deadline {
-            if let Ok(s) = std::fs::read_to_string(&pidfile)
-                && let Ok(p) = s.trim().parse::<u32>()
-                && p != 0
-                && pid_is_live(p)
-            {
-                pid = Some(p);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let gc = pid.expect("grandchild PID file should appear while child is live");
-        (dir, parent, gc)
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn kill_pid_best_effort_tree_kills_grandchild() {
-        if !taskkill_on_path() {
-            return;
-        }
-        let (_dir, mut parent, gc) = spawn_cmd_tree_with_grandchild();
-        kill_pid_best_effort(parent.id());
-        assert!(
-            wait_pid_gone(gc, 5000),
-            "grandchild PID {gc} should be gone after kill_pid_best_effort /T"
-        );
-        let _ = parent.wait();
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn shutdown_tree_kills_cmd_grandchild() {
-        if !taskkill_on_path() {
-            return;
-        }
-        let _guard = test_env_lock();
-        let home = tempdir().unwrap();
-        let proj = tempdir().unwrap();
-        unsafe {
-            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
-        }
-        let mut reg = Registry::default();
-        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
-        reg.save(&crate::config::registry_path().unwrap()).unwrap();
-
-        let (_dir, mut parent, gc) = spawn_cmd_tree_with_grandchild();
-        let handle = PersistedGrokHandle {
-            version: 1,
-            model: None,
-            bin: None,
-            project_id: rec.id.clone(),
-            session_id: Some("sess-tree".into()),
-            cwd: Some(proj.path().to_path_buf()),
-            pid: Some(parent.id()),
-            holder_pid: None,
-            control_addr: None,
-            adapter: "grok".into(),
-            supports_compact: true,
-            alive: true,
-            prompt_in_flight: false,
-            error: None,
-
-            context_usage: None,
-            last_signal: None,
-            last_tool_title: None,
-        };
-        save_persist(&rec, &handle).unwrap();
-        let _ = shutdown(Some(&rec.id), false).await;
-        assert!(
-            wait_pid_gone(gc, 5000),
-            "grandchild PID {gc} should be gone after persist shutdown tree-kill"
-        );
-        let _ = parent.wait();
-        unsafe {
-            std::env::remove_var(ENV_COORDINATOR_HOME);
-        }
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn reuse_recycle_adapter_mismatch_tree_kills_grandchild() {
-        if !taskkill_on_path() {
-            return;
-        }
-        let _guard = test_env_lock();
-        let home = tempdir().unwrap();
-        let proj = tempdir().unwrap();
-        unsafe {
-            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
-        }
-        let mut reg = Registry::default();
-        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
-        reg.save(&crate::config::registry_path().unwrap()).unwrap();
-
-        let (_dir, mut parent, gc) = spawn_cmd_tree_with_grandchild();
-        let handle = PersistedGrokHandle {
-            version: 1,
-            model: None,
-            bin: None,
-            project_id: rec.id.clone(),
-            session_id: Some("sess-tree-mismatch".into()),
-            cwd: Some(proj.path().to_path_buf()),
-            pid: Some(parent.id()),
-            holder_pid: None,
-            control_addr: Some("127.0.0.1:1".into()),
-            adapter: "grok".into(),
-            supports_compact: true,
-            alive: true,
-            prompt_in_flight: false,
-            error: None,
-
-            context_usage: None,
-            last_signal: None,
-            last_tool_title: None,
-        };
-        save_persist(&rec, &handle).unwrap();
-        let reused = reuse_or_reap_existing(&rec, "cursor", None, None)
-            .await
-            .unwrap();
-        assert!(
-            reused.is_none(),
-            "adapter mismatch must not reuse grok persist"
-        );
-        assert!(
-            wait_pid_gone(gc, 5000),
-            "grandchild PID {gc} should be gone after reuse-recycle tree-kill"
-        );
-        let _ = parent.wait();
-        unsafe {
-            std::env::remove_var(ENV_COORDINATOR_HOME);
         }
     }
 
@@ -4683,61 +5760,6 @@ Loop\r\n",
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn abort_recycle_marks_persist_dead() {
-        let _guard = test_env_lock();
-        let home = tempdir().unwrap();
-        let proj = tempdir().unwrap();
-        unsafe {
-            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
-            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
-        }
-        let mut reg = Registry::default();
-        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
-        reg.save(&crate::config::registry_path().unwrap()).unwrap();
-
-        let mut child = spawn_dummy_long_child();
-        let handle = PersistedGrokHandle {
-            version: 1,
-            model: None,
-            bin: None,
-            project_id: rec.id.clone(),
-            session_id: Some("sess-old".into()),
-            cwd: Some(proj.path().to_path_buf()),
-            pid: Some(child.id()),
-            holder_pid: None,
-            control_addr: None,
-            adapter: "grok".into(),
-            supports_compact: true,
-            alive: true,
-            prompt_in_flight: true,
-            error: None,
-
-            context_usage: None,
-            last_signal: None,
-            last_tool_title: None,
-        };
-        save_persist(&rec, &handle).unwrap();
-        crate::harness::abort::abort_stuck_prompt_sync(
-            &rec,
-            crate::harness::abort::AbortReason::Stall,
-        );
-        let persist = load_persist(&rec).unwrap().expect("persist");
-        assert!(!persist.alive);
-        assert!(!persist.prompt_in_flight);
-        if taskkill_on_path() {
-            assert!(wait_child_dead(&mut child, 1000));
-        } else if !wait_child_dead(&mut child, 50) {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        unsafe {
-            std::env::remove_var(ENV_COORDINATOR_HOME);
-            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
-        }
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn aborted_session_id_skips_error_apply_without_recycle_prefix() {
         let _guard = test_env_lock();
         let home = tempdir().unwrap();
@@ -4822,7 +5844,7 @@ Loop\r\n",
             cwd: Some(proj.path().to_path_buf()),
             pid: None,
             holder_pid: None,
-            control_addr: Some("127.0.0.1:1".into()),
+            control_addr: Some(closed_addr()),
             adapter: "grok".into(),
             supports_compact: true,
             alive: true,
@@ -4839,6 +5861,10 @@ Loop\r\n",
             .await
             .unwrap();
         assert!(reused.is_none());
+        assert!(
+            load_persist(&rec).unwrap().is_none(),
+            "a closed listener is the start path's arm A: clear + start"
+        );
         assert!(
             crate::harness::abort::should_refuse_reuse(&rec),
             "recycle last_event must refuse reuse"
@@ -6636,7 +7662,7 @@ Loop\r\n",
         assert!(view.applied);
         assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
         let error = view.error.unwrap_or_default();
-        assert!(error.contains("replacement holder"), "{error}");
+        assert!(error.contains("old holder shutdown failed"), "{error}");
         assert!(error.contains("failure resolve"), "{error}");
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         assert_eq!(
@@ -7199,21 +8225,27 @@ Loop\r\n",
                 .expect("identity join")
                 .expect("identity read")
                 .expect("identity present");
+        let rec_prove = rec.clone();
         let want = identity.clone();
         let verified = tokio::task::spawn_blocking(move || {
-            verify_holder_identity(&want, Duration::from_millis(750))
+            prove_holder(&rec_prove, &want, Duration::from_millis(750))
         })
         .await
-        .expect("verify join");
-        assert_eq!(verified, HolderReapRpc::Verified);
+        .expect("prove join")
+        .expect("identity must be proven over the real accept loop");
+        assert_eq!(
+            verified.want.session_id.as_deref(),
+            identity.session_id.as_deref()
+        );
 
-        let want = identity.clone();
-        let shutdown = tokio::task::spawn_blocking(move || {
-            request_holder_shutdown(&want, Duration::from_millis(750))
-        })
-        .await
-        .expect("shutdown join");
-        assert_eq!(shutdown, HolderReapRpc::Verified);
+        let outcome =
+            tokio::task::spawn_blocking(move || terminate_verified(verified, Intent::Reap))
+                .await
+                .expect("shutdown join");
+        assert!(
+            matches!(outcome, HolderTermination::Delivered { .. }),
+            "the real holder must answer its own Shutdown: {outcome:?}"
+        );
 
         tokio::time::timeout(Duration::from_secs(2), hold)
             .await
@@ -7223,5 +8255,2499 @@ Loop\r\n",
         let dead = load_persist(&rec).unwrap().expect("persist present");
         assert!(!dead.alive);
         assert!(dead.control_addr.is_none());
+    }
+
+    // ---- 0117: fixtures ------------------------------------------------------
+
+    fn record_in(dir: &tempfile::TempDir, id: &str) -> ProjectRecord {
+        ProjectRecord {
+            id: id.into(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: Default::default(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: Default::default(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_handle(
+        rec: &ProjectRecord,
+        session: Option<&str>,
+        cwd: Option<PathBuf>,
+        addr: Option<String>,
+        holder_pid: Option<u32>,
+        alive: bool,
+        prompt: bool,
+        error: Option<String>,
+    ) -> PersistedGrokHandle {
+        PersistedGrokHandle {
+            version: 1,
+            model: None,
+            bin: None,
+            project_id: rec.id.clone(),
+            session_id: session.map(str::to_string),
+            cwd,
+            pid: Some(4242),
+            holder_pid,
+            control_addr: addr,
+            adapter: "grok".into(),
+            supports_compact: true,
+            alive,
+            prompt_in_flight: prompt,
+            error,
+            context_usage: None,
+            last_signal: None,
+            last_tool_title: None,
+        }
+    }
+
+    fn attempt_handle(rec: &ProjectRecord, error: Option<&str>) -> PersistedGrokHandle {
+        make_handle(
+            rec,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            error.map(str::to_string),
+        )
+    }
+
+    fn write_handle(rec: &ProjectRecord, handle: &PersistedGrokHandle) {
+        save_persist(rec, handle).unwrap();
+    }
+
+    fn ref_of(rec: &ProjectRecord) -> PersistRef {
+        load_ref(rec).unwrap().expect("persist present").1
+    }
+
+    fn file_bytes(rec: &ProjectRecord) -> Vec<u8> {
+        std::fs::read(persist_path(rec).unwrap()).unwrap()
+    }
+
+    fn set_file_mtime(rec: &ProjectRecord, at: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(persist_path(rec).unwrap())
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    fn age_file(rec: &ProjectRecord, age: Duration) {
+        set_file_mtime(rec, SystemTime::now() - age);
+    }
+
+    /// Register `rec` in an isolated machine home so the CLI-resolution paths
+    /// (`shutdown`, `start_with_bin`) can find it. Returns the home/temp guard.
+    fn register_rec(rec: &ProjectRecord) -> (tempfile::TempDir, crate::config::TestEnvGuard) {
+        let home = tempdir().unwrap();
+        let guard = crate::config::TestEnvGuard::capture(&[ENV_COORDINATOR_HOME]);
+        unsafe { std::env::set_var(ENV_COORDINATOR_HOME, home.path()) };
+        let mut reg = Registry::default();
+        reg.projects.push(rec.clone());
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        (home, guard)
+    }
+
+    fn mock_session_for(rec: &ProjectRecord, session_id: &str) -> GrokSession {
+        futures_lite_block_on(GrokSession::start_mock(
+            crate::harness::grok_cwd(rec),
+            mock_handshake_ok(session_id),
+            Duration::from_secs(2),
+        ))
+        .unwrap()
+    }
+
+    /// Tiny blocking test helper: these fence tests are `#[test]` and need one mock
+    /// session; a current-thread runtime is enough.
+    fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    // ---- 0117: the exclusive start claim + attempt fences --------------------
+
+    #[test]
+    fn claim_start_is_exclusive() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "claim-exclusive");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let rec = rec.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                claim_start(&rec, "grok")
+            }));
+        }
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one caller owns the absent->pending claim"
+        );
+        let loser = results
+            .iter()
+            .find(|r| r.is_err())
+            .and_then(|r| r.as_ref().err())
+            .map(|e| e.to_string())
+            .unwrap();
+        assert!(loser.contains("persist-appeared"), "{loser}");
+        let (identity, _) = persist_identity(&rec).unwrap().unwrap();
+        assert!(identity.is_attempt(), "the winner wrote the pending record");
+        assert!(identity.error.is_none());
+        let before = file_bytes(&rec);
+        assert!(claim_start(&rec, "grok").is_err());
+        assert_eq!(
+            before,
+            file_bytes(&rec),
+            "a loser never removes the winner's bytes"
+        );
+    }
+
+    #[test]
+    fn claim_start_refuses_an_existing_persist() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "claim-existing");
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-live"),
+                Some(crate::harness::grok_cwd(&rec)),
+                Some("127.0.0.1:9".into()),
+                Some(4242),
+                true,
+                false,
+                None,
+            ),
+        );
+        let before = file_bytes(&rec);
+        let err = claim_start(&rec, "grok").unwrap_err().to_string();
+        assert!(err.contains("persist-appeared"), "{err}");
+        assert_eq!(
+            before,
+            file_bytes(&rec),
+            "the claim never truncates a record"
+        );
+    }
+
+    #[test]
+    fn start_claims_after_the_decision_not_before_it() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "claim-race");
+        assert!(persist_identity(&rec).unwrap().is_none());
+        // Another start wins between the decision and this claim.
+        write_handle(&rec, &attempt_handle(&rec, None));
+        let before = file_bytes(&rec);
+        let err = claim_start(&rec, "grok").unwrap_err().to_string();
+        assert!(err.contains("persist-appeared"), "{err}");
+        assert_eq!(before, file_bytes(&rec));
+    }
+
+    #[test]
+    fn same_record_distinguishes_pending_from_failed_start() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "same-record");
+
+        write_handle(&rec, &attempt_handle(&rec, None));
+        let pending = ref_of(&rec);
+        write_handle(&rec, &attempt_handle(&rec, Some("boom")));
+        let failed = ref_of(&rec);
+        assert!(
+            !same_record(&pending, &failed.identity, failed.mtime),
+            "a failed start is not the pending attempt"
+        );
+
+        // Force distinct mtimes: the filesystem does not guarantee a new tick.
+        set_file_mtime(&rec, failed.mtime + Duration::from_secs(1));
+        let failed_later = ref_of(&rec);
+        assert_ne!(failed.mtime, failed_later.mtime);
+        assert!(!same_record(
+            &failed,
+            &failed_later.identity,
+            failed_later.mtime
+        ));
+
+        // A named holder rewritten by itself (mtime changed) is still the same record.
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-1"),
+                Some(crate::harness::grok_cwd(&rec)),
+                Some("127.0.0.1:9".into()),
+                Some(4242),
+                true,
+                false,
+                None,
+            ),
+        );
+        let named = ref_of(&rec);
+        set_file_mtime(&rec, named.mtime + Duration::from_secs(2));
+        let rewritten = ref_of(&rec);
+        assert!(same_record(&named, &rewritten.identity, rewritten.mtime));
+    }
+
+    #[test]
+    fn start_error_write_is_fenced() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-error-fence");
+        let claim = claim_start(&rec, "grok").unwrap();
+        // A newer pending record owns the slot (forced distinct mtime).
+        write_handle(&rec, &attempt_handle(&rec, None));
+        set_file_mtime(&rec, claim.mtime + Duration::from_secs(1));
+        let newer = ref_of(&rec);
+        assert_ne!(claim.mtime, newer.mtime);
+        let before = file_bytes(&rec);
+        assert!(
+            !mark_start_error(&rec, Some(&claim), "stale"),
+            "a stale claim cannot write its error"
+        );
+        assert_eq!(before, file_bytes(&rec));
+
+        // With the claim still on disk the failure is written.
+        let _ = std::fs::remove_file(persist_path(&rec).unwrap());
+        let own = claim_start(&rec, "grok").unwrap();
+        assert!(mark_start_error(&rec, Some(&own), "spawn failed"));
+        let (identity, _) = persist_identity(&rec).unwrap().unwrap();
+        assert!(identity.error.as_deref() == Some("spawn failed"));
+    }
+
+    #[test]
+    fn stale_child_error_write_is_fenced() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "child-error-fence");
+        let a = claim_start(&rec, "grok").unwrap();
+        assert!(mark_start_error(&rec, Some(&a), "holder failed"));
+        let failed = ref_of(&rec);
+        assert!(
+            clear_persist_if(&rec, &failed),
+            "the retry clears the aged failure"
+        );
+
+        let _b = claim_start(&rec, "grok").unwrap();
+        set_file_mtime(&rec, a.mtime + Duration::from_secs(1));
+        let b = ref_of(&rec);
+        assert_ne!(a.mtime, b.mtime, "forced distinct attempt stamps");
+        let before = file_bytes(&rec);
+        assert!(
+            !mark_start_error(&rec, Some(&a), "late child error"),
+            "the times-out child cannot clobber the retry's claim"
+        );
+        assert_eq!(before, file_bytes(&rec));
+
+        // The same child against its own live claim does write.
+        let current = ref_of(&rec);
+        assert!(clear_persist_if(&rec, &current));
+        let own = claim_start(&rec, "grok").unwrap();
+        assert!(mark_start_error(&rec, Some(&own), "late child error"));
+    }
+
+    #[tokio::test]
+    async fn stale_child_ready_write_is_fenced_and_tears_down() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "child-ready-fence");
+        let a = claim_start(&rec, "grok").unwrap();
+        let _b = claim_start(&rec, "grok").unwrap_err();
+        // Simulate the ordinary retry: the timed-out start's record is replaced.
+        assert!(mark_start_error(&rec, Some(&a), "timed out"));
+        let failed = ref_of(&rec);
+        assert!(clear_persist_if(&rec, &failed));
+        let _retry = claim_start(&rec, "grok").unwrap();
+        set_file_mtime(&rec, a.mtime + Duration::from_secs(1));
+        let before = file_bytes(&rec);
+
+        let mut session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            mock_handshake_ok("sess-child"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let err = publish_ready_or_teardown(&rec, &mut session, None, Some(&a))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("persist-changed"), "{err}");
+        assert_eq!(
+            before,
+            file_bytes(&rec),
+            "the refused ready write changes nothing"
+        );
+        assert_eq!(
+            session.shutdown_probe(),
+            1,
+            "the child tore its own ACP session down"
+        );
+        assert!(
+            crate::harness::abort::cancel_handle_for(&rec.id).is_none(),
+            "the refused in-process ready write leaves no dead registration"
+        );
+        assert!(
+            !global_pool().lock().await.contains(&rec.id),
+            "no session inserted"
+        );
+    }
+
+    #[test]
+    fn unclaimed_hold_does_not_overwrite_an_attempt() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "unclaimed");
+        let session = mock_session_for(&rec, "sess-direct");
+
+        for error in [None, Some("prior failure")] {
+            write_handle(&rec, &attempt_handle(&rec, error));
+            let before = file_bytes(&rec);
+            assert!(
+                !mark_start_error(&rec, None, "direct failure"),
+                "an unclaimed hold never writes over an attempt"
+            );
+            assert!(
+                !write_holder_ready(&rec, &session, None, None),
+                "an unclaimed hold never publishes over an attempt"
+            );
+            assert_eq!(before, file_bytes(&rec));
+        }
+
+        // A live/identified record is refused too.
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-live"),
+                Some(crate::harness::grok_cwd(&rec)),
+                Some("127.0.0.1:9".into()),
+                Some(4242),
+                true,
+                false,
+                None,
+            ),
+        );
+        let before = file_bytes(&rec);
+        assert!(!write_holder_ready(&rec, &session, None, None));
+        assert_eq!(before, file_bytes(&rec));
+
+        // Absent and DeadAfterExit records are the direct-hold path.
+        let _ = std::fs::remove_file(persist_path(&rec).unwrap());
+        assert!(write_holder_ready(&rec, &session, None, None));
+
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-clean-exit"),
+                Some(crate::harness::grok_cwd(&rec)),
+                None,
+                Some(4242),
+                false,
+                false,
+                None,
+            ),
+        );
+        assert!(write_holder_ready(&rec, &session, None, None));
+    }
+
+    #[test]
+    fn exit_persist_write_is_fenced() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "exit-fence");
+        let session = mock_session_for(&rec, "sess-own");
+        // Another session owns the record: the exit write is a no-op.
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-other"),
+                Some(session.cwd.clone()),
+                Some("127.0.0.1:9".into()),
+                Some(4242),
+                true,
+                false,
+                None,
+            ),
+        );
+        let before = file_bytes(&rec);
+        assert!(!write_holder_exit(&rec, &session));
+        assert_eq!(before, file_bytes(&rec));
+
+        // Its own identity: the truthful dead record is written.
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some(&session.session_id),
+                Some(session.cwd.clone()),
+                Some("127.0.0.1:9".into()),
+                Some(std::process::id()),
+                true,
+                false,
+                None,
+            ),
+        );
+        assert!(write_holder_exit(&rec, &session));
+        let (identity, _) = persist_identity(&rec).unwrap().unwrap();
+        assert!(!identity.alive);
+        assert!(identity.control_addr.is_none());
+        assert_eq!(identity.session_id.as_deref(), Some("sess-own"));
+    }
+
+    #[test]
+    fn set_prompt_in_flight_and_fidelity_do_not_clobber_a_newer_record() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "flag-fence");
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-newer"),
+                Some(crate::harness::grok_cwd(&rec)),
+                Some("127.0.0.1:9".into()),
+                Some(7),
+                true,
+                false,
+                None,
+            ),
+        );
+        set_prompt_in_flight(&rec, true);
+        let (identity, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(identity.session_id.as_deref(), Some("sess-newer"));
+        assert!(identity.prompt_in_flight);
+        assert_eq!(identity.holder_pid, Some(7));
+    }
+
+    // ---- 0117: scripted control-socket holder --------------------------------
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RawMode {
+        Normal,
+        PingNoResponse,
+        ShutdownNoResponse,
+        ShutdownRejected,
+        PingNoHarness,
+        PingMutatePrompt,
+        PingMutateSession,
+        PingRemovePersist,
+        PingCorruptPersist,
+        PingTouchMtime,
+        PingPending,
+        PingFailedStart,
+        /// Answers `Shutdown` but never writes the exit record.
+        ShutdownNoExit,
+        /// Answers `Shutdown` after 120 ms, then writes the dead record.
+        ShutdownDelayedExit,
+        /// Rewrites the persist to a different live holder, then answers `Shutdown`.
+        ShutdownMutate,
+    }
+
+    struct RawHolder {
+        addr: String,
+        ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RawHolder {
+        fn seen(&self) -> Vec<String> {
+            self.ops.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+
+        fn stop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let sock = self.addr.parse::<std::net::SocketAddr>().ok();
+                if let Some(sock) = sock
+                    && let Ok(mut stream) =
+                        std::net::TcpStream::connect_timeout(&sock, Duration::from_millis(200))
+                {
+                    use std::io::Write;
+                    let _ = stream.write_all(b"{\"op\":\"stop-test\"}\n");
+                }
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for RawHolder {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    fn mutate_persist_json(path: &Option<PathBuf>, f: impl Fn(&mut serde_json::Value)) {
+        let Some(path) = path else { return };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        f(&mut body);
+        let _ = std::fs::write(path, body.to_string());
+    }
+
+    fn raw_holder(
+        persist: Option<PathBuf>,
+        session: &str,
+        cwd: &Path,
+        holder_pid: u32,
+        mode: RawMode,
+    ) -> RawHolder {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ops_thread = ops.clone();
+        let session = session.to_string();
+        let cwd = cwd.to_path_buf();
+        let _ = holder_pid;
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let Ok(mut reader) = stream.try_clone().map(BufReader::new) else {
+                    continue;
+                };
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let op = serde_json::from_str::<serde_json::Value>(line.trim())
+                    .ok()
+                    .and_then(|v| {
+                        v.get("op")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                ops_thread
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(op.clone());
+                if op == "stop-test" {
+                    break;
+                }
+                match op.as_str() {
+                    "ping" => {
+                        if mode == RawMode::PingNoResponse {
+                            std::thread::sleep(Duration::from_millis(1200));
+                            continue;
+                        }
+                        let before_mtime = persist
+                            .as_ref()
+                            .and_then(|p| std::fs::metadata(p).ok())
+                            .and_then(|m| m.modified().ok());
+                        match mode {
+                            RawMode::PingMutatePrompt => {
+                                mutate_persist_json(&persist, |b| {
+                                    b["prompt_in_flight"] = serde_json::Value::Bool(true)
+                                });
+                            }
+                            RawMode::PingMutateSession => {
+                                mutate_persist_json(&persist, |b| {
+                                    b["session_id"] = serde_json::Value::String("spoofed".into())
+                                });
+                            }
+                            RawMode::PingRemovePersist => {
+                                if let Some(path) = &persist {
+                                    let _ = std::fs::remove_file(path);
+                                }
+                            }
+                            RawMode::PingCorruptPersist => {
+                                if let Some(path) = &persist {
+                                    let _ = std::fs::write(path, b"{not json");
+                                }
+                            }
+                            RawMode::PingTouchMtime => {
+                                if let Some(path) = &persist {
+                                    let later = SystemTime::now() + Duration::from_secs(5);
+                                    if let Ok(file) =
+                                        std::fs::OpenOptions::new().write(true).open(path)
+                                    {
+                                        let _ = file.set_modified(later);
+                                    }
+                                }
+                            }
+                            RawMode::PingPending => {
+                                mutate_persist_json(&persist, |b| {
+                                    b["alive"] = serde_json::Value::Bool(false);
+                                    b["control_addr"] = serde_json::Value::Null;
+                                    b["session_id"] = serde_json::Value::Null;
+                                    b["cwd"] = serde_json::Value::Null;
+                                    b["holder_pid"] = serde_json::Value::Null;
+                                    b["error"] = serde_json::Value::Null;
+                                });
+                            }
+                            RawMode::PingFailedStart => {
+                                mutate_persist_json(&persist, |b| {
+                                    b["alive"] = serde_json::Value::Bool(false);
+                                    b["control_addr"] = serde_json::Value::Null;
+                                    b["session_id"] = serde_json::Value::Null;
+                                    b["cwd"] = serde_json::Value::Null;
+                                    b["holder_pid"] = serde_json::Value::Null;
+                                    b["error"] =
+                                        serde_json::Value::String("ACP handshake failed".into());
+                                });
+                            }
+                            _ => {}
+                        }
+                        // Preserve the mtime for every mutation except the explicit touch,
+                        // so the arm under test (not "recently-active") is the one that fires.
+                        if mode != RawMode::PingTouchMtime
+                            && let (Some(path), Some(before)) = (&persist, before_mtime)
+                            && let Ok(file) = std::fs::OpenOptions::new().write(true).open(path)
+                        {
+                            let _ = file.set_modified(before);
+                        }
+                        let body = if mode == RawMode::PingNoHarness {
+                            serde_json::json!({ "ok": true })
+                        } else {
+                            serde_json::json!({
+                                "ok": true,
+                                "harness": {
+                                    "alive": true,
+                                    "session_id": session,
+                                    "cwd": cwd,
+                                    "pid": 4242,
+                                    "adapter": "grok",
+                                    "supports_compact": true,
+                                }
+                            })
+                        };
+                        let _ = stream.write_all(body.to_string().as_bytes());
+                        let _ = stream.write_all(b"\n");
+                        let _ = stream.flush();
+                    }
+                    "shutdown" => {
+                        if mode == RawMode::ShutdownNoResponse {
+                            std::thread::sleep(Duration::from_millis(1200));
+                            continue;
+                        }
+                        if mode == RawMode::ShutdownRejected {
+                            let _ = stream
+                                .write_all(b"{\"ok\":false,\"error\":\"shutdown rejected\"}\n");
+                            continue;
+                        }
+                        if mode == RawMode::ShutdownMutate {
+                            mutate_persist_json(&persist, |b| {
+                                b["session_id"] =
+                                    serde_json::Value::String("sess-newer-holder".into());
+                            });
+                        }
+                        if mode == RawMode::ShutdownDelayedExit {
+                            std::thread::sleep(Duration::from_millis(120));
+                        }
+                        let _ = stream.write_all(b"{\"ok\":true}\n");
+                        let _ = stream.flush();
+                        if matches!(mode, RawMode::Normal | RawMode::ShutdownDelayedExit)
+                            && let Some(path) = &persist
+                        {
+                            mutate_persist_json(&Some(path.clone()), |b| {
+                                b["alive"] = serde_json::Value::Bool(false);
+                                b["control_addr"] = serde_json::Value::Null;
+                                b["prompt_in_flight"] = serde_json::Value::Bool(false);
+                            });
+                        }
+                        if mode != RawMode::ShutdownNoExit && mode != RawMode::ShutdownMutate {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        RawHolder {
+            addr,
+            ops,
+            handle: Some(handle),
+        }
+    }
+
+    /// Persist that matches `addr` for a raw holder.
+    fn write_live_handle(rec: &ProjectRecord, session: &str, addr: &str) {
+        write_handle(
+            rec,
+            &make_handle(
+                rec,
+                Some(session),
+                Some(crate::harness::grok_cwd(rec)),
+                Some(addr.to_string()),
+                Some(4242),
+                true,
+                false,
+                None,
+            ),
+        );
+    }
+
+    fn prove_live(rec: &ProjectRecord) -> std::result::Result<VerifiedHolder, HolderTermination> {
+        let (identity, _) = persist_identity(rec).unwrap().unwrap();
+        prove_holder(rec, &identity, Duration::from_millis(750))
+    }
+
+    // ---- 0117: the delivery seam --------------------------------------------
+
+    #[test]
+    fn deliver_shutdown_is_the_only_shutdown() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-ok");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::Normal,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        let outcome = terminate_verified(v, Intent::Reap);
+        assert!(
+            matches!(outcome, HolderTermination::Delivered { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(holder.seen(), vec!["ping", "shutdown"]);
+    }
+
+    #[test]
+    fn deliver_shutdown_rechecks_before_send() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-prompt");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::PingMutatePrompt,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        let outcome = terminate_verified(v, Intent::Sweep);
+        assert_eq!(
+            outcome,
+            HolderTermination::Unproven {
+                why: "prompt-in-flight".into()
+            }
+        );
+        assert_eq!(
+            holder.seen(),
+            vec!["ping"],
+            "the sweep never interrupts a turn"
+        );
+    }
+
+    #[test]
+    fn deliver_shutdown_delivers_during_a_prompt_for_operator() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-operator-prompt");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::PingMutatePrompt,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        let outcome = terminate_verified(v, Intent::Operator);
+        assert!(
+            matches!(outcome, HolderTermination::Delivered { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(holder.seen(), vec!["ping", "shutdown"]);
+    }
+
+    #[test]
+    fn deliver_shutdown_refuses_persist_changed() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-changed");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::PingMutateSession,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        assert_eq!(
+            terminate_verified(v, Intent::Reap),
+            HolderTermination::Unproven {
+                why: "persist-changed".into()
+            }
+        );
+        assert_eq!(holder.seen(), vec!["ping"]);
+    }
+
+    #[test]
+    fn deliver_shutdown_keeps_when_persist_removed_after_ping() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-removed");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::PingRemovePersist,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        assert_eq!(
+            terminate_verified(v, Intent::Reap),
+            HolderTermination::Unproven {
+                why: "persist-missing".into()
+            }
+        );
+        assert_eq!(holder.seen(), vec!["ping"]);
+    }
+
+    #[test]
+    fn deliver_shutdown_keeps_when_persist_unreadable_after_ping() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-unreadable");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::PingCorruptPersist,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        assert_eq!(
+            terminate_verified(v, Intent::Reap),
+            HolderTermination::Unproven {
+                why: "persist-unreadable".into()
+            }
+        );
+        assert_eq!(holder.seen(), vec!["ping"]);
+    }
+
+    #[test]
+    fn deliver_shutdown_refuses_recently_active() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-active");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::PingTouchMtime,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        assert_eq!(
+            terminate_verified(v, Intent::Reap),
+            HolderTermination::Unproven {
+                why: "recently-active".into()
+            }
+        );
+        assert_eq!(holder.seen(), vec!["ping"]);
+    }
+
+    #[test]
+    fn deliver_shutdown_rejected_is_unproven() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-rejected");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::ShutdownRejected,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        assert_eq!(
+            terminate_verified(v, Intent::Reap),
+            HolderTermination::Unproven {
+                why: "shutdown-rejected".into()
+            }
+        );
+        assert_eq!(holder.seen(), vec!["ping", "shutdown"]);
+    }
+
+    #[test]
+    fn deliver_shutdown_times_out() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-timeout");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::ShutdownNoResponse,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        assert_eq!(
+            terminate_verified(v, Intent::Reap),
+            HolderTermination::Unproven {
+                why: "shutdown-timeout".into()
+            }
+        );
+        assert_eq!(holder.seen(), vec!["ping", "shutdown"]);
+    }
+
+    #[test]
+    fn deliver_shutdown_pending_after_ping_is_not_exited() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-pending");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::PingPending,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        assert_eq!(
+            terminate_verified(v, Intent::Reap),
+            HolderTermination::Unproven {
+                why: "persist-changed".into()
+            },
+            "another producer's record is not this holder's exit"
+        );
+        assert_eq!(holder.seen(), vec!["ping"]);
+    }
+
+    #[test]
+    fn deliver_shutdown_failed_start_after_ping_is_not_exited() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "deliver-failed-start");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::PingFailedStart,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let v = prove_live(&rec).expect("proven");
+        assert_eq!(
+            terminate_verified(v, Intent::Reap),
+            HolderTermination::Unproven {
+                why: "persist-changed".into()
+            }
+        );
+        assert_eq!(holder.seen(), vec!["ping"]);
+    }
+
+    #[test]
+    fn prove_holder_no_listener_is_not_gone() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "prove-no-listener");
+        let addr = closed_addr();
+        write_live_handle(&rec, "sess-d", &addr);
+        match prove_live(&rec) {
+            Err(HolderTermination::NoListener { addr: got }) => assert_eq!(got, addr),
+            other => panic!("expected NoListener, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prove_holder_no_response_is_unproven() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "prove-no-response");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::PingNoResponse,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        match prove_live(&rec) {
+            Err(HolderTermination::Unproven { why }) => assert_eq!(why, "ping-timeout"),
+            other => panic!("expected ping-timeout, got {other:?}"),
+        }
+        assert_eq!(holder.seen(), vec!["ping"]);
+    }
+
+    #[test]
+    fn prove_holder_no_socket_classifies_producer() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "prove-no-socket");
+        let shapes = [
+            (
+                make_handle(&rec, Some("s"), None, None, Some(4242), false, false, None),
+                NoSocketWhy::DeadAfterExit,
+            ),
+            (
+                make_handle(&rec, None, None, None, None, false, false, Some("e".into())),
+                NoSocketWhy::FailedStart,
+            ),
+            (
+                make_handle(&rec, None, None, None, None, false, false, None),
+                NoSocketWhy::PendingStart,
+            ),
+            (
+                make_handle(
+                    &rec,
+                    Some("s"),
+                    None,
+                    None,
+                    Some(std::process::id()),
+                    true,
+                    false,
+                    None,
+                ),
+                NoSocketWhy::AliveSelfNoAddress,
+            ),
+            (
+                make_handle(&rec, Some("s"), None, None, Some(4242), true, false, None),
+                NoSocketWhy::AliveForeignNoAddress,
+            ),
+            (
+                make_handle(&rec, Some("s"), None, None, None, true, false, None),
+                NoSocketWhy::AliveUnknownNoAddress,
+            ),
+        ];
+        for (handle, want) in shapes {
+            write_handle(&rec, &handle);
+            let identity = PersistIdentity::from_handle(&handle);
+            assert_eq!(
+                classify_persist(&identity),
+                PersistClass::NoAddress(want),
+                "one classifier for every caller"
+            );
+            match prove_holder(&rec, &identity, Duration::from_millis(100)) {
+                Err(HolderTermination::NoSocket { why }) => assert_eq!(why, want),
+                other => panic!("expected NoSocket({want:?}), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn probe_holder_uses_one_ping() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "probe-one-ping");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::Normal,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let status = probe_holder(&rec, "implementor").unwrap().expect("proven");
+        assert_eq!(status.pid, Some(4242));
+        assert_eq!(holder.seen(), vec!["ping"], "one Ping, one identity proof");
+
+        // A pid mismatch is not the holder.
+        let mut handle = load_persist(&rec).unwrap().unwrap();
+        handle.pid = Some(9999);
+        write_handle(&rec, &handle);
+        assert!(probe_holder(&rec, "implementor").unwrap().is_none());
+    }
+
+    // ---- 0117: start-path table B --------------------------------------------
+
+    struct HookInstalled;
+    impl Drop for HookInstalled {
+        fn drop(&mut self) {
+            *AFTER_GONE_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    fn install_after_gone(f: impl Fn(&ProjectRecord) + Send + Sync + 'static) -> HookInstalled {
+        *AFTER_GONE_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(f));
+        HookInstalled
+    }
+
+    #[tokio::test]
+    async fn start_refuses_while_a_start_is_pending() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-pending-token");
+        write_handle(&rec, &attempt_handle(&rec, None));
+        age_file(&rec, Duration::from_secs(5));
+        let err = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("start-pending"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn start_refuses_a_pending_record_does_not_touch_it() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-pending-bytes");
+        write_handle(&rec, &attempt_handle(&rec, None));
+        age_file(&rec, Duration::from_secs(5));
+        let before = file_bytes(&rec);
+        let _ = reuse_or_reap_existing(&rec, "grok", None, None).await;
+        assert_eq!(before, file_bytes(&rec));
+        assert!(
+            !global_pool().lock().await.contains(&rec.id),
+            "nothing spawned"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_discards_pending_persist_after_the_start_window() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-aged-pending");
+        write_handle(&rec, &attempt_handle(&rec, None));
+        age_file(&rec, PENDING_START_GRACE + Duration::from_secs(1));
+        let got = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+        assert!(load_persist(&rec).unwrap().is_none());
+        let log = std::fs::read_to_string(rec.path.join("status.md")).unwrap_or_default();
+        assert!(log.contains("holder-persist-discarded"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn start_waits_out_the_grace_then_discards() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-grace-wait");
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-exit"),
+                Some(crate::harness::grok_cwd(&rec)),
+                None,
+                Some(4242),
+                false,
+                false,
+                None,
+            ),
+        );
+        age_file(&rec, DISCARD_GRACE - Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let got = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "the start waited out the remaining grace"
+        );
+        assert!(load_persist(&rec).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_discards_dead_no_address_after_grace() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-aged-dead");
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-exit"),
+                Some(crate::harness::grok_cwd(&rec)),
+                None,
+                Some(4242),
+                false,
+                false,
+                None,
+            ),
+        );
+        age_file(&rec, DISCARD_GRACE + Duration::from_secs(1));
+        let got = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+        assert!(load_persist(&rec).unwrap().is_none());
+        let log = std::fs::read_to_string(rec.path.join("status.md")).unwrap_or_default();
+        assert!(
+            log.contains("holder_pid=4242"),
+            "the receipt names the old identity: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_refuses_alive_no_address_foreign_holder() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-foreign-no-addr");
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess"),
+                None,
+                None,
+                Some(4242),
+                true,
+                false,
+                None,
+            ),
+        );
+        let err = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("foreign-holder"), "{err}");
+
+        write_handle(
+            &rec,
+            &make_handle(&rec, Some("sess"), None, None, None, true, false, None),
+        );
+        let err = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown-record"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn start_refuses_when_termination_unproven() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-unproven");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-other",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::Normal,
+        );
+        write_live_handle(&rec, "sess-ours", &holder.addr);
+        let before = file_bytes(&rec);
+        let err = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("identity:session"), "{err}");
+        assert_eq!(
+            before,
+            file_bytes(&rec),
+            "an unproven holder is never clobbered"
+        );
+        let ops = holder.seen();
+        assert!(
+            !ops.is_empty() && ops.iter().all(|op| op == "ping"),
+            "the proof never sends a Shutdown to an unproven holder: {ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reuse_clears_persist_when_no_listener() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "reuse-no-listener");
+        write_live_handle(&rec, "sess-d", &closed_addr());
+        let got = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+        assert!(
+            load_persist(&rec).unwrap().is_none(),
+            "a closed listener is the start path's arm A"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_refuses_when_delivered_holder_never_goes_dead() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-never-dead");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::ShutdownNoExit,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let before = file_bytes(&rec);
+        let err = reuse_or_reap_existing(&rec, "grok", Some("phase-model"), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("retry"), "{err}");
+        assert_eq!(before, file_bytes(&rec), "TimedOut writes nothing");
+        assert_eq!(holder.seen(), vec!["ping", "shutdown"]);
+    }
+
+    #[tokio::test]
+    async fn start_does_not_clear_a_newer_holder_persist() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "start-superseded");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::ShutdownMutate,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let err = reuse_or_reap_existing(&rec, "grok", Some("phase-model"), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holder-changed"), "{err}");
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(
+            now.session_id.as_deref(),
+            Some("sess-newer-holder"),
+            "the successor record survives byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn gone_then_changed_start_does_not_spawn() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "gone-changed-start");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::Normal,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let rec_hook = rec.clone();
+        let _hook = install_after_gone(move |_| {
+            write_handle(
+                &rec_hook,
+                &make_handle(
+                    &rec_hook,
+                    Some("sess-successor"),
+                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some("127.0.0.1:9".into()),
+                    Some(99),
+                    true,
+                    false,
+                    None,
+                ),
+            );
+        });
+        let err = reuse_or_reap_existing(&rec, "grok", Some("phase-model"), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holder-changed"), "{err}");
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(now.session_id.as_deref(), Some("sess-successor"));
+        assert!(
+            !global_pool().lock().await.contains(&rec.id),
+            "nothing spawned"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivered_waits_for_the_old_persist_before_clear() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "delivered-late-write");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::ShutdownDelayedExit,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let got = reuse_or_reap_existing(&rec, "grok", Some("phase-model"), None)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+        assert!(
+            load_persist(&rec).unwrap().is_none(),
+            "the wait observed the late exit record before clearing"
+        );
+    }
+
+    // ---- 0117: the recycle ------------------------------------------------
+
+    #[tokio::test]
+    async fn recycle_holder_kind_uses_shutdown_rpc() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-holder");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::Normal,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        recycle_without_pool_lock(&rec).await.unwrap();
+        assert_eq!(holder.seen(), vec!["ping", "shutdown"]);
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert!(!now.alive);
+        assert!(now.control_addr.is_none());
+    }
+
+    #[tokio::test]
+    async fn recycle_unproven_leaves_persist() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-unproven");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-other",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::Normal,
+        );
+        write_live_handle(&rec, "sess-ours", &holder.addr);
+        let before = file_bytes(&rec);
+        let err = recycle_without_pool_lock(&rec)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("identity:session"), "{err}");
+        assert_eq!(before, file_bytes(&rec));
+    }
+
+    #[tokio::test]
+    async fn recycle_no_listener_keeps_persist() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-no-listener");
+        write_live_handle(&rec, "sess-d", &closed_addr());
+        let before = file_bytes(&rec);
+        let err = recycle_without_pool_lock(&rec)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no listener"), "{err}");
+        assert_eq!(before, file_bytes(&rec));
+    }
+
+    #[tokio::test]
+    async fn recycle_without_a_persist_only_touches_the_pool() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-pool-only");
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            mock_handshake_ok("sess-pool"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+        assert!(global_pool().lock().await.contains(&rec.id));
+        recycle_without_pool_lock(&rec).await.unwrap();
+        assert!(!global_pool().lock().await.contains(&rec.id));
+        assert!(
+            !persist_path(&rec).unwrap().exists(),
+            "no persist is created"
+        );
+        assert!(crate::harness::abort::cancel_handle_for(&rec.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn recycle_pending_start_leaves_the_record() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-pending");
+        write_handle(&rec, &attempt_handle(&rec, None));
+        let before = file_bytes(&rec);
+        let err = recycle_without_pool_lock(&rec)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("start-pending"), "{err}");
+        assert_eq!(before, file_bytes(&rec));
+    }
+
+    #[tokio::test]
+    async fn recycle_in_process_tears_down_owned_session() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-in-process");
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            mock_handshake_ok("sess-self"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let counter = session.shutdown_counter();
+        insert_test_session(rec.id.clone(), session).await;
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-self"),
+                Some(crate::harness::grok_cwd(&rec)),
+                None,
+                Some(std::process::id()),
+                true,
+                false,
+                None,
+            ),
+        );
+        recycle_without_pool_lock(&rec).await.unwrap();
+        assert!(!global_pool().lock().await.contains(&rec.id));
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the owned session was torn down"
+        );
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert!(!now.alive, "a truthful dead record");
+        assert!(now.control_addr.is_none());
+    }
+
+    #[tokio::test]
+    async fn recycle_in_process_busy_leaves_persist_honest() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-busy");
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-self"),
+                Some(crate::harness::grok_cwd(&rec)),
+                None,
+                Some(std::process::id()),
+                true,
+                false,
+                None,
+            ),
+        );
+        let held = tokio::spawn(async {
+            let _guard = global_pool().lock().await;
+            tokio::time::sleep(Duration::from_millis(6000)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let err = recycle_without_pool_lock(&rec)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pool lock busy"), "{err}");
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert!(now.alive, "the persist stays honest");
+        assert!(now.control_addr.is_none());
+        held.abort();
+    }
+
+    #[tokio::test]
+    async fn recycle_in_process_without_an_owned_session_clears_only_the_record() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-stale-self");
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-self"),
+                Some(crate::harness::grok_cwd(&rec)),
+                None,
+                Some(std::process::id()),
+                true,
+                false,
+                None,
+            ),
+        );
+        recycle_without_pool_lock(&rec).await.unwrap();
+        assert!(load_persist(&rec).unwrap().is_none());
+        let log = std::fs::read_to_string(rec.path.join("status.md")).unwrap_or_default();
+        assert!(log.contains("stale-self"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn recycle_leaves_a_fresh_failed_start_for_the_start_grace() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-fresh-failure");
+        write_handle(&rec, &attempt_handle(&rec, Some("prior failure")));
+        age_file(&rec, Duration::from_secs(1));
+        let before = file_bytes(&rec);
+        recycle_without_pool_lock(&rec).await.unwrap();
+        assert_eq!(before, file_bytes(&rec), "recycle writes nothing");
+        let log = std::fs::read_to_string(rec.path.join("status.md")).unwrap_or_default();
+        assert!(!log.contains("holder-persist-discarded"), "no line either");
+
+        // The following start waits out the rest of the grace, then discards + starts.
+        age_file(&rec, DISCARD_GRACE - Duration::from_millis(200));
+        let got = reuse_or_reap_existing(&rec, "grok", None, None)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+        assert!(load_persist(&rec).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recycle_leaves_a_newer_holder_persist_byte_identical() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-superseded");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::ShutdownMutate,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        recycle_without_pool_lock(&rec).await.unwrap();
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(now.session_id.as_deref(), Some("sess-newer-holder"));
+        assert!(now.alive);
+    }
+
+    #[tokio::test]
+    async fn recycle_alive_self_false_compare_is_a_refusal() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-self-changed");
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            mock_handshake_ok("sess-self"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-self"),
+                Some(crate::harness::grok_cwd(&rec)),
+                None,
+                Some(std::process::id()),
+                true,
+                false,
+                None,
+            ),
+        );
+        let rec_hook = rec.clone();
+        let _hook = install_after_gone(move |_| {
+            write_handle(
+                &rec_hook,
+                &make_handle(
+                    &rec_hook,
+                    Some("sess-successor"),
+                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some("127.0.0.1:9".into()),
+                    Some(99),
+                    true,
+                    false,
+                    None,
+                ),
+            );
+        });
+        let err = recycle_without_pool_lock(&rec)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holder-changed"), "{err}");
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(now.session_id.as_deref(), Some("sess-successor"));
+        assert!(now.alive, "no dead write on the newer record");
+    }
+
+    #[tokio::test]
+    async fn gone_then_changed_recycle_keeps_the_record() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-gone-changed");
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::Normal,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let rec_hook = rec.clone();
+        let _hook = install_after_gone(move |_| {
+            write_handle(
+                &rec_hook,
+                &make_handle(
+                    &rec_hook,
+                    Some("sess-successor"),
+                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some("127.0.0.1:9".into()),
+                    Some(99),
+                    true,
+                    false,
+                    None,
+                ),
+            );
+        });
+        recycle_without_pool_lock(&rec).await.unwrap();
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(now.session_id.as_deref(), Some("sess-successor"));
+        assert!(now.alive);
+    }
+
+    #[tokio::test]
+    async fn recycle_holder_kind_leaves_the_pool_and_cancel_untouched() {
+        let _guard = test_env_lock();
+        let modes = [
+            RawMode::Normal,         // Delivered -> Gone -> mark_dead (false: write skipped)
+            RawMode::ShutdownNoExit, // TimedOut
+            RawMode::ShutdownMutate, // Superseded
+        ];
+        for mode in modes {
+            let dir = tempdir().unwrap();
+            let rec = record_in(&dir, &format!("recycle-neutral-{mode:?}"));
+            let holder = raw_holder(
+                Some(persist_path(&rec).unwrap()),
+                "sess-d",
+                &crate::harness::grok_cwd(&rec),
+                4242,
+                mode,
+            );
+            write_live_handle(&rec, "sess-d", &holder.addr);
+            let session = GrokSession::start_mock(
+                crate::harness::grok_cwd(&rec),
+                mock_handshake_ok("sess-pool"),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            insert_test_session(rec.id.clone(), session).await;
+            assert!(crate::harness::abort::cancel_handle_for(&rec.id).is_some());
+            let _ = recycle_without_pool_lock(&rec).await;
+            assert!(
+                global_pool().lock().await.contains(&rec.id),
+                "the addressed-holder branch never touches the pool ({mode:?})"
+            );
+            assert!(
+                crate::harness::abort::cancel_handle_for(&rec.id).is_some(),
+                "nor the cancel registration ({mode:?})"
+            );
+            global_pool().lock().await.remove(&rec.id);
+            crate::harness::abort::unregister_cancel_handle(&rec.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn recycle_unreadable_persist_is_a_refusal() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "recycle-unreadable");
+        std::fs::create_dir_all(persist_path(&rec).unwrap().parent().unwrap()).unwrap();
+        std::fs::write(persist_path(&rec).unwrap(), b"{not json").unwrap();
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            mock_handshake_ok("sess-pool"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), session).await;
+        let before = file_bytes(&rec);
+        let err = recycle_without_pool_lock(&rec)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("persist-unreadable"), "{err}");
+        assert_eq!(before, file_bytes(&rec));
+        assert!(global_pool().lock().await.contains(&rec.id));
+        assert!(crate::harness::abort::cancel_handle_for(&rec.id).is_some());
+        global_pool().lock().await.remove(&rec.id);
+        crate::harness::abort::unregister_cancel_handle(&rec.id);
+    }
+
+    // ---- 0117: operator path ------------------------------------------------
+
+    #[tokio::test]
+    async fn operator_shutdown_is_rpc_only() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "operator-rpc-only");
+        let _registered = register_rec(&rec);
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::ShutdownNoResponse,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let before = file_bytes(&rec);
+        let err = shutdown(Some(&rec.id), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shutdown-timeout"), "{err}");
+        assert_eq!(
+            before,
+            file_bytes(&rec),
+            "an unproven operator teardown writes nothing"
+        );
+        assert_eq!(holder.seen(), vec!["ping", "shutdown"]);
+    }
+
+    #[tokio::test]
+    async fn operator_shutdown_never_kills_a_foreign_pid() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "operator-foreign-pid");
+        let _registered = register_rec(&rec);
+        let mut child = spawn_dummy_long_child();
+        let mut handle = make_handle(
+            &rec,
+            Some("sess-d"),
+            Some(crate::harness::grok_cwd(&rec)),
+            Some(closed_addr()),
+            None,
+            true,
+            false,
+            None,
+        );
+        handle.pid = Some(child.id());
+        write_handle(&rec, &handle);
+        let before = file_bytes(&rec);
+        let err = shutdown(Some(&rec.id), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no listener"), "{err}");
+        assert!(
+            !wait_child_dead(&mut child, 100),
+            "the dummy PID must still be alive"
+        );
+        assert_eq!(before, file_bytes(&rec));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn operator_shutdown_does_not_overwrite_a_newer_persist() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "operator-superseded");
+        let _registered = register_rec(&rec);
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::ShutdownMutate,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let err = shutdown(Some(&rec.id), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holder-changed"), "{err}");
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(now.session_id.as_deref(), Some("sess-newer-holder"));
+    }
+
+    #[tokio::test]
+    async fn operator_shutdown_timeout_does_not_suggest_delete() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "operator-timeout");
+        let _registered = register_rec(&rec);
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::ShutdownNoExit,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let err = shutdown(Some(&rec.id), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("retry"), "{err}");
+        assert!(!err.contains("delete"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn gone_then_changed_operator_keeps_the_record() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "operator-gone-changed");
+        let _registered = register_rec(&rec);
+        let holder = raw_holder(
+            Some(persist_path(&rec).unwrap()),
+            "sess-d",
+            &crate::harness::grok_cwd(&rec),
+            4242,
+            RawMode::Normal,
+        );
+        write_live_handle(&rec, "sess-d", &holder.addr);
+        let rec_hook = rec.clone();
+        let _hook = install_after_gone(move |_| {
+            write_handle(
+                &rec_hook,
+                &make_handle(
+                    &rec_hook,
+                    Some("sess-successor"),
+                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some("127.0.0.1:9".into()),
+                    Some(99),
+                    true,
+                    false,
+                    None,
+                ),
+            );
+        });
+        let err = shutdown(Some(&rec.id), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holder-changed"), "{err}");
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(now.session_id.as_deref(), Some("sess-successor"));
+        assert!(now.alive, "no dead status/write on the successor");
+    }
+
+    #[tokio::test]
+    async fn alive_self_false_compare_is_a_refusal_in_the_operator_path() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "operator-self-changed");
+        let _registered = register_rec(&rec);
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-self"),
+                Some(crate::harness::grok_cwd(&rec)),
+                None,
+                Some(std::process::id()),
+                true,
+                false,
+                None,
+            ),
+        );
+        let rec_hook = rec.clone();
+        let _hook = install_after_gone(move |_| {
+            write_handle(
+                &rec_hook,
+                &make_handle(
+                    &rec_hook,
+                    Some("sess-successor"),
+                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some("127.0.0.1:9".into()),
+                    Some(99),
+                    true,
+                    false,
+                    None,
+                ),
+            );
+        });
+        let err = shutdown(Some(&rec.id), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holder-changed"), "{err}");
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(now.session_id.as_deref(), Some("sess-successor"));
+    }
+
+    // ---- 0117: abort recycle under the lock ---------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn abort_recycle_in_process_under_lock() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        let _env = crate::config::TestEnvGuard::capture(&[
+            ENV_COORDINATOR_HOME,
+            crate::harness::abort::ENV_CANCEL_WAIT_SECS,
+        ]);
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
+        }
+        let rec = record_in(&dir, "abort-in-process");
+        crate::run::run_stub(&rec, Some("0027".into())).unwrap();
+        let session = GrokSession::start_mock(
+            crate::harness::grok_cwd(&rec),
+            mock_handshake_ok("sess-self"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let counter = session.shutdown_counter();
+        insert_test_session(rec.id.clone(), session).await;
+        write_handle(
+            &rec,
+            &make_handle(
+                &rec,
+                Some("sess-self"),
+                Some(crate::harness::grok_cwd(&rec)),
+                None,
+                Some(std::process::id()),
+                true,
+                true,
+                None,
+            ),
+        );
+        crate::harness::abort::abort_stuck_prompt_sync(
+            &rec,
+            crate::harness::abort::AbortReason::Stall,
+        );
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (now, _) = persist_identity(&rec).unwrap().unwrap();
+        assert!(!now.alive);
+        assert!(!now.prompt_in_flight);
+    }
+
+    // ---- 0117: two real start paths, exactly one spawn ----------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn both_start_paths_claim_and_exactly_one_spawns() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _guard = test_env_lock();
+        let previous_hook = SPAWN_HOOK.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let spawns = std::sync::Arc::new(AtomicUsize::new(0));
+        {
+            let spawns = spawns.clone();
+            *SPAWN_HOOK.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(std::sync::Arc::new(move |rec: &ProjectRecord| {
+                    spawns.fetch_add(1, Ordering::SeqCst);
+                    // The claim must already be the only write on disk.
+                    let (identity, _) = persist_identity(rec).unwrap().unwrap();
+                    assert!(
+                        identity.is_attempt(),
+                        "the spawn stand-in observes the winner's PendingStart claim"
+                    );
+                    assert!(identity.error.is_none());
+                    Ok(GrokHarnessStatus::missing())
+                }));
+        }
+
+        for (arm, a_in_process, b_in_process) in [
+            ("detached", false, false),
+            ("in-process", true, true),
+            ("cross", false, true),
+        ] {
+            let home = tempdir().unwrap();
+            let proj = tempdir().unwrap();
+            unsafe {
+                std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            }
+            let mut reg = Registry::default();
+            let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+            reg.save(&crate::config::registry_path().unwrap()).unwrap();
+            let _ = std::fs::remove_file(persist_path(&rec).unwrap());
+            global_pool().lock().await.remove(&rec.id);
+            crate::harness::abort::unregister_cancel_handle(&rec.id);
+            spawns.store(0, Ordering::SeqCst);
+
+            let barrier = std::sync::Arc::new(Barrier::new(2));
+            {
+                let barrier = barrier.clone();
+                *PRE_CLAIM_HOOK.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(std::sync::Arc::new(move |_: &ProjectRecord| {
+                        barrier.wait();
+                    }));
+            }
+
+            let id_a = rec.id.clone();
+            let bin = PathBuf::from("missing-0117-holder.exe");
+            let first = tokio::spawn({
+                let bin = bin.clone();
+                async move { start_with_bin(Some(&id_a), a_in_process, bin, None, false, "grok").await }
+            });
+            let id_b = rec.id.clone();
+            let second = tokio::spawn(async move {
+                start_with_bin(Some(&id_b), b_in_process, bin, None, false, "grok").await
+            });
+            let results = [first.await.unwrap(), second.await.unwrap()];
+            assert_eq!(
+                spawns.load(Ordering::SeqCst),
+                1,
+                "exactly one spawn per arm ({arm})"
+            );
+            let winners = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(winners, 1, "one start owns the claim ({arm})");
+            let loser = results
+                .iter()
+                .find(|r| r.is_err())
+                .and_then(|r| r.as_ref().err())
+                .map(|e| e.to_string())
+                .unwrap();
+            assert!(
+                loser.contains("persist-appeared"),
+                "the loser refuses without spawning ({arm}): {loser}"
+            );
+            let (identity, _) = persist_identity(&rec).unwrap().unwrap();
+            assert!(identity.is_attempt());
+            assert!(identity.error.is_none());
+
+            *PRE_CLAIM_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            let _ = std::fs::remove_file(persist_path(&rec).unwrap());
+            global_pool().lock().await.remove(&rec.id);
+            crate::harness::abort::unregister_cancel_handle(&rec.id);
+        }
+        *SPAWN_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = previous_hook;
+    }
+
+    #[tokio::test]
+    async fn refuse_path_with_no_persist_is_not_blocked_by_the_owner() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        let _env = crate::config::TestEnvGuard::capture(&[ENV_COORDINATOR_HOME]);
+        unsafe { std::env::set_var(ENV_COORDINATOR_HOME, home.path()) };
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::run::run_stub(&rec, Some("0027".into())).unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            let mut s = crate::state::load_run_state(&rec)?;
+            s.last_event = crate::harness::abort::RECYCLE_STALL_EVENT.into();
+            crate::state::save_run_state(&rec, &s)
+        })
+        .unwrap();
+        assert!(!persist_path(&rec).unwrap().exists());
+        assert!(crate::harness::abort::should_refuse_reuse(&rec));
+
+        let missing = proj.path().join("missing-grok-refuse.exe");
+        let started = start_with_bin(Some(&rec.id), true, missing, None, false, "grok").await;
+        let err = started.unwrap_err().to_string();
+        assert!(
+            !err.contains("persist-missing"),
+            "an absent persist is nothing to terminate, not a refusal: {err}"
+        );
+        let (identity, _) = persist_identity(&rec).unwrap().unwrap();
+        assert!(!identity.alive);
+        assert!(
+            identity.error.is_some(),
+            "the real spawn failure is recorded"
+        );
+    }
+
+    #[test]
+    fn same_identity_covers_model_and_bin() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "same-identity");
+        let mut a = attempt_handle(&rec, None);
+        a.alive = true;
+        a.session_id = Some("sess".into());
+        a.holder_pid = Some(4242);
+        a.model = Some("gpt-6.1-sol[medium]".into());
+        a.bin = Some(PathBuf::from(r"C:\bin\codex-acp.cmd"));
+        let base = PersistIdentity::from_handle(&a);
+
+        let mut b = a.clone();
+        b.model = Some("gpt-6-luna".into());
+        assert!(
+            !base.same_identity(&PersistIdentity::from_handle(&b)),
+            "a model change between Ping and delivery is persist-changed"
+        );
+
+        let mut c = a.clone();
+        c.bin = Some(PathBuf::from(r"C:\bin\other.exe"));
+        assert!(!base.same_identity(&PersistIdentity::from_handle(&c)));
+
+        // A pre-upgrade persist without model/bin still proves identity.
+        let mut d = a.clone();
+        d.model = None;
+        assert!(base.same_identity(&PersistIdentity::from_handle(&d)));
+
+        let mut e = a.clone();
+        e.bin = None;
+        assert!(base.same_identity(&PersistIdentity::from_handle(&e)));
+    }
+
+    // ---- 0117: the single-owner source scan --------------------------------
+
+    /// A **known-token regression guard, not semantic proof** (agy-m1). The real
+    /// guarantee is the private `VerifiedHolder` + the deleted functions.
+    ///
+    /// Production shard = each scan-set file truncated at its **own** `mod tests`
+    /// (`pool.rs` also has two earlier `#[cfg(test)]` regions at `apply_turn` and
+    /// `hold_loop_with_session`; they are not test modules and stay in the shard).
+    #[test]
+    fn termination_single_owner_scan() {
+        let files: [(&str, &str); 9] = [
+            ("pool", include_str!("pool.rs")),
+            ("reap", include_str!("reap.rs")),
+            ("grok", include_str!("grok.rs")),
+            ("abort", include_str!("abort.rs")),
+            ("worktree", include_str!("../worktree.rs")),
+            ("drive", include_str!("../workflow/drive.rs")),
+            ("state", include_str!("../state.rs")),
+            ("api", include_str!("../api.rs")),
+            ("cli", include_str!("../cli.rs")),
+        ];
+        let shards: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(name, text)| {
+                let cut = text.find("\nmod tests {").unwrap_or(text.len());
+                (*name, &text[..cut])
+            })
+            .collect();
+        let pool_shard = shards
+            .iter()
+            .find(|(name, _)| *name == "pool")
+            .map(|(_, text)| *text)
+            .unwrap();
+        let joined: String = shards.iter().map(|(_, text)| *text).collect();
+
+        assert_eq!(
+            pool_shard.matches("&HoldRequest::Shutdown").count(),
+            1,
+            "exactly one Shutdown construction"
+        );
+        assert_eq!(pool_shard.matches("deliver_shutdown(").count(), 3);
+        assert_eq!(pool_shard.matches("fn deliver_shutdown(").count(), 1);
+        assert_eq!(pool_shard.matches("struct VerifiedHolder {").count(), 1);
+        assert_eq!(pool_shard.matches("VerifiedHolder {").count(), 2);
+        assert_eq!(pool_shard.matches("fn same_record(").count(), 1);
+        assert_eq!(pool_shard.matches("create_new(true)").count(), 1);
+        assert_eq!(pool_shard.matches("persist_marked_dead(").count(), 2);
+        assert_eq!(pool_shard.matches("claim_start(").count(), 3);
+
+        for token in [
+            "kill_persist_pids",
+            "kill_pid_best_effort",
+            "kill_live_pids",
+            "verify_holder_identity",
+            "HolderReapRpc",
+        ] {
+            assert!(
+                !joined.contains(token),
+                "{token} must appear nowhere in the production shards"
+            );
+        }
+        assert!(
+            !pool_shard.contains("taskkill"),
+            "taskkill is the ACP child's teardown in grok only"
+        );
+        assert!(
+            shards
+                .iter()
+                .any(|(name, text)| *name == "grok" && text.contains("taskkill"))
+        );
+
+        for name in [
+            "deliver_shutdown(",
+            "wait_holder_gone(",
+            "clear_persist_if(",
+            "mark_dead_if(",
+            "mark_start_error(",
+            "write_holder_ready(",
+            "write_holder_exit(",
+        ] {
+            let body = fn_body(pool_shard, name);
+            assert!(
+                body.contains("same_record("),
+                "{name} must use the one compare rule"
+            );
+        }
+        assert!(fn_body(pool_shard, "same_record(").contains("is_attempt()"));
+
+        for caller in [
+            "reuse_or_reap_existing(",
+            "recycle_without_pool_lock(",
+            "shutdown(project:",
+            "start_inner(",
+        ] {
+            let body = fn_body(pool_shard, caller);
+            assert_eq!(
+                body.matches("run_holder_work(").count(),
+                1,
+                "{caller} offloads the blocking seam exactly once"
+            );
+        }
+
+        let start_holder = fn_body(pool_shard, "start_holder(");
+        assert_eq!(start_holder.matches("claim_start(").count(), 1);
+        let claim_at = start_holder.rfind("claim_start(").unwrap();
+        let spawn_at = start_holder.find("spawn_holder_process(").unwrap();
+        assert!(
+            claim_at < spawn_at,
+            "the claim is the last step before spawn"
+        );
+        assert!(
+            !start_holder[claim_at..spawn_at].contains("save_persist("),
+            "no write between the claim and the spawn"
+        );
+
+        let in_process = fn_body(pool_shard, "spawn_in_process(");
+        assert_eq!(in_process.matches("claim_start(").count(), 1);
+        let claim_at = in_process.rfind("claim_start(").unwrap();
+        let start_at = in_process.find("GrokSession::start").unwrap();
+        assert!(claim_at < start_at);
+        assert!(
+            !in_process[claim_at..start_at].contains("save_persist("),
+            "no write between the claim and the ACP start"
+        );
+
+        // `remove_file(` is scoped to pool.rs's shard; drive.rs removes unrelated
+        // mailbox/review files, so a whole-set scan is wrong.
+        let remove_at = pool_shard.find("std::fs::remove_file(").unwrap();
+        let enclosing = pool_shard[..remove_at]
+            .rfind("fn ")
+            .map(|i| &pool_shard[i..])
+            .unwrap_or("");
+        assert!(
+            enclosing.starts_with("fn clear_persist_if("),
+            "remove_file( lives only in clear_persist_if"
+        );
+
+        // No async worker sleeps on the thread.
+        for (name, body) in async_fns(pool_shard) {
+            assert!(
+                !body.contains("std::thread::sleep"),
+                "{name} must not block an async worker"
+            );
+        }
+    }
+
+    /// Literal-aware body extractor: skips `"…"`, raw strings, char literals and
+    /// `//` / `/* */` comments, and returns the text through the matching `}`.
+    fn fn_body<'a>(shard: &'a str, sig_prefix: &str) -> &'a str {
+        let needle = format!("fn {sig_prefix}");
+        let found = shard.find(&needle).or_else(|| {
+            // Generic parameters sit between the name and `(`.
+            sig_prefix
+                .strip_suffix('(')
+                .and_then(|stem| shard.find(&format!("fn {stem}<")))
+        });
+        let start = found.unwrap_or_else(|| panic!("missing fn {sig_prefix}"));
+        let bytes = shard.as_bytes();
+        let mut i = start;
+        let mut depth = 0i32;
+        let mut seen_brace = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    i = skip_string(bytes, i);
+                    continue;
+                }
+                b'\'' => {
+                    if let Some(next) = skip_char_or_lifetime(bytes, i) {
+                        i = next;
+                        continue;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                b'{' => {
+                    depth += 1;
+                    seen_brace = true;
+                }
+                b'}' => {
+                    depth -= 1;
+                    if seen_brace && depth == 0 {
+                        return &shard[start..=i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        &shard[start..]
+    }
+
+    fn skip_string(bytes: &[u8], start: usize) -> usize {
+        let mut i = start + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'"' => return i + 1,
+                _ => i += 1,
+            }
+        }
+        bytes.len()
+    }
+
+    /// A char literal (`'a'`, `'\n'`) is consumed; a lifetime (`'a`) is not.
+    fn skip_char_or_lifetime(bytes: &[u8], start: usize) -> Option<usize> {
+        match bytes.get(start + 1) {
+            Some(b'\\') => {
+                let mut i = start + 2;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                Some(i + 1)
+            }
+            Some(_) if bytes.get(start + 2) == Some(&b'\'') => Some(start + 3),
+            _ => None,
+        }
+    }
+
+    fn async_fns(shard: &str) -> Vec<(String, String)> {
+        let mut names: Vec<String> = Vec::new();
+        let mut rest = shard;
+        while let Some(at) = rest.find("async fn ") {
+            rest = &rest[at + "async fn ".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+            .into_iter()
+            .map(|name| {
+                let body = fn_body(shard, &format!("{name}(")).to_string();
+                (name, body)
+            })
+            .collect()
     }
 }

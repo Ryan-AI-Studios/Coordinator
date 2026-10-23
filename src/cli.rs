@@ -413,7 +413,12 @@ pub enum GrokCommands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Kill the Grok ACP child (explicit teardown)
+    /// Shut the Grok holder down over its own control socket (RPC only).
+    ///
+    /// Reports `Unproven` (exit 1) with the reason and the recovery steps when the
+    /// holder cannot be proved: end any live `harness grok hold` process first, then
+    /// delete the printed persist path, then retry. Works during a prompt (the turn is
+    /// cancelled); never kills by pid, image or process tree.
     Shutdown {
         #[arg(long)]
         project: Option<String>,

@@ -225,6 +225,9 @@ pub struct GrokSession {
     /// Per-turn ACP target roots (prepared implement/address-findings turns only).
     /// Cleared on every turn exit, cancel/recycle and before manual prompts.
     turn_roots: Vec<PathBuf>,
+    /// Test-only teardown counter: proves the owned session was torn down.
+    #[cfg(test)]
+    shutdown_calls: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Cloneable stdin writer so abort can send `session/cancel` without the pool lock.
@@ -414,6 +417,8 @@ impl GrokSession {
             last_signal: None,
             last_tool_title: None,
             turn_roots: Vec::new(),
+            #[cfg(test)]
+            shutdown_calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         session.terminals.set_adapter(harness);
         session.handshake(timeout, model).await?;
@@ -489,6 +494,8 @@ impl GrokSession {
             last_signal: None,
             last_tool_title: None,
             turn_roots: Vec::new(),
+            #[cfg(test)]
+            shutdown_calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         session.terminals.set_adapter(harness);
         session.handshake(timeout, None).await?;
@@ -721,6 +728,9 @@ impl GrokSession {
 
     /// Kill the ACP child (explicit teardown). Mock transport is a no-op drop.
     pub async fn shutdown(&mut self) -> Result<()> {
+        #[cfg(test)]
+        self.shutdown_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match &mut self.transport {
             AcpTransport::Process { child, .. } => {
                 if let Some(pid) = child.id() {
@@ -731,6 +741,36 @@ impl GrokSession {
             AcpTransport::Mock { .. } => {}
         }
         Ok(())
+    }
+
+    /// The same owned-session teardown, synchronously (worktree paths run under the
+    /// run-state lock): `tree_kill_pid` on its own ACP child + `start_kill`.
+    pub fn shutdown_blocking(&mut self) {
+        #[cfg(test)]
+        self.shutdown_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match &mut self.transport {
+            AcpTransport::Process { child, .. } => {
+                if let Some(pid) = child.id() {
+                    tree_kill_pid(pid);
+                }
+                let _ = child.start_kill();
+            }
+            AcpTransport::Mock { .. } => {}
+        }
+    }
+
+    /// Test-only: how many times this session's teardown was invoked.
+    #[cfg(test)]
+    pub(crate) fn shutdown_probe(&self) -> u32 {
+        self.shutdown_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Test-only: a handle to the teardown counter, for a session handed to the pool.
+    #[cfg(test)]
+    pub(crate) fn shutdown_counter(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        self.shutdown_calls.clone()
     }
 
     pub fn is_process_alive(&mut self) -> bool {
@@ -1388,7 +1428,10 @@ fn acp_spawn_command(bin: &Path) -> tokio::process::Command {
 }
 
 /// Tree-kill `pid` (`taskkill /F /T /PID` on Windows). Never pid 0 or this process.
-pub(crate) fn tree_kill_pid(pid: u32) {
+///
+/// Private to `grok`: the only caller is the owned ACP child's teardown
+/// ([`GrokSession::shutdown`] / [`GrokSession::shutdown_blocking`]). Never a holder path.
+fn tree_kill_pid(pid: u32) {
     if pid == 0 || pid == std::process::id() {
         return;
     }

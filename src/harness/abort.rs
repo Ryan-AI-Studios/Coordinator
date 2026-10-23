@@ -199,7 +199,9 @@ async fn abort_stuck_prompt_async(record: &ProjectRecord, reason: AbortReason) -
         }
     }
 
-    let _ = crate::harness::pool::recycle_without_pool_lock(record).await;
+    if let Err(e) = crate::harness::pool::recycle_without_pool_lock(record).await {
+        eprintln!("coordinator: abort recycle: project={} {e}", record.id);
+    }
     Ok(())
 }
 

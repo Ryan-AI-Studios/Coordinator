@@ -497,8 +497,10 @@ fn drive_adapter(
         .name(format!("adapter-inject-{}", rec.id))
         .spawn(move || {
             let result = block_on_async(async {
-                if recycle_mismatch {
-                    let _ = crate::harness::pool::recycle_without_pool_lock(&rec).await;
+                if recycle_mismatch
+                    && let Err(e) = crate::harness::pool::recycle_without_pool_lock(&rec).await
+                {
+                    eprintln!("coordinator: adapter recycle: project={} {e}", rec.id);
                 }
                 crate::harness::start_with_bin(
                     Some(&selector),

@@ -644,6 +644,7 @@ mod tests {
             self_check: None,
             registry: None,
             ready: None,
+            holder: None,
         }
     }
 
