@@ -75,9 +75,10 @@ pub fn cargo_target_dir_for(record: &ProjectRecord, cwd: &Path) -> Option<PathBu
     Some(absolutize(dir))
 }
 
-/// Create the detached worktree for `next_epoch` before run state becomes Running.
+/// Prepare the detached worktree for `next_epoch` before run state becomes Running.
 ///
-/// Flag off returns immediately. A git failure leaves run state unsaved.
+/// Flag off returns immediately. A git failure leaves run state unsaved. An unproven
+/// holder fails the epoch closed **before** `clear_progress`/`create_dir_all`.
 pub fn prepare_epoch(record: &ProjectRecord, next_epoch: u64) -> Result<()> {
     if !isolation_enabled(record)? {
         return Ok(());
@@ -85,7 +86,13 @@ pub fn prepare_epoch(record: &ProjectRecord, next_epoch: u64) -> Result<()> {
     let exec = execution_repo(record)?;
     let root = worktrees_root(record)?;
     let target = root.join(next_epoch.to_string());
-    shutdown_under(record, &root, Some(&target));
+    shutdown_under(record, &root, Some(&target)).map_err(|e| {
+        CoordinatorError::Message(format!(
+            "worktree: epoch {next_epoch} holder unproven; refusing to prepare the next epoch \
+             (persist: {}): {e}",
+            persist_display(record)
+        ))
+    })?;
     crate::workflow::watchdog::clear_progress(record);
     std::fs::create_dir_all(&root)?;
     let children = numeric_children(&root);
@@ -131,7 +138,8 @@ pub fn prepare_epoch(record: &ProjectRecord, next_epoch: u64) -> Result<()> {
 }
 
 /// After a commit that landed Idle, shut down a session on this epoch and remove it.
-/// A failed remove is journaled and does not roll the Idle commit back.
+/// A failed remove is journaled and does not roll the Idle commit back; an unproven
+/// holder keeps the tree.
 pub fn release_if_idle(record: &ProjectRecord, view: &StatusView) {
     if view.status != RunStatus::Idle {
         return;
@@ -145,7 +153,9 @@ pub fn release_if_idle(record: &ProjectRecord, view: &StatusView) {
     let Ok(dir) = epoch_dir(record, view.run_epoch) else {
         return;
     };
-    shutdown_if_cwd(record, &dir);
+    if !shutdown_if_cwd(record, &dir) {
+        return;
+    }
     let _ = remove_worktree(record, &exec, &dir);
 }
 
@@ -282,7 +292,10 @@ fn replaced_by_next_epoch(record: &ProjectRecord, path: &Path, target: &Path) ->
 }
 
 fn session_bound(record: &ProjectRecord, path: &Path) -> bool {
-    let snap = crate::harness::pool::persist_live(record);
+    // An unreadable persist is bound: keep the tree rather than guess.
+    let Ok(snap) = crate::harness::pool::persist_live(record) else {
+        return true;
+    };
     if let Some(ref live) = snap
         && live.cwd.as_ref().is_some_and(|cwd| paths_same(cwd, path))
         && (live.alive || live.prompt_in_flight)
@@ -307,42 +320,334 @@ fn session_bound(record: &ProjectRecord, path: &Path) -> bool {
     false
 }
 
-fn shutdown_under(record: &ProjectRecord, root: &Path, keep: Option<&Path>) {
-    let Some(live) = crate::harness::pool::persist_live(record) else {
-        detach_if(record, |cwd| {
-            path_is_inside(cwd, root) && keep.is_none_or(|keep| !paths_same(cwd, keep))
-        });
-        return;
-    };
-    let Some(cwd) = live.cwd.as_ref() else {
-        return;
-    };
-    if !path_is_inside(cwd, root) {
-        return;
-    }
-    if keep.is_some_and(|keep| paths_same(cwd, keep)) {
-        return;
-    }
-    crate::harness::pool::kill_live_pids(&live);
-    crate::harness::pool::clear_persist_file(record);
-    crate::harness::abort::unregister_cancel_handle(&record.id);
-    detach_if(record, |cwd| path_is_inside(cwd, root));
+/// What a worktree termination did. `Unchanged` means nothing in this epoch was bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownOutcome {
+    Unchanged,
+    Handled,
 }
 
-fn shutdown_if_cwd(record: &ProjectRecord, epoch_path: &Path) {
-    if let Some(live) = crate::harness::pool::persist_live(record)
-        && live
-            .cwd
-            .as_ref()
-            .is_some_and(|cwd| paths_same(cwd, epoch_path) || path_is_inside(cwd, epoch_path))
-    {
-        crate::harness::pool::kill_live_pids(&live);
-        crate::harness::pool::clear_persist_file(record);
-        crate::harness::abort::unregister_cancel_handle(&record.id);
+fn persist_display(record: &ProjectRecord) -> String {
+    crate::harness::pool::persist_path(record)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "{state_dir}/harness-grok.json".into())
+}
+
+fn holder_refused(record: &ProjectRecord, detail: &str) -> CoordinatorError {
+    CoordinatorError::Message(format!(
+        "holder-changed: {detail} (persist: {}). {}",
+        persist_display(record),
+        crate::harness::pool::recovery_hint(record)
+    ))
+}
+
+fn holder_unproven(record: &ProjectRecord, why: &str) -> CoordinatorError {
+    CoordinatorError::Message(format!(
+        "holder unproven ({why}) (persist: {}). {}",
+        persist_display(record),
+        crate::harness::pool::recovery_hint(record)
+    ))
+}
+
+fn shutdown_under(
+    record: &ProjectRecord,
+    root: &Path,
+    keep: Option<&Path>,
+) -> Result<ShutdownOutcome> {
+    use crate::harness::pool::{self, Intent, PersistClass, PersistRef, WaitGone};
+
+    let (identity, mtime) = match pool::persist_identity(record) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            detach_if(record, |cwd| {
+                path_is_inside(cwd, root) && keep.is_none_or(|keep| !paths_same(cwd, keep))
+            });
+            return Ok(ShutdownOutcome::Unchanged);
+        }
+        // Unreadable is `Unproven`, never absent: keep the persist **and** the cancel
+        // registration, before `clear_progress`/`create_dir_all`.
+        Err(e) => {
+            return Err(CoordinatorError::Message(format!(
+                "holder persist unreadable ({e}); keeping it (persist: {})",
+                persist_display(record)
+            )));
+        }
+    };
+    let old = PersistRef::new(identity.clone(), mtime);
+    if let PersistClass::Addressed { .. } = pool::classify_persist(&identity) {
+        let Some(cwd) = identity.cwd.as_deref() else {
+            return Ok(ShutdownOutcome::Unchanged);
+        };
+        if !path_is_inside(cwd, root) || keep.is_some_and(|keep| paths_same(cwd, keep)) {
+            return Ok(ShutdownOutcome::Unchanged);
+        }
     }
-    detach_if(record, |cwd| {
-        paths_same(cwd, epoch_path) || path_is_inside(cwd, epoch_path)
+
+    match pool::classify_persist(&identity) {
+        PersistClass::NoAddress(why) => {
+            if worktree_settle_no_address(record, &old, why)? {
+                // Table B: one line + compare-clear + detach. The pooled session (if
+                // any) is dropped only after a successful clear.
+                teardown_epoch(record, old.identity.cwd.as_deref(), root);
+                Ok(ShutdownOutcome::Handled)
+            } else {
+                Ok(ShutdownOutcome::Unchanged)
+            }
+        }
+        PersistClass::Addressed { .. } => {
+            let termination = pool::terminate_persisted_holder(record, Intent::Reap)?;
+            let outcome = termination.outcome;
+            let Some(old) = termination.old else {
+                return Ok(ShutdownOutcome::Unchanged);
+            };
+            match outcome {
+                pool::HolderTermination::Delivered { .. } => {
+                    match pool::wait_holder_gone(record, &old, pool::WAIT_GONE) {
+                        WaitGone::Gone { .. } => {
+                            pool::after_gone(record);
+                            if !pool::clear_persist_if(record, &old) {
+                                return Err(holder_refused(
+                                    record,
+                                    "the record changed before the clear",
+                                ));
+                            }
+                            teardown_epoch(record, old.identity.cwd.as_deref(), root);
+                            Ok(ShutdownOutcome::Handled)
+                        }
+                        WaitGone::Superseded => Err(holder_refused(
+                            record,
+                            "a newer holder owns the persist after the wait",
+                        )),
+                        WaitGone::TimedOut => Err(CoordinatorError::Message(format!(
+                            "delivered; the holder has not written its exit record; retry (persist: {})",
+                            persist_display(record)
+                        ))),
+                    }
+                }
+                pool::HolderTermination::Exited { .. } => {
+                    pool::after_gone(record);
+                    if !pool::clear_persist_if(record, &old) {
+                        return Err(holder_refused(
+                            record,
+                            "the record changed before the clear",
+                        ));
+                    }
+                    teardown_epoch(record, old.identity.cwd.as_deref(), root);
+                    Ok(ShutdownOutcome::Handled)
+                }
+                pool::HolderTermination::NoListener { addr } => {
+                    Err(CoordinatorError::Message(format!(
+                        "no listener at {addr}: the holder control socket accepted no connection \
+                         (persist: {}). {}",
+                        persist_display(record),
+                        crate::harness::pool::recovery_hint(record)
+                    )))
+                }
+                pool::HolderTermination::NoSocket { why } => {
+                    if worktree_settle_no_address(record, &old, why)? {
+                        Ok(ShutdownOutcome::Handled)
+                    } else {
+                        Ok(ShutdownOutcome::Unchanged)
+                    }
+                }
+                pool::HolderTermination::Unproven { why } => Err(holder_unproven(record, &why)),
+            }
+        }
+    }
+}
+
+fn teardown_epoch(record: &ProjectRecord, cwd: Option<&Path>, root: &Path) {
+    let cwd = cwd.map(|cwd| cwd.to_path_buf());
+    detach_if(record, |candidate| match &cwd {
+        Some(cwd) => paths_same(candidate, cwd),
+        None => path_is_inside(candidate, root),
     });
+    crate::harness::abort::unregister_cancel_handle(&record.id);
+}
+
+/// Table B for the worktree callers. `Ok(true)` = handled/clearable, `Ok(false)` =
+/// nothing to do, `Err` = refuse and keep everything.
+fn worktree_settle_no_address(
+    record: &ProjectRecord,
+    old: &crate::harness::pool::PersistRef,
+    why: crate::harness::pool::NoSocketWhy,
+) -> Result<bool> {
+    use crate::harness::pool::{self, NoAddressAction, PersistClass};
+
+    let mut action = pool::no_address_decision(&why, old.mtime, SystemTime::now());
+    loop {
+        match action {
+            NoAddressAction::DiscardNow => {
+                pool::discard_line(record, old);
+                pool::after_gone(record);
+                if !pool::clear_persist_if(record, old) {
+                    return Err(holder_refused(
+                        record,
+                        "the record changed before the clear",
+                    ));
+                }
+                return Ok(true);
+            }
+            NoAddressAction::WaitUntil(at) => {
+                let now = SystemTime::now();
+                if at > now {
+                    std::thread::sleep(at.duration_since(now).unwrap_or(Duration::ZERO));
+                }
+                let Some((identity, mtime)) = pool::persist_identity(record)? else {
+                    return Ok(false);
+                };
+                if !pool::same_record(old, &identity, mtime) {
+                    return Err(holder_refused(
+                        record,
+                        "a newer record owns the persist during the grace wait",
+                    ));
+                }
+                match pool::classify_persist(&identity) {
+                    PersistClass::NoAddress(next) => {
+                        action = pool::no_address_decision(&next, mtime, SystemTime::now());
+                    }
+                    PersistClass::Addressed { .. } => {
+                        return Err(holder_refused(
+                            record,
+                            "the record gained an address during the grace wait",
+                        ));
+                    }
+                }
+            }
+            NoAddressAction::Refuse(reason) => {
+                return Err(CoordinatorError::Message(format!(
+                    "{reason}: refusing to prepare or release a worktree over an authoritative \
+                     record (persist: {}). {}",
+                    persist_display(record),
+                    pool::recovery_hint(record)
+                )));
+            }
+            NoAddressAction::OwnedInProcess => {
+                let cwd = old.identity.cwd.clone();
+                let torn = pool::teardown_pooled_if_cwd(
+                    &record.id,
+                    |candidate| match &cwd {
+                        Some(cwd) => paths_same(candidate, cwd),
+                        None => true,
+                    },
+                    pool::POOL_LOCK_BUDGET,
+                );
+                if !torn && !pool::pool_lock_available() {
+                    return Err(CoordinatorError::Message(format!(
+                        "pool lock busy: the owned session was not torn down and its cancel \
+                         registration is kept (persist: {}). Retry.",
+                        persist_display(record)
+                    )));
+                }
+                pool::after_gone(record);
+                if !pool::clear_persist_if(record, old) {
+                    return Err(holder_refused(
+                        record,
+                        "the record changed before the clear",
+                    ));
+                }
+                // The owned session is gone (or this is a stale self record): drop the
+                // registration only now, never before the teardown.
+                crate::harness::abort::unregister_cancel_handle(&record.id);
+                return Ok(true);
+            }
+        }
+    }
+}
+
+/// `false` means "keep the tree": unproven, unreadable, superseded, timed out, a false
+/// compare, a foreign no-address record, or a lock that is still held.
+fn shutdown_if_cwd(record: &ProjectRecord, epoch_path: &Path) -> bool {
+    shutdown_if_cwd_inner(record, epoch_path).unwrap_or_else(|e| {
+        eprintln!("coordinator: worktree: release refused: {e}");
+        false
+    })
+}
+
+fn shutdown_if_cwd_inner(record: &ProjectRecord, epoch_path: &Path) -> Result<bool> {
+    use crate::harness::pool::{self, Intent, PersistClass, PersistRef, WaitGone};
+
+    let (identity, mtime) = match pool::persist_identity(record) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            detach_if(record, |cwd| {
+                paths_same(cwd, epoch_path) || path_is_inside(cwd, epoch_path)
+            });
+            return Ok(true);
+        }
+        Err(e) => {
+            return Err(CoordinatorError::Message(format!(
+                "holder persist unreadable ({e}); keeping it (persist: {})",
+                persist_display(record)
+            )));
+        }
+    };
+    let old = PersistRef::new(identity.clone(), mtime);
+    if let PersistClass::Addressed { .. } = pool::classify_persist(&identity) {
+        let Some(cwd) = identity.cwd.as_deref() else {
+            return Ok(true);
+        };
+        if !(paths_same(cwd, epoch_path) || path_is_inside(cwd, epoch_path)) {
+            // Another epoch's session: nothing here to dispose.
+            return Ok(true);
+        }
+    }
+
+    match pool::classify_persist(&identity) {
+        PersistClass::NoAddress(why) => {
+            if worktree_settle_no_address(record, &old, why)? {
+                detach_if(record, |cwd| {
+                    paths_same(cwd, epoch_path) || path_is_inside(cwd, epoch_path)
+                });
+                // The owned session is gone (or this was a stale self record): drop the
+                // registration only after the clear + detach.
+                crate::harness::abort::unregister_cancel_handle(&record.id);
+            }
+            Ok(true)
+        }
+        PersistClass::Addressed { .. } => {
+            let termination = pool::terminate_persisted_holder(record, Intent::Reap)?;
+            let outcome = termination.outcome;
+            let Some(old) = termination.old else {
+                return Ok(true);
+            };
+            let cleared = match outcome {
+                pool::HolderTermination::Delivered { .. } => {
+                    match pool::wait_holder_gone(record, &old, pool::WAIT_GONE) {
+                        WaitGone::Gone { .. } => {
+                            pool::after_gone(record);
+                            pool::clear_persist_if(record, &old)
+                        }
+                        WaitGone::Superseded | WaitGone::TimedOut => return Ok(false),
+                    }
+                }
+                pool::HolderTermination::Exited { .. } => {
+                    pool::after_gone(record);
+                    pool::clear_persist_if(record, &old)
+                }
+                pool::HolderTermination::NoListener { .. } => return Ok(false),
+                pool::HolderTermination::NoSocket { why } => {
+                    return Ok(
+                        worktree_settle_no_address(record, &old, why).unwrap_or_else(|e| {
+                            eprintln!("coordinator: worktree: release refused: {e}");
+                            false
+                        }),
+                    );
+                }
+                pool::HolderTermination::Unproven { why } => {
+                    return Err(holder_unproven(record, &why));
+                }
+            };
+            if !cleared {
+                return Err(holder_refused(
+                    record,
+                    "the record changed before the clear",
+                ));
+            }
+            teardown_epoch(record, old.identity.cwd.as_deref(), epoch_path);
+            Ok(true)
+        }
+    }
 }
 
 fn detach_if(record: &ProjectRecord, pred: impl Fn(&Path) -> bool) {
@@ -420,6 +725,7 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::layout::auto_detect_nested_execution;
@@ -991,5 +1297,565 @@ mod tests {
         let err = prepare_epoch(&rec, 1).unwrap_err();
         assert!(err.to_string().contains("no execution repo"), "{err}");
         assert!(!worktrees_root(&rec).unwrap().join("1").exists());
+    }
+
+    // ---- 0117: worktree paths fail closed ------------------------------------
+
+    fn persist_body(
+        rec: &ProjectRecord,
+        session: Option<&str>,
+        cwd: Option<&Path>,
+        alive: bool,
+        addr: Option<&str>,
+        holder: Option<u32>,
+        error: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "project_id": rec.id,
+            "session_id": session,
+            "cwd": cwd.map(|p| p.display().to_string()),
+            "pid": 4242,
+            "holder_pid": holder,
+            "control_addr": addr,
+            "adapter": "grok",
+            "supports_compact": true,
+            "alive": alive,
+            "prompt_in_flight": false,
+            "error": error,
+        })
+    }
+
+    fn write_persist(rec: &ProjectRecord, body: &serde_json::Value) -> std::path::PathBuf {
+        let path = crate::harness::pool::persist_path(rec).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body.to_string()).unwrap();
+        path
+    }
+
+    /// Register a real cancel handle for the sync worktree tests.
+    fn register_dummy_cancel(rec: &ProjectRecord) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let session = rt
+            .block_on(crate::harness::grok::GrokSession::start_mock(
+                rec.path.clone(),
+                crate::harness::grok::mock_handshake_ok("sess-cancel"),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+        crate::harness::abort::register_cancel_handle(rec.id.clone(), session.cancel_handle());
+    }
+
+    fn aged(path: &Path, age: std::time::Duration) {
+        let at = SystemTime::now() - age;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    enum WtMode {
+        Normal,
+        PingMismatch,
+        ShutdownNoExit,
+        ShutdownMutate,
+    }
+
+    struct WtHolder {
+        addr: String,
+        /// Ordered ops the scripted holder saw (asserted by the refusal tests).
+        #[allow(dead_code)]
+        ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for WtHolder {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                if let Ok(sock) = self.addr.parse::<std::net::SocketAddr>()
+                    && let Ok(mut stream) =
+                        std::net::TcpStream::connect_timeout(&sock, Duration::from_millis(200))
+                {
+                    use std::io::Write;
+                    let _ = stream.write_all(b"{\"op\":\"stop-test\"}\n");
+                }
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn wt_holder(persist: std::path::PathBuf, session: &str, cwd: &Path, mode: WtMode) -> WtHolder {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ops2 = ops.clone();
+        let session = session.to_string();
+        let cwd = cwd.display().to_string();
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let Ok(mut reader) = stream.try_clone().map(BufReader::new) else {
+                    continue;
+                };
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let op = serde_json::from_str::<serde_json::Value>(line.trim())
+                    .ok()
+                    .and_then(|v| {
+                        v.get("op")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                ops2.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(op.clone());
+                if op == "stop-test" {
+                    break;
+                }
+                match op.as_str() {
+                    "ping" => {
+                        let sid = if matches!(mode, WtMode::PingMismatch) {
+                            "mismatched".to_string()
+                        } else {
+                            session.clone()
+                        };
+                        let body = serde_json::json!({
+                            "ok": true,
+                            "harness": {
+                                "alive": true,
+                                "session_id": sid,
+                                "cwd": cwd,
+                                "pid": 4242,
+                                "adapter": "grok",
+                                "supports_compact": true,
+                            }
+                        });
+                        let _ = stream.write_all(body.to_string().as_bytes());
+                        let _ = stream.write_all(b"\n");
+                    }
+                    "shutdown" => {
+                        if matches!(mode, WtMode::ShutdownMutate) {
+                            let mut body: serde_json::Value =
+                                serde_json::from_str(&std::fs::read_to_string(&persist).unwrap())
+                                    .unwrap();
+                            body["session_id"] = serde_json::Value::String("sess-newer".into());
+                            let _ = std::fs::write(&persist, body.to_string());
+                        }
+                        let _ = stream.write_all(b"{\"ok\":true}\n");
+                        if matches!(mode, WtMode::Normal) {
+                            let mut body: serde_json::Value =
+                                serde_json::from_str(&std::fs::read_to_string(&persist).unwrap())
+                                    .unwrap();
+                            body["alive"] = serde_json::Value::Bool(false);
+                            body["control_addr"] = serde_json::Value::Null;
+                            let _ = std::fs::write(&persist, body.to_string());
+                        }
+                        if !matches!(mode, WtMode::ShutdownNoExit | WtMode::ShutdownMutate) {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        WtHolder {
+            addr,
+            ops,
+            handle: Some(handle),
+        }
+    }
+
+    fn epoch_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ProjectRecord,
+        std::path::PathBuf,
+    ) {
+        let repo = init_repo();
+        let ws = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let rec = record(
+            ws.path().to_path_buf(),
+            Some(repo.path().to_path_buf()),
+            Some(state.path().to_path_buf()),
+            true,
+        );
+        // A stray override would move every state path under a sibling test's dir.
+        unsafe { std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR) };
+        let target = epoch_dir(&rec, 1).unwrap();
+        // The audit trail must survive a refusal (clear_progress runs after it).
+        let progress = crate::workflow::watchdog::progress_path(&rec).unwrap();
+        std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
+        std::fs::write(&progress, b"{}").unwrap();
+        (repo, state, rec, target)
+    }
+
+    #[test]
+    fn prepare_epoch_refuses_when_holder_unproven() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, target) = epoch_fixture();
+        let progress = crate::workflow::watchdog::progress_path(&rec).unwrap();
+        let path = write_persist(
+            &rec,
+            &persist_body(&rec, Some("sess"), None, true, None, Some(999_991), None),
+        );
+        register_dummy_cancel(&rec);
+        let before = std::fs::read(&path).unwrap();
+        let err = prepare_epoch(&rec, 1).unwrap_err().to_string();
+        assert!(err.contains("foreign-holder"), "{err}");
+        assert!(!target.exists(), "the next epoch is not created");
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        assert!(
+            crate::harness::abort::cancel_handle_for(&rec.id).is_some(),
+            "the cancel registration survives"
+        );
+        assert!(progress.exists(), "clear_progress did not run");
+        crate::harness::abort::unregister_cancel_handle(&rec.id);
+    }
+
+    #[test]
+    fn prepare_epoch_refuses_on_ping_unproven() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, _first) = epoch_fixture();
+        prepare_epoch(&rec, 1).unwrap();
+        let epoch = epoch_dir(&rec, 1).unwrap();
+        let path = crate::harness::pool::persist_path(&rec).unwrap();
+        let holder = wt_holder(path.clone(), "sess", &epoch, WtMode::PingMismatch);
+        write_persist(
+            &rec,
+            &persist_body(
+                &rec,
+                Some("sess"),
+                Some(&epoch),
+                true,
+                Some(&holder.addr),
+                Some(4242),
+                None,
+            ),
+        );
+        let target = epoch_dir(&rec, 2).unwrap();
+        let err = prepare_epoch(&rec, 2).unwrap_err().to_string();
+        assert!(err.contains("identity:session"), "{err}");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn prepare_epoch_refuses_when_delivered_holder_never_goes_dead() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, _first) = epoch_fixture();
+        prepare_epoch(&rec, 1).unwrap();
+        let epoch = epoch_dir(&rec, 1).unwrap();
+        let path = crate::harness::pool::persist_path(&rec).unwrap();
+        let holder = wt_holder(path.clone(), "sess", &epoch, WtMode::ShutdownNoExit);
+        write_persist(
+            &rec,
+            &persist_body(
+                &rec,
+                Some("sess"),
+                Some(&epoch),
+                true,
+                Some(&holder.addr),
+                Some(4242),
+                None,
+            ),
+        );
+        let target = epoch_dir(&rec, 2).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let err = prepare_epoch(&rec, 2).unwrap_err().to_string();
+        assert!(err.contains("retry"), "{err}");
+        assert!(!target.exists());
+        assert_eq!(before, std::fs::read(&path).unwrap());
+    }
+
+    #[test]
+    fn prepare_epoch_refuses_when_persist_unreadable() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, target) = epoch_fixture();
+        let path = crate::harness::pool::persist_path(&rec).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not json").unwrap();
+        let progress = crate::workflow::watchdog::progress_path(&rec).unwrap();
+        let err = prepare_epoch(&rec, 1).unwrap_err().to_string();
+        assert!(err.contains("unreadable"), "{err}");
+        assert!(!target.exists());
+        assert!(progress.exists(), "the refusal precedes clear_progress");
+        assert_eq!(b"{not json", std::fs::read(&path).unwrap().as_slice());
+    }
+
+    #[test]
+    fn prepare_epoch_refuses_when_the_persist_is_superseded() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, _first) = epoch_fixture();
+        prepare_epoch(&rec, 1).unwrap();
+        let epoch = epoch_dir(&rec, 1).unwrap();
+        let path = crate::harness::pool::persist_path(&rec).unwrap();
+        let holder = wt_holder(path.clone(), "sess", &epoch, WtMode::ShutdownMutate);
+        write_persist(
+            &rec,
+            &persist_body(
+                &rec,
+                Some("sess"),
+                Some(&epoch),
+                true,
+                Some(&holder.addr),
+                Some(4242),
+                None,
+            ),
+        );
+        let target = epoch_dir(&rec, 2).unwrap();
+        let err = prepare_epoch(&rec, 2).unwrap_err().to_string();
+        assert!(err.contains("holder-changed"), "{err}");
+        assert!(!target.exists());
+        let (now, _) = crate::harness::pool::persist_identity(&rec)
+            .unwrap()
+            .unwrap();
+        assert_eq!(now.session_id.as_deref(), Some("sess-newer"));
+    }
+
+    #[test]
+    fn worktree_refuses_a_fresh_pending_start() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, target) = epoch_fixture();
+        let path = write_persist(
+            &rec,
+            &persist_body(&rec, None, None, false, None, None, None),
+        );
+        let before = std::fs::read(&path).unwrap();
+        let err = prepare_epoch(&rec, 1).unwrap_err().to_string();
+        assert!(err.contains("start-pending"), "{err}");
+        assert!(!target.exists());
+        assert_eq!(before, std::fs::read(&path).unwrap());
+    }
+
+    #[test]
+    fn worktree_discards_an_aged_pending_start() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, target) = epoch_fixture();
+        let path = write_persist(
+            &rec,
+            &persist_body(&rec, None, None, false, None, None, None),
+        );
+        register_dummy_cancel(&rec);
+        aged(&path, std::time::Duration::from_secs(61));
+        let root = worktrees_root(&rec).unwrap();
+        let outcome = shutdown_under(&rec, &root, Some(&target)).unwrap();
+        assert_eq!(outcome, ShutdownOutcome::Handled);
+        assert!(!path.exists(), "the aged pending record is discarded");
+        assert!(
+            crate::harness::abort::cancel_handle_for(&rec.id).is_none(),
+            "a successful discard detaches and drops the registration"
+        );
+        let log = std::fs::read_to_string(rec.path.join("status.md")).unwrap_or_default();
+        assert!(log.contains("holder-persist-discarded"), "{log}");
+    }
+
+    #[test]
+    fn release_if_idle_keeps_worktree_when_unproven() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, _target) = epoch_fixture();
+        prepare_epoch(&rec, 1).unwrap();
+        let epoch = epoch_dir(&rec, 1).unwrap();
+        assert!(epoch.is_dir());
+        write_persist(
+            &rec,
+            &persist_body(
+                &rec,
+                Some("sess"),
+                Some(&epoch),
+                true,
+                None,
+                Some(999_991),
+                None,
+            ),
+        );
+        let state = crate::state::RunState::idle(&rec.id);
+        let mut view = StatusView::from_record(&rec, &state);
+        view.run_epoch = 1;
+        release_if_idle(&rec, &view);
+        assert!(epoch.is_dir(), "an unproven holder keeps the tree");
+    }
+
+    #[test]
+    fn release_if_idle_keeps_worktree_when_unreadable() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, _target) = epoch_fixture();
+        prepare_epoch(&rec, 1).unwrap();
+        let epoch = epoch_dir(&rec, 1).unwrap();
+        let path = crate::harness::pool::persist_path(&rec).unwrap();
+        std::fs::write(&path, b"{not json").unwrap();
+        let state = crate::state::RunState::idle(&rec.id);
+        let mut view = StatusView::from_record(&rec, &state);
+        view.run_epoch = 1;
+        release_if_idle(&rec, &view);
+        assert!(epoch.is_dir(), "an unreadable persist keeps the tree");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_if_idle_tears_down_owned_in_process_session() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, _target) = epoch_fixture();
+        prepare_epoch(&rec, 1).unwrap();
+        let epoch = epoch_dir(&rec, 1).unwrap();
+        let session = crate::harness::grok::GrokSession::start_mock(
+            epoch.clone(),
+            crate::harness::grok::mock_handshake_ok("sess-self"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let counter = session.shutdown_counter();
+        crate::harness::pool::insert_test_session(rec.id.clone(), session).await;
+        write_persist(
+            &rec,
+            &persist_body(
+                &rec,
+                Some("sess-self"),
+                Some(&epoch),
+                true,
+                None,
+                Some(std::process::id()),
+                None,
+            ),
+        );
+        let state = crate::state::RunState::idle(&rec.id);
+        let mut view = StatusView::from_record(&rec, &state);
+        view.run_epoch = 1;
+        release_if_idle(&rec, &view);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            !epoch.exists(),
+            "the tree is removed after the owned teardown"
+        );
+        assert!(
+            crate::harness::pool::persist_identity(&rec)
+                .unwrap()
+                .is_none(),
+            "the stale self record is cleared"
+        );
+        assert!(
+            crate::harness::abort::cancel_handle_for(&rec.id).is_none(),
+            "the registration is dropped only after the owned session is gone"
+        );
+    }
+
+    #[test]
+    fn alive_self_false_compare_is_a_refusal_in_the_worktree_paths() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, _first) = epoch_fixture();
+        prepare_epoch(&rec, 1).unwrap();
+        let epoch = epoch_dir(&rec, 1).unwrap();
+        let target = epoch_dir(&rec, 2).unwrap();
+        write_persist(
+            &rec,
+            &persist_body(
+                &rec,
+                Some("sess-self"),
+                Some(&epoch),
+                true,
+                None,
+                Some(std::process::id()),
+                None,
+            ),
+        );
+        register_dummy_cancel(&rec);
+        let rec_hook = rec.clone();
+        let epoch_hook = epoch.clone();
+        *crate::harness::pool::AFTER_GONE_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(move |_| {
+            write_persist(
+                &rec_hook,
+                &persist_body(
+                    &rec_hook,
+                    Some("sess-successor"),
+                    Some(&epoch_hook),
+                    true,
+                    Some("127.0.0.1:9"),
+                    Some(99),
+                    None,
+                ),
+            );
+        }));
+        let root = worktrees_root(&rec).unwrap();
+        let err = shutdown_under(&rec, &root, Some(&target))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holder-changed"), "{err}");
+        assert!(!shutdown_if_cwd(&rec, &epoch), "the release refuses too");
+        *crate::harness::pool::AFTER_GONE_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        crate::harness::abort::unregister_cancel_handle(&rec.id);
+        let (now, _) = crate::harness::pool::persist_identity(&rec)
+            .unwrap()
+            .unwrap();
+        assert_eq!(now.session_id.as_deref(), Some("sess-successor"));
+        assert!(epoch.is_dir(), "the owned session's tree stays");
+    }
+
+    #[test]
+    fn gone_then_changed_worktree_keeps_the_tree() {
+        let _guard = crate::config::test_env_lock();
+        let (_repo, _state, rec, _first) = epoch_fixture();
+        prepare_epoch(&rec, 1).unwrap();
+        let epoch = epoch_dir(&rec, 1).unwrap();
+        let target = epoch_dir(&rec, 2).unwrap();
+        let path = crate::harness::pool::persist_path(&rec).unwrap();
+        let holder = wt_holder(path.clone(), "sess", &epoch, WtMode::Normal);
+        write_persist(
+            &rec,
+            &persist_body(
+                &rec,
+                Some("sess"),
+                Some(&epoch),
+                true,
+                Some(&holder.addr),
+                Some(4242),
+                None,
+            ),
+        );
+        register_dummy_cancel(&rec);
+        let rec_hook = rec.clone();
+        let epoch_hook = epoch.clone();
+        *crate::harness::pool::AFTER_GONE_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(move |_| {
+            write_persist(
+                &rec_hook,
+                &persist_body(
+                    &rec_hook,
+                    Some("sess-successor"),
+                    Some(&epoch_hook),
+                    true,
+                    Some("127.0.0.1:9"),
+                    Some(99),
+                    None,
+                ),
+            );
+        }));
+        let root = worktrees_root(&rec).unwrap();
+        let err = shutdown_under(&rec, &root, Some(&target))
+            .unwrap_err()
+            .to_string();
+        *crate::harness::pool::AFTER_GONE_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        assert!(err.contains("holder-changed"), "{err}");
+        assert!(epoch.is_dir(), "the tree stays");
+        assert!(path.exists(), "the successor persist stays");
+        assert!(
+            crate::harness::abort::cancel_handle_for(&rec.id).is_some(),
+            "the cancel registration stays"
+        );
+        crate::harness::abort::unregister_cancel_handle(&rec.id);
     }
 }

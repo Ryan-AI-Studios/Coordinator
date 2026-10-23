@@ -230,7 +230,11 @@ fn persist_blocks(record: &ProjectRecord) -> Result<Option<String>> {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if alive || in_flight {
-        Ok(Some("restore refused: harness grok shutdown first".into()))
+        Ok(Some(format!(
+            "restore refused: harness grok shutdown first; if it reports unproven, end any \
+             holder process for this project, then delete {}",
+            path.display()
+        )))
     } else {
         Ok(None)
     }

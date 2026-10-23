@@ -493,6 +493,9 @@ pub struct StatusView {
     /// `status_all`, and the poll path omit it (0102/0109 precedent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<ReadyStatusView>,
+    /// 0117: derived, read-only holder lifecycle (files only, no RPC, no lock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<crate::harness::reap::HolderLifecycle>,
 }
 
 /// 0109 status evidence for a project whose registry may have a structured store.
@@ -637,8 +640,23 @@ impl StatusView {
             self_check: state.self_check.clone(),
             registry: None,
             ready: None,
+            holder: Some(holder_lifecycle(record, state)),
         }
     }
+}
+
+/// 0117 `status.holder`: the one file-only gate list, computed read-only. No lock and no
+/// socket I/O — `candidate` is pre-RPC eligibility, never an identity verdict.
+fn holder_lifecycle(
+    record: &ProjectRecord,
+    state: &RunState,
+) -> crate::harness::reap::HolderLifecycle {
+    let state_present = crate::state::run_state_path(record).is_ok_and(|path| path.exists());
+    // `gate_direct`, not `is_enabled`: a status render may already have resolved (or
+    // will resolve) the machine snapshot, and 0115's one-snapshot-per-status budget
+    // must not be consumed twice.
+    let gate_on = crate::features::gate_direct(crate::features::Duty::SelfReap);
+    crate::harness::reap::decide(record, Utc::now(), state, state_present, gate_on).lifecycle
 }
 
 fn failure_superseded_for(record: &ProjectRecord, state: &RunState) -> Option<String> {
@@ -904,6 +922,199 @@ mod tests {
             resolve_state_dir(&rec).unwrap(),
             dir.path().join(".coordinator")
         );
+    }
+
+    // ---- 0117: status.holder (DoD-5) ----------------------------------------
+
+    fn holder_record(dir: &Path) -> ProjectRecord {
+        let mut rec = sample_record(dir);
+        rec.state_dir = Some(dir.join("holder-state"));
+        rec
+    }
+
+    fn holder_persist(rec: &ProjectRecord, body: serde_json::Value) -> std::path::PathBuf {
+        let path = crate::harness::pool::persist_path(rec).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body.to_string()).unwrap();
+        let at = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 60 * 60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        path
+    }
+
+    fn holder_body(
+        rec: &ProjectRecord,
+        session: Option<&str>,
+        alive: bool,
+        addr: Option<&str>,
+        holder_pid: Option<u32>,
+        error: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "project_id": rec.id,
+            "session_id": session,
+            "cwd": rec.path.display().to_string(),
+            "pid": 4242,
+            "holder_pid": holder_pid,
+            "control_addr": addr,
+            "adapter": "grok",
+            "supports_compact": true,
+            "alive": alive,
+            "prompt_in_flight": false,
+            "error": error,
+        })
+    }
+
+    fn stale_state(rec: &ProjectRecord) -> RunState {
+        let mut state = RunState::idle(&rec.id);
+        state.status = RunStatus::Stopped;
+        state.updated_at = Utc::now() - chrono::Duration::hours(7);
+        state
+    }
+
+    #[test]
+    fn status_project_renders_holder_candidate() {
+        let dir = tempdir().unwrap();
+        let rec = holder_record(dir.path());
+        let path = holder_persist(
+            &rec,
+            holder_body(
+                &rec,
+                Some("sess-live"),
+                true,
+                Some("127.0.0.1:9"),
+                Some(4242),
+                None,
+            ),
+        );
+        let state = stale_state(&rec);
+        save_run_state(&rec, &state).unwrap();
+
+        let view = StatusView::from_record(&rec, &state);
+        let holder = view.holder.expect("holder object is always present");
+        assert_eq!(holder.state, "candidate");
+        assert_eq!(holder.reason, "pre-rpc-eligible");
+        assert!(
+            holder.candidate,
+            "pre-RPC eligibility, not an identity verdict"
+        );
+        assert!(holder.run_terminal);
+        assert_eq!(holder.persist_alive, Some(true));
+        assert_eq!(holder.holder_pid, Some(4242));
+        assert_eq!(holder.session_id.as_deref(), Some("sess-live"));
+        assert!(holder.age_secs >= 6 * 60 * 60);
+        assert_eq!(holder.persist_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn status_project_renders_holder_kept_dead_persist_no_address() {
+        let dir = tempdir().unwrap();
+        let rec = holder_record(dir.path());
+        let state = stale_state(&rec);
+        save_run_state(&rec, &state).unwrap();
+
+        // All three evidence-free producers share one reason; `persist_alive:false`
+        // plus the age are the only discriminators (no `start-pending` token).
+        for body in [
+            holder_body(&rec, Some("sess-exit"), false, None, Some(4242), None),
+            holder_body(&rec, None, false, None, None, Some("handshake failed")),
+            holder_body(&rec, None, false, None, None, None),
+        ] {
+            holder_persist(&rec, body);
+            let holder = StatusView::from_record(&rec, &state).holder.unwrap();
+            assert_eq!(holder.state, "kept");
+            assert_eq!(holder.reason, "dead-persist-no-address");
+            assert_eq!(holder.persist_alive, Some(false));
+            assert!(!holder.candidate);
+        }
+    }
+
+    #[test]
+    fn status_project_renders_holder_gate_off() {
+        use crate::config::test_env_lock;
+
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = holder_record(dir.path());
+        let path = holder_persist(
+            &rec,
+            holder_body(
+                &rec,
+                Some("sess-live"),
+                true,
+                Some("127.0.0.1:9"),
+                Some(4242),
+                None,
+            ),
+        );
+        let state = stale_state(&rec);
+        save_run_state(&rec, &state).unwrap();
+        let key = crate::features::Duty::SelfReap.env_var();
+        let previous = std::env::var_os(key);
+        // SAFETY: serialized by test_env_lock; restored below.
+        unsafe { std::env::set_var(key, "off") };
+        let holder = StatusView::from_record(&rec, &state).holder.unwrap();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert_eq!(holder.state, "gate-off");
+        assert_eq!(holder.reason, "gate-off");
+        assert_eq!(
+            holder.persist_path.as_deref(),
+            Some(path.as_path()),
+            "§7.5: the recovery path is visible even with the duty off"
+        );
+    }
+
+    #[test]
+    fn status_project_renders_holder_absent() {
+        let dir = tempdir().unwrap();
+        let rec = holder_record(dir.path());
+        let state = stale_state(&rec);
+        // No run-state file on disk.
+        let holder = StatusView::from_record(&rec, &state).holder.unwrap();
+        assert_eq!(holder.state, "absent");
+        assert_eq!(holder.reason, "missing-run-state");
+        assert!(!holder.run_terminal, "never inferred from the Idle stub");
+    }
+
+    #[test]
+    fn status_project_renders_holder_names_the_persist_path() {
+        let dir = tempdir().unwrap();
+        let rec = holder_record(dir.path());
+        let path = holder_persist(&rec, holder_body(&rec, None, false, None, None, None));
+        let state = stale_state(&rec);
+        save_run_state(&rec, &state).unwrap();
+        let holder = StatusView::from_record(&rec, &state).holder.unwrap();
+        assert_eq!(holder.persist_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn status_view_additive_holder_field() {
+        let dir = tempdir().unwrap();
+        let rec = holder_record(dir.path());
+        let state = stale_state(&rec);
+        save_run_state(&rec, &state).unwrap();
+        let json = serde_json::to_value(StatusView::from_record(&rec, &state)).unwrap();
+        assert!(
+            json.get("holder").is_some(),
+            "the holder object is additive"
+        );
+
+        // A pre-track view (no `holder` key) still deserializes.
+        let mut legacy = json.clone();
+        legacy.as_object_mut().unwrap().remove("holder");
+        let back: StatusView = serde_json::from_value(legacy).unwrap();
+        assert!(back.holder.is_none());
+        assert_eq!(back.project_id, rec.id);
     }
 
     #[test]

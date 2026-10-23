@@ -359,7 +359,8 @@ fn sample_watch(paths: &[PathBuf]) -> Vec<Option<(SystemTime, u64)>> {
         .collect()
 }
 
-/// Tree-kill a live child. Local to spawn (do not reuse Grok `kill_pid_best_effort`).
+/// Tree-kill a live child. Local to spawn: the one-shot reviewer is not a holder and
+/// is outside 0117's single-owner seam.
 fn tree_kill(child: &mut Child) {
     let pid = child.id();
     if pid != 0 && pid != std::process::id() {

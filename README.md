@@ -644,19 +644,66 @@ snapshot, git read, build or file write.
   `coordinator.exe` is a refusal. Tests use temp install/artifact fixtures only and never swap the
   machine install.
 
-### Holder self-reap (0107)
+### Holder self-reap (0107, one owner since 0117)
 
 The serve loop reaps a harness holder only when the project's owning run is **terminal**
 (`Idle`/`Stopped`) and both `run-state.json` and `harness-grok.json` are older than **6 h**. It runs
 at most once per hour, once on the first serve tick after start, and once on graceful shutdown. The
 sweep re-reads `features.self_reap` live; `self_reap:false` (or `COORDINATOR_FEATURE_SELF_REAP=0`)
-is the escape. Ownership is proven by the project's own persist record, the holder cwd being equal
-to or under the project workspace/execution/state roots, and a live control-socket **Ping identity
-handshake** (session id, cwd, adapter, ACP child pid). Termination is the holder's own `Shutdown`
-RPC to that verified address; the reaper never selects by image name and has no PID fallback. Any
-missing/unreadable state, lock failure, live (`Running`/`Paused`) run, young run, in-flight prompt,
-self PID or identity/RPC timeout keeps the holder. A successful reap appends one `holder-reap` line
-to `status.md` and prints one stderr line. Refusals write no run-state, `FAILURE.md` or toast.
+is the escape.
+
+Termination has **one owner**: the holder is first **proved** (bounded `Ping` identity handshake:
+session id, cwd, adapter, ACP child pid, and model/bin when both sides carry them) and then asked to
+run its own `Shutdown` RPC. The same owner serves the sweep, a replacement start, the 0110 recycle
+and the operator command; no automatic path kills a holder by PID, image name or process tree.
+`grok`'s own tree-kill survives only for its **own ACP child** (and the one-shot reviewer kill is
+out of scope).
+
+The persist `alive` flag is **not** a skip reason. A holder whose session died but whose control
+socket still answers is reaped exactly like any other. When there is **no control address** the
+record is classified by producer, and the sweep keeps it with a named reason
+**`dead-persist-no-address`** — the 15512 shape (a dead record whose process may still live). It
+carries `holder_pid` and `age_secs` in `status`. The product stops *creating* that shape: a dead
+record is written only after a delivered `Shutdown`, after the address proved unreachable on the
+start path, or by the holder's own exit write. A reached holder behind a dead persist is therefore
+**defensive** (only an external rewrite or a pre-track persist can produce it); the incident shape
+itself is **kept, not reaped**.
+
+`connect-refused` means **no listener**, never "it exited". Only the start path may act on it
+(clear + start); the recycle, operator and worktree callers keep the record and refuse.
+
+`status --project` carries a read-only `holder` object (`state`, `reason`, `candidate`,
+`run_terminal`, `persist_alive`, `holder_pid`, `session_id`, `persist_path`, `age_secs`). `candidate`
+means **pre-RPC eligibility** — `status` never Pings. All three evidence-free producers share
+`dead-persist-no-address`; `persist_alive:false` plus the age are the discriminators.
+
+Every clear/dead write is a compare-and-act on the record the caller terminated: a newer holder or a
+newer attempt is **never** cleared, dead-written, detached or spawned over. The start slot is claimed
+with an exclusive create (`claim_start`), so two concurrent starts cannot both spawn. A failed
+compare is a refusal, not a success.
+
+**Accepted residual (R2).** An evidence-free record (`alive:false`, no address) may be discarded by
+the **start** path or the two **worktree** paths after a 10 s grace (60 s for a pending start), after
+one `holder-persist-discarded` progress line naming the old identity. If a process survived after its
+accept loop closed without writing a dead record, the pool can therefore start a second holder and an
+epoch transition can remove the old holder's tree; the old process is untracked. Nothing in the
+product can tell that apart from a crashed holder without a forbidden kill.
+
+**Recovery when termination is `Unproven`** (the error prints the reason and the resolved persist
+path; `status.holder.persist_path` carries it read-only):
+
+1. **Look for a holder process first.** If a `coordinator.exe harness <adapter> hold` process for
+   this project is running, **end it first**. Never delete the persist while a holder process is
+   alive — that creates exactly the orphan this rule prevents. If none is found, continue.
+2. **Delete the persist file printed with the refusal** (normally `{state_dir}/harness-grok.json`).
+3. **Retry** `coordinator run --track <id>` (or `harness grok start`).
+
+Which recovery: `persist-unreadable`, `identity:*`, `persist-changed`, `shutdown-*`,
+`foreign-holder`, `unknown-record` → the three steps. `start-pending` → delete nothing, another start
+is in progress, retry shortly. `prompt-in-flight` (sweep) → nothing to do. An operator `TimedOut`
+after a delivery → wait and retry (the holder has not written its exit record yet; **do not** delete
+the persist). `connect-refused` → retry the start path first. A new epoch refused by
+`prepare_epoch` uses the same three steps.
 
 ### Ticker auto-start (0103)
 
@@ -860,7 +907,7 @@ Long-lived **Grok Build** sessions use `grok agent stdio` (JSON-RPC 2.0, line-de
 | Permission | `session/request_permission` is answered with allow-once (or cancelled while aborting). Unanswered permission hangs the turn. |
 | Compact | Inject stored `compact_command` via `session/prompt` (Grok `/compact`; Cursor `/summarize` when `availableCommands` is missing). If unsupported: `supports_compact=false` and skip (ADR-0021), do not fail the run |
 | Auth | Operator `grok login` (`cached_token`) or `XAI_API_KEY` (`xai.api_key`). Coordinator does **not** own OAuth |
-| Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` is teardown: in-process pool, then a quick holder `Shutdown` RPC, then `taskkill /F /T /PID` on persist `pid` then `holder_pid`. Persist is always written `alive: false`; returned status matches the file. `taskkill` “not found” is success. Missing `taskkill` is not a shutdown error. |
+| Stop vs shutdown | `coordinator stop` aborts the phase and **leaves the Grok process alive** for attach. `harness grok shutdown` is teardown over the holder's own control socket: the in-process pool session (its own ACP child), else a proof-then-`Shutdown` RPC to the proved holder. **RPC only** — no PID, image or process-tree kill. It works during a prompt (the holder cancels the turn). When the holder cannot be proved it exits 1 with `Unproven` and the reason plus the three recovery steps; the persist and the process are left untouched. A delivered teardown marks the record dead only while it still names that holder; a newer record is never overwritten (`TimedOut` says retry, never delete). |
 | Pause | New injects are refused while Paused; the child stays up |
 | Pool | One Grok ACP session per `project_id`. CLI `start`, HTTP `POST /v1/harness/grok/start`, and adapter ticks from `run` / `wait` / `serve` detach a localhost holder so a later `prompt` does not pin the poll loop. In-process spawn is for tests / `insert_test_session`. |
 | Persist | `{state_dir}/harness-grok.json` (session id / pid / holder pid / control addr / alive) — not a transcript |
@@ -1077,7 +1124,7 @@ Required rows (`planner`, `implementor`, `plan_reviewer_agy`, `plan_reviewer_ope
 
 Scripts that want “success only” must inspect `status` / `failure_class` after exit 0 (e.g. `coordinator status`).
 
-Stop aborts advancement with **no merge**; `last_event` records **sessions left for attach**. After Stopped, further outcomes are ignored until a new `run`. `harness grok shutdown` is the explicit teardown (kills the holder / persist pid, including a child that `wait` used to own in-process).
+Stop aborts advancement with **no merge**; `last_event` records **sessions left for attach**. After Stopped, further outcomes are ignored until a new `run`. `harness grok shutdown` is the explicit teardown: it delivers the holder's own `Shutdown` RPC (or tears down the in-process pool session it owns), reports `Unproven` with the reason and the recovery steps when the holder cannot be proved, and **works during a prompt** (the turn is cancelled). It never kills by pid, image or process tree.
 
 ### Illustrative hook writers (docs only)
 
