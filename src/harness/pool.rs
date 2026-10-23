@@ -459,6 +459,239 @@ pub(crate) const POOL_LOCK_BUDGET: Duration = Duration::from_secs(5);
 /// Child-only marker carrying the parent start claim's mtime (nanos since UNIX_EPOCH).
 pub(crate) const ENV_HOLDER_ATTEMPT_MTIME: &str = "COORDINATOR_HOLDER_ATTEMPT_MTIME";
 
+// ---- 0121: the holder-persist atomic fence ---------------------------------
+
+/// Zero-byte sentinel for the exclusive holder-persist mutation lock.
+///
+/// The JSON file itself is never locked: Windows `LockFileEx` locks are enforced
+/// against other handles' I/O, so locking `harness-grok.json` would make every
+/// lock-free reader (`status`, `checkpoint`, `ui`) fail or block. Readers stay
+/// lock-free because the write path replaces the file atomically.
+pub(crate) const PERSIST_LOCK_FILE: &str = ".harness-grok.lock";
+/// One critical section is a small read plus one atomic replace or unlink.
+pub(crate) const PERSIST_LOCK_BUDGET: Duration = Duration::from_secs(2);
+/// Retry cadence while the sentinel is held by a live writer.
+const PERSIST_LOCK_RETRY: Duration = Duration::from_millis(2);
+/// Coherent-snapshot attempts (2 retries) before the read refuses.
+const PERSIST_SNAPSHOT_TRIES: u32 = 3;
+/// Backoff between snapshot attempts: lets a retry outlast one fenced section.
+const PERSIST_SNAPSHOT_BACKOFF: Duration = Duration::from_millis(2);
+
+/// Three-way internal outcome of a compare-and-act writer (OD-121-10).
+///
+/// `Refused` is the existing `holder-changed` verdict: the record is not the one the
+/// caller loaded. `Unavailable` is a fence failure (`persist-lock-timeout`,
+/// `persist-lock-io`, `persist-lock-order` or an unreadable record) and must **never**
+/// be re-labelled as a record change.
+#[derive(Debug)]
+pub(crate) enum PersistAct {
+    Ok,
+    Refused,
+    Unavailable(CoordinatorError),
+}
+
+/// Map a compare-and-act outcome to the caller's `Result` shape: `Refused` becomes the
+/// caller's existing `holder-changed` message, `Unavailable` propagates the named token.
+pub(crate) fn persist_act_or_refused(
+    act: PersistAct,
+    refused: impl FnOnce() -> CoordinatorError,
+) -> Result<()> {
+    match act {
+        PersistAct::Ok => Ok(()),
+        PersistAct::Refused => Err(refused()),
+        PersistAct::Unavailable(e) => Err(e),
+    }
+}
+
+/// RAII guard proving the holder-persist fence is held. The OS releases the advisory
+/// lock when the handle closes (drop) or the process dies, so a crashed writer never
+/// leaves a held lock behind — only a harmless zero-byte sentinel.
+///
+/// Deliberately **`!Send`**: its [`crate::state::PersistLockScope`] decrements the
+/// *acquiring* thread's depth, so moving the guard to another thread would leak the
+/// depth and make every later `with_run_state_lock` on the origin thread fail closed.
+pub(crate) struct PersistLock {
+    /// Holds the OS lock; released on drop or process death.
+    file: std::fs::File,
+    /// `{state_dir}`.
+    dir: PathBuf,
+    /// `{state_dir}/harness-grok.json`.
+    data: PathBuf,
+    _order: crate::state::PersistLockScope,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+fn persist_lock_path(record: &ProjectRecord) -> Result<PathBuf> {
+    Ok(resolve_state_dir(record)?.join(PERSIST_LOCK_FILE))
+}
+
+/// Map every dir/open failure to the named token; the intended sentinel path is explicit.
+fn lock_io(e: impl std::fmt::Display, sentinel: &Path) -> CoordinatorError {
+    CoordinatorError::Message(format!(
+        "persist-lock-io: {e} (lock: {})",
+        sentinel.display()
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only lock-budget override so the bounded refusal is provable without 2 s.
+    static TEST_PERSIST_LOCK_BUDGET: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII test override for [`persist_lock_budget`]. Saves/restores the previous value so
+/// nested overrides are legal; `#[must_use]` because dropping it immediately would make
+/// the test silently use the production budget.
+#[cfg(test)]
+#[must_use = "the override resets when the guard drops"]
+pub(crate) struct PersistLockBudgetGuard(Option<Duration>);
+
+#[cfg(test)]
+pub(crate) fn test_persist_lock_budget(duration: Duration) -> PersistLockBudgetGuard {
+    let previous = TEST_PERSIST_LOCK_BUDGET.with(|cell| cell.replace(Some(duration)));
+    PersistLockBudgetGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for PersistLockBudgetGuard {
+    fn drop(&mut self) {
+        TEST_PERSIST_LOCK_BUDGET.with(|cell| cell.set(self.0));
+    }
+}
+
+fn persist_lock_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = TEST_PERSIST_LOCK_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
+    PERSIST_LOCK_BUDGET
+}
+
+impl PersistLock {
+    /// `sentinel` is locked; `data` is the record the holder will be allowed to mutate.
+    ///
+    /// The recursion check runs **before** `try_lock`: a nested acquisition on the same
+    /// thread must fail fast instead of spending the whole budget and reporting a
+    /// misleading timeout.
+    pub(crate) fn acquire(sentinel: &Path, data: &Path) -> Result<Self> {
+        if crate::state::persist_lock_held() {
+            return Err(CoordinatorError::Message(format!(
+                "persist-lock-order: recursive persist lock (lock: {})",
+                sentinel.display()
+            )));
+        }
+        // Read+write, never append-only: std documents that a lock fails on an
+        // append-only handle. `create` keeps the sentinel a zero-byte file.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(sentinel)
+            .map_err(|e| lock_io(e, sentinel))?;
+        let started = std::time::Instant::now();
+        let budget = persist_lock_budget();
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    let order = crate::state::persist_lock_scope()?;
+                    let dir = data
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .or_else(|| sentinel.parent())
+                        .unwrap_or_else(|| Path::new("."))
+                        .to_path_buf();
+                    return Ok(Self {
+                        file,
+                        dir,
+                        data: data.to_path_buf(),
+                        _order: order,
+                        _not_send: std::marker::PhantomData,
+                    });
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= budget {
+                        return Err(CoordinatorError::Message(format!(
+                            "persist-lock-timeout: the holder persist lock was held for {}ms \
+                             (lock: {})",
+                            elapsed.as_millis(),
+                            sentinel.display()
+                        )));
+                    }
+                    std::thread::sleep(PERSIST_LOCK_RETRY);
+                }
+                // A non-contention fault (permissions, unsupported filesystem) is named,
+                // never retried as contention and never re-labelled as a record change.
+                Err(std::fs::TryLockError::Error(e)) => return Err(lock_io(e, sentinel)),
+            }
+        }
+    }
+}
+
+impl Drop for PersistLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+        // `_order` drops next and decrements this thread's depth.
+    }
+}
+
+/// Take the fence for one `read -> compare -> act`. `lock_persist` stays private: this is
+/// the only acquisition entry point, so a writer cannot open a bare handle.
+fn lock_persist(record: &ProjectRecord) -> Result<PersistLock> {
+    let sentinel =
+        persist_lock_path(record).map_err(|e| lock_io(e, Path::new(PERSIST_LOCK_FILE)))?;
+    ensure_state_dir(record).map_err(|e| lock_io(e, &sentinel))?;
+    PersistLock::acquire(&sentinel, &persist_path(record)?)
+}
+
+/// The one entry point every persist writer uses. The closure is synchronous, so the
+/// lock cannot be held across an `.await` and no async lock can be taken inside it.
+pub(crate) fn with_persist_lock<T>(
+    record: &ProjectRecord,
+    f: impl FnOnce(&PersistLock) -> Result<T>,
+) -> Result<T> {
+    let lock = lock_persist(record)?;
+    f(&lock) // the lock drops after f: the act is inside the fence
+}
+
+/// W1's claim primitive: serialise first, then create exclusively (`create_new`).
+fn create_persist_claim_locked(lock: &PersistLock, handle: &PersistedGrokHandle) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(handle)?;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock.data)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CoordinatorError::Message(format!(
+                "persist-appeared: another start holds the claim (persist: {})",
+                lock.data.display()
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn save_persist_locked(lock: &PersistLock, handle: &PersistedGrokHandle) -> Result<()> {
+    std::fs::create_dir_all(&lock.dir)?;
+    atomic_write_json(&lock.data, handle)
+}
+
+fn remove_persist_locked(lock: &PersistLock) -> Result<()> {
+    match std::fs::remove_file(&lock.data) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // already settled
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Authorization token. Private fields; **only** [`prove_holder`] builds one, so no
 /// `Shutdown` can be sent to an address that has not answered a matching `Ping`.
 #[derive(Debug)]
@@ -602,6 +835,112 @@ pub(crate) static PRE_CLAIM_HOOK: std::sync::Mutex<Option<PreClaimHook>> =
 #[cfg(test)]
 pub(crate) static SPAWN_HOOK: std::sync::Mutex<Option<SpawnHook>> = std::sync::Mutex::new(None);
 
+/// 0121 test-only seam: pauses a writer *inside* the fenced section, after a successful
+/// compare (W2-W6) or after the load (W8/W9), and before the mutation. Armed only on the
+/// calling thread, so a retry thread never blocks on the test's gate. The `Arc` is cloned
+/// out and the mutex guard dropped before the closure runs: a blocked hook cannot
+/// deadlock another writer.
+#[cfg(test)]
+type PersistPauseHook = Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(test)]
+pub(crate) static PERSIST_PAUSE_HOOK: std::sync::Mutex<Option<PersistPauseHook>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    static PERSIST_PAUSE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm the one-shot pause on this thread.
+#[cfg(test)]
+pub(crate) fn arm_persist_pause() {
+    PERSIST_PAUSE_ARMED.with(|cell| cell.set(true));
+}
+
+/// Drop the test hooks and any thread-local arming (test cleanup).
+#[cfg(test)]
+pub(crate) fn clear_persist_hooks() {
+    *PERSIST_PAUSE_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PERSIST_SNAPSHOT_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    PERSIST_PAUSE_ARMED.with(|cell| cell.set(false));
+    PERSIST_SNAPSHOT_ARMED.with(|cell| cell.set(false));
+}
+
+fn persist_pause_before_write(label: &str) {
+    #[cfg(test)]
+    {
+        if !PERSIST_PAUSE_ARMED.with(std::cell::Cell::get) {
+            return;
+        }
+        PERSIST_PAUSE_ARMED.with(|cell| cell.set(false));
+        let hook = PERSIST_PAUSE_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(label);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = label;
+}
+
+/// 0121 test-only seam between the first `mtime` and the content read of
+/// [`persist_snapshot`]. One-shot (the armed flag clears before the hook runs) so a
+/// retry cannot re-mutate the file.
+#[cfg(test)]
+type PersistSnapshotHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+pub(crate) static PERSIST_SNAPSHOT_HOOK: std::sync::Mutex<Option<PersistSnapshotHook>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    static PERSIST_SNAPSHOT_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Thread-local so parallel tests cannot race the attempt count (T11).
+    static PERSIST_SNAPSHOT_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_persist_snapshot_hook(f: impl Fn() + Send + Sync + 'static) {
+    *PERSIST_SNAPSHOT_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+    PERSIST_SNAPSHOT_ARMED.with(|cell| cell.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_persist_snapshot_attempts() {
+    PERSIST_SNAPSHOT_ATTEMPTS.with(|cell| cell.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn persist_snapshot_attempts() -> u32 {
+    PERSIST_SNAPSHOT_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+fn persist_snapshot_hook() {
+    #[cfg(test)]
+    {
+        if !PERSIST_SNAPSHOT_ARMED.with(std::cell::Cell::get) {
+            return;
+        }
+        PERSIST_SNAPSHOT_ARMED.with(|cell| cell.set(false));
+        let hook = PERSIST_SNAPSHOT_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+fn persist_snapshot_attempt() {
+    #[cfg(test)]
+    PERSIST_SNAPSHOT_ATTEMPTS.with(|cell| cell.set(cell.get() + 1));
+}
+
 pub(crate) fn after_gone(record: &ProjectRecord) {
     #[cfg(test)]
     {
@@ -720,10 +1059,10 @@ pub(crate) fn same_record(old: &PersistRef, now: &PersistIdentity, now_mtime: Sy
 }
 
 /// The exclusive absent→pending claim: the only way to begin a start.
+///
+/// 0121: the whole create + read-back runs inside the persist fence, so a writer that
+/// interleaves after the create cannot have its record destroyed by a stale compare.
 pub(crate) fn claim_start(record: &ProjectRecord, harness: &str) -> Result<PersistRef> {
-    use std::io::Write;
-    ensure_state_dir(record)?;
-    let path = persist_path(record)?;
     let handle = PersistedGrokHandle {
         version: 1,
         model: None,
@@ -743,38 +1082,20 @@ pub(crate) fn claim_start(record: &ProjectRecord, harness: &str) -> Result<Persi
         last_signal: None,
         last_tool_title: None,
     };
-    // Serialize before touching the file: a create that cannot be filled is worse
-    // than no claim at all.
-    let bytes = serde_json::to_vec(&handle)?;
-    let mut file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+    with_persist_lock(record, |lock| {
+        create_persist_claim_locked(lock, &handle)?;
+        let path = lock.data.clone();
+        let Some((handle, mtime)) = persist_snapshot(record)? else {
             return Err(CoordinatorError::Message(format!(
-                "persist-appeared: another start holds the claim (persist: {})",
+                "persist-appeared: the claim vanished (persist: {})",
                 path.display()
             )));
-        }
-        Err(e) => {
-            return Err(CoordinatorError::Message(format!(
-                "holder persist claim failed (persist: {}): {e}",
-                path.display()
-            )));
-        }
-    };
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    let Some((identity, mtime)) = persist_identity(record)? else {
-        return Err(CoordinatorError::Message(format!(
-            "persist-appeared: the claim vanished (persist: {})",
-            path.display()
-        )));
-    };
-    Ok(PersistRef::new(identity, mtime))
+        };
+        Ok(PersistRef::new(
+            PersistIdentity::from_handle(&handle),
+            mtime,
+        ))
+    })
 }
 
 /// Fenced attempt-error write. `Some(claim)` writes only while the file is still that
@@ -785,6 +1106,16 @@ pub(crate) fn mark_start_error(
     claim: Option<&PersistRef>,
     err: &str,
 ) -> bool {
+    matches!(mark_start_error_outcome(record, claim, err), PersistAct::Ok)
+}
+
+/// The fenced body behind [`mark_start_error`]; `Unavailable` keeps the named fence
+/// failure visible to callers that need the distinction.
+fn mark_start_error_outcome(
+    record: &ProjectRecord,
+    claim: Option<&PersistRef>,
+    err: &str,
+) -> PersistAct {
     let adapter = match claim {
         Some(claim) => claim.identity.adapter.clone(),
         None => persist_adapter_name(&holder_harness_slug()),
@@ -808,17 +1139,24 @@ pub(crate) fn mark_start_error(
         last_signal: None,
         last_tool_title: None,
     };
-    match claim {
-        Some(claim) => match persist_identity(record) {
-            Ok(Some((now, mtime))) if same_record(claim, &now, mtime) => {
-                save_persist(record, &handle).is_ok()
+    match with_persist_lock(record, |lock| {
+        let now = persist_snapshot(record)?;
+        let accepted = match (claim, now) {
+            (Some(claim), Some((handle, mtime))) => {
+                same_record(claim, &PersistIdentity::from_handle(&handle), mtime)
             }
+            (None, None) => true,
             _ => false,
-        },
-        None => match persist_identity(record) {
-            Ok(None) => save_persist(record, &handle).is_ok(),
-            _ => false,
-        },
+        };
+        if !accepted {
+            return Ok(PersistAct::Refused);
+        }
+        persist_pause_before_write("error");
+        save_persist_locked(lock, &handle)?;
+        Ok(PersistAct::Ok)
+    }) {
+        Ok(act) => act,
+        Err(e) => PersistAct::Unavailable(e),
     }
 }
 
@@ -870,46 +1208,69 @@ fn ready_handle(
 /// parent's claim. `None` (a direct `hold`) publishes only over an absent record or a
 /// `DeadAfterExit` no-address record. `false` = nothing written and the holder child
 /// must tear its own ACP session down and exit rather than serve untracked.
+/// Bool verdict kept by OD-121-6 for callers/readers that only need "written or not";
+/// production verdict paths use the `_outcome` twin so contention is named. Exercised by
+/// the fixture suite.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_holder_ready(
     record: &ProjectRecord,
     session: &GrokSession,
     control_addr: Option<String>,
     stamp: Option<&PersistRef>,
 ) -> bool {
+    matches!(
+        write_holder_ready_outcome(record, session, control_addr, stamp),
+        PersistAct::Ok
+    )
+}
+
+/// The fenced body behind [`write_holder_ready`]. `Refused` = the child must tear its own
+/// session down; `Unavailable` = the fence failed and the caller retries, never a teardown.
+fn write_holder_ready_outcome(
+    record: &ProjectRecord,
+    session: &GrokSession,
+    control_addr: Option<String>,
+    stamp: Option<&PersistRef>,
+) -> PersistAct {
     let handle = ready_handle(record, session, control_addr);
-    match stamp {
-        Some(stamp) => match persist_identity(record) {
-            Ok(Some((now, mtime))) if same_record(stamp, &now, mtime) => {
-                save_persist(record, &handle).is_ok()
+    match with_persist_lock(record, |lock| {
+        let now = persist_snapshot(record)?;
+        let accepted = match (stamp, now) {
+            (Some(stamp), Some((handle, mtime))) => {
+                same_record(stamp, &PersistIdentity::from_handle(&handle), mtime)
             }
-            _ => false,
-        },
-        None => match persist_identity(record) {
-            Ok(None) => save_persist(record, &handle).is_ok(),
-            Ok(Some((now, _))) => match classify_persist(&now) {
-                PersistClass::NoAddress(NoSocketWhy::DeadAfterExit) => {
-                    save_persist(record, &handle).is_ok()
-                }
-                _ => false,
-            },
-            Err(_) => false,
-        },
+            (None, None) => true,
+            (None, Some((handle, _))) => matches!(
+                classify_persist(&PersistIdentity::from_handle(&handle)),
+                PersistClass::NoAddress(NoSocketWhy::DeadAfterExit)
+            ),
+            (Some(_), None) => false,
+        };
+        if !accepted {
+            return Ok(PersistAct::Refused);
+        }
+        persist_pause_before_write("ready");
+        save_persist_locked(lock, &handle)?;
+        Ok(PersistAct::Ok)
+    }) {
+        Ok(act) => act,
+        Err(e) => PersistAct::Unavailable(e),
     }
 }
 
 /// Fenced holder-exit write: writes only while the persist still names this holder's
 /// own `session_id` + `holder_pid`. A child whose ready write was refused has no
 /// matching identity on disk, so its exit write is a no-op.
+/// Bool verdict kept by OD-121-6 (see [`write_holder_ready`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_holder_exit(record: &ProjectRecord, session: &GrokSession) -> bool {
-    let Ok(Some((now, mtime))) = persist_identity(record) else {
-        return false;
-    };
+    matches!(write_holder_exit_outcome(record, session), PersistAct::Ok)
+}
+
+fn write_holder_exit_outcome(record: &ProjectRecord, session: &GrokSession) -> PersistAct {
     let mut own = ready_handle(record, session, None);
     own.alive = true;
-    let old = PersistRef::new(PersistIdentity::from_handle(&own), mtime);
-    if !same_record(&old, &now, mtime) {
-        return false;
-    }
+    let own_identity = PersistIdentity::from_handle(&own);
     let dead = PersistedGrokHandle {
         version: 1,
         model: session.model.clone(),
@@ -929,7 +1290,21 @@ pub(crate) fn write_holder_exit(record: &ProjectRecord, session: &GrokSession) -
         last_signal: session.last_signal.clone(),
         last_tool_title: session.last_tool_title.clone(),
     };
-    save_persist(record, &dead).is_ok()
+    match with_persist_lock(record, |lock| {
+        let Some((handle, mtime)) = persist_snapshot(record)? else {
+            return Ok(PersistAct::Refused);
+        };
+        let old = PersistRef::new(own_identity, mtime);
+        if !same_record(&old, &PersistIdentity::from_handle(&handle), mtime) {
+            return Ok(PersistAct::Refused);
+        }
+        persist_pause_before_write("exit");
+        save_persist_locked(lock, &dead)?;
+        Ok(PersistAct::Ok)
+    }) {
+        Ok(act) => act,
+        Err(e) => PersistAct::Unavailable(e),
+    }
 }
 
 /// The one discard rule. Only the clock is consulted here; the shape was produced by
@@ -962,6 +1337,54 @@ pub(crate) fn no_address_decision(
     }
 }
 
+/// The one coherent `(content, mtime)` snapshot every compare ref comes from.
+///
+/// Reads `mtime1 -> content -> mtime2` and accepts the pair only when both mtimes agree,
+/// so a caller can never compare content of A against the mtime of B. Absence is decided
+/// **only** from the `NotFound` of the first `metadata`: a `None` after a successful
+/// metadata is a change, not absence, and is retried. A corrupt file still returns the
+/// existing typed error; a sustained change is `persist-unstable` (a refusal, not a new
+/// tolerance).
+fn persist_snapshot(record: &ProjectRecord) -> Result<Option<(PersistedGrokHandle, SystemTime)>> {
+    let path = persist_path(record)?;
+    for attempt in 0..PERSIST_SNAPSHOT_TRIES {
+        persist_snapshot_attempt();
+        let first = match std::fs::metadata(&path) {
+            Ok(meta) => meta.modified()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        persist_snapshot_hook();
+        let loaded = match load_persist(record) {
+            Ok(loaded) => loaded,
+            // Removed between `metadata` and the read: a change, not absence.
+            Err(CoordinatorError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(handle) = loaded {
+            let second = match std::fs::metadata(&path) {
+                Ok(meta) => meta.modified()?,
+                // Removed after the content read: retry, never `Ok(None)`.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(PERSIST_SNAPSHOT_BACKOFF);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if first == second {
+                return Ok(Some((handle, second)));
+            }
+        }
+        if attempt + 1 < PERSIST_SNAPSHOT_TRIES {
+            std::thread::sleep(PERSIST_SNAPSHOT_BACKOFF);
+        }
+    }
+    Err(CoordinatorError::Message(format!(
+        "persist-unstable: the record changed while it was read (persist: {})",
+        path.display()
+    )))
+}
+
 /// Read-only view of the persist identity plus the file mtime.
 ///
 /// `Ok(None)` means the persist file is absent; `Err` means it is unreadable or
@@ -969,11 +1392,8 @@ pub(crate) fn no_address_decision(
 pub(crate) fn persist_identity(
     record: &ProjectRecord,
 ) -> Result<Option<(PersistIdentity, std::time::SystemTime)>> {
-    let Some(handle) = load_persist(record)? else {
-        return Ok(None);
-    };
-    let mtime = std::fs::metadata(persist_path(record)?)?.modified()?;
-    Ok(Some((PersistIdentity::from_handle(&handle), mtime)))
+    Ok(persist_snapshot(record)?
+        .map(|(handle, mtime)| (PersistIdentity::from_handle(&handle), mtime)))
 }
 
 /// Typed socket fault. "No connection" must stay a typed arm (`NoListener`), not text.
@@ -1103,6 +1523,12 @@ pub(crate) fn prove_holder(
         Ok(None) => {
             return Err(HolderTermination::Unproven {
                 why: "persist-missing".into(),
+            });
+        }
+        // A fence-read refusal is a distinct operator token, never "unreadable".
+        Err(e) if e.to_string().starts_with("persist-unstable") => {
+            return Err(HolderTermination::Unproven {
+                why: "persist-unstable".into(),
             });
         }
         Err(_) => {
@@ -1362,14 +1788,35 @@ pub(crate) fn wait_holder_gone(
 /// **`false` is a verdict, not a hint** — the caller performs none of its success
 /// effects (no spawn, detach, unregister, tree removal or dead status). Absent means
 /// there is nothing to do (`true`).
+/// Bool verdict kept by OD-121-6 (see [`write_holder_ready`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn clear_persist_if(record: &ProjectRecord, old: &PersistRef) -> bool {
-    match persist_identity(record) {
-        Ok(None) => true,
-        Ok(Some((now, mtime))) if same_record(old, &now, mtime) => match persist_path(record) {
-            Ok(path) => std::fs::remove_file(path).is_ok(),
-            Err(_) => false,
-        },
-        _ => false,
+    matches!(clear_persist_if_outcome(record, old), PersistAct::Ok)
+}
+
+/// The fenced body behind [`clear_persist_if`]. The lock-free absent fast path keeps a
+/// never-started project from creating `{state_dir}` or the sentinel: no act is taken, so
+/// there is nothing to fence and a claim created concurrently is a newer record the old
+/// ref cannot own.
+pub(crate) fn clear_persist_if_outcome(record: &ProjectRecord, old: &PersistRef) -> PersistAct {
+    match persist_absent_fast_path(record) {
+        Ok(true) => return PersistAct::Ok,
+        Ok(false) => {}
+        Err(e) => return PersistAct::Unavailable(e),
+    }
+    match with_persist_lock(record, |lock| {
+        let Some((handle, mtime)) = persist_snapshot(record)? else {
+            return Ok(PersistAct::Ok);
+        };
+        if !same_record(old, &PersistIdentity::from_handle(&handle), mtime) {
+            return Ok(PersistAct::Refused);
+        }
+        persist_pause_before_write("clear");
+        remove_persist_locked(lock)?;
+        Ok(PersistAct::Ok)
+    }) {
+        Ok(act) => act,
+        Err(e) => PersistAct::Unavailable(e),
     }
 }
 
@@ -1378,13 +1825,38 @@ pub(crate) fn clear_persist_if(record: &ProjectRecord, old: &PersistRef) -> bool
 /// **`false` is a verdict** (see [`clear_persist_if`]). This is the only path to
 /// [`persist_marked_dead`].
 pub(crate) fn mark_dead_if(record: &ProjectRecord, old: &PersistRef) -> bool {
-    match persist_identity(record) {
-        Ok(None) => true,
-        Ok(Some((now, mtime))) if same_record(old, &now, mtime) => match load_persist(record) {
-            Ok(Some(handle)) => save_persist(record, &persist_marked_dead(&handle)).is_ok(),
-            _ => false,
-        },
-        _ => false,
+    matches!(mark_dead_if_outcome(record, old), PersistAct::Ok)
+}
+
+pub(crate) fn mark_dead_if_outcome(record: &ProjectRecord, old: &PersistRef) -> PersistAct {
+    match persist_absent_fast_path(record) {
+        Ok(true) => return PersistAct::Ok,
+        Ok(false) => {}
+        Err(e) => return PersistAct::Unavailable(e),
+    }
+    match with_persist_lock(record, |lock| {
+        let Some((handle, mtime)) = persist_snapshot(record)? else {
+            return Ok(PersistAct::Ok);
+        };
+        if !same_record(old, &PersistIdentity::from_handle(&handle), mtime) {
+            return Ok(PersistAct::Refused);
+        }
+        persist_pause_before_write("dead");
+        save_persist_locked(lock, &persist_marked_dead(&handle))?;
+        Ok(PersistAct::Ok)
+    }) {
+        Ok(act) => act,
+        Err(e) => PersistAct::Unavailable(e),
+    }
+}
+
+/// `Ok(true)` = the persist is absent (nothing to fence); `Ok(false)` = present.
+fn persist_absent_fast_path(record: &ProjectRecord) -> Result<bool> {
+    let path = persist_path(record)?;
+    match std::fs::metadata(&path) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -1446,9 +1918,17 @@ pub(crate) fn probe_holder(
     Ok(Some(status))
 }
 
+/// Test-only seed: every fixture goes through the real fenced path.
+#[cfg(test)]
 fn save_persist(record: &ProjectRecord, handle: &PersistedGrokHandle) -> Result<()> {
-    ensure_state_dir(record)?;
-    atomic_write_json(&persist_path(record)?, handle)
+    with_persist_lock(record, |lock| save_persist_locked(lock, handle))
+}
+
+/// W10: the async `shutdown` cannot contain the lock literal (DoD-2); this sync helper
+/// owns the fence and is called after the caller's last `.await`. Keeps 0117's
+/// documented no-compare posture: in-process sessions exist only in tests.
+fn save_in_process_shutdown(record: &ProjectRecord, dead: &PersistedGrokHandle) -> Result<()> {
+    with_persist_lock(record, |lock| save_persist_locked(lock, dead))
 }
 
 fn persist_adapter_name(harness: &str) -> String {
@@ -1473,22 +1953,59 @@ pub(crate) fn persist_session_id(record: &ProjectRecord) -> Option<String> {
         .and_then(|h| h.session_id)
 }
 
+/// One journaled line + stderr for a status-fidelity writer that could not take the
+/// fence (OD-121-8: the dispatch semantics do not change, but the skip is observable).
+fn journal_persist_lock_skip(record: &ProjectRecord, e: &CoordinatorError) {
+    let text = e.to_string();
+    let token = if text.contains("persist-lock-timeout") {
+        "persist-lock-timeout"
+    } else if text.contains("persist-lock-order") {
+        "persist-lock-order"
+    } else if text.contains("persist-lock-io") {
+        "persist-lock-io"
+    } else {
+        "persist-unavailable"
+    };
+    crate::progress_log::append(
+        record,
+        "persist-lock",
+        &format!("{token} project={}", record.id),
+    );
+    eprintln!(
+        "coordinator: persist-lock: {token} project={} ({e})",
+        record.id
+    );
+}
+
 fn set_prompt_in_flight(record: &ProjectRecord, value: bool) {
-    if let Ok(Some(mut h)) = load_persist(record) {
-        h.prompt_in_flight = value;
-        let _ = save_persist(record, &h);
+    let result = with_persist_lock(record, |lock| {
+        let Some((mut handle, _)) = persist_snapshot(record)? else {
+            return Ok(());
+        };
+        handle.prompt_in_flight = value;
+        persist_pause_before_write("flag");
+        save_persist_locked(lock, &handle)
+    });
+    if let Err(e) = result {
+        journal_persist_lock_skip(record, &e);
     }
 }
 
 /// Copy fidelity onto the existing persist file. Leaves `control_addr` and `prompt_in_flight` alone.
 fn remember_fidelity(record: &ProjectRecord, session: &GrokSession) {
-    let Ok(Some(mut handle)) = load_persist(record) else {
-        return;
-    };
-    handle.context_usage = session.context_usage.clone();
-    handle.last_signal = session.last_signal.clone();
-    handle.last_tool_title = session.last_tool_title.clone();
-    let _ = save_persist(record, &handle);
+    let result = with_persist_lock(record, |lock| {
+        let Some((mut handle, _)) = persist_snapshot(record)? else {
+            return Ok(());
+        };
+        handle.context_usage = session.context_usage.clone();
+        handle.last_signal = session.last_signal.clone();
+        handle.last_tool_title = session.last_tool_title.clone();
+        persist_pause_before_write("fidelity");
+        save_persist_locked(lock, &handle)
+    });
+    if let Err(e) = result {
+        journal_persist_lock_skip(record, &e);
+    }
 }
 
 /// Holder `Cancel` RPC (no-op if no live control addr).
@@ -2257,12 +2774,10 @@ where
 }
 
 fn load_ref(record: &ProjectRecord) -> Result<Option<(PersistedGrokHandle, PersistRef)>> {
-    let Some(handle) = load_persist(record)? else {
-        return Ok(None);
-    };
-    let identity = PersistIdentity::from_handle(&handle);
-    let mtime = std::fs::metadata(persist_path(record)?)?.modified()?;
-    Ok(Some((handle, PersistRef::new(identity, mtime))))
+    Ok(persist_snapshot(record)?.map(|(handle, mtime)| {
+        let identity = PersistIdentity::from_handle(&handle);
+        (handle, PersistRef::new(identity, mtime))
+    }))
 }
 
 /// Reuse a live holder that still answers a matching Ping. Every other shape goes
@@ -2284,12 +2799,9 @@ pub(crate) async fn reuse_or_reap_existing(
                 // discarded identity, then compare-clear (never over a newer write).
                 after_gone(record);
                 discard_line(record, &old);
-                if !clear_persist_if(record, &old) {
-                    return Err(holder_changed(
-                        record,
-                        "the record changed before the clear",
-                    ));
-                }
+                persist_act_or_refused(clear_persist_if_outcome(record, &old), || {
+                    holder_changed(record, "the record changed before the clear")
+                })?;
                 Ok(None)
             }
             NoSocketWhy::AliveForeignNoAddress | NoSocketWhy::AliveUnknownNoAddress => {
@@ -2339,14 +2851,30 @@ pub(crate) async fn reuse_or_reap_existing(
 
 /// Publish the holder's ready record, or tear its own session down and drop the
 /// registration when a newer writer owns the file. A holder never serves untracked.
+///
+/// A fence failure (`Unavailable`) is **not** a record change: retry the whole fenced
+/// write three times, then fail the start with the named token. The ordinary
+/// start-failure path owns the child; this function never tears a healthy session down
+/// for contention.
 async fn publish_ready_or_teardown(
     record: &ProjectRecord,
     session: &mut GrokSession,
     control_addr: Option<String>,
     stamp: Option<&PersistRef>,
 ) -> Result<()> {
-    if write_holder_ready(record, session, control_addr, stamp) {
-        return Ok(());
+    let mut attempt = 0u8;
+    loop {
+        attempt += 1;
+        match write_holder_ready_outcome(record, session, control_addr.clone(), stamp) {
+            PersistAct::Ok => return Ok(()),
+            PersistAct::Refused => break,
+            PersistAct::Unavailable(e) => {
+                if attempt >= 3 {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
     let _ = session.shutdown().await;
     crate::harness::abort::unregister_cancel_handle(&record.id);
@@ -2375,14 +2903,10 @@ fn settle_start_termination(
             match wait_holder_gone(record, old, WAIT_GONE) {
                 WaitGone::Gone { .. } => {
                     after_gone(record);
-                    if clear_persist_if(record, old) {
-                        Ok(())
-                    } else {
-                        Err(holder_changed(
-                            record,
-                            "the record changed before the clear",
-                        ))
-                    }
+                    persist_act_or_refused(clear_persist_if_outcome(record, old), || {
+                        holder_changed(record, "the record changed before the clear")
+                    })?;
+                    Ok(())
                 }
                 WaitGone::Superseded => Err(holder_changed(
                     record,
@@ -2399,14 +2923,10 @@ fn settle_start_termination(
                 return Ok(());
             };
             after_gone(record);
-            if clear_persist_if(record, old) {
-                Ok(())
-            } else {
-                Err(holder_changed(
-                    record,
-                    "the record changed before the clear",
-                ))
-            }
+            persist_act_or_refused(clear_persist_if_outcome(record, old), || {
+                holder_changed(record, "the record changed before the clear")
+            })?;
+            Ok(())
         }
         HolderTermination::NoListener { addr } => {
             // The start path is the only arm that may act on "no listener".
@@ -2414,18 +2934,14 @@ fn settle_start_termination(
                 return Ok(());
             };
             discard_line(record, old);
-            if clear_persist_if(record, old) {
-                eprintln!(
-                    "coordinator: holder-persist-discarded: project={} reason=connect-refused addr={addr}",
-                    record.id
-                );
-                Ok(())
-            } else {
-                Err(holder_changed(
-                    record,
-                    "the record changed before the clear",
-                ))
-            }
+            persist_act_or_refused(clear_persist_if_outcome(record, old), || {
+                holder_changed(record, "the record changed before the clear")
+            })?;
+            eprintln!(
+                "coordinator: holder-persist-discarded: project={} reason=connect-refused addr={addr}",
+                record.id
+            );
+            Ok(())
         }
         HolderTermination::NoSocket { why } => settle_no_address_now(record, old, why),
         HolderTermination::Unproven { why } => Err(holder_unproven(record, &why)),
@@ -2524,14 +3040,9 @@ fn settle_no_address_now(
 
 fn discard_now(record: &ProjectRecord, old: &PersistRef) -> Result<()> {
     discard_line(record, old);
-    if clear_persist_if(record, old) {
-        Ok(())
-    } else {
-        Err(holder_changed(
-            record,
-            "the record changed before the clear",
-        ))
-    }
+    persist_act_or_refused(clear_persist_if_outcome(record, old), || {
+        holder_changed(record, "the record changed before the clear")
+    })
 }
 
 /// Persist fields the worktree live-check and sync shutdown need.
@@ -2823,10 +3334,15 @@ pub async fn hold_loop(project: Option<&str>) -> Result<()> {
     let session = match started {
         Ok(s) => s,
         Err(e) => {
-            if !mark_start_error(&rec, stamp.as_ref(), &e.to_string()) {
-                eprintln!(
+            match mark_start_error_outcome(&rec, stamp.as_ref(), &e.to_string()) {
+                PersistAct::Ok => {}
+                PersistAct::Refused => eprintln!(
                     "coordinator: holder child refused to publish its error record (persist changed)"
-                );
+                ),
+                // A fence failure is named, never reported as a record change.
+                PersistAct::Unavailable(lock_err) => eprintln!(
+                    "coordinator: holder child could not publish its error record: {lock_err}"
+                ),
             }
             return Err(e);
         }
@@ -2902,10 +3418,14 @@ async fn hold_accept_loop(
     crate::harness::abort::unregister_cancel_handle(&rec.id);
     let mut session = shared.session.lock().await;
     let _ = session.shutdown().await;
-    if !write_holder_exit(&rec, &session) {
-        eprintln!(
+    match write_holder_exit_outcome(&rec, &session) {
+        PersistAct::Ok => {}
+        PersistAct::Refused => eprintln!(
             "coordinator: holder exit record not written: the persist no longer names this holder"
-        );
+        ),
+        PersistAct::Unavailable(e) => {
+            eprintln!("coordinator: holder exit record not written: {e}");
+        }
     }
     Ok(())
 }
@@ -3991,20 +4511,14 @@ async fn recycle_in_process(record: &ProjectRecord, old: &PersistRef) -> Result<
     crate::harness::abort::unregister_cancel_handle(&record.id);
     after_gone(record);
     if owned {
-        if !mark_dead_if(record, old) {
-            return Err(holder_changed(
-                record,
-                "the record changed before the dead write",
-            ));
-        }
+        persist_act_or_refused(mark_dead_if_outcome(record, old), || {
+            holder_changed(record, "the record changed before the dead write")
+        })?;
         return Ok(());
     }
-    if !clear_persist_if(record, old) {
-        return Err(holder_changed(
-            record,
-            "the record changed before the clear",
-        ));
-    }
+    persist_act_or_refused(clear_persist_if_outcome(record, old), || {
+        holder_changed(record, "the record changed before the clear")
+    })?;
     let holder = old
         .identity
         .holder_pid
@@ -4044,8 +4558,15 @@ pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarn
             last_signal: session.last_signal.clone(),
             last_tool_title: session.last_tool_title.clone(),
         };
-        let _ = save_persist(&rec, &dead);
-        return Ok(dead.to_status());
+        match save_in_process_shutdown(&rec, &dead) {
+            Ok(()) => return Ok(dead.to_status()),
+            Err(e) => {
+                // Nothing was written: report the truthful on-disk status, never the
+                // in-memory dead record.
+                eprintln!("coordinator: shutdown: holder persist write skipped: {e}");
+                return Ok(current_persist_status(&rec));
+            }
+        }
     }
 
     let termination = run_holder_work({
@@ -4061,12 +4582,9 @@ pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarn
         HolderTermination::Delivered { .. } => match wait_holder_gone(&rec, &old, WAIT_GONE) {
             WaitGone::Gone { .. } => {
                 after_gone(&rec);
-                if !mark_dead_if(&rec, &old) {
-                    return Err(holder_changed(
-                        &rec,
-                        "the record changed before the dead write",
-                    ));
-                }
+                persist_act_or_refused(mark_dead_if_outcome(&rec, &old), || {
+                    holder_changed(&rec, "the record changed before the dead write")
+                })?;
                 Ok(current_persist_status(&rec))
             }
             WaitGone::Superseded => Err(holder_changed(
@@ -4080,12 +4598,9 @@ pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarn
         },
         HolderTermination::Exited { .. } => {
             after_gone(&rec);
-            if !mark_dead_if(&rec, &old) {
-                return Err(holder_changed(
-                    &rec,
-                    "the record changed before the dead write",
-                ));
-            }
+            persist_act_or_refused(mark_dead_if_outcome(&rec, &old), || {
+                holder_changed(&rec, "the record changed before the dead write")
+            })?;
             Ok(current_persist_status(&rec))
         }
         HolderTermination::NoListener { addr } => Err(CoordinatorError::Message(format!(
@@ -4107,9 +4622,9 @@ pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarn
             ))),
             NoSocketWhy::AliveSelfNoAddress => {
                 after_gone(&rec);
-                if !clear_persist_if(&rec, &old) {
-                    return Err(holder_changed(&rec, "the record changed before the clear"));
-                }
+                persist_act_or_refused(clear_persist_if_outcome(&rec, &old), || {
+                    holder_changed(&rec, "the record changed before the clear")
+                })?;
                 Ok(GrokHarnessStatus::missing())
             }
             NoSocketWhy::AliveForeignNoAddress | NoSocketWhy::AliveUnknownNoAddress => {
@@ -10498,6 +11013,997 @@ mod tests {
         assert!(base.same_identity(&PersistIdentity::from_handle(&e)));
     }
 
+    // ---- 0121: persist-level atomic fence -----------------------------------
+
+    /// A blocking gate for the in-fence pause seam.
+    #[derive(Default)]
+    struct Gate {
+        open: std::sync::Mutex<bool>,
+        cv: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.cv.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                open = self.cv.wait(open).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
+
+    /// Releases a paused writer if an assertion panics (no stuck sentinel/thread).
+    struct GateRelease(Arc<Gate>);
+
+    impl Drop for GateRelease {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    fn install_pause_hook(hook: PersistPauseHook) {
+        *PERSIST_PAUSE_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// A live thread holding the record's sentinel; dropping it releases the fence.
+    struct HeldFence {
+        release: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for HeldFence {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn hold_sentinel(rec: &ProjectRecord) -> HeldFence {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = rec.clone();
+        let thread = std::thread::spawn(move || {
+            let _ = with_persist_lock(&held, |_| {
+                let _ = ready_tx.send(());
+                let _ = release_rx.recv();
+                Ok(())
+            });
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the holder thread takes the sentinel");
+        HeldFence {
+            release: release_tx,
+            thread: Some(thread),
+        }
+    }
+
+    #[test]
+    fn persist_lock_is_exclusive_between_handles() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let sentinel = dir.path().join(PERSIST_LOCK_FILE);
+        let data = dir.path().join("harness-grok.json");
+        let first = PersistLock::acquire(&sentinel, &data).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+        let second_sentinel = sentinel.clone();
+        let second_data = data.clone();
+        let second = std::thread::spawn(move || {
+            let outcome = PersistLock::acquire(&second_sentinel, &second_data);
+            let _ = done_tx.send(outcome.is_ok());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a second handle must not enter the critical section"
+        );
+        drop(first);
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the second acquire completes once the first drops"),
+            "the second handle acquires after the first releases"
+        );
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn persist_lock_rejects_a_recursive_acquire() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-recursive");
+        with_persist_lock(&rec, |_| {
+            let err = with_persist_lock(&rec, |_| Ok(())).unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("persist-lock-order: recursive"),
+                "expected the named order refusal, got {text}"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn persist_lock_reuses_the_sentinel_and_never_deletes_it() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-sentinel");
+        let sentinel = persist_lock_path(&rec).unwrap();
+        for _ in 0..5 {
+            with_persist_lock(&rec, |_| Ok(())).unwrap();
+        }
+        let first = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(first.len(), 0, "the sentinel stays zero bytes");
+        let created = first.created().ok();
+        for _ in 0..2 {
+            with_persist_lock(&rec, |_| Ok(())).unwrap();
+        }
+        let second = std::fs::metadata(&sentinel).unwrap();
+        assert_eq!(second.len(), 0);
+        assert_eq!(
+            created,
+            second.created().ok(),
+            "the same file is reused, never recreated or deleted"
+        );
+        assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn persist_lock_is_released_on_panic() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-panic");
+        let started = std::time::Instant::now();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_persist_lock(&rec, |_| -> Result<()> {
+                panic!("boom inside the fenced section");
+            });
+        }));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the unwinding closure releases the OS lock and the order depth"
+        );
+        with_persist_lock(&rec, |_| Ok(())).expect("the fence is reusable after a panic");
+    }
+
+    fn unreref(rec: &ProjectRecord) -> PersistRef {
+        PersistRef::new(attempt_identity(rec, "grok"), SystemTime::now())
+    }
+
+    #[test]
+    fn old_child_error_cannot_land_inside_the_compare_act_window() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t1");
+        let a = claim_start(&rec, "grok").unwrap();
+
+        let gate = Gate::new();
+        let release = GateRelease(gate.clone());
+        let (compared_tx, compared_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let gate = gate.clone();
+            install_pause_hook(Arc::new(move |_label: &str| {
+                let _ = compared_tx.send(());
+                gate.wait();
+            }));
+        }
+
+        let o_rec = rec.clone();
+        let o_a = a.clone();
+        let old_child = std::thread::spawn(move || {
+            arm_persist_pause();
+            mark_start_error(&o_rec, Some(&o_a), "timed out")
+        });
+        compared_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the old child compared before the retry starts");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(String, Option<String>, bool)>();
+        let r_rec = rec.clone();
+        let r_a = a.clone();
+        let retry = std::thread::spawn(move || match clear_persist_if_outcome(&r_rec, &r_a) {
+            PersistAct::Ok => {
+                let claimed = claim_start(&r_rec, "grok").is_ok();
+                let _ = done_tx.send(("ok".into(), None, claimed));
+            }
+            PersistAct::Refused => {
+                let _ = done_tx.send(("refused".into(), None, false));
+            }
+            PersistAct::Unavailable(e) => {
+                let _ = done_tx.send(("unavailable".into(), Some(e.to_string()), false));
+            }
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the retry entered the compare/act window"
+        );
+        drop(release);
+        assert!(
+            old_child.join().unwrap(),
+            "the old child's error record is the one write that happened"
+        );
+        let (kind, err, claimed) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the retry finishes after the fence is released");
+        assert_eq!(kind, "refused", "compare refusal, not a timeout: {err:?}");
+        assert!(!claimed, "the retry never claims");
+        retry.join().unwrap();
+
+        let (identity, _) = persist_identity(&rec).unwrap().unwrap();
+        assert_eq!(identity.error.as_deref(), Some("timed out"));
+        assert!(!identity.is_attempt() || identity.error.is_some());
+
+        // Phase 2: the newer claim is unchanged by any stale writer.
+        let failed = ref_of(&rec);
+        assert!(clear_persist_if(&rec, &failed));
+        let _b = claim_start(&rec, "grok").unwrap();
+        set_file_mtime(&rec, a.mtime + Duration::from_secs(1));
+        let b = ref_of(&rec);
+        assert_ne!(a.mtime, b.mtime, "forced distinct attempt stamps");
+        let bytes = file_bytes(&rec);
+        let mtime = std::fs::metadata(persist_path(&rec).unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
+        let session = mock_session_for(&rec, "sess-t1");
+        assert!(
+            !mark_start_error(&rec, Some(&a), "late child error"),
+            "the stale child cannot clobber the retry's claim"
+        );
+        assert!(
+            !write_holder_ready(&rec, &session, None, Some(&a)),
+            "the stale child cannot publish ready over the retry's claim"
+        );
+        assert_eq!(bytes, file_bytes(&rec), "B's bytes are unchanged");
+        assert_eq!(
+            mtime,
+            std::fs::metadata(persist_path(&rec).unwrap())
+                .unwrap()
+                .modified()
+                .unwrap(),
+            "B's mtime is unchanged"
+        );
+        clear_persist_hooks();
+    }
+
+    #[test]
+    fn old_child_ready_cannot_land_inside_the_window() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t2");
+        let a = claim_start(&rec, "grok").unwrap();
+
+        let gate = Gate::new();
+        let release = GateRelease(gate.clone());
+        let (compared_tx, compared_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let gate = gate.clone();
+            install_pause_hook(Arc::new(move |_label: &str| {
+                let _ = compared_tx.send(());
+                gate.wait();
+            }));
+        }
+
+        let o_rec = rec.clone();
+        let o_a = a.clone();
+        let old_child = std::thread::spawn(move || {
+            let session = mock_session_for(&o_rec, "sess-t2-child");
+            arm_persist_pause();
+            write_holder_ready(&o_rec, &session, Some("127.0.0.1:9".into()), Some(&o_a))
+        });
+        compared_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the old child compared before the retry starts");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(String, Option<String>, bool)>();
+        let r_rec = rec.clone();
+        let r_a = a.clone();
+        let retry = std::thread::spawn(move || match clear_persist_if_outcome(&r_rec, &r_a) {
+            PersistAct::Ok => {
+                let claimed = claim_start(&r_rec, "grok").is_ok();
+                let _ = done_tx.send(("ok".into(), None, claimed));
+            }
+            PersistAct::Refused => {
+                let _ = done_tx.send(("refused".into(), None, false));
+            }
+            PersistAct::Unavailable(e) => {
+                let _ = done_tx.send(("unavailable".into(), Some(e.to_string()), false));
+            }
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the retry entered the compare/act window"
+        );
+        drop(release);
+        assert!(
+            old_child.join().unwrap(),
+            "the old child published its ready record"
+        );
+        let (kind, err, claimed) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(kind, "refused", "{err:?}");
+        assert!(!claimed);
+        retry.join().unwrap();
+
+        // Phase 2: a stale ready write cannot land over the newer claim.
+        let ready = ref_of(&rec);
+        assert!(clear_persist_if(&rec, &ready));
+        let _b = claim_start(&rec, "grok").unwrap();
+        set_file_mtime(&rec, a.mtime + Duration::from_secs(1));
+        let b = ref_of(&rec);
+        assert_ne!(a.mtime, b.mtime);
+        let bytes = file_bytes(&rec);
+        let session = mock_session_for(&rec, "sess-t2-stale");
+        assert!(!write_holder_ready(
+            &rec,
+            &session,
+            Some("127.0.0.1:9".into()),
+            Some(&a)
+        ));
+        assert_eq!(bytes, file_bytes(&rec));
+        clear_persist_hooks();
+    }
+
+    #[test]
+    fn ready_contention_does_not_tear_down_a_healthy_session() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t2b");
+        let claim = claim_start(&rec, "grok").unwrap();
+        let before = file_bytes(&rec);
+        let held = hold_sentinel(&rec);
+        let mut session = mock_session_for(&rec, "sess-t2b");
+        let err = {
+            let _budget = test_persist_lock_budget(Duration::from_millis(50));
+            futures_lite_block_on(publish_ready_or_teardown(
+                &rec,
+                &mut session,
+                None,
+                Some(&claim),
+            ))
+            .unwrap_err()
+        };
+        let text = err.to_string();
+        assert!(text.contains("persist-lock-timeout"), "{text}");
+        assert!(!text.contains("persist-changed"), "{text}");
+        assert_eq!(
+            session.shutdown_probe(),
+            0,
+            "contention never tears down a healthy session"
+        );
+        assert_eq!(before, file_bytes(&rec));
+        drop(held);
+        assert!(
+            write_holder_ready(&rec, &session, None, Some(&claim)),
+            "the fence is free once the holder releases"
+        );
+        clear_persist_hooks();
+    }
+
+    fn seed_named(rec: &ProjectRecord) {
+        write_handle(
+            rec,
+            &make_handle(
+                rec,
+                Some("sess-old"),
+                Some(crate::harness::grok_cwd(rec)),
+                Some("127.0.0.1:9".into()),
+                Some(4242),
+                true,
+                false,
+                None,
+            ),
+        );
+    }
+
+    fn run_merge_writer(rec: &ProjectRecord, writer: &str, session: Option<GrokSession>) {
+        match writer {
+            "flag" => set_prompt_in_flight(rec, true),
+            _ => remember_fidelity(rec, session.as_ref().unwrap()),
+        }
+    }
+
+    fn merge_writer_session(rec: &ProjectRecord, writer: &str) -> Option<GrokSession> {
+        if writer == "fidelity" {
+            let mut session = mock_session_for(rec, "sess-old");
+            session.last_signal = Some("fid-t3".into());
+            Some(session)
+        } else {
+            None
+        }
+    }
+
+    type RetryReport = (String, Option<String>, bool);
+    type RetryRun = (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<RetryReport>,
+    );
+
+    fn spawn_retry(rec: &ProjectRecord, old: &PersistRef, arm_pause: bool) -> RetryRun {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<RetryReport>();
+        let r_rec = rec.clone();
+        let r_old = old.clone();
+        let thread = std::thread::spawn(move || {
+            if arm_pause {
+                arm_persist_pause();
+            }
+            match clear_persist_if_outcome(&r_rec, &r_old) {
+                PersistAct::Ok => {
+                    let claimed = claim_start(&r_rec, "grok").is_ok();
+                    let _ = done_tx.send(("ok".into(), None, claimed));
+                }
+                PersistAct::Refused => {
+                    let _ = done_tx.send(("refused".into(), None, false));
+                }
+                PersistAct::Unavailable(e) => {
+                    let _ = done_tx.send(("unavailable".into(), Some(e.to_string()), false));
+                }
+            }
+        });
+        (thread, done_rx)
+    }
+
+    fn assert_final_is_retry_claim(rec: &ProjectRecord) {
+        let (identity, _) = persist_identity(rec).unwrap().unwrap();
+        assert!(
+            identity.is_attempt(),
+            "the retry's claim is the final record"
+        );
+        assert_eq!(
+            identity.session_id, None,
+            "the old session was not resurrected"
+        );
+        assert_eq!(identity.cwd, None);
+        assert_eq!(identity.holder_pid, None);
+        assert_eq!(identity.pid, None);
+        assert!(!identity.prompt_in_flight);
+        // (c) Capture B, then run the stale writers that lost the interleaving: neither
+        // may rewrite a byte of the retry's claim.
+        let b_bytes = file_bytes(rec);
+        let stale = PersistRef::new(
+            attempt_identity(rec, "grok"),
+            SystemTime::now() - Duration::from_secs(3600),
+        );
+        assert!(
+            !mark_start_error(rec, Some(&stale), "stale merge writer"),
+            "a stale attempt cannot rewrite B"
+        );
+        let stale_session = mock_session_for(rec, "sess-stale");
+        assert!(
+            !write_holder_ready(rec, &stale_session, None, Some(&stale)),
+            "a stale ready write cannot publish over B"
+        );
+        assert_eq!(
+            b_bytes,
+            file_bytes(rec),
+            "B's bytes are unchanged after the stale writers"
+        );
+    }
+
+    #[test]
+    fn fidelity_and_flag_writes_cannot_clobber_a_newer_claim() {
+        let _guard = test_env_lock();
+        for writer in ["flag", "fidelity"] {
+            // ---- Phase A (the discriminator): while the merge writer is paused after
+            // its snapshot, the retry must not be able to clear+claim. Without the fence
+            // the retry completes inside the window and the merge then overwrites B.
+            let dir = tempdir().unwrap();
+            let rec = record_in(&dir, &format!("0121-t3a-{writer}"));
+            seed_named(&rec);
+            let old = ref_of(&rec);
+            let gate = Gate::new();
+            let release = GateRelease(gate.clone());
+            let (compared_tx, compared_rx) = std::sync::mpsc::channel::<()>();
+            {
+                let gate = gate.clone();
+                install_pause_hook(Arc::new(move |_label: &str| {
+                    let _ = compared_tx.send(());
+                    gate.wait();
+                }));
+            }
+            let o_rec = rec.clone();
+            let o_writer = writer.to_string();
+            let o_session = merge_writer_session(&rec, writer);
+            let merge = std::thread::spawn(move || {
+                arm_persist_pause();
+                run_merge_writer(&o_rec, &o_writer, o_session);
+            });
+            compared_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the merge writer paused after its snapshot");
+
+            let (retry, done_rx) = spawn_retry(&rec, &old, false);
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+                "the retry entered the merge/act window"
+            );
+            drop(release);
+            merge.join().unwrap();
+            let (kind, err, claimed) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(kind, "ok", "{err:?}");
+            assert!(claimed);
+            retry.join().unwrap();
+            assert_final_is_retry_claim(&rec);
+
+            // ---- Phase B (the spec's observation): pause the retry just before its
+            // unlink, so the merge's landing on the old record is directly visible.
+            let dir = tempdir().unwrap();
+            let rec = record_in(&dir, &format!("0121-t3b-{writer}"));
+            seed_named(&rec);
+            let old = ref_of(&rec);
+            let gate_o = Gate::new();
+            let gate_r = Gate::new();
+            let release_o = GateRelease(gate_o.clone());
+            let release_r = GateRelease(gate_r.clone());
+            let (compared_tx, compared_rx) = std::sync::mpsc::channel::<()>();
+            let (clear_tx, clear_rx) = std::sync::mpsc::channel::<()>();
+            {
+                let gate_o = gate_o.clone();
+                let gate_r = gate_r.clone();
+                install_pause_hook(Arc::new(move |label: &str| {
+                    if label == "clear" {
+                        let _ = clear_tx.send(());
+                        gate_r.wait();
+                    } else {
+                        let _ = compared_tx.send(());
+                        gate_o.wait();
+                    }
+                }));
+            }
+            let o_rec = rec.clone();
+            let o_writer = writer.to_string();
+            let o_session = merge_writer_session(&rec, writer);
+            let merge = std::thread::spawn(move || {
+                arm_persist_pause();
+                run_merge_writer(&o_rec, &o_writer, o_session);
+            });
+            compared_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the merge writer paused after its snapshot");
+            let (retry, done_rx) = spawn_retry(&rec, &old, true);
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+                "the retry entered the merge/act window"
+            );
+            drop(release_o);
+            merge.join().unwrap();
+            clear_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the retry reached its own clear under the fence");
+            // (a) The merge landed on the old record while the retry is paused.
+            let merged = load_persist(&rec).unwrap().expect("old record present");
+            if writer == "flag" {
+                assert!(
+                    merged.prompt_in_flight,
+                    "the flag write landed on the old record"
+                );
+            } else {
+                assert_eq!(merged.last_signal.as_deref(), Some("fid-t3"));
+            }
+            drop(release_r);
+            let (kind, err, claimed) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(kind, "ok", "{err:?}");
+            assert!(claimed);
+            retry.join().unwrap();
+            // (b) + (c) the final record is B and stays B.
+            assert_final_is_retry_claim(&rec);
+            clear_persist_hooks();
+        }
+    }
+
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn persist_lock_child_holds_until_killed() {
+        let Some(path) = std::env::var_os("COORDINATOR_TEST_PERSIST_LOCK_PATH") else {
+            return;
+        };
+        let Some(marker) = std::env::var_os("COORDINATOR_TEST_PERSIST_LOCK_MARKER") else {
+            return;
+        };
+        let sentinel = PathBuf::from(path);
+        let _lock =
+            PersistLock::acquire(&sentinel, &sentinel.with_file_name("unused.json")).unwrap();
+        std::fs::write(marker, b"ready").unwrap();
+        // Bounded so a leaked child cannot outlive the test binary for long.
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn persist_lock_survives_a_crashed_holder() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let mut rec = record_in(&dir, "0121-t4");
+        // Pin the parent record to the child's state dir: `persist_lock_path` is exactly
+        // the sentinel the child holds (not `<dir>/state/.harness-grok.lock`).
+        let child_temp = tempdir().unwrap();
+        rec.state_dir = Some(child_temp.path().to_path_buf());
+        let sentinel = child_temp.path().join(PERSIST_LOCK_FILE);
+        assert_eq!(persist_lock_path(&rec).unwrap(), sentinel);
+        let marker = child_temp.path().join("child-ready.marker");
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "harness::pool::tests::persist_lock_child_holds_until_killed",
+            "--nocapture",
+        ]);
+        cmd.env("COORDINATOR_TEST_PERSIST_LOCK_PATH", &sentinel);
+        cmd.env("COORDINATOR_TEST_PERSIST_LOCK_MARKER", &marker);
+        let child = ChildGuard(cmd.spawn().unwrap());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never took the sentinel"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let handle = attempt_handle(&rec, None);
+        {
+            let _budget = test_persist_lock_budget(Duration::from_millis(50));
+            let err = with_persist_lock(&rec, |lock| save_persist_locked(lock, &handle))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("persist-lock-timeout"), "{err}");
+        }
+
+        let mut child = child;
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+        let mut acquired = false;
+        for _ in 0..200 {
+            if with_persist_lock(&rec, |lock| save_persist_locked(lock, &handle)).is_ok() {
+                acquired = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            acquired,
+            "a killed holder must not wedge the next production writer"
+        );
+        assert!(sentinel.exists(), "the sentinel is reusable");
+        assert_eq!(std::fs::metadata(&sentinel).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn readers_stay_lock_free_while_a_writer_holds_the_lock() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t5");
+        let a = claim_start(&rec, "grok").unwrap();
+        let before = file_bytes(&rec);
+
+        let gate = Gate::new();
+        let release = GateRelease(gate.clone());
+        let (compared_tx, compared_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let gate = gate.clone();
+            install_pause_hook(Arc::new(move |_label: &str| {
+                let _ = compared_tx.send(());
+                gate.wait();
+            }));
+        }
+        let o_rec = rec.clone();
+        let writer = std::thread::spawn(move || {
+            arm_persist_pause();
+            mark_start_error(&o_rec, Some(&a), "timed out")
+        });
+        compared_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // A lock-free reader must still see the pre-write record.
+        let (identity, _) = persist_identity(&rec).unwrap().unwrap();
+        assert!(
+            identity.error.is_none(),
+            "the reader sees the pre-write record"
+        );
+        assert!(status_bundle_sync(&rec).is_none());
+        assert_eq!(before, file_bytes(&rec));
+
+        drop(release);
+        assert!(writer.join().unwrap());
+        clear_persist_hooks();
+    }
+
+    #[test]
+    fn lock_order_is_run_state_then_persist() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t6");
+        crate::state::with_run_state_lock(&rec, || with_persist_lock(&rec, |_| Ok(())))
+            .expect("run_state -> persist is the legal order");
+        let err = with_persist_lock(&rec, |_| crate::state::with_run_state_lock(&rec, || Ok(())))
+            .unwrap_err();
+        assert!(err.to_string().contains("persist-lock-order"), "{err}");
+        let state_dir = resolve_state_dir(&rec).unwrap();
+        assert!(
+            !state_dir.join(".run-state.lock").exists(),
+            "the reverse acquisition never creates the run-state lock"
+        );
+        assert!(persist_lock_path(&rec).unwrap().exists());
+    }
+
+    #[test]
+    fn persist_lock_timeout_is_named_and_writes_nothing() {
+        let _guard = test_env_lock();
+
+        // claim_start
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t7-claim");
+        let held = hold_sentinel(&rec);
+        {
+            let _budget = test_persist_lock_budget(Duration::from_millis(50));
+            let err = claim_start(&rec, "grok").unwrap_err().to_string();
+            assert!(err.contains("persist-lock-timeout"), "{err}");
+        }
+        drop(held);
+        assert!(!persist_path(&rec).unwrap().exists());
+
+        // W2: a claim the writer would accept.
+        let dir = tempdir().unwrap();
+        let rec_w2 = record_in(&dir, "0121-t7-w2");
+        let claim = claim_start(&rec_w2, "grok").unwrap();
+        let before = file_bytes(&rec_w2);
+        let held = hold_sentinel(&rec_w2);
+        {
+            let _budget = test_persist_lock_budget(Duration::from_millis(50));
+            match mark_start_error_outcome(&rec_w2, Some(&claim), "timed out") {
+                PersistAct::Unavailable(e) => {
+                    assert!(e.to_string().contains("persist-lock-timeout"), "{e}");
+                }
+                other => panic!("expected Unavailable, got {other:?}"),
+            }
+        }
+        drop(held);
+        assert_eq!(before, file_bytes(&rec_w2));
+
+        // W4: the live record the exit writer would accept.
+        let dir = tempdir().unwrap();
+        let rec_w4 = record_in(&dir, "0121-t7-w4");
+        let session = mock_session_for(&rec_w4, "sess-t7");
+        write_handle(
+            &rec_w4,
+            &ready_handle(&rec_w4, &session, Some("127.0.0.1:9".into())),
+        );
+        let before = file_bytes(&rec_w4);
+        let held = hold_sentinel(&rec_w4);
+        {
+            let _budget = test_persist_lock_budget(Duration::from_millis(50));
+            match write_holder_exit_outcome(&rec_w4, &session) {
+                PersistAct::Unavailable(e) => {
+                    assert!(e.to_string().contains("persist-lock-timeout"), "{e}");
+                }
+                other => panic!("expected Unavailable, got {other:?}"),
+            }
+        }
+        drop(held);
+        assert_eq!(before, file_bytes(&rec_w4));
+
+        // W8/W9: a named record, no write, one `persist-lock` status line.
+        let dir = tempdir().unwrap();
+        let rec_flag = record_in(&dir, "0121-t7-flag");
+        write_handle(
+            &rec_flag,
+            &make_handle(
+                &rec_flag,
+                Some("sess-flag"),
+                Some(crate::harness::grok_cwd(&rec_flag)),
+                Some("127.0.0.1:9".into()),
+                Some(4242),
+                true,
+                false,
+                None,
+            ),
+        );
+        let before = file_bytes(&rec_flag);
+        let held = hold_sentinel(&rec_flag);
+        {
+            let _budget = test_persist_lock_budget(Duration::from_millis(50));
+            set_prompt_in_flight(&rec_flag, true);
+            remember_fidelity(&rec_flag, &session);
+        }
+        drop(held);
+        assert_eq!(before, file_bytes(&rec_flag));
+        let status = std::fs::read_to_string(crate::progress_log::path(&rec_flag)).unwrap();
+        assert!(status.contains("persist-lock"), "{status}");
+
+        // W10: the sync helper refuses; the shutdown-equivalent reports on-disk truth.
+        let dir = tempdir().unwrap();
+        let rec_w10 = record_in(&dir, "0121-t7-w10");
+        let live = make_handle(
+            &rec_w10,
+            Some("sess-w10"),
+            Some(crate::harness::grok_cwd(&rec_w10)),
+            Some("127.0.0.1:9".into()),
+            Some(4242),
+            true,
+            false,
+            None,
+        );
+        write_handle(&rec_w10, &live);
+        let on_disk = current_persist_status(&rec_w10);
+        let dead = persist_marked_dead(&live);
+        let held = hold_sentinel(&rec_w10);
+        {
+            let _budget = test_persist_lock_budget(Duration::from_millis(50));
+            let err = save_in_process_shutdown(&rec_w10, &dead)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("persist-lock-timeout"), "{err}");
+        }
+        drop(held);
+        assert_eq!(
+            on_disk,
+            current_persist_status(&rec_w10),
+            "nothing was written: the truthful on-disk status, not the dead one"
+        );
+    }
+
+    #[test]
+    fn snapshot_pair_is_coherent_under_a_mid_read_replacement() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t8");
+        write_handle(&rec, &attempt_handle(&rec, Some("a")));
+        let a_mtime = std::fs::metadata(persist_path(&rec).unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
+        let b_mtime = Arc::new(std::sync::Mutex::new(None));
+        let rec_hook = rec.clone();
+        let slot = b_mtime.clone();
+        arm_persist_snapshot_hook(move || {
+            save_persist(&rec_hook, &attempt_handle(&rec_hook, Some("b"))).unwrap();
+            let forced = a_mtime + Duration::from_secs(1);
+            set_file_mtime(&rec_hook, forced);
+            let mtime = std::fs::metadata(persist_path(&rec_hook).unwrap())
+                .unwrap()
+                .modified()
+                .unwrap();
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(mtime);
+        });
+        let result = persist_identity(&rec);
+        let b_mtime = b_mtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expect("the snapshot hook fired");
+        assert_ne!(a_mtime, b_mtime);
+        match result {
+            Ok(Some((identity, mtime))) => {
+                assert_eq!(identity.error.as_deref(), Some("b"), "content is B");
+                assert_eq!(mtime, b_mtime, "the mtime is B's");
+            }
+            Ok(None) => panic!("the record is present"),
+            Err(e) => assert!(e.to_string().contains("persist-unstable"), "{e}"),
+        }
+        clear_persist_hooks();
+
+        // The existing typed outcomes are unchanged.
+        std::fs::write(persist_path(&rec).unwrap(), b"{not json").unwrap();
+        assert!(persist_identity(&rec).is_err(), "corrupt is a typed error");
+        std::fs::remove_file(persist_path(&rec).unwrap()).unwrap();
+        assert!(
+            persist_identity(&rec).unwrap().is_none(),
+            "absent stays Ok(None)"
+        );
+    }
+
+    struct ReadonlyGuard {
+        path: PathBuf,
+        original: std::fs::Permissions,
+    }
+
+    impl Drop for ReadonlyGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.original.clone());
+        }
+    }
+
+    #[test]
+    fn persist_lock_io_is_named_and_fails_closed() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t9");
+        let sentinel = persist_lock_path(&rec).unwrap();
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"").unwrap();
+        write_handle(&rec, &attempt_handle(&rec, None));
+        let before = file_bytes(&rec);
+        let old = ref_of(&rec);
+        let original = std::fs::metadata(&sentinel).unwrap().permissions();
+        let mut perms = original.clone();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&sentinel, perms).unwrap();
+        let restore = ReadonlyGuard {
+            path: sentinel.clone(),
+            original,
+        };
+
+        let err = claim_start(&rec, "grok").unwrap_err().to_string();
+        assert!(err.contains("persist-lock-io"), "{err}");
+        assert!(!err.contains("persist-lock-timeout"), "{err}");
+        match clear_persist_if_outcome(&rec, &old) {
+            PersistAct::Unavailable(e) => {
+                let text = e.to_string();
+                assert!(text.contains("persist-lock-io"), "{text}");
+                assert!(!text.contains("persist-lock-timeout"), "{text}");
+            }
+            other => panic!("expected persist-lock-io, got {other:?}"),
+        }
+        assert_eq!(before, file_bytes(&rec), "no record was written");
+        drop(restore);
+
+        // A state dir whose parent is a regular file fails the same way.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut bad = record_in(&dir, "0121-t9-dir");
+        bad.state_dir = Some(blocker.join("state"));
+        let err = claim_start(&bad, "grok").unwrap_err().to_string();
+        assert!(err.contains("persist-lock-io"), "{err}");
+        assert!(!err.contains("persist-lock-timeout"), "{err}");
+    }
+
+    #[test]
+    fn clear_on_absent_persist_does_not_create_the_state_dir() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t10");
+        let state = resolve_state_dir(&rec).unwrap();
+        assert!(!state.exists());
+        let old = unreref(&rec);
+        assert!(clear_persist_if(&rec, &old), "absent is the clear verdict");
+        assert!(mark_dead_if(&rec, &old), "absent is the dead verdict");
+        assert!(!state.exists(), "the absent fast path creates no state dir");
+        assert!(!persist_lock_path(&rec).unwrap().exists());
+
+        claim_start(&rec, "grok").expect("a claim creates the state dir and sentinel");
+        assert!(state.exists());
+        assert!(persist_lock_path(&rec).unwrap().exists());
+    }
+
+    #[test]
+    fn snapshot_absence_is_only_first_metadata_not_found() {
+        let _guard = test_env_lock();
+        let dir = tempdir().unwrap();
+        let rec = record_in(&dir, "0121-t11");
+        write_handle(&rec, &attempt_handle(&rec, None));
+        let path = persist_path(&rec).unwrap();
+        let remove = path.clone();
+        arm_persist_snapshot_hook(move || {
+            let _ = std::fs::remove_file(&remove);
+        });
+        reset_persist_snapshot_attempts();
+        assert!(persist_identity(&rec).unwrap().is_none());
+        assert_eq!(
+            persist_snapshot_attempts(),
+            2,
+            "a None after a successful metadata is a change and must retry"
+        );
+        assert!(!path.exists());
+        clear_persist_hooks();
+    }
+
     // ---- 0117: the single-owner source scan --------------------------------
 
     /// A **known-token regression guard, not semantic proof** (agy-m1). The real
@@ -10572,19 +12078,19 @@ mod tests {
         for name in [
             "deliver_shutdown(",
             "wait_holder_gone(",
-            "clear_persist_if(",
-            "mark_dead_if(",
-            "mark_start_error(",
-            "write_holder_ready(",
-            "write_holder_exit(",
+            "mark_start_error_outcome(",
+            "write_holder_ready_outcome(",
+            "write_holder_exit_outcome(",
+            "clear_persist_if_outcome(",
+            "mark_dead_if_outcome(",
         ] {
             let body = fn_body(pool_shard, name);
             assert!(
-                body.contains("same_record("),
+                code_only(body).contains("same_record("),
                 "{name} must use the one compare rule"
             );
         }
-        assert!(fn_body(pool_shard, "same_record(").contains("is_attempt()"));
+        assert!(code_only(fn_body(pool_shard, "same_record(")).contains("is_attempt()"));
 
         for caller in [
             "reuse_or_reap_existing(",
@@ -10631,8 +12137,8 @@ mod tests {
             .map(|i| &pool_shard[i..])
             .unwrap_or("");
         assert!(
-            enclosing.starts_with("fn clear_persist_if("),
-            "remove_file( lives only in clear_persist_if"
+            enclosing.starts_with("fn remove_persist_locked("),
+            "remove_file( lives only in remove_persist_locked"
         );
 
         // No async worker sleeps on the thread.
@@ -10642,6 +12148,205 @@ mod tests {
                 "{name} must not block an async worker"
             );
         }
+    }
+
+    /// 0121 DoD-1/DoD-2: every persist writer body takes the fence, no async body takes
+    /// it directly, and the three write primitives are the only write sites in the
+    /// product. A token-only guard is not semantic proof; this is the inventory.
+    #[test]
+    fn every_persist_writer_takes_the_lock() {
+        let files: [(&str, &str); 9] = [
+            ("pool", include_str!("pool.rs")),
+            ("reap", include_str!("reap.rs")),
+            ("grok", include_str!("grok.rs")),
+            ("abort", include_str!("abort.rs")),
+            ("worktree", include_str!("../worktree.rs")),
+            ("drive", include_str!("../workflow/drive.rs")),
+            ("state", include_str!("../state.rs")),
+            ("api", include_str!("../api.rs")),
+            ("cli", include_str!("../cli.rs")),
+        ];
+        let shards: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(name, text)| {
+                let cut = text.find("\nmod tests {").unwrap_or(text.len());
+                (*name, &text[..cut])
+            })
+            .collect();
+        let pool_shard = shards
+            .iter()
+            .find(|(name, _)| *name == "pool")
+            .map(|(_, text)| *text)
+            .unwrap();
+        let pool_code = code_only(pool_shard);
+
+        for name in [
+            "mark_start_error_outcome(",
+            "write_holder_ready_outcome(",
+            "write_holder_exit_outcome(",
+            "clear_persist_if_outcome(",
+            "mark_dead_if_outcome(",
+            "claim_start(",
+            "set_prompt_in_flight(",
+            "remember_fidelity(",
+            "save_in_process_shutdown(",
+        ] {
+            assert!(
+                code_only(fn_body(pool_shard, name)).contains("with_persist_lock("),
+                "{name} must own the fence"
+            );
+        }
+        for (wrapper, twin) in [
+            ("mark_start_error(", "mark_start_error_outcome("),
+            ("write_holder_ready(", "write_holder_ready_outcome("),
+            ("write_holder_exit(", "write_holder_exit_outcome("),
+            ("clear_persist_if(", "clear_persist_if_outcome("),
+            ("mark_dead_if(", "mark_dead_if_outcome("),
+        ] {
+            assert!(
+                code_only(fn_body(pool_shard, wrapper)).contains(twin),
+                "the public bool verdict {wrapper} delegates to {twin}"
+            );
+        }
+
+        // W10 is not an exception: the async body calls the sync helper and never the lock.
+        let shutdown = code_only(fn_body(pool_shard, "shutdown(project:"));
+        assert!(shutdown.contains("save_in_process_shutdown("));
+        assert!(!shutdown.contains("with_persist_lock("));
+
+        for (name, body) in async_fns(pool_shard) {
+            assert!(
+                !code_only(&body).contains("with_persist_lock("),
+                "{name} is async and must not acquire the persist lock directly"
+            );
+        }
+
+        // One atomic writer, one remover, one exclusive create.
+        assert_eq!(
+            pool_code.matches("atomic_write_json(").count(),
+            1,
+            "atomic_write_json( has one production call site"
+        );
+        let write_at = pool_code.find("atomic_write_json(").unwrap();
+        let write_fn = pool_code[..write_at]
+            .rfind("fn ")
+            .map(|i| &pool_code[i..])
+            .unwrap_or("");
+        assert!(
+            write_fn.starts_with("fn save_persist_locked("),
+            "the atomic write lives only in save_persist_locked"
+        );
+        assert_eq!(
+            pool_code.matches("std::fs::remove_file(").count(),
+            1,
+            "remove_file( has one production call site"
+        );
+        let remove_at = pool_code.find("std::fs::remove_file(").unwrap();
+        let remove_fn = pool_code[..remove_at]
+            .rfind("fn ")
+            .map(|i| &pool_code[i..])
+            .unwrap_or("");
+        assert!(
+            remove_fn.starts_with("fn remove_persist_locked("),
+            "the unlink lives only in remove_persist_locked"
+        );
+        assert_eq!(
+            pool_code.matches("create_new(true)").count(),
+            1,
+            "create_new(true) has one production call site"
+        );
+        let create_at = pool_code.find("create_new(true)").unwrap();
+        let create_fn = pool_code[..create_at]
+            .rfind("fn ")
+            .map(|i| &pool_code[i..])
+            .unwrap_or("");
+        assert!(
+            create_fn.starts_with("fn create_persist_claim_locked("),
+            "the exclusive create lives only in create_persist_claim_locked"
+        );
+
+        // `save_persist` is a test-only seed.
+        assert_eq!(
+            pool_code.matches("fn save_persist(").count(),
+            1,
+            "exactly one save_persist definition"
+        );
+        let save_at = pool_shard
+            .find("fn save_persist(")
+            .expect("the seed is defined");
+        assert!(
+            pool_shard[..save_at].trim_end().ends_with("#[cfg(test)]"),
+            "save_persist is a #[cfg(test)] seed"
+        );
+        assert_eq!(
+            pool_code.matches("save_persist(").count(),
+            1,
+            "no production caller of save_persist remains"
+        );
+
+        assert_eq!(pool_code.matches("const PERSIST_LOCK_FILE").count(), 1);
+        for forbidden in [
+            "remove_file(&persist_lock_path",
+            "remove_file(persist_lock_path",
+            "remove_dir(&persist_lock_path",
+            "remove_dir(persist_lock_path",
+        ] {
+            assert!(
+                !pool_code.contains(forbidden),
+                "the sentinel is never deleted or renamed: {forbidden}"
+            );
+        }
+
+        // The whole-product claim: no shard outside `pool` writes the persist target.
+        for (name, shard) in &shards {
+            let code = code_only(shard);
+            for pattern in [
+                "atomic_write_json(persist_path",
+                "std::fs::write(persist_path",
+                "std::fs::remove_file(persist_path",
+            ] {
+                assert!(
+                    !code.contains(pattern),
+                    "{name} must not write the holder persist directly ({pattern})"
+                );
+            }
+        }
+    }
+
+    /// Strip comments, strings and char literals so a guard cannot be satisfied by prose.
+    fn code_only(shard: &str) -> String {
+        let bytes = shard.as_bytes();
+        let mut out = String::with_capacity(shard.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => i = skip_string(bytes, i),
+                b'\'' => match skip_char_or_lifetime(bytes, i) {
+                    Some(next) => i = next,
+                    None => {
+                        out.push('\'');
+                        i += 1;
+                    }
+                },
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                other => {
+                    out.push(if other.is_ascii() { other as char } else { ' ' });
+                    i += 1;
+                }
+            }
+        }
+        out
     }
 
     /// Literal-aware body extractor: skips `"…"`, raw strings, char literals and

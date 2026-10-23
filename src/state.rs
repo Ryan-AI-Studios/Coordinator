@@ -948,14 +948,66 @@ fn run_state_lock_wait() -> std::time::Duration {
     std::time::Duration::from_secs(10)
 }
 
+thread_local! {
+    /// 0121: how many holder-persist fences this thread currently holds. The persist
+    /// lock is a synchronous leaf, so the only legal nesting is
+    /// `run_state.lock -> pool mutex -> persist lock`.
+    static PERSIST_LOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Proof that the persist fence is the *inner* lock on this thread. The private field
+/// keeps the token unforgeable outside `state.rs`; dropping it releases the depth, so a
+/// panic inside the fenced section cannot leak the ordering state.
+pub(crate) struct PersistLockScope(());
+
+impl Drop for PersistLockScope {
+    fn drop(&mut self) {
+        PERSIST_LOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Enter the persist-lock depth. Fails closed on a recursive acquire; the caller has
+/// already succeeded in holding the OS lock when this runs.
+pub(crate) fn persist_lock_scope() -> Result<PersistLockScope> {
+    if persist_lock_held() {
+        return Err(crate::error::CoordinatorError::Message(
+            "persist-lock-order: recursive persist lock".into(),
+        ));
+    }
+    PERSIST_LOCK_DEPTH.with(|d| d.set(1));
+    Ok(PersistLockScope(()))
+}
+
+/// Whether this thread currently holds the holder-persist fence.
+pub(crate) fn persist_lock_held() -> bool {
+    PERSIST_LOCK_DEPTH.with(std::cell::Cell::get) > 0
+}
+
 /// Cross-process exclusive lock for run-state mutation (mkdir is atomic).
 ///
 /// Held across load → decide → save so concurrent CLI vs serve first-commit-wins.
 /// Stale locks older than 60s are broken (process crash recovery).
+///
+/// 0121 order: `run_state.lock -> pool mutex -> persist lock`. The persist lock is a
+/// synchronous leaf; taking the run-state lock while it is held is a defect (a grown
+/// critical section would park the 10 s run-state budget behind it). The bounded persist
+/// acquire already prevents a permanent hang, so this check is about making the
+/// violation immediate, named and testable rather than about avoiding the hang.
 pub fn with_run_state_lock<T, F>(record: &ProjectRecord, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
+    if persist_lock_held() {
+        eprintln!(
+            "coordinator: persist-lock-order: run-state lock requested while the persist \
+             lock is held (order is run-state -> persist)"
+        );
+        return Err(crate::error::CoordinatorError::Message(
+            "persist-lock-order: run-state lock requested while the persist lock is held \
+             (order is run-state -> persist)"
+                .into(),
+        ));
+    }
     ensure_state_dir(record)?;
     let lock_path = resolve_state_dir(record)?.join(".run-state.lock");
     let deadline = std::time::Instant::now() + run_state_lock_wait();
@@ -1629,5 +1681,41 @@ mod tests {
         assert!(state.stall_paging.paged_epoch.is_none());
         assert!(state.stall_paging.paged_at.is_none());
         assert!(!state.stall_paging.cleared);
+    }
+
+    // ---- 0121: the persist lock order ---------------------------------------
+
+    #[test]
+    fn persist_lock_order_rejects_run_state_inside_the_fence() {
+        let dir = tempdir().unwrap();
+        let rec = holder_record(dir.path());
+        let scope = persist_lock_scope().unwrap();
+        let err = with_run_state_lock(&rec, || Ok(())).unwrap_err();
+        assert!(err.to_string().contains("persist-lock-order"), "{err}");
+        assert!(
+            !resolve_state_dir(&rec)
+                .unwrap()
+                .join(".run-state.lock")
+                .exists(),
+            "the refused acquisition creates nothing"
+        );
+        drop(scope);
+        with_run_state_lock(&rec, || Ok(())).expect("the order is legal once the fence drops");
+    }
+
+    #[test]
+    fn persist_lock_order_is_per_thread() {
+        let dir = tempdir().unwrap();
+        let rec = holder_record(dir.path());
+        let scope = persist_lock_scope().unwrap();
+        let other = {
+            let rec = rec.clone();
+            std::thread::spawn(move || with_run_state_lock(&rec, || Ok(())).is_ok())
+        };
+        assert!(
+            other.join().unwrap(),
+            "the depth is thread-local, so another thread still takes the run-state lock"
+        );
+        drop(scope);
     }
 }

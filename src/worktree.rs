@@ -405,12 +405,10 @@ fn shutdown_under(
                     match pool::wait_holder_gone(record, &old, pool::WAIT_GONE) {
                         WaitGone::Gone { .. } => {
                             pool::after_gone(record);
-                            if !pool::clear_persist_if(record, &old) {
-                                return Err(holder_refused(
-                                    record,
-                                    "the record changed before the clear",
-                                ));
-                            }
+                            pool::persist_act_or_refused(
+                                pool::clear_persist_if_outcome(record, &old),
+                                || holder_refused(record, "the record changed before the clear"),
+                            )?;
                             teardown_epoch(record, old.identity.cwd.as_deref(), root);
                             Ok(ShutdownOutcome::Handled)
                         }
@@ -426,12 +424,10 @@ fn shutdown_under(
                 }
                 pool::HolderTermination::Exited { .. } => {
                     pool::after_gone(record);
-                    if !pool::clear_persist_if(record, &old) {
-                        return Err(holder_refused(
-                            record,
-                            "the record changed before the clear",
-                        ));
-                    }
+                    pool::persist_act_or_refused(
+                        pool::clear_persist_if_outcome(record, &old),
+                        || holder_refused(record, "the record changed before the clear"),
+                    )?;
                     teardown_epoch(record, old.identity.cwd.as_deref(), root);
                     Ok(ShutdownOutcome::Handled)
                 }
@@ -480,12 +476,9 @@ fn worktree_settle_no_address(
             NoAddressAction::DiscardNow => {
                 pool::discard_line(record, old);
                 pool::after_gone(record);
-                if !pool::clear_persist_if(record, old) {
-                    return Err(holder_refused(
-                        record,
-                        "the record changed before the clear",
-                    ));
-                }
+                pool::persist_act_or_refused(pool::clear_persist_if_outcome(record, old), || {
+                    holder_refused(record, "the record changed before the clear")
+                })?;
                 return Ok(true);
             }
             NoAddressAction::WaitUntil(at) => {
@@ -540,12 +533,9 @@ fn worktree_settle_no_address(
                     )));
                 }
                 pool::after_gone(record);
-                if !pool::clear_persist_if(record, old) {
-                    return Err(holder_refused(
-                        record,
-                        "the record changed before the clear",
-                    ));
-                }
+                pool::persist_act_or_refused(pool::clear_persist_if_outcome(record, old), || {
+                    holder_refused(record, "the record changed before the clear")
+                })?;
                 // The owned session is gone (or this is a stale self record): drop the
                 // registration only now, never before the teardown.
                 crate::harness::abort::unregister_cancel_handle(&record.id);
@@ -611,19 +601,25 @@ fn shutdown_if_cwd_inner(record: &ProjectRecord, epoch_path: &Path) -> Result<bo
             let Some(old) = termination.old else {
                 return Ok(true);
             };
-            let cleared = match outcome {
+            match outcome {
                 pool::HolderTermination::Delivered { .. } => {
                     match pool::wait_holder_gone(record, &old, pool::WAIT_GONE) {
                         WaitGone::Gone { .. } => {
                             pool::after_gone(record);
-                            pool::clear_persist_if(record, &old)
+                            pool::persist_act_or_refused(
+                                pool::clear_persist_if_outcome(record, &old),
+                                || holder_refused(record, "the record changed before the clear"),
+                            )?;
                         }
                         WaitGone::Superseded | WaitGone::TimedOut => return Ok(false),
                     }
                 }
                 pool::HolderTermination::Exited { .. } => {
                     pool::after_gone(record);
-                    pool::clear_persist_if(record, &old)
+                    pool::persist_act_or_refused(
+                        pool::clear_persist_if_outcome(record, &old),
+                        || holder_refused(record, "the record changed before the clear"),
+                    )?;
                 }
                 pool::HolderTermination::NoListener { .. } => return Ok(false),
                 pool::HolderTermination::NoSocket { why } => {
@@ -637,12 +633,6 @@ fn shutdown_if_cwd_inner(record: &ProjectRecord, epoch_path: &Path) -> Result<bo
                 pool::HolderTermination::Unproven { why } => {
                     return Err(holder_unproven(record, &why));
                 }
-            };
-            if !cleared {
-                return Err(holder_refused(
-                    record,
-                    "the record changed before the clear",
-                ));
             }
             teardown_epoch(record, old.identity.cwd.as_deref(), epoch_path);
             Ok(true)
