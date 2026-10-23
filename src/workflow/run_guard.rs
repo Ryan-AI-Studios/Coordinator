@@ -70,6 +70,11 @@ pub(crate) fn check_explicit_run(
         .iter()
         .find_map(|row| conductor_md::terminal_token(&row.status_raw).map(|token| (*row, token)))
     {
+        // Replay never overrides ambiguity: duplicate rows (even when one is terminal)
+        // have nothing safe to pick (spec §3.2, AC-4.9; codex P1, pass 5).
+        if replay && matches.len() > 1 {
+            return Err(ambiguous_run_track(record, id, actor, &matches));
+        }
         if replay {
             crate::progress_log::append(
                 record,
@@ -95,27 +100,38 @@ pub(crate) fn check_explicit_run(
     }
 
     if matches.len() > 1 {
-        let rows_desc = matches
-            .iter()
-            .map(|row| format!("{}={}", row.id, conductor_md::status_token(&row.status_raw)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        crate::progress_log::append(
-            record,
-            "run-refused",
-            &format!(
-                "actor={} track={id} reason=ambiguous rows={}",
-                actor.as_str(),
-                matches.len()
-            ),
-        );
-        return Err(CoordinatorError::AmbiguousRunTrack {
-            track: id.to_string(),
-            rows: rows_desc,
-        });
+        return Err(ambiguous_run_track(record, id, actor, &matches));
     }
 
     Ok(())
+}
+
+/// The ambiguous refusal plus its one `run-refused` line. `--replay` is never a
+/// disambiguator, so this arm is shared by the plain and replay paths.
+fn ambiguous_run_track(
+    record: &ProjectRecord,
+    id: &str,
+    actor: RunActor,
+    matches: &[&TrackRow],
+) -> CoordinatorError {
+    let rows_desc = matches
+        .iter()
+        .map(|row| format!("{}={}", row.id, conductor_md::status_token(&row.status_raw)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::progress_log::append(
+        record,
+        "run-refused",
+        &format!(
+            "actor={} track={id} reason=ambiguous rows={}",
+            actor.as_str(),
+            matches.len()
+        ),
+    );
+    CoordinatorError::AmbiguousRunTrack {
+        track: id.to_string(),
+        rows: rows_desc,
+    }
 }
 
 /// The registry rows an explicit `--track` must be checked against (spec §3.3).
@@ -662,6 +678,61 @@ mod tests {
             !fx.status_log().contains("run-replay"),
             "{}",
             fx.status_log()
+        );
+    }
+
+    #[test]
+    fn replay_does_not_override_terminal_plus_duplicate() {
+        let (_lock, _env) = isolated();
+        // Plain runs keep terminal-over-ambiguity precedence; replay must not pick the
+        // terminal row out of a duplicate pair (codex P1, pass 5).
+        let plain = fixture("p-1222");
+        plain.write_view(&registry(&[
+            row("0099", "**Completed**", "shipped"),
+            row("0099", "**Ready - not started**", "duplicate"),
+        ]));
+        assert_terminal(
+            check_explicit_run(&plain.record, Some("0099"), false, RunActor::Cli).unwrap_err(),
+            "0099",
+            "Completed",
+        );
+
+        let replay = fixture("p-1223");
+        replay.write_view(&registry(&[
+            row("0099", "**Completed**", "shipped"),
+            row("0099", "**Ready - not started**", "duplicate"),
+        ]));
+        let err =
+            check_explicit_run(&replay.record, Some("0099"), true, RunActor::Cli).unwrap_err();
+        assert!(
+            matches!(err, CoordinatorError::AmbiguousRunTrack { .. }),
+            "{err:?}"
+        );
+        let log = replay.status_log();
+        assert!(!log.contains("run-replay"), "{log}");
+        assert!(log.contains("reason=ambiguous rows=2"), "{log}");
+
+        // Two terminal duplicates are ambiguous for replay too.
+        let twin = fixture("p-1224");
+        twin.write_view(&registry(&[
+            row("0099", "**Completed**", "one"),
+            row("0099", "**Completed** - again", "two"),
+        ]));
+        let err = check_explicit_run(&twin.record, Some("0099"), true, RunActor::Cli).unwrap_err();
+        assert!(
+            matches!(err, CoordinatorError::AmbiguousRunTrack { .. }),
+            "{err:?}"
+        );
+        assert!(
+            !twin.status_log().contains("run-replay"),
+            "{}",
+            twin.status_log()
+        );
+        // The plain path still names the first terminal row.
+        assert_terminal(
+            check_explicit_run(&twin.record, Some("0099"), false, RunActor::Cli).unwrap_err(),
+            "0099",
+            "Completed",
         );
     }
 
