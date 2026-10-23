@@ -281,6 +281,34 @@ pub fn is_terminal(status_raw: &str) -> bool {
     is_completed(status_raw) || is_absorbed(status_raw) || is_cancelled(status_raw)
 }
 
+/// Canonical terminal token for a row status; `None` when the row is not terminal.
+///
+/// The 0120 guard uses one token for the receipt and the error text, so a house-style
+/// `**Completed** <detail>` row never puts spaces inside a `key=value` field.
+pub(crate) fn terminal_token(status_raw: &str) -> Option<&'static str> {
+    let clean = status_clean(status_raw);
+    ["Completed", "Absorbed", "Cancelled"]
+        .into_iter()
+        .find(|token| status_token_matches(&clean, token))
+}
+
+/// Canonical vocabulary token for a non-terminal row, used by the 0120 ambiguity message.
+///
+/// Terminal rows answer [`terminal_token`]; a house-style `**Blocked** - prerequisite` cell
+/// answers `Blocked`, and an unrecognised cell falls back to its cleaned text.
+pub(crate) fn status_token(status_raw: &str) -> String {
+    if let Some(token) = terminal_token(status_raw) {
+        return token.to_string();
+    }
+    let clean = status_clean(status_raw);
+    for phrase in ["In progress", "Proposed", "Blocked"] {
+        if status_token_matches(&clean, phrase) {
+            return phrase.to_string();
+        }
+    }
+    clean
+}
+
 /// A downgrade that carries a stated reason is a decision, not lost bookkeeping.
 ///
 /// `Proposed` and `Blocked` are written two ways. Bare - as a marker that the next tick should
@@ -1004,11 +1032,29 @@ pub fn width_deviations_for(record: &ProjectRecord) -> Vec<WidthDeviation> {
 
 /// Every GFM table with Track/Id + Status columns, concatenated, by header name.
 pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
+    let (rows, _) = parse_conductor_md_parts(text);
+    if rows.is_empty() {
+        return Err(CoordinatorError::Message(
+            "could not parse track registry in conductor.md; pass --track <id>".into(),
+        ));
+    }
+    Ok(rows)
+}
+
+/// [`parse_conductor_md`] without the zero-row `Err`, plus whether any table looked like a
+/// Track/Status registry at all.
+///
+/// 0120 needs to tell a readable but empty registry (a new project's `# tracks\n`, or a
+/// header-only Tracks table) from a view that is not a registry. `parse_conductor_md` keeps
+/// its shipped zero-row error for every existing caller; only the explicit-run guard uses
+/// this parts form.
+pub(crate) fn parse_conductor_md_parts(text: &str) -> (Vec<TrackRow>, bool) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let tables = collect_pipe_tables(text);
     let mut rows = Vec::new();
+    let mut registry_shaped = false;
     for table in tables {
-        if table.len() < 2 {
+        if table.is_empty() {
             continue;
         }
         let headers: Vec<String> = table[0]
@@ -1022,6 +1068,7 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
         let Some(status_col) = headers.iter().position(|h| is_status_header(h)) else {
             continue;
         };
+        registry_shaped = true;
         let summary_col = headers.iter().position(|h| is_summary_header(h));
         let execution_col = headers.iter().position(|h| is_execution_header(h));
         let ncols = headers.len();
@@ -1050,12 +1097,107 @@ pub fn parse_conductor_md(text: &str) -> Result<Vec<TrackRow>> {
             });
         }
     }
-    if rows.is_empty() {
-        return Err(CoordinatorError::Message(
-            "could not parse track registry in conductor.md; pass --track <id>".into(),
-        ));
+    (rows, registry_shaped)
+}
+
+/// True when every non-blank line is an ATX heading, fence delimiter, thematic break, or
+/// blockquote marker — a scaffold such as a new project's `# tracks\n`, not prose and not a
+/// table.
+///
+/// Fence state is tracked: fenced **content** is prose and fails closed (including a line
+/// that merely looks like a delimiter). Only a real opening/closing fence line is scaffolding.
+/// 0120 uses this to keep a readable-but-empty registry on the explicit-wins path instead of
+/// failing it closed as "no Track/Status table".
+pub(crate) fn view_is_scaffolding_only(text: &str) -> bool {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some((ch, len)) = fence {
+            if closes_fence(line, ch, len) {
+                fence = None;
+                continue;
+            }
+            return false;
+        }
+        if is_indented_code(line) {
+            return false;
+        }
+        if let Some(open) = opens_fence(line) {
+            fence = Some(open);
+            continue;
+        }
+        if is_atx_heading(t) || t.starts_with('>') || is_thematic_break_line(t) {
+            continue;
+        }
+        return false;
     }
-    Ok(rows)
+    true
+}
+
+/// `(fence char, run length)` when `line` opens a GFM code fence (≤3 leading spaces, 3+
+/// backticks or tildes).
+fn opens_fence(line: &str) -> Option<(char, usize)> {
+    if line.len() - line.trim_start_matches(' ').len() > 3 {
+        return None;
+    }
+    let t = line.trim_start();
+    for ch in ['`', '~'] {
+        let run = t.chars().take_while(|c| *c == ch).count();
+        if run >= 3 {
+            return Some((ch, run));
+        }
+    }
+    None
+}
+
+/// A closing fence uses the same char, is at least as long as the opener, and carries only
+/// trailing whitespace.
+fn closes_fence(line: &str, ch: char, open_len: usize) -> bool {
+    if line.len() - line.trim_start_matches(' ').len() > 3 {
+        return false;
+    }
+    let t = line.trim_start();
+    let run = t.chars().take_while(|c| *c == ch).count();
+    run >= open_len && t[run..].trim().is_empty()
+}
+
+/// GFM indented code block: four or more leading whitespace columns (a tab advances to the
+/// next multiple of 4). A table indented this far is code, not registry text.
+pub(crate) fn is_indented_code(line: &str) -> bool {
+    let mut cols = 0usize;
+    for c in line.chars() {
+        match c {
+            ' ' => cols += 1,
+            '\t' => cols += 4 - (cols % 4),
+            _ => break,
+        }
+        if cols >= 4 {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_atx_heading(line: &str) -> bool {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    (1..=6).contains(&hashes)
+        && line[hashes..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace())
+}
+
+fn is_thematic_break_line(line: &str) -> bool {
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut chars = compact.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    matches!(first, '-' | '*' | '_') && compact.len() >= 3 && chars.all(|c| c == first)
 }
 
 /// Why a row never reached [`TrackRow`] (0115).
@@ -1377,7 +1519,26 @@ fn collect_pipe_tables_lines(text: &str) -> Vec<Vec<(PipeRow, usize)>> {
     let lines: Vec<&str> = text.lines().collect();
     let mut tables = Vec::new();
     let mut i = 0;
+    let mut fence: Option<(char, usize)> = None;
     while i < lines.len() {
+        // GFM fences are code, not tables: a fenced fake Track/Status table is not a
+        // registry. The walk is the one place rows are collected, so the state lives here.
+        if let Some((ch, len)) = fence {
+            if closes_fence(lines[i], ch, len) {
+                fence = None;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(open) = opens_fence(lines[i]) {
+            fence = Some(open);
+            i += 1;
+            continue;
+        }
+        if is_indented_code(lines[i]) {
+            i += 1;
+            continue;
+        }
         if !is_table_start(&lines, i) {
             i += 1;
             continue;
@@ -1397,7 +1558,8 @@ fn collect_pipe_tables_lines(text: &str) -> Vec<Vec<(PipeRow, usize)>> {
                 i += 1;
                 continue;
             }
-            if !looks_like_row(lines[i]) || is_table_start(&lines, i) {
+            if is_indented_code(lines[i]) || !looks_like_row(lines[i]) || is_table_start(&lines, i)
+            {
                 break;
             }
             let (stripped, nostart) = strip_nostart_literal(lines[i]);
@@ -1600,15 +1762,10 @@ pub fn pick_next_ready_excluding_sticky(
             (parse_conductor_md(&text)?, parse_execution_order(&text))
         }
         crate::registry_store::StoreView::Drifted { expected, actual } => {
-            let dir = crate::layout::resolve(record).conductor_dir;
-            return Err(CoordinatorError::Message(format!(
-                "{} (store {expected}, view {actual}); run \
-                 `coordinator registry import --conductor-dir {} --force` to adopt the edit \
-                 or `coordinator registry render --conductor-dir {} --force` to discard it",
-                crate::registry_store::VIEW_DRIFT_PREFIX,
-                dir.display(),
-                dir.display(),
-            )));
+            let dir = crate::registry_store::conductor_dir_for(record);
+            return Err(crate::registry_store::view_drift_error(
+                &dir, expected, actual,
+            ));
         }
         crate::registry_store::StoreView::Ok => {
             (snapshot.rows.clone(), snapshot.execution_order.clone())
@@ -3105,6 +3262,85 @@ mod tests {
     }
 
     #[test]
+    fn terminal_token_is_canonical() {
+        assert_eq!(
+            terminal_token("**Completed** 2026-10-23 - PR **#135** squash `018a8ef`"),
+            Some("Completed")
+        );
+        assert_eq!(terminal_token("**Absorbed** into 0107"), Some("Absorbed"));
+        assert_eq!(
+            terminal_token("**Cancelled** - replaced"),
+            Some("Cancelled")
+        );
+        assert_eq!(terminal_token("**Ready - not started**"), None);
+        assert_eq!(terminal_token("**Proposed**"), None);
+        assert_eq!(terminal_token("**Blocked** - prerequisite"), None);
+    }
+
+    #[test]
+    fn parser_parts_empty_is_zero_rows_not_an_error() {
+        let (rows, shaped) = parse_conductor_md_parts("# tracks\n");
+        assert!(rows.is_empty());
+        assert!(!shaped);
+        assert!(view_is_scaffolding_only("# tracks\n"));
+
+        let header_only = "| Track | Execution path | Status | Summary |\n\
+                           | --- | --- | --- | --- |\n";
+        let (rows, shaped) = parse_conductor_md_parts(header_only);
+        assert!(rows.is_empty());
+        assert!(shaped);
+        assert!(!view_is_scaffolding_only(header_only));
+
+        let prose = "# Tracks\n\nThis project has no track registry yet.\n";
+        let (rows, shaped) = parse_conductor_md_parts(prose);
+        assert!(rows.is_empty());
+        assert!(!shaped);
+        assert!(!view_is_scaffolding_only(prose));
+
+        assert!(view_is_scaffolding_only(""));
+        assert!(view_is_scaffolding_only("# Tracks\n\n---\n\n> note\n"));
+        assert!(!view_is_scaffolding_only("# Tracks\nplain prose\n"));
+        // Fenced content is prose: only the delimiter is scaffolding.
+        assert!(!view_is_scaffolding_only(
+            "# Tracks\n```\nnot a registry\n```\n"
+        ));
+        assert!(view_is_scaffolding_only("# Tracks\n```\n```\n"));
+        // A fence-like line inside a fence is content, not a delimiter.
+        assert!(!view_is_scaffolding_only(
+            "# Tracks\n```\n```not a delimiter\n```\n"
+        ));
+        // A fenced fake Track/Status table is code, not a registry (codex P2, pass 3).
+        let fenced_table =
+            "# tracks\n```\n| Track | Status |\n| --- | --- |\n| 0099 | **Completed** |\n```\n";
+        let (rows, shaped) = parse_conductor_md_parts(fenced_table);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert!(!shaped, "a fenced table is not registry-shaped");
+        assert!(!view_is_scaffolding_only(fenced_table));
+        // A real table after a fence still parses.
+        let after_fence = "# notes\n```\nnot a registry\n```\n\
+                           | Track | Status |\n| --- | --- |\n\
+                           | 0099 | **Ready - not started** |\n";
+        let (rows, shaped) = parse_conductor_md_parts(after_fence);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(shaped);
+        // Indented code (4+ columns) is code, not registry text (codex P2, pass 4).
+        let indented_table =
+            "    | Track | Status |\n    | --- | --- |\n    | 0099 | **Completed** |\n";
+        let (rows, shaped) = parse_conductor_md_parts(indented_table);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert!(!shaped);
+        assert!(!view_is_scaffolding_only(indented_table));
+    }
+
+    #[test]
+    fn parse_conductor_md_keeps_zero_row_error() {
+        let err = parse_conductor_md("# tracks\n").unwrap_err().to_string();
+        assert!(err.contains("could not parse"), "{err}");
+        let err = parse_conductor_md("").unwrap_err().to_string();
+        assert!(err.contains("could not parse"), "{err}");
+    }
+
+    #[test]
     fn pick_ready_without_plan_md_still_starts() {
         let dir = tempdir().unwrap();
         let ws = dir.path();
@@ -3851,6 +4087,24 @@ mod tests_0109 {
         body
     }
 
+    /// 0120 `m-2`: the picker's drift text is the byte guard for the shared helper.
+    fn assert_drift_error_text(err: &CoordinatorError) {
+        let msg = err.to_string();
+        assert!(msg.starts_with("track registry view drifted"), "{msg}");
+        assert!(msg.contains("(store "), "expected/actual shape: {msg}");
+        assert!(msg.contains(", view "), "expected/actual shape: {msg}");
+        assert!(
+            msg.contains("registry import --conductor-dir")
+                && msg.contains("--force` to adopt the edit"),
+            "adopt recovery missing: {msg}"
+        );
+        assert!(
+            msg.contains("registry render --conductor-dir")
+                && msg.contains("--force` to discard it"),
+            "discard recovery missing: {msg}"
+        );
+    }
+
     struct FixedProbe {
         merged: Vec<String>,
     }
@@ -4222,10 +4476,7 @@ mod tests_0109 {
             "one line per process/project: {log}"
         );
         let err = pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap_err();
-        assert!(
-            err.to_string().starts_with("track registry view drifted"),
-            "{err}"
-        );
+        assert_drift_error_text(&err);
         assert!(!ready_pick_miss_is_benign(&err));
     }
 
@@ -4247,7 +4498,7 @@ mod tests_0109 {
         assert!(view.recovery.unwrap().contains("import"));
 
         let err = pick_next_ready_excluding_sticky(&fx.record, &[], None, &[]).unwrap_err();
-        assert!(err.to_string().starts_with("track registry view drifted"));
+        assert_drift_error_text(&err);
 
         let mut record = fx.record.clone();
         record.auto_start = AutoStartPolicy::Full;

@@ -179,7 +179,7 @@ cargo run -- project show --project C:\dev\Orca
 cargo run -- project scan --root C:\dev\Orca
 # expect already_registered
 
-# Probe only — never --track 0001–0005
+# Probe only — never --track 0001–0005 (0099 is Ready - not started; a terminal explicit id is refused, exit 2)
 # Bare `run` ticks until Idle/Stopped (no separate `wait`).
 cargo run -- run --project C:\dev\Orca --track 0099 --driver stub
 cargo run -- status --project C:\dev\Orca
@@ -212,7 +212,7 @@ cargo run -- project show --project C:\dev\coordinated
 cargo run -- project scan --root C:\dev\coordinated
 # expect already_registered=true; detected_profile may be nested (expected)
 
-# Probe only — never --track 0001–0187 or 0101
+# Probe only - never --track 0001-0187 or 0101 (0899 is Ready - not started; a terminal explicit id is refused, exit 2)
 # Bare `run` ticks until Idle/Stopped (no separate `wait`).
 cargo run -- run --project C:\dev\coordinated --track 0899 --driver stub
 cargo run -- status --project C:\dev\coordinated
@@ -240,6 +240,7 @@ Windows Service and no second start path.
 coordinator serve
 coordinator serve --check
 coordinator run --project C:\dev\Orca --track 0099 --detach
+# 0099 is Ready - not started; a terminal explicit id is refused (exit 2) and --replay is the only override
 # or omit --detach: run skips wait when serve health/lease is up
 coordinator status --project C:\dev\Orca
 # expect ticker.owner = serve
@@ -334,22 +335,22 @@ path).
 
 ### Autonomous pipeline dogfood
 
-Live proof of the installed daily path on registered Project **`C:\dev\Helping-Hands`** (nested, `execution_repo` = `hands\`, `auto_merge=false`). Probe track is **`0099-AutonomousPipelineProbe`** (planning-only; not a Helping Hands product milestone). Default driver is **adapter** — omit `--driver`.
+Live proof of the installed daily path on registered Project **`C:\dev\Helping-Hands`** (nested, `execution_repo` = `hands\`, `auto_merge=false`). Live probe track is **`0120-PrivilegedHandsLaunchPath`** (`**Ready - not started**`; re-pick a non-terminal Ready id if the registry moves - an explicit `--track` naming a `Completed` / `Absorbed` / `Cancelled` row is refused, `TerminalRunTrack` exit **2**, before anything starts). Default driver is **adapter** - omit `--driver`.
 
 ```powershell
 cd C:\dev\coordinator\coordinator
 # Do NOT: coordinator project scan --root C:\dev --add
-# Do NOT: coordinator run --track 0001   (or 0002–0013, including 0009)
+# Do NOT: coordinator run --track 0001   (or 0002-0013, including 0009)
 cargo install --path . --locked
 coordinator serve                 # pre-install/manual path; leave running, default 7420. Supported always-on = the logon task
 coordinator serve --check         # exit 0; service=coordinator
 coordinator ui                    # attach; do not start a second ticker
-coordinator run --project C:\dev\Helping-Hands --track 0099 --detach
+coordinator run --project C:\dev\Helping-Hands --track 0120 --detach
 coordinator status --project C:\dev\Helping-Hands
-# expect ticker.owner=serve, driver=adapter, track=0099
+# expect ticker.owner=serve, driver=adapter, track=0120
 ```
 
-Zero operator role JSON: do not `outcome write`, do not drop `agy-review.md` / `opencode-review.md`. Coordinator injects Grok for plan/fold/implement and **spawns** `agy --print` + `opencode run` for plan-review. `next_track` on 0099 is **null** — this walk must not start Helping Hands **0001–0013**.
+Zero operator role JSON: do not `outcome write`, do not drop `agy-review.md` / `opencode-review.md`. Coordinator injects Grok for plan/fold/implement and **spawns** `agy --print` + `opencode run` for plan-review. This walk must not start Helping Hands **0001-0013**. A terminal explicit id is refused (exit **2**, no run state, one `run-refused` line in `status.md`); `run --replay` is the only override and is never used on a real shipped track.
 
 Phase start / end / stall / stop append a timestamped line to `{workspace}/status.md` (Helping Hands: `C:\dev\Helping-Hands\status.md`). That file stays outside `hands\`.
 
@@ -370,7 +371,7 @@ CLI `run` / `wait` keep the start-of-command `ProjectRecord` snapshot — set ti
 
 Self-check is step-bounded, does not move `phase_started_at`, and writes the progress sidecar only through the existing inject heartbeat. It is off unless `project set --self-continuation true`. `COORDINATOR_SELF_CONTINUATION=off` forces it off.
 
-**`run` without `--track`:** when `track_id` is unset/empty, **or** the run is Idle after `workflow: backlog clear` (no `failure_class`, no `next_track`), start the first exact **`Ready — not started`** row in that project's `conductor/conductor.md` (never Proposed / HITL / trailing notes; fail closed → pass `--track`). Adapter omit-pick (CLI / HTTP `POST /v1/run` / UI) also skips a Ready row whose `track(NNNN):` PR is already merged on the default branch (`gh pr list --state merged`; fail-open if `gh` is missing or errors). `finish_advance` skip is local only (`ci.merge` `done`/`queued` on this run, or a **Completed** conductor row) — no `gh` under the apply lock. Every other Idle/Stopped case with a set `track_id` **retains** (Stopped restart, Idle after failure). Explicit `--track` always wins (including Proposed / probes / already-merged ids). Fresh `run` **clears** `next_track` (stale Planner handoff). Omit on Orca today starts `0099` if it remains the only exact Ready; `--track 0099` / `0899` stay the safe explicit probe path.
+**`run` without `--track`:** when `track_id` is unset/empty, **or** the run is Idle after `workflow: backlog clear` (no `failure_class`, no `next_track`), start the first exact **`Ready — not started`** row in that project's `conductor/conductor.md` (never Proposed / HITL / trailing notes; fail closed → pass `--track`). Adapter omit-pick (CLI / HTTP `POST /v1/run` / UI) also skips a Ready row whose `track(NNNN):` PR is already merged on the default branch (`gh pr list --state merged`; fail-open if `gh` is missing or errors). `finish_advance` skip is local only (`ci.merge` `done`/`queued` on this run, or a **Completed** conductor row) — no `gh` under the apply lock. Every other Idle/Stopped case with a set `track_id` **retains** (Stopped restart, Idle after failure). Explicit `--track` wins for a row that is **not terminal** (Ready / Proposed / Blocked / In progress / absent / probe ids). A nonempty `--track` naming a `Completed`, `Absorbed`, or `Cancelled` row is **refused before anything starts**: no run state, no failure settle, no preflight, no spawn - exit **2**, one `run-refused` line in `status.md`, error names the row and the recovery (new id, or owner `registry set-status`; `failure resolve` + retry does not make a Completed row start). `run --replay --track <id>` is the single deliberate override (CLI-only, requires the id, writes one `run-replay` authorization line, never rewrites the row or its provenance, and does not override a broken registry or an active Blocked hold). `POST /v1/run` inherits the refusal as **409** and has no replay field. Fresh `run` **clears** `next_track` (stale Planner handoff). Omit on Orca today starts `0099` if it remains the only exact Ready; a terminal explicit id is refused rather than probed, so name a non-terminal Ready id or use `--replay` for a deliberate re-run.
 
 **`ready` (read-only preview, 0115):** `coordinator ready [--project <sel>] [--all] [--all-rows]` prints what the ready pick would start, per project or fleet-wide, and **starts nothing, writes nothing, and mutates no registry**. `decision` is the **ticker's** ordered gate walk (`feature → policy → run state → durable failure → pick state → pick`) with one of fourteen named reasons (`feature_off`, `policy_hitl`, `policy_never`, `already_active`, `durable_failure`, `not_pick_state`, `no_ready_row`, `nostart`, `registry_drift`, `registry_missing`, `registry_invalid`, `transient_read`, `no_track_dir`, `unclassified`) or `would_start { track_id }`. `operator_omit_pick` is separate: it is what an omit-`--track` operator `run` would choose from the same run state (so a pick id stays visible while the machine gate is off), and it reports `none` for Running/Paused or a retained track rather than naming a row `run` would not choose. `ticker_effective` is the explicit mapping `full → start` (only with the gate on), `hitl`, `never`, or `feature_off` — never the literal `full`. `probe` is the literal `"none"`: the preview is probeless, so the canonical start may still skip a `would_start` row on an already-merged PR. The report also carries the compatibility block (`registry.{source,state,store_path}`, `tables`, `rows.{source,data,parsed,dropped,by_reason,samples}`, `pick_rows`, `id_form`, `ready_phrases`, `ready_hits`, `pickable`, `row_reasons`, `pick_not_in_snapshot`, `pick_row_version`); `rows.data == rows.parsed + rows.dropped` always, and `--all-rows` lists every row instead of the ambiguous set. The decision is data, not an exit code: the command exits 0 whenever it produced a report. The comparison folds the dash family (`U+2010`–`U+2015`, `U+2212`, `U+FE58`, `U+FE63`, `U+FF0D`) and collapses Unicode whitespace runs at the **comparison** seam only — the registry text is never rewritten. A dropped/odd row form (`trackN`, `AI-T572-…`) is reported with counts and samples, not repaired.
 
@@ -406,7 +407,7 @@ Status JSON includes additive `workflow` `{ id, driver, pending_roles, address_f
 | `hitl` (default) | **Park** — Idle + `workflow: backlog clear`, `next_track` cleared, `parked_next` set, journal `parked-next <id> (policy=…)` | Unchanged (first Ready) |
 | `never` | Same park | Error `auto_start=never; pass --track` |
 
-A per-row `<!-- nostart -->` (exact literal, inside a cell) skips that id for advance and omit-pick; explicit `run --track N` always starts. No eligible Ready → Idle (backlog clear). Unknown or missing planner id is **not** a sticky Idle — the Ready walk still runs. Pause holds until resume, then the same Ready walk + policy gate run (registry may have moved). Probe 0099 / Helping Hands 0001–0013 safety is **row eligibility** (`nostart` / HITL / not Ready), not planner `null`.
+A per-row `<!-- nostart -->` (exact literal, inside a cell) skips that id for advance and omit-pick; explicit `run --track N` starts a non-terminal row (a terminal row is refused — see the run contract above). No eligible Ready → Idle (backlog clear). Unknown or missing planner id is **not** a sticky Idle — the Ready walk still runs. Pause holds until resume, then the same Ready walk + policy gate run (registry may have moved). Probe 0099 / Helping Hands 0001–0013 safety is **row eligibility** (`nostart` / HITL / not Ready), not planner `null`.
 
 **Compact:** capability-gated; timeout/failure **skips** (not a hard gate). Adapter errors surface as `compact: skipped — {reason}` (still no Failure Artifact).
 
@@ -434,7 +435,7 @@ A leg can report that it cannot complete the phase. Coordinator recognizes that 
 | Control tails | A trailing `self-check:` line (`implement` / `address-findings`) or the maximal `next_track:` suffix (`advance`) is tolerated with the shipped parsers, but a recognized block discards every successor/self-check directive. A malformed trailing control is not stripped and prevents terminality. |
 | Channel | Solely the completed turn's `agent_message_chunk` text. No evidence/`foldin-note`/receipt/review/spec/plan read, hash, snapshot, baseline-version extension or fallback resolver. Whole-message `agent_message` and `tool_call` updates are ignored, `messageId` is ignored and chunks are concatenated without a separator, so a block declared in those updates or glued into prior prose can be missed (known channel limit; ACP collection is unchanged). |
 | Outcome | `status=failure`, `failure_class=blocked`, `RunStatus::Stopped`, same phase, one Failure Artifact + one toast/Hermes failure event, no success progress, no bounce to address-findings/address-ci, never advances. A block overrides partial or committed product changes and unchanged planning-only artifacts. |
-| Hold | While `failure_class` is `blocked`, **every** fresh run for that project is refused (`BlockedHold`, HTTP **409**), before driver resolution, `gh` omit-pick and machine preflight, including another explicit `--track` and every driver. The refusal names the held track and its current conductor row status (or `unknown`). `status`, `failure show`, `project show` and `failure resolve` stay usable. Other projects are unaffected. |
+| Hold | While `failure_class` is `blocked`, **every** fresh run for that project is refused (`BlockedHold`, HTTP **409**), before driver resolution, `gh` omit-pick and machine preflight, including another explicit `--track` and every driver. The refusal names the held track and its current conductor row status (or `unknown`). `status`, `failure show`, `project show` and `failure resolve` stay usable. A **terminal** explicit id is refused earlier as `TerminalRunTrack` (also **409**, still nothing started); `--replay` does not release the hold. Other projects are unaffected. |
 | Release | Only a successful `failure resolve`. A conductor-row edit — including the held track's **Completed** row — does not release it. A blocked resolve persists the cleared class + `last_event` **before** removing the artifact, so a failed save retains the hold and artifact; retrying succeeds. After acknowledgment there is no automatic resume: fix the prerequisite, then start a new `run --track` (an unfinished track restarts at `plan`; a shipped track blocked in `advance` starts the chosen next Ready track). Re-stop replaces `last_event` but keeps the class/artifact/hold. |
 | Counters | A blocked turn is excluded from `consecutive_failures`: zero stays zero and a nonzero count is retained through the block and through `failure resolve`, so the next policy checkpoint threshold is unchanged. A later ordinary success resets it. |
 | False-block risk | There is no natural-language classifier. An unmarked narration that contains a valid terminal line can conservatively stop the leg. Use `Example:` / `Examples:` / `For example:` / `Sample output:` before a quoted example (excluded through the next blank line), a fence/blockquote, or a coordinator decision block. Ordinary success is covered by the normal outcome, so there is **no** model-controlled `Completed:` anti-block escape and **no** planning-only success exemption. |

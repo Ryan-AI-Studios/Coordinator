@@ -1752,4 +1752,157 @@ mod tests {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
     }
+
+    struct RunFixture {
+        _home: tempfile::TempDir,
+        proj: tempfile::TempDir,
+        rec: crate::registry::ProjectRecord,
+        _env: crate::config::TestEnvGuard,
+    }
+
+    fn run_fixture() -> RunFixture {
+        let env = crate::config::TestEnvGuard::capture(&[ENV_COORDINATOR_HOME]);
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let rec =
+            api::project_add(proj.path(), crate::registry::ProjectAddOptions::default()).unwrap();
+        RunFixture {
+            _home: home,
+            proj,
+            rec,
+            _env: env,
+        }
+    }
+
+    fn write_run_row(proj: &std::path::Path, id: &str, status: &str) {
+        let cond = proj.join("conductor");
+        let dir = cond.join(format!("{id}-Fixture"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("spec.md"), b"fixture spec\n").unwrap();
+        std::fs::write(dir.join("plan.md"), b"fixture plan\n").unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            format!(
+                "| Track | Execution path | Status | Summary |\n\
+                 | --- | --- | --- | --- |\n\
+                 | [{id}-Fixture]({id}-Fixture/spec.md) | `.` | {status} | fixture |\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn post_run_json(body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::to_vec(&body).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_terminal_track_is_409_not_500() {
+        let _guard = test_env_lock();
+        let fx = run_fixture();
+        write_run_row(fx.proj.path(), "0099", "**Completed**");
+        let (status, body) = post_run_json(json!({ "driver": "stub", "track": "0099" })).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status, StatusCode::CONFLICT);
+        let error = body["error"].as_str().expect("normal error JSON body");
+        assert!(error.contains("0099"), "{error}");
+        assert!(error.contains("terminal (Completed)"), "{error}");
+        assert!(
+            !crate::state::run_state_path(&fx.rec).unwrap().exists(),
+            "HTTP refusal must not write run state"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_terminal_track_ignores_replay_body_field() {
+        let _guard = test_env_lock();
+        let fx = run_fixture();
+        write_run_row(fx.proj.path(), "0099", "**Completed**");
+        let (status, body) =
+            post_run_json(json!({ "driver": "stub", "track": "0099", "replay": true })).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("0099"), "{body}");
+        assert!(!crate::state::run_state_path(&fx.rec).unwrap().exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_drifted_view_is_400_not_500() {
+        let _guard = test_env_lock();
+        let fx = run_fixture();
+        write_run_row(fx.proj.path(), "0099", "**Ready - not started**");
+        crate::registry_store::import_at(
+            &crate::registry_store::conductor_dir_for(&fx.rec),
+            crate::registry_store::ImportOpts {
+                dry_run: false,
+                force: false,
+            },
+        )
+        .unwrap();
+        let view_path = fx.proj.path().join("conductor").join("conductor.md");
+        let edited = std::fs::read_to_string(&view_path)
+            .unwrap()
+            .replace("| fixture |", "| hand edit |");
+        std::fs::write(&view_path, edited).unwrap();
+
+        let (status, body) = post_run_json(json!({ "driver": "stub", "track": "0099" })).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let error = body["error"].as_str().expect("normal error JSON body");
+        assert!(error.starts_with("track registry view drifted"), "{error}");
+        assert!(error.contains("registry import --conductor-dir"), "{error}");
+        assert!(error.contains("registry render --conductor-dir"), "{error}");
+        assert!(!crate::state::run_state_path(&fx.rec).unwrap().exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_invalid_store_is_400_not_500() {
+        let _guard = test_env_lock();
+        let fx = run_fixture();
+        let cond = fx.proj.path().join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        std::fs::write(cond.join("track-registry.json"), b"").unwrap();
+        let (status, body) = post_run_json(json!({ "driver": "stub", "track": "0099" })).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let error = body["error"].as_str().expect("normal error JSON body");
+        assert!(error.contains("track-registry.json"), "{error}");
+        assert!(error.contains("repair or delete"), "{error}");
+        assert!(!crate::state::run_state_path(&fx.rec).unwrap().exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_zero_row_registry_starts() {
+        let _guard = test_env_lock();
+        let fx = run_fixture();
+        let cond = fx.proj.path().join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        std::fs::write(cond.join("conductor.md"), b"# tracks\n").unwrap();
+        let (status, body) = post_run_json(json!({ "driver": "stub", "track": "0120" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "Running", "{body}");
+        assert_eq!(body["track_id"], "0120", "{body}");
+    }
 }

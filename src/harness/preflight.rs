@@ -1766,6 +1766,53 @@ mod tests {
     }
 
     #[test]
+    fn terminal_track_refuses_before_preflight_and_state() {
+        let iso = IsolatedDoctor::enter();
+        iso.point_all_to_dummies();
+        iso.grok_ready_via_key();
+        let probe = ScriptedProbe::ready();
+        let _g = install_test_probe(probe.clone());
+        let (proj, rec) = iso.add_project();
+        let cond = proj.path().join("conductor");
+        std::fs::create_dir_all(&cond).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0099-Done](0099-Done/spec.md) | `.` | **Completed** | shipped |\n",
+        )
+        .unwrap();
+
+        let err = api::cmd_run(
+            Some(&rec.id),
+            Some("0099".into()),
+            Some("adapter"),
+            false,
+            false,
+        )
+        .unwrap_err();
+        match err {
+            CoordinatorError::TerminalRunTrack { track, status } => {
+                assert_eq!(track, "0099");
+                assert_eq!(status, "Completed");
+            }
+            other => panic!("expected TerminalRunTrack, got {other:?}"),
+        }
+        assert!(
+            probe.calls().is_empty(),
+            "no preflight probe on a terminal refusal: {:?}",
+            probe.calls()
+        );
+        let path = crate::state::run_state_path(&rec).unwrap();
+        assert!(!path.exists(), "run-state must not be written");
+        assert_eq!(
+            api::status(Some(&rec.id), false).unwrap().status,
+            crate::state::RunStatus::Idle
+        );
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+    }
+
+    #[test]
     fn doctor_scripted_missing_required_refuses_run() {
         let iso = IsolatedDoctor::enter();
         let bins = iso.point_all_to_dummies();
