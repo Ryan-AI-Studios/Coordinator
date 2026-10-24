@@ -7,7 +7,7 @@
 //! prevention belongs to the task's `IgnoreNew` plus the shipped `serve` start guard
 //! and the atomic OS bind — this module's answer is only a hint.
 //!
-//! Everything here is a fixed constant: the 5-minute task trigger, the 1500 ms health
+//! Everything here is a fixed constant: the 5-minute task trigger, the 3000 ms health
 //! bound, the 60-poll startup grace, the 5→60 minute backoff and the 64 KiB log have
 //! no configuration knob. State, log, lock and the maintenance marker live under
 //! `{COORDINATOR_HOME}`.
@@ -37,7 +37,17 @@ pub const LOG_NAME: &str = "serve-nudge.log";
 pub const LOCK_NAME: &str = "serve-nudge.lock";
 
 /// Hard bound for one `/health` probe (connect + read).
-pub const HEALTH_TIMEOUT_MS: u64 = 1_500;
+///
+/// Must exceed Windows' SYN-retransmission budget for a **refused** loopback connect:
+/// Windows keeps re-sending the SYN after an RST until its connect-retransmission budget
+/// is spent (`TcpMaxConnectRetransmissions`, 3 extra by default), so a closed 127.0.0.1
+/// port refuses in ~2.03 s (4 attempts). Measured 2026-10-24: 2171 ms worst over 44+
+/// samples (plan + fold re-measures; 24 busy-job samples moved the tail only ~30 ms).
+/// The former 1500 ms bound turned every dead 7420 into `Unresponsive` and the nudge
+/// never issued `/Run`. 3000 ms keeps ~0.83 s (38 %) of margin and still leaves the
+/// 60-poll startup grace at 3.49 min and the whole run ≈218 s, under the task's PT5M
+/// limit. A timeout is still never `Absent`: a slow/starting/hung serve is left alone.
+pub const HEALTH_TIMEOUT_MS: u64 = 3_000;
 /// Startup grace: 60 polls.
 pub const STARTUP_GRACE_POLLS: u32 = 60;
 /// Spacing of the startup-grace polls.
@@ -1366,7 +1376,10 @@ mod tests {
             prod.contains("Duration::from_millis(HEALTH_TIMEOUT_MS)"),
             "the probe closure must pass the named constant"
         );
-        assert!(!prod.contains("from_millis(1_500)"), "no stale 1500 ms literal");
+        assert!(
+            !prod.contains("from_millis(1_500)"),
+            "no stale 1500 ms literal"
+        );
         assert!(
             !prod.contains("from_millis(3_000)"),
             "no duplicated 3000 ms literal"

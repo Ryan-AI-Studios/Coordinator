@@ -720,7 +720,6 @@ pub fn status_after_wait(record: &ProjectRecord) -> Result<StatusView> {
 mod tests {
     use super::*;
     // 0124: bind the closed-port test to the production bound instead of a copy.
-    use crate::serve_nudge::HEALTH_TIMEOUT_MS;
     use crate::config::{
         ENV_COORDINATOR_HOME, ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, MachineConfig,
         save_machine_config, test_env_lock,
@@ -729,6 +728,7 @@ mod tests {
         FailureClass, OutcomeSource, PhaseOutcome, outcome_current_path, save_current_outcome,
         write_and_apply,
     };
+    use crate::serve_nudge::HEALTH_TIMEOUT_MS;
     use crate::state::STUB_PHASE_ACTIVE;
     use crate::workflow::graph::{ROLE_IMPLEMENTOR, ROLE_PLANNER};
     use tempfile::tempdir;

@@ -368,11 +368,13 @@ $x.Task.Actions.Exec.Arguments                        # contains 'serve-nudge', 
 coordinator serve-nudge                               # manual run; inspect the JSON + log
 ```
 
-**What the nudge does.** One `/health` probe with a hard **1500 ms** bound (connect + read), healthy
+**What the nudge does.** One `/health` probe with a hard **3000 ms** bound (connect + read;
+sized above the Windows SYN-retransmission budget for a refused loopback connect, ~2.0 s), healthy
 only for `{"ok":true,"service":"coordinator"}`. A bare TCP answer is **not** health; a responder that
 is not coordinator is `skip-foreign`, a silent/slow/starting/truncated one is `skip-unresponsive`;
 both are left alone. Only when nothing answers does it run `schtasks.exe /Run /TN CoordinatorServe`
-and then poll health every 500 ms for up to 60 polls (nominal 30 s, hard ceiling 120 s). A start
+and then poll health every 500 ms for up to 60 polls (nominal 30 s, **hard ceiling 210 s** grace;
+whole run ≈218 s). A start
 request that answers "already running" (`267009`/`0x00041301`, `267039`/`0x0004131F`) counts as
 satisfied. It never binds, never launches serve, never writes the lease, and never stops or kills
 anything.
@@ -414,8 +416,13 @@ Unregister-ScheduledTask -TaskName 'CoordinatorServeNudge' -Confirm:$false
 # optional: Remove-Item "$home\serve-nudge.json","$home\serve-nudge.log","$home\serve-nudge.disabled" -ErrorAction SilentlyContinue
 ```
 
-**Honest limits.** Logon-only (no ticker before the user logs on — harness OAuth needs the interactive
-user); the logon task supervises only the process **it** started. `RestartOnFailure` retries only a
+**Honest limits.** Logon-only (no ticker before the user logs on - harness OAuth needs the interactive
+user); the logon task supervises only the process **it** started. The health bound must exceed the
+**Windows SYN-retransmission budget** for a refused loopback connect (~2.0 s / 4 SYN attempts on
+current builds; 3000 ms chosen with ~0.83 s headroom). A host that refuses more slowly still reads
+`skip-unresponsive` and starts nothing. A **live** serve under heavy build/host load can also miss
+the bound and read `skip-unresponsive` - inert, never a start.
+`RestartOnFailure` retries only a
 task whose action cannot start (`LastTaskResult 0x80070002`): the isolated 0116 proof observed the
 configured 3 retries for a missing action, but **no** retry after a serve exited non-zero or was
 killed. Revival now comes from the nudge — within ~5 minutes plus the bounded startup grace while
