@@ -2659,12 +2659,14 @@ mod route_tests {
     fn first_poll_creates_the_route_record_and_stamps_it() {
         let dir = tempfile::tempdir().unwrap();
         let r = record(dir.path(), true);
-        let state = seed(dir.path(), 0, Vec::new(), None, None);
+        let mut state = seed(dir.path(), 0, Vec::new(), None, None);
+        state.review_route = None;
+        save_run_state(&r, &state).unwrap();
         let b = backend(snap(Vec::new(), Vec::new()));
         let _ =
             try_route_review_comments(&r, &state, &target(78), dir.path(), &b, Utc::now()).unwrap();
         let saved = load_run_state(&r).unwrap();
-        let route = saved.review_route.unwrap();
+        let route = saved.review_route.expect("first poll must create the stamp");
         assert_eq!(route.pr_number, 78);
         assert_eq!(route.last_result, Some(ReviewPollResult::Clean));
         assert!(route.last_poll_at.is_some());
