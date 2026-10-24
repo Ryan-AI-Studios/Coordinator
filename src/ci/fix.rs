@@ -2,8 +2,11 @@
 
 use std::path::Path;
 
+use chrono::Utc;
+
 use crate::error::Result;
 use crate::notify::artifact::numeric_track_id;
+use crate::outcome::FailureClass;
 use crate::registry::ProjectRecord;
 use crate::state::{
     CiFixCheck, CiFixRequest, RunState, StatusView, load_run_state, save_run_state,
@@ -17,6 +20,11 @@ use super::gh::branch_is_track;
 
 /// `COORDINATOR_CI_FIX=off` forces the route off. No other value turns it on.
 pub const ENV_CI_FIX: &str = "COORDINATOR_CI_FIX";
+
+/// Failed engine push attempts before a terminal `ci_failed` stop. Not [`CI_FIX_CAP`].
+pub const CI_FIX_PUSH_RETRIES: u32 = 3;
+/// Bound on waiting for the PR head to observe a delivered ci-fix push.
+pub const CI_FIX_PUSH_WAIT_MAX_MS: i64 = 600_000;
 
 /// Record flag on, and the env kill switch is not `off`.
 pub fn enabled(record: &ProjectRecord) -> bool {
@@ -32,9 +40,17 @@ pub fn enabled(record: &ProjectRecord) -> bool {
 /// What `on_success` should do with an `address-ci` tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffClass {
-    Changed,
+    Changed { head: String },
     Empty { sha: String },
     Unreadable,
+}
+
+/// What a ci-fix delivery helper wants the caller to do.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum CiFixDelivery {
+    Continue,
+    Done(Option<StatusView>),
 }
 
 /// What `ci::drive` should do with a `Decision::Fail`.
@@ -120,10 +136,14 @@ pub(crate) fn owned_pr(state: &RunState, target: &CiTarget) -> Option<OwnedPr> {
             if !branch_is_track(head_ref, numeric) || !pr_title_is_track(title, numeric) {
                 return None;
             }
+            let from_sha = head_oid
+                .as_deref()
+                .map(str::trim)
+                .filter(|sha| !sha.is_empty())?;
             Some(OwnedPr {
                 number: *number,
-                from_sha: head_oid.clone().unwrap_or_default(),
-                head_oid: head_oid.clone(),
+                from_sha: from_sha.to_string(),
+                head_oid: Some(from_sha.to_string()),
             })
         }
         CiTarget::HeadSha { .. } => None,
@@ -190,7 +210,7 @@ pub fn classify_diff(record: &ProjectRecord, state: &RunState) -> DiffClass {
     };
     let changed = names.lines().any(|line| !line.trim().is_empty());
     if head != from_sha && changed {
-        DiffClass::Changed
+        DiffClass::Changed { head }
     } else {
         DiffClass::Empty {
             sha: from_sha.to_string(),
@@ -210,6 +230,310 @@ fn git_text(cwd: &Path, args: &[&str]) -> Option<String> {
     }
     let text = String::from_utf8(out.stdout).ok()?;
     Some(text.trim().to_string())
+}
+
+/// First 7 bytes, same slice as `review::short`. Display only.
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRESET_PUSH_REMOTE: std::cell::RefCell<Option<Result<Option<String>>>> =
+        const { std::cell::RefCell::new(None) };
+    static PRESET_GIT_PUSH: std::cell::RefCell<Option<Result<Option<String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One-shot `push_remote` result. Production never calls this.
+#[cfg(test)]
+pub(crate) fn preset_next_push_remote(result: Result<Option<String>>) {
+    PRESET_PUSH_REMOTE.with(|slot| *slot.borrow_mut() = Some(result));
+}
+
+/// One-shot `git_push` result. Production never calls this.
+#[cfg(test)]
+pub(crate) fn preset_next_git_push(result: Result<Option<String>>) {
+    PRESET_GIT_PUSH.with(|slot| *slot.borrow_mut() = Some(result));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_push_presets() {
+    PRESET_PUSH_REMOTE.with(|slot| *slot.borrow_mut() = None);
+    PRESET_GIT_PUSH.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn call_push_remote(cwd: &Path) -> Result<Option<String>> {
+    #[cfg(test)]
+    if let Some(preset) = PRESET_PUSH_REMOTE.with(|slot| slot.borrow_mut().take()) {
+        return preset;
+    }
+    super::gh::push_remote(cwd)
+}
+
+fn call_git_push(cwd: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    #[cfg(test)]
+    if let Some(preset) = PRESET_GIT_PUSH.with(|slot| slot.borrow_mut().take()) {
+        return preset;
+    }
+    super::gh::git_push(cwd, remote, branch)
+}
+
+fn stop_ci_fix(
+    record: &ProjectRecord,
+    state: &RunState,
+    message: String,
+) -> Result<Option<StatusView>> {
+    super::apply_failure(record, state, FailureClass::CiFailed, message)
+}
+
+fn hold_ci_fix(record: &ProjectRecord, state: &RunState, event: &str) -> Result<CiFixDelivery> {
+    let now = Utc::now();
+    let key = match state.ci.as_ref().and_then(|c| c.pr_number) {
+        Some(n) => format!("pr:{n}"),
+        None => "ci-push".to_string(),
+    };
+    let interval = super::next_interval_ms(super::elapsed(state, now), false);
+    super::persist_watch(record, Some(event), |ci| {
+        super::stamp_poll(ci, now, event, &key, interval);
+    })?;
+    Ok(CiFixDelivery::Done(None))
+}
+
+fn note_push_miss(
+    record: &ProjectRecord,
+    state: &RunState,
+    pending: &str,
+    number: u64,
+    text: &str,
+) -> Result<CiFixDelivery> {
+    let reason = super::review::truncate_scalars_with_ellipsis(text, 160);
+    let attempts = state
+        .ci
+        .as_ref()
+        .map(|c| c.ci_fix_push_attempts)
+        .unwrap_or(0)
+        .saturating_add(1);
+    if attempts >= CI_FIX_PUSH_RETRIES {
+        let event = format!("ci-push: {reason} ({attempts}/{CI_FIX_PUSH_RETRIES})");
+        return Ok(CiFixDelivery::Done(stop_ci_fix(record, state, event)?));
+    }
+    let now = Utc::now();
+    let interval = super::next_interval_ms(super::elapsed(state, now), false);
+    let key = format!("pr:{number}");
+    let event = format!("ci-push: {reason} (retry {attempts}/{CI_FIX_PUSH_RETRIES})");
+    super::persist_watch(record, Some(&event), |ci| {
+        ci.ci_fix_push_attempts = attempts;
+        ci.ci_fix_push_pending = Some(pending.to_string());
+        super::stamp_poll(ci, now, "ci-push retry", &key, interval);
+    })?;
+    Ok(CiFixDelivery::Done(None))
+}
+
+fn mutation_cwd(
+    record: &ProjectRecord,
+    state: &RunState,
+) -> std::result::Result<std::path::PathBuf, crate::workflow::execution_repo::MutationRefusal> {
+    let latched = state.ci.as_ref().and_then(|c| c.target_repo.as_deref());
+    crate::workflow::execution_repo::mutation_target(record, state, latched)
+        .map(|target| target.execution.sample_path)
+}
+
+/// Engine delivery of an `address-ci` commit. `Continue` only when nothing is pending.
+/// Every `Some(pending)` arm returns `Done` and ends the tick.
+pub(crate) fn deliver_ci_fix_push(
+    record: &ProjectRecord,
+    state: &RunState,
+    target: &CiTarget,
+) -> Result<CiFixDelivery> {
+    let Some(pending) = state
+        .ci
+        .as_ref()
+        .and_then(|c| c.ci_fix_push_pending.clone())
+    else {
+        return Ok(CiFixDelivery::Continue);
+    };
+    let (number, head_ref) = match target {
+        CiTarget::PullRequest {
+            number,
+            head_ref,
+            merged,
+            closed,
+            ..
+        } => {
+            if *merged {
+                let event = format!(
+                    "ci-push: PR #{number} merged before the CI fix was delivered (local {} on {head_ref})",
+                    short(&pending)
+                );
+                return Ok(CiFixDelivery::Done(stop_ci_fix(record, state, event)?));
+            }
+            if *closed {
+                let event = format!(
+                    "ci-push: PR #{number} closed before the CI fix was delivered (local {} on {head_ref})",
+                    short(&pending)
+                );
+                return Ok(CiFixDelivery::Done(stop_ci_fix(record, state, event)?));
+            }
+            (*number, head_ref.clone())
+        }
+        CiTarget::HeadSha { .. } => return hold_ci_fix(record, state, "ci-push: waiting for PR"),
+    };
+    let Some(request) = state.ci_fix_request.as_ref() else {
+        return hold_ci_fix(record, state, "ci-push: waiting for request");
+    };
+    if request.pr_number != number {
+        let event = format!("ci-push: foreign PR #{number}");
+        return Ok(CiFixDelivery::Done(stop_ci_fix(record, state, event)?));
+    }
+    let from_sha = request.from_sha.clone();
+    let cwd = match mutation_cwd(record, state) {
+        Ok(cwd) => cwd,
+        Err(refusal) => {
+            return Ok(CiFixDelivery::Done(super::apply_mutation_refusal(
+                record, state, "ci-push", &refusal,
+            )?));
+        }
+    };
+    let live_branch = super::gh::symbolic_head_branch(&cwd).unwrap_or_default();
+    let numeric = state
+        .track_id
+        .as_deref()
+        .and_then(numeric_track_id)
+        .unwrap_or_default();
+    if live_branch != head_ref || !branch_is_track(&live_branch, numeric) {
+        let event = format!("ci-push: branch {live_branch} is not the PR head {head_ref}");
+        return Ok(CiFixDelivery::Done(stop_ci_fix(record, state, event)?));
+    }
+    let Some(names) = git_text(&cwd, &["diff", "--name-only", &from_sha, "HEAD"]) else {
+        return Ok(CiFixDelivery::Done(stop_ci_fix(
+            record,
+            state,
+            "ci-push: diff unreadable".into(),
+        )?));
+    };
+    if !names.lines().any(|line| !line.trim().is_empty()) {
+        let event = format!("ci-push: no diff from {}", short(&from_sha));
+        return Ok(CiFixDelivery::Done(stop_ci_fix(record, state, event)?));
+    }
+    let Some(head) = super::gh::git_head_sha(&cwd) else {
+        return Ok(CiFixDelivery::Done(stop_ci_fix(
+            record,
+            state,
+            "ci-push: head unreadable".into(),
+        )?));
+    };
+    let gate = crate::policy::decide(record, state, &cwd, &head);
+    match super::release_for_mutation(record, state, &gate)? {
+        super::MutationGate::Stop(Some(view)) => return Ok(CiFixDelivery::Done(Some(*view))),
+        super::MutationGate::Stop(None) => {
+            return hold_ci_fix(record, state, "ci-push: policy hold");
+        }
+        super::MutationGate::Go => {}
+    }
+    let remote = match call_push_remote(&cwd) {
+        Ok(Some(remote)) => remote,
+        Ok(None) => {
+            return Ok(CiFixDelivery::Done(stop_ci_fix(
+                record,
+                state,
+                "ci-push: no GitHub remote".into(),
+            )?));
+        }
+        Err(err) => return note_push_miss(record, state, &pending, number, &err.to_string()),
+    };
+    match call_git_push(&cwd, &remote, &live_branch) {
+        Ok(None) => {
+            let Some(tip) = super::gh::git_head_sha(&cwd) else {
+                return Ok(CiFixDelivery::Done(stop_ci_fix(
+                    record,
+                    state,
+                    "ci-push: head unreadable".into(),
+                )?));
+            };
+            let now = Utc::now();
+            with_run_state_lock(record, || {
+                let mut saved = load_run_state(record)?;
+                let mut ci = saved.ci.take().unwrap_or_default();
+                ci.ci_fix_push_pending = None;
+                ci.ci_fix_pushed_sha = Some(tip.clone());
+                ci.ci_fix_push_attempts = 0;
+                ci.ci_fix_push_waiting_since = None;
+                ci.last_poll_at = None;
+                saved.ci = Some(ci);
+                saved.ci_fix_request = None;
+                saved.last_event = format!("ci-push: pushed {}", short(&tip));
+                saved.updated_at = now;
+                save_run_state(record, &saved)
+            })?;
+            Ok(CiFixDelivery::Done(None))
+        }
+        Ok(Some(reason)) => note_push_miss(record, state, &pending, number, &reason),
+        Err(err) => note_push_miss(record, state, &pending, number, &err.to_string()),
+    }
+}
+
+/// Wait until the PR observes the pushed ci-fix head. Clears the marker on a match.
+pub(crate) fn wait_for_ci_fix_head(
+    record: &ProjectRecord,
+    state: &RunState,
+    target: &CiTarget,
+) -> Result<CiFixDelivery> {
+    let Some(pushed) = state.ci.as_ref().and_then(|c| c.ci_fix_pushed_sha.clone()) else {
+        return Ok(CiFixDelivery::Continue);
+    };
+    let CiTarget::PullRequest {
+        head_oid,
+        number,
+        head_ref,
+        closed,
+        ..
+    } = target
+    else {
+        return Ok(CiFixDelivery::Continue);
+    };
+    if head_oid.as_deref().map(str::trim) == Some(pushed.as_str()) {
+        with_run_state_lock(record, || {
+            let mut saved = load_run_state(record)?;
+            if let Some(ci) = saved.ci.as_mut() {
+                ci.ci_fix_pushed_sha = None;
+                ci.ci_fix_push_waiting_since = None;
+            }
+            saved.updated_at = Utc::now();
+            save_run_state(record, &saved)
+        })?;
+        return Ok(CiFixDelivery::Continue);
+    }
+    if *closed {
+        let event = format!(
+            "ci-push: PR #{number} closed before the CI fix head was observed (local {} on {head_ref})",
+            short(&pushed)
+        );
+        return Ok(CiFixDelivery::Done(stop_ci_fix(record, state, event)?));
+    }
+    let now = Utc::now();
+    let since = state
+        .ci
+        .as_ref()
+        .and_then(|c| c.ci_fix_push_waiting_since)
+        .unwrap_or(now);
+    if (now - since).num_milliseconds() > CI_FIX_PUSH_WAIT_MAX_MS {
+        let event = format!("ci-push: head moved ({})", short(&pushed));
+        return Ok(CiFixDelivery::Done(stop_ci_fix(record, state, event)?));
+    }
+    let interval = super::next_interval_ms(super::elapsed(state, now), false);
+    let key = format!("pr:{number}");
+    super::persist_watch(
+        record,
+        Some("ci-wait: waiting for pushed CI fix head"),
+        |ci| {
+            if ci.ci_fix_push_waiting_since.is_none() {
+                ci.ci_fix_push_waiting_since = Some(now);
+            }
+            super::stamp_poll(ci, now, "waiting for pushed CI fix head", &key, interval);
+        },
+    )?;
+    Ok(CiFixDelivery::Done(None))
 }
 
 #[cfg(test)]
@@ -471,8 +795,16 @@ mod tests {
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.phase, crate::workflow::graph::PHASE_CI_WAIT);
         assert!(view.failure_class.is_none());
+        let head = git_text(dir.path(), &["rev-parse", "HEAD"]).unwrap();
         let state = load_run_state(&record).unwrap();
         assert_eq!(state.ci_fix_attempts, 1);
+        assert!(state.ci_fix_request.is_some());
+        let ci = state.ci.as_ref().expect("watch state");
+        assert_eq!(ci.ci_fix_push_pending.as_deref(), Some(head.as_str()));
+        assert!(ci.review_push_pending.is_none());
+        assert!(ci.review_pushed_sha.is_none());
+        assert!(ci.review_push_waiting_since.is_none());
+        assert_eq!(ci.review_push_attempts, 0);
         assert!(crate::notify::artifact::existing_path(&record).is_none());
     }
 
@@ -623,6 +955,142 @@ mod tests {
                 "target fix",
             ],
         );
-        assert_eq!(classify_diff(&record, &state), DiffClass::Changed);
+        let head = git_text(sibling.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(classify_diff(&record, &state), DiffClass::Changed { head });
+    }
+
+    fn owned_ci_target(head: Option<&str>) -> CiTarget {
+        CiTarget::PullRequest {
+            number: 10,
+            url: "https://example/pr/10".into(),
+            is_draft: false,
+            merged: false,
+            closed: false,
+            head_oid: head.map(str::to_string),
+            merge_state: MergeStateStatus::Clean,
+            head_ref: "track/0010-Fixture".into(),
+            title: "track(0010): fixture".into(),
+        }
+    }
+
+    fn failing_check() -> Vec<CheckItem> {
+        vec![CheckItem::new("ci", CheckBucket::Fail)]
+    }
+
+    fn save_route_state(record: &ProjectRecord, attempts: u32) -> RunState {
+        let mut state = RunState::idle(&record.id);
+        state.track_id = Some("0010".into());
+        state.phase = crate::workflow::graph::PHASE_CI_WAIT.into();
+        state.status = RunStatus::Running;
+        state.ci_fix_attempts = attempts;
+        state.ci_fix_request = None;
+        save_run_state(record, &state).unwrap();
+        state
+    }
+
+    fn assert_declined(record: &ProjectRecord, attempts: u32, outcome: &RouteOutcome) {
+        assert!(matches!(outcome, RouteOutcome::Declined));
+        let saved = load_run_state(record).unwrap();
+        assert_eq!(saved.ci_fix_attempts, attempts);
+        assert!(saved.ci_fix_request.is_none());
+        assert_ne!(saved.phase, PHASE_ADDRESS_CI);
+        assert!(!saved.last_event.contains("exhausted"));
+    }
+
+    #[test]
+    fn missing_head_oid_does_not_route() {
+        let _lock = test_env_lock();
+        let _env = EnvFix::enter();
+        unsafe {
+            std::env::remove_var(ENV_CI_FIX);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let record = sample(dir.path(), true);
+        let state = save_route_state(&record, 0);
+        let outcome =
+            try_route_ci_failure(&record, &state, &owned_ci_target(None), &failing_check())
+                .unwrap();
+        assert_declined(&record, 0, &outcome);
+        let state = save_route_state(&record, 0);
+        let outcome = try_route_ci_failure(
+            &record,
+            &state,
+            &owned_ci_target(Some("abc111")),
+            &failing_check(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, RouteOutcome::Routed(_)));
+        let saved = load_run_state(&record).unwrap();
+        assert_eq!(saved.phase, PHASE_ADDRESS_CI);
+        assert_eq!(saved.ci_fix_attempts, 1);
+        assert_eq!(
+            saved.ci_fix_request.as_ref().map(|r| r.from_sha.as_str()),
+            Some("abc111")
+        );
+    }
+
+    #[test]
+    fn blank_head_oid_does_not_route() {
+        let _lock = test_env_lock();
+        let _env = EnvFix::enter();
+        unsafe {
+            std::env::remove_var(ENV_CI_FIX);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let record = sample(dir.path(), true);
+        for blank in [Some(""), Some("  ")] {
+            let state = save_route_state(&record, 0);
+            let outcome =
+                try_route_ci_failure(&record, &state, &owned_ci_target(blank), &failing_check())
+                    .unwrap();
+            assert_declined(&record, 0, &outcome);
+        }
+        let state = save_route_state(&record, 0);
+        let outcome = try_route_ci_failure(
+            &record,
+            &state,
+            &owned_ci_target(Some("abc111")),
+            &failing_check(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, RouteOutcome::Routed(_)));
+        assert_eq!(
+            load_run_state(&record)
+                .unwrap()
+                .ci_fix_request
+                .unwrap()
+                .from_sha,
+            "abc111"
+        );
+    }
+
+    #[test]
+    fn missing_head_at_cap_is_declined_not_exhausted() {
+        let _lock = test_env_lock();
+        let _env = EnvFix::enter();
+        unsafe {
+            std::env::remove_var(ENV_CI_FIX);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let record = sample(dir.path(), true);
+        let state = save_route_state(&record, CI_FIX_CAP);
+        let outcome =
+            try_route_ci_failure(&record, &state, &owned_ci_target(None), &failing_check())
+                .unwrap();
+        assert_declined(&record, CI_FIX_CAP, &outcome);
+        assert!(!matches!(outcome, RouteOutcome::Exhausted));
+        let state = save_route_state(&record, CI_FIX_CAP);
+        let outcome = try_route_ci_failure(
+            &record,
+            &state,
+            &owned_ci_target(Some("abc111")),
+            &failing_check(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, RouteOutcome::Exhausted));
+        let saved = load_run_state(&record).unwrap();
+        assert_eq!(saved.ci_fix_attempts, CI_FIX_CAP);
+        assert!(saved.ci_fix_request.is_none());
+        assert_ne!(saved.phase, PHASE_ADDRESS_CI);
     }
 }
