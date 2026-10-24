@@ -157,6 +157,12 @@ pub enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// One-shot health-first nudge for the task-owned serve (0122)
+    ///
+    /// Probes the coordinator `/health` surface with a hard bound, then asks Task
+    /// Scheduler to run the existing `CoordinatorServe` task only when no coordinator
+    /// answers. Never binds, never launches serve, never kills or stops anything.
+    ServeNudge,
     /// Open the Local Ops Console (Status Surface).
     Ui {
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
@@ -1008,6 +1014,18 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 serve_check(port)?;
             } else {
                 block_on(server::serve(port.unwrap_or(DEFAULT_SERVE_PORT)))?;
+            }
+        }
+        Commands::ServeNudge => {
+            let action = crate::serve_nudge::run_cli()?;
+            let ok = action.ok();
+            let mut body = serde_json::to_value(&action)?;
+            body["ok"] = serde_json::Value::Bool(ok);
+            println!("{body}");
+            if !ok {
+                return Err(CoordinatorError::Message(
+                    "serve-nudge could not restore health".into(),
+                ));
             }
         }
         Commands::Ui { port } => {
@@ -1901,6 +1919,45 @@ mod tests {
         let cmd = Cli::command();
         let failure = cmd.find_subcommand("failure").expect("failure");
         assert!(failure.find_subcommand("show").is_some());
+    }
+
+    #[test]
+    fn serve_nudge_is_a_top_level_command() {
+        let parsed = Cli::try_parse_from(["coordinator", "serve-nudge"]).unwrap();
+        assert!(matches!(parsed.command, Commands::ServeNudge));
+    }
+
+    #[test]
+    fn serve_nudge_has_no_flags() {
+        let cmd = Cli::command();
+        let nudge = cmd.find_subcommand("serve-nudge").expect("serve-nudge");
+        let mut help = nudge.clone();
+        let help = help.render_long_help().to_string();
+        assert!(help.contains("CoordinatorServe"), "{help}");
+        assert!(help.contains("never"), "{help}");
+        assert!(!help.contains("--port"), "{help}");
+        assert!(!help.contains("--check"), "{help}");
+        assert!(
+            Cli::try_parse_from(["coordinator", "serve-nudge", "--check"]).is_err(),
+            "serve-nudge takes no flags"
+        );
+    }
+
+    #[test]
+    fn serve_and_serve_nudge_are_distinct() {
+        let parsed = Cli::try_parse_from(["coordinator", "serve", "--check"]).unwrap();
+        assert!(
+            matches!(
+                parsed.command,
+                Commands::Serve {
+                    port: None,
+                    check: true
+                }
+            ),
+            "serve --check must keep its own shape"
+        );
+        let parsed = Cli::try_parse_from(["coordinator", "serve-nudge"]).unwrap();
+        assert!(matches!(parsed.command, Commands::ServeNudge));
     }
 
     #[test]

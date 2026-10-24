@@ -1444,11 +1444,20 @@ mod tests {
         unsafe {
             std::env::set_var(ENV_COORDINATOR_HOME, home.path());
         }
+        // An occupied non-coordinator port is `SkipOccupied` at the guard and fails
+        // the real bind; the occupant is never displaced and no lease is written.
+        // Whether the nudge's probe was wrong is irrelevant here: the guard + the
+        // atomic bind are the singleton, so a wrong `Absent` can only produce one
+        // start request that this port refuses.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let err = serve(port).await.unwrap_err();
         assert!(err.to_string().contains("bind"), "err={err}");
         assert!(!home.path().join("serve.json").exists());
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "the occupant must still own the port after the failed start"
+        );
         drop(listener);
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);

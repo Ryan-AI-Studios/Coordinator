@@ -57,6 +57,7 @@ Minimal local Control Plane: machine **Project Registry**, per-project **run sta
 | Registry file | `{home}/registry.json` | — |
 | Machine config | `{home}/config.json` (`scan_roots`, `role_bindings`, `phase_timeouts_secs`, `hermes`, `features`) | — |
 | Serve lease | `{home}/serve.json` | written after a successful `serve` bind; deleted on graceful shutdown (a stale lease is harmless — it never blocks a bind) |
+| Serve-nudge state | `{home}/serve-nudge.json` (backoff, schema 1), `{home}/serve-nudge.log` (64 KiB, rotates to `.1`), `{home}/serve-nudge.lock` (OS advisory lock), `{home}/serve-nudge.disabled` (maintenance marker) | **state / log / lock / marker — not configuration.** The marker's existence is the switch; delete it to re-enable |
 | Per-project run state | `{workspace}/.coordinator/run-state.json` | `COORDINATOR_STATE_DIR` → `{override}/{project_id}/run-state.json`, or registry `state_dir` field |
 | Active Phase Outcome | `{state_dir}/outcomes/current.json` | same state-dir rules |
 | Last applied outcome | `{state_dir}/outcomes/current.applied.json` | written on successful apply; `current.json` removed |
@@ -254,23 +255,29 @@ coordinator status --project C:\dev\Orca
 
 **Custom-port serve:** `serve --port 7500` writes the lease. A later default `run` finds that port via the lease — `--detach` is no longer required. A non-default port is an explicit operator action and is **not** blocked by a healthy lease (0110's isolated 7421 proof path); the guard protects the machine ticker (the default port) only.
 
-### Serve supervision (0116)
+### Serve supervision (0116 + 0122)
 
-There is exactly **one** supervisor: the Windows logon Scheduled Task `CoordinatorServe`, which runs
-the installed `coordinator.exe serve --port 7420` as the interactive user at logon.
-`Start-ScheduledTask -TaskName CoordinatorServe` is the supported on-demand start and the recovery
-path after a dead serve. The task is the only owner of the machine ticker; `RestartOnFailure` is
-configured (3 attempts, 1 min apart) but Windows applies it only when the action **fails to start** —
-it does not revive a serve that exits non-zero or is killed (verified on this host; see honest
-limits). `serve` itself refuses to start a second machine ticker: if a
-coordinator answers on 7420, or on the lease port while 7420 is requested, it exits 0 without
-binding, without rewriting the lease, and without touching the running process. **Nothing autonomous
-kills serve.** A manual `coordinator serve` in a terminal is a debugging path: it is not adopted by
-the task and not supervised. `coordinator self-update` never restarts serve (0108); after a swap,
-start it with the task. The paused Hermes `ensure_serve()` carriers may be retired by 0111 only after
-this task is installed and a logon start is proven — do not resume them. ADR-0024 stop semantics are
-unchanged: Stop aborts the phase and leaves harness sessions running; process kill is not the stop
-mechanism.
+There are exactly **two** supervisors, both owned by the same interactive user: the Windows logon
+Scheduled Task `CoordinatorServe`, which runs the installed `coordinator.exe serve --port 7420` at
+logon, and the periodic nudge `CoordinatorServeNudge`, which probes health every five minutes and
+asks Task Scheduler to run `CoordinatorServe` only when no coordinator answers. Neither is a Windows
+service or a resident loop; **nothing autonomous kills a live serve**. This is the **OD-116-7**
+amendment to OD-116-1 ("exactly one Windows logon Scheduled Task"): **one logon task plus one
+periodic health-first nudge**.
+
+`Start-ScheduledTask -TaskName CoordinatorServe` remains the supported on-demand start. The logon
+task is the only owner of the machine ticker; `RestartOnFailure` (3 attempts, 1 min apart) is
+configured, but Windows applies it only when the action **fails to start** — it does not revive a
+serve that exits non-zero or is killed (verified on this host). The nudge closes that gap.
+`serve` itself refuses to start a second machine ticker: if a coordinator answers on 7420, or on the
+lease port while 7420 is requested, it exits 0 without binding, without rewriting the lease, and
+without touching the running process. Duplicate prevention is the task's `IgnoreNew` plus that guard
+plus the atomic OS bind — never the probe. A manual `coordinator serve` in a terminal is a debugging
+path: it is not adopted by the task and not supervised. `coordinator self-update` never restarts
+serve (0108); after a swap, start it with the task. The paused Hermes `ensure_serve()` carriers may
+be retired by 0111 only after this task is installed and a logon start is proven — do not resume
+them. ADR-0024 stop semantics are unchanged: Stop aborts the phase and leaves harness sessions
+running; process kill is not the stop mechanism.
 
 Install (normal PowerShell; elevate only if `Register-ScheduledTask` returns Access Denied — the task
 still runs as the interactive user). `$exe` must match the installed binary; the command fails loudly
@@ -297,7 +304,7 @@ $exe   # record this exact path: it is the task's verified action target
 ```
 
 ```powershell
-# verify
+# verify the logon task
 Get-ScheduledTask -TaskName 'CoordinatorServe' | Select-Object -ExpandProperty Actions
 Get-ScheduledTask -TaskName 'CoordinatorServe' | Select-Object -ExpandProperty Settings
 Get-ScheduledTask -TaskName 'CoordinatorServe' | Get-ScheduledTaskInfo
@@ -305,10 +312,6 @@ coordinator serve --check
 
 # on-demand start (the supported manual start)
 Start-ScheduledTask -TaskName 'CoordinatorServe'
-
-# stop half of the deploy preflight (0108 self-update still refuses while a live coordinator.exe exists)
-# confirm with: coordinator serve --check   # exit 1 when serve is really down
-Stop-ScheduledTask -TaskName 'CoordinatorServe'
 
 # uninstall
 Stop-ScheduledTask -TaskName 'CoordinatorServe' -ErrorAction SilentlyContinue
@@ -320,18 +323,114 @@ so `ExecutionTimeLimit` must be `PT0S`; battery/idle defaults would stop a lapto
 prevents a second task instance; `RestartCount`/`RestartInterval` are the only restart mechanism;
 `Interactive`/`Limited` keep harness OAuth/profile working and avoid elevation.
 
+Install the periodic nudge the same way (normal PowerShell, no elevation; the nudge only requests the
+task above, so the `CoordinatorServe` action never changes). The hidden PowerShell host exists **only**
+to suppress a console window every five minutes; its only child is `coordinator serve-nudge`. The
+wrapper must fail loudly when the exe is missing — `exit $LASTEXITCODE` in a fresh session exits **0**
+when the path does not exist, which would pin `LastTaskResult 0` forever while nothing runs:
+
+```powershell
+$exe  = (Get-Command coordinator -CommandType Application -ErrorAction Stop).Source
+if (-not (Test-Path -LiteralPath $exe)) { throw "coordinator.exe not found: $exe" }
+$pwsh = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
+$user = "$env:USERDOMAIN\$env:USERNAME"
+$nudgeArg = @"
+-NoProfile -NonInteractive -WindowStyle Hidden -Command if (-not (Test-Path -LiteralPath '$exe')) { exit 1 }; & '$exe' serve-nudge; if (`$null -eq `$LASTEXITCODE) { exit 1 } else { exit `$LASTEXITCODE }
+"@
+$nudgeArg = $nudgeArg.Trim()
+$action  = New-ScheduledTaskAction -Execute $pwsh -Argument $nudgeArg -WorkingDirectory $env:USERPROFILE
+$trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5)
+$trigger.Repetition.StopAtDurationEnd = $false   # no Duration: repeats indefinitely
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+$settings  = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd `
+    -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+    -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName 'CoordinatorServeNudge' `
+    -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+    -Description 'Coordinator serve nudge: health-first; starts CoordinatorServe only when no coordinator answers; never kills a live serve.' `
+    -Force
+```
+
+```powershell
+# verify the nudge from the EXPORTED XML, not from a stringified object
+Get-ScheduledTask -TaskName 'CoordinatorServeNudge' | Select-Object Actions,Settings,Triggers
+Get-ScheduledTaskInfo -TaskName 'CoordinatorServeNudge'
+[xml]$x = Export-ScheduledTask -TaskName 'CoordinatorServeNudge'
+$x.Task.Settings.MultipleInstancesPolicy              # IgnoreNew
+$x.Task.Settings.ExecutionTimeLimit                   # PT5M (== the interval; IgnoreNew prevents overlap)
+$x.Task.Settings.RestartOnFailure                     # absent
+$x.Task.Triggers.TimeTrigger.Repetition.Interval      # PT5M
+$x.Task.Triggers.TimeTrigger.Repetition.Duration      # empty (repeats indefinitely)
+$x.Task.Actions.Exec.Arguments                        # contains 'serve-nudge', NOT 'serve --port'
+(Get-ScheduledTaskInfo -TaskName 'CoordinatorServeNudge').NextRunTime   # within one interval
+coordinator serve-nudge                               # manual run; inspect the JSON + log
+```
+
+**What the nudge does.** One `/health` probe with a hard **1500 ms** bound (connect + read), healthy
+only for `{"ok":true,"service":"coordinator"}`. A bare TCP answer is **not** health; a responder that
+is not coordinator is `skip-foreign`, a silent/slow/starting/truncated one is `skip-unresponsive`;
+both are left alone. Only when nothing answers does it run `schtasks.exe /Run /TN CoordinatorServe`
+and then poll health every 500 ms for up to 60 polls (nominal 30 s, hard ceiling 120 s). A start
+request that answers "already running" (`267009`/`0x00041301`, `267039`/`0x0004131F`) counts as
+satisfied. It never binds, never launches serve, never writes the lease, and never stops or kills
+anything.
+
+**Interval and backoff.** The task repeats every **5 minutes**; `ExecutionTimeLimit` is `PT5M` and
+`MultipleInstances=IgnoreNew` prevents overlap, so the limit does not gate the interval. Failures back
+off `5 → 60` minutes of *requested* delay, but the 5-minute trigger quantises the realised cadence:
+the first retry is **5–10 min** away and the cap is **~60–65 min** (one attempt per trigger). One line
+per run lands in `{COORDINATOR_HOME}/serve-nudge.log`, rotated at **64 KiB** to `.1`; the state is
+`{COORDINATOR_HOME}/serve-nudge.json`. Exit is **0** for healthy/disabled/overlap/backoff/skip-*/
+started and **1** for start-failed/start-unhealthy, with the JSON line printed first.
+
+**Intentional stop / maintenance** — the marker is mandatory, and it must be observed **before** the
+stop (`serve` itself never reads it):
+
+```powershell
+$home = if ($env:COORDINATOR_HOME) { $env:COORDINATOR_HOME } else { "$env:LOCALAPPDATA\coordinator" }
+New-Item -ItemType File -Force "$home\serve-nudge.disabled" | Out-Null
+Get-Content "$home\serve-nudge.log" -Tail 1      # confirm action=disabled (or wait one interval) BEFORE stopping
+Stop-ScheduledTask -TaskName 'CoordinatorServe'
+# if the maintenance spans a logoff/reboot, also:
+#   Disable-ScheduledTask -TaskName 'CoordinatorServe'
+# re-enable is TWO parts — the marker alone leaves the logon task disabled, and the nudge
+# then gets a non-zero /Run every interval (start-failed, hourly backoff) while serve stays down:
+#   Enable-ScheduledTask -TaskName 'CoordinatorServe'
+Remove-Item "$home\serve-nudge.disabled"
+```
+
+A marker created inside the probe→request window does **not** win; the operator's next
+`Stop-ScheduledTask` does. Stopping `CoordinatorServe` **without** the marker is not an intentional
+stop: the nudge revives it within one interval.
+
+**Uninstall / rollback** (the nudge only; the logon task and serve stay untouched):
+
+```powershell
+$home = if ($env:COORDINATOR_HOME) { $env:COORDINATOR_HOME } else { "$env:LOCALAPPDATA\coordinator" }
+Stop-ScheduledTask -TaskName 'CoordinatorServeNudge' -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName 'CoordinatorServeNudge' -Confirm:$false
+# optional: Remove-Item "$home\serve-nudge.json","$home\serve-nudge.log","$home\serve-nudge.disabled" -ErrorAction SilentlyContinue
+```
+
 **Honest limits.** Logon-only (no ticker before the user logs on — harness OAuth needs the interactive
-user); the task supervises only the process **it** started. `RestartOnFailure` retries only a task
-whose action cannot start (`LastTaskResult 0x80070002`): the isolated 0116 proof observed the configured
-3 retries for a missing action, but **no** retry after a serve exited non-zero or was killed, so a
-crashed serve is **not** revived automatically. Recovery is
-`Start-ScheduledTask -TaskName CoordinatorServe` (verified: kill the isolated serve, start the task,
-and a new serve answers). There is no timer, no watchdog loop, no kill. A serve that is bound but stops
-answering `/health` is not restarted. **A logon run that finds a healthy serve exits 0 and is not
-re-run until the next logon or a manual `Start-ScheduledTask`; if that serve later dies there is no
-automatic retry — recovery is `Start-ScheduledTask -TaskName CoordinatorServe`.** On an interactive-logon
-task a console-subsystem exe may show a console window; that is accepted (no wrapper, no hidden second
-path).
+user); the logon task supervises only the process **it** started. `RestartOnFailure` retries only a
+task whose action cannot start (`LastTaskResult 0x80070002`): the isolated 0116 proof observed the
+configured 3 retries for a missing action, but **no** retry after a serve exited non-zero or was
+killed. Revival now comes from the nudge — within ~5 minutes plus the bounded startup grace while
+logged on. A serve that is bound but stops answering `/health` is left alone (a saturated accept
+backlog can read as absent, and the real bind still refuses a second listener). A foreign occupant on
+7420 blocks revival; the log names it and nothing kills it. A restart restores the **ticker**, not
+in-process harness sessions. The marker is required before any intentional stop/deploy and wins only
+if it is seen before the start request. If revival seems delayed after a clock change, delete
+`{COORDINATOR_HOME}/serve-nudge.json` (the backoff state) and run `serve-nudge`. Both tasks see the
+interactive user's environment: a custom `COORDINATOR_HOME` must be a user/machine environment
+variable, not a shell-only value, or the nudge's marker/state/log land in the default
+`%LOCALAPPDATA%\coordinator` while serve uses another home. `-WindowStyle Hidden` hides the console
+**after** creation, so a brief flash on the first run may still occur — that is a recorded limit, not
+a claim that it is eliminated. On an interactive-logon task the serve action itself may show a
+console window; that is accepted (no wrapper, no hidden second start path).
 
 ### Autonomous pipeline dogfood
 
@@ -639,7 +738,12 @@ snapshot, git read, build or file write.
   `coordinator self-update`, then start `serve`. When the logon task owns serve, the stop half is
   `Stop-ScheduledTask -TaskName CoordinatorServe` (not a PID) and the start half is
   `Start-ScheduledTask -TaskName CoordinatorServe` (or the operator foreground command; see **Serve
-  supervision (0116)**). `cargo run -- self-update` always refuses because
+  supervision (0116 + 0122)**). **Because the 0122 nudge revives a stopped serve within one interval,
+  create `{COORDINATOR_HOME}/serve-nudge.disabled` and confirm an `action=disabled` line in
+  `serve-nudge.log` before that stop**, otherwise the nudge restarts serve and defeats the "no live
+  `coordinator.exe`" condition. After the swap: `Enable-ScheduledTask -TaskName CoordinatorServe` (only
+  if you disabled it), `Start-ScheduledTask -TaskName CoordinatorServe`, then delete the marker.
+  `cargo run -- self-update` always refuses because
   the invoking `cargo.exe` is in the process table; that is correct, not a bug. `--check` runs every
   gate and reports, touching nothing. The product never stops, restarts or kills any process; a live
   `coordinator.exe` is a refusal. Tests use temp install/artifact fixtures only and never swap the

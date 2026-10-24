@@ -58,6 +58,8 @@
 //! view (drift fails the pick closed), plus bounded `status.md` rotation: track **0109**.
 //! Read-only `ready` preview (ticker + operator decision, per-row reasons, dash/space comparison
 //! seam) and CLI-only `status.ready`: track **0115**.
+//! Periodic health-first nudge (`serve-nudge`) reviving a crashed task-owned serve, one logon task
+//! plus one nudge (OD-116-7): track **0122**.
 
 pub mod api;
 pub mod checkpoint;
@@ -81,6 +83,7 @@ pub mod run;
 pub mod scan;
 pub mod selfupdate;
 pub mod serve_lease;
+pub mod serve_nudge;
 pub mod server;
 pub mod state;
 pub mod ui;
