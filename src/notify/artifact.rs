@@ -301,6 +301,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }

@@ -91,12 +91,13 @@ pub(crate) fn try_route_ci_failure(
     Ok(RouteOutcome::Routed(Box::new(view)))
 }
 
-struct OwnedPr {
-    number: u64,
-    from_sha: String,
+pub(crate) struct OwnedPr {
+    pub number: u64,
+    pub from_sha: String,
+    pub head_oid: Option<String>,
 }
 
-fn owned_pr(state: &RunState, target: &CiTarget) -> Option<OwnedPr> {
+pub(crate) fn owned_pr(state: &RunState, target: &CiTarget) -> Option<OwnedPr> {
     // Any digit run, not exactly four. A project may register `T374`, whose digit run is the
     // three-digit `374`; a four-digit floor here returned None for such a track, so the chain
     // could never remediate CI on its own PR. Same family as `branch_is_track` -- see the
@@ -122,6 +123,7 @@ fn owned_pr(state: &RunState, target: &CiTarget) -> Option<OwnedPr> {
             Some(OwnedPr {
                 number: *number,
                 from_sha: head_oid.clone().unwrap_or_default(),
+                head_oid: head_oid.clone(),
             })
         }
         CiTarget::HeadSha { .. } => None,
@@ -242,6 +244,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: on,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
@@ -282,6 +285,7 @@ mod tests {
             url: "https://example/pr/71".into(),
             is_draft: false,
             merged: false,
+            closed: false,
             head_oid: Some("abc111".into()),
             merge_state: MergeStateStatus::Clean,
             head_ref: "track/374".into(),

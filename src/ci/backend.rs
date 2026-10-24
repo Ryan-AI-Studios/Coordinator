@@ -55,6 +55,8 @@ pub enum CiTarget {
         url: String,
         is_draft: bool,
         merged: bool,
+        /// `state == CLOSED` and not merged. Distinct from `merged` (0078).
+        closed: bool,
         head_oid: Option<String>,
         merge_state: MergeStateStatus,
         /// `headRefName` from `gh pr view`. Empty when the caller did not supply it.
@@ -218,6 +220,98 @@ impl AutoPublishResult {
     }
 }
 
+/// GraphQL `Actor.__typename` for a review author. A null author is `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthorKind {
+    User,
+    Bot,
+    #[default]
+    Other,
+}
+
+/// One review thread comment (bounded by the query's `last: 20`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCommentView {
+    pub id: String,
+    pub body: String,
+    pub author_login: Option<String>,
+    pub author_kind: AuthorKind,
+    pub association: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub minimized: bool,
+    pub url: String,
+}
+
+/// One `PullRequestReviewThread`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewThreadView {
+    pub id: String,
+    pub is_resolved: bool,
+    pub is_outdated: bool,
+    pub path: String,
+    pub line: Option<u32>,
+    pub comments: Vec<ReviewCommentView>,
+    pub comment_count: u64,
+}
+
+/// One `PullRequestReview` body. `line_comment_count` dedupes the body against its threads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewView {
+    pub id: String,
+    pub state: String,
+    pub body: String,
+    pub author_login: Option<String>,
+    pub author_kind: AuthorKind,
+    pub association: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub minimized: bool,
+    pub url: String,
+    pub line_comment_count: u64,
+}
+
+/// One bounded review-surface read (0078).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSnapshot {
+    pub pr_number: u64,
+    pub head_ref: String,
+    pub head_oid: String,
+    pub base_ref: String,
+    pub base_oid: String,
+    pub review_decision: Option<String>,
+    pub viewer_login: Option<String>,
+    pub author_login: Option<String>,
+    pub author_kind: AuthorKind,
+    pub rate_remaining: Option<u64>,
+    pub threads: Vec<ReviewThreadView>,
+    pub reviews: Vec<ReviewView>,
+    pub truncated: bool,
+    pub unavailable: Option<String>,
+}
+
+impl ReviewSnapshot {
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            pr_number: 0,
+            head_ref: String::new(),
+            head_oid: String::new(),
+            base_ref: String::new(),
+            base_oid: String::new(),
+            review_decision: None,
+            viewer_login: None,
+            author_login: None,
+            author_kind: AuthorKind::Other,
+            rate_remaining: None,
+            threads: Vec::new(),
+            reviews: Vec::new(),
+            truncated: false,
+            unavailable: Some(reason.into()),
+        }
+    }
+}
+
 pub trait CiBackend: Send + Sync {
     fn resolve_pr(
         &self,
@@ -237,6 +331,8 @@ pub trait CiBackend: Send + Sync {
     fn pr_files(&self, cwd: &Path, pr_number: u64) -> Result<Vec<String>>;
     /// Apply `label` to the PR unless it is already there or the repo lacks it.
     fn ensure_label(&self, cwd: &Path, pr_number: u64, label: &str) -> Result<LabelOutcome>;
+    /// One bounded GraphQL read of the PR review surface (0078).
+    fn review_comments(&self, cwd: &Path, pr_number: u64) -> Result<ReviewSnapshot>;
 }
 
 /// Result of [`CiBackend::ensure_label`].
@@ -264,6 +360,8 @@ struct ScriptedInner {
     files: VecDeque<Result<Vec<String>>>,
     labels: VecDeque<Result<LabelOutcome>>,
     labelled: Vec<(u64, String)>,
+    reviews: VecDeque<Result<ReviewSnapshot>>,
+    last_reviews: Option<Result<ReviewSnapshot>>,
 }
 
 impl ScriptedBackend {
@@ -281,6 +379,8 @@ impl ScriptedBackend {
                 files: VecDeque::new(),
                 labels: VecDeque::new(),
                 labelled: Vec::new(),
+                reviews: VecDeque::new(),
+                last_reviews: None,
             }),
         }
     }
@@ -319,6 +419,14 @@ impl ScriptedBackend {
 
     pub fn push_files(&self, v: Result<Vec<String>>) {
         self.inner.lock().expect("scripted lock").files.push_back(v);
+    }
+
+    pub fn push_reviews(&self, v: Result<ReviewSnapshot>) {
+        self.inner
+            .lock()
+            .expect("scripted lock")
+            .reviews
+            .push_back(v);
     }
 
     pub fn push_label(&self, v: Result<LabelOutcome>) {
@@ -422,6 +530,21 @@ impl CiBackend for ScriptedBackend {
         g.labelled.push((pr_number, label.to_string()));
         g.labels.pop_front().unwrap_or(Ok(LabelOutcome::Applied))
     }
+
+    fn review_comments(&self, _cwd: &Path, _pr_number: u64) -> Result<ReviewSnapshot> {
+        let mut g = self.inner.lock().expect("scripted lock");
+        let next = g
+            .reviews
+            .pop_front()
+            .or_else(|| g.last_reviews.as_ref().map(clone_reviews));
+        if let Some(v) = next {
+            g.last_reviews = Some(clone_reviews(&v));
+            return v;
+        }
+        Err(CoordinatorError::Message(
+            "scripted backend: no review snapshot programmed".into(),
+        ))
+    }
 }
 
 fn clone_resolve(v: &Result<Option<CiTarget>>) -> Result<Option<CiTarget>> {
@@ -445,6 +568,13 @@ fn clone_merge(v: &Result<MergeResult>) -> Result<MergeResult> {
     }
 }
 
+fn clone_reviews(v: &Result<ReviewSnapshot>) -> Result<ReviewSnapshot> {
+    match v {
+        Ok(s) => Ok(s.clone()),
+        Err(e) => Err(CoordinatorError::Message(e.to_string())),
+    }
+}
+
 fn clone_publish(v: &Result<AutoPublishResult>) -> Result<AutoPublishResult> {
     match v {
         Ok(p) => Ok(p.clone()),
@@ -460,6 +590,7 @@ pub struct CallCounts {
     pub publish: Arc<AtomicUsize>,
     pub pr_files: Arc<AtomicUsize>,
     pub ensure_label: Arc<AtomicUsize>,
+    pub review_comments: Arc<AtomicUsize>,
 }
 
 impl CallCounts {
@@ -480,6 +611,9 @@ impl CallCounts {
     }
     pub fn ensure_label_n(&self) -> usize {
         self.ensure_label.load(Ordering::SeqCst)
+    }
+    pub fn review_comments_n(&self) -> usize {
+        self.review_comments.load(Ordering::SeqCst)
     }
 }
 
@@ -537,5 +671,10 @@ impl CiBackend for RecordingBackend {
     fn ensure_label(&self, cwd: &Path, pr_number: u64, label: &str) -> Result<LabelOutcome> {
         self.counts.ensure_label.fetch_add(1, Ordering::SeqCst);
         self.inner.ensure_label(cwd, pr_number, label)
+    }
+
+    fn review_comments(&self, cwd: &Path, pr_number: u64) -> Result<ReviewSnapshot> {
+        self.counts.review_comments.fetch_add(1, Ordering::SeqCst);
+        self.inner.review_comments(cwd, pr_number)
     }
 }

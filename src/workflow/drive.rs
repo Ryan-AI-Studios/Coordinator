@@ -1605,6 +1605,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
@@ -2948,6 +2949,7 @@ mod tests {
             url: "https://example/pr/71".into(),
             is_draft: false,
             merged: false,
+            closed: false,
             head_oid: Some("abc111".into()),
             merge_state: crate::ci::MergeStateStatus::Clean,
             head_ref: "track/0071-CiFailureRoutesToImplementer".into(),

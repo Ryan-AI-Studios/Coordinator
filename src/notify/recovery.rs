@@ -1,7 +1,9 @@
 //! Recovery policy table (ADR-0009). Advisory text. Automatic recovery has stopped
 //! once `FAILURE.md` exists. An ACP stdout close or a transport drop restarts the
 //! session only before that file is written (bounded). Opt-in `address-ci` (0071) may route the ci-wait gate's
-//! failing checks before that file exists. Nothing else auto-retries, and `FAILURE.md` ends auto-retry.
+//! failing checks before that file exists; opt-in `address-review` (0078) may route owned-PR review
+//! comments, and the engine delivers its commit with three bounded push attempts. Nothing else
+//! auto-retries, and `FAILURE.md` ends auto-retry.
 
 use crate::outcome::FailureClass;
 
@@ -33,6 +35,9 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
         }
         FailureClass::Blocked => {
             "Resolve the prerequisite the leg named, then `coordinator failure resolve` and start a new `coordinator run --track <id>`. No blocked repair was attempted, and the block never advances."
+        }
+        FailureClass::ReviewComments => {
+            "Do not merge. Resolve or address the open review comments on the PR, then `failure resolve` and start a new `run --track <id>`. If `last_event` begins `review-push:`, the review fix is committed on the track branch but not delivered - fix the named push error and push it, or push the branch by hand, before re-running; a fresh run starts at `plan` and does not re-push. A `review-push: PR #N merged|closed` stop means the PR ended before the fix landed - reopen or open a new PR for that branch. Routing may also be off, capped, or the review surface could not be read (0078)."
         }
     }
 }
@@ -70,6 +75,14 @@ mod tests {
         assert_eq!(
             recommended_action(FailureClass::SkillMissing),
             "Create the missing skill file or set skill_aliases; do not blind-retry."
+        );
+        assert!(
+            recommended_action(FailureClass::ReviewComments)
+                .contains("Resolve or address the open review comments")
+        );
+        assert!(
+            recommended_action(FailureClass::ReviewComments)
+                .contains("a fresh run starts at `plan` and does not re-push")
         );
     }
 }

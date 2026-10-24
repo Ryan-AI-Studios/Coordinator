@@ -221,6 +221,15 @@ pub struct RunState {
     /// Payload for the current `address-ci` inject (0071). Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_fix_request: Option<CiFixRequest>,
+    /// Review-comment repair entries this `run_epoch` (0078). Cap 2. Always serialized on disk.
+    #[serde(default)]
+    pub review_fix_attempts: u32,
+    /// Payload for the current `address-review` inject (0078). Omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_fix_request: Option<ReviewFixRequest>,
+    /// Review route latch and resolution stamp (0078). Omitted when no poll has been examined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_route: Option<ReviewRouteState>,
     /// 0101: the frozen delivery target of the most recent delivery leg.
     ///
     /// Written at checkpoint/inject, compared before overwrite, and cleared on a fresh
@@ -337,6 +346,18 @@ pub struct CiWatchState {
     /// follow a later row edit; publish authority only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_repo: Option<PathBuf>,
+    /// 0078: the `address-review` commit that still has to be pushed by the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_push_pending: Option<String>,
+    /// 0078: the actual pushed tip. Cleared when the PR head matches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_pushed_sha: Option<String>,
+    /// 0078: consecutive failed review-push attempts (cap 3).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub review_push_attempts: u32,
+    /// 0078: first tick that waited for the pushed head (10 minute bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_push_waiting_since: Option<DateTime<Utc>>,
 }
 
 /// One failing check from the judged slice handed to `address-ci` (0071).
@@ -354,6 +375,66 @@ pub struct CiFixRequest {
     pub pr_number: u64,
     pub from_sha: String,
     pub checks: Vec<CiFixCheck>,
+}
+
+/// Durable `address-review` payload (0078). `from_sha` is the PR head at route time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewFixRequest {
+    pub pr_number: u64,
+    pub from_sha: String,
+    pub comments: Vec<ReviewComment>,
+}
+
+/// One rendered/latched review item (0078). `body` is sanitized and bounded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub key: String,
+    pub kind: String,
+    pub author: String,
+    pub path: String,
+    pub line: Option<u32>,
+    pub body: String,
+    pub url: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 0078 route dedupe and poll stamp. `routed` is a route latch, not the merge gate;
+/// `last_result == Clean` plus zero open items is the merge gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewRouteState {
+    pub pr_number: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routed: Vec<RoutedReviewItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_poll_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_result: Option<ReviewPollResult>,
+    /// Consecutive `ReadFailed` polls only; every completed read resets to 0.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub read_failures: u32,
+}
+
+/// One latched review item. `source_*` is route-time evidence and is never refreshed
+/// by a later observation; a later edit is a new round.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutedReviewItem {
+    pub key: String,
+    pub round: u32,
+    pub routed_at: DateTime<Utc>,
+    pub source_comment_id: String,
+    pub source_updated_at: DateTime<Utc>,
+}
+
+/// Outcome of one bounded review poll.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewPollResult {
+    Clean,
+    Open,
+    Truncated,
+    RateLow,
+    ReadFailed,
+    Foreign,
 }
 
 impl RunState {
@@ -404,6 +485,9 @@ impl RunState {
             self_check: None,
             ci_fix_attempts: 0,
             ci_fix_request: None,
+            review_fix_attempts: 0,
+            review_fix_request: None,
+            review_route: None,
             delivery_target: None,
             gate_target_journal: None,
         }
@@ -724,6 +808,9 @@ pub struct WorkflowView {
     /// Omitted on happy-path JSON when 0.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub ci_fix_attempts: u32,
+    /// Review-comment repair entries this epoch. Omitted when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub review_fix_attempts: u32,
 }
 
 impl StatusView {
@@ -754,6 +841,7 @@ impl StatusView {
                 pending_roles: state.pending_roles.clone(),
                 address_findings_attempts: state.address_findings_attempts,
                 ci_fix_attempts: state.ci_fix_attempts,
+                review_fix_attempts: state.review_fix_attempts,
             }),
             failure_artifact: crate::notify::artifact::existing_path(record),
             failure_superseded: failure_superseded_for(record, state),
@@ -1191,6 +1279,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }

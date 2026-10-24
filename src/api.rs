@@ -72,6 +72,8 @@ pub struct ProjectSetRequest {
     #[serde(default)]
     pub ci_fix_routing: Option<bool>,
     #[serde(default)]
+    pub review_comment_routing: Option<bool>,
+    #[serde(default)]
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     pub clear_phase_timeouts: Option<bool>,
@@ -408,6 +410,7 @@ pub fn project_set_request(req: ProjectSetRequest) -> Result<ProjectRecord> {
         worktree_isolation: req.worktree_isolation,
         self_continuation: req.self_continuation,
         ci_fix_routing: req.ci_fix_routing,
+        review_comment_routing: req.review_comment_routing,
         phase_timeouts_secs: req.phase_timeouts_secs,
         clear_phase_timeouts: req.clear_phase_timeouts.unwrap_or(false),
         clear_phase_timeout: req.clear_phase_timeout.unwrap_or_default(),
@@ -1246,6 +1249,15 @@ mod tests {
         assert_eq!(req.notify_progress, Some(true));
         let omitted: ProjectSetRequest = serde_json::from_str(r#"{"project":"abc"}"#).unwrap();
         assert_eq!(omitted.notify_progress, None);
+    }
+
+    #[test]
+    fn api_project_set_review_comment_routing() {
+        let req: ProjectSetRequest =
+            serde_json::from_str(r#"{"project":"abc","review_comment_routing":true}"#).unwrap();
+        assert_eq!(req.review_comment_routing, Some(true));
+        let omitted: ProjectSetRequest = serde_json::from_str(r#"{"project":"abc"}"#).unwrap();
+        assert_eq!(omitted.review_comment_routing, None);
     }
 
     #[test]

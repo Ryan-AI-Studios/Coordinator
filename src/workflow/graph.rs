@@ -14,10 +14,15 @@ pub const PHASE_ADVANCE: &str = "advance";
 pub const PHASE_ADDRESS_FINDINGS: &str = "address-findings";
 /// Same-epoch repair after the ci-wait gate fails (0071; slice unified in 0079). Not in [`canonical_phases`].
 pub const PHASE_ADDRESS_CI: &str = "address-ci";
+/// Same-epoch repair after review comments are routed from ci-wait (0078). Not in
+/// [`canonical_phases`].
+pub const PHASE_ADDRESS_REVIEW: &str = "address-review";
 /// Max entries into `address-findings` this `run_epoch`. No operator env.
 pub const ADDRESS_FINDINGS_CAP: u32 = 2;
 /// Max entries into `address-ci` this `run_epoch`. No operator env.
 pub const CI_FIX_CAP: u32 = 2;
+/// Max entries into `address-review` this `run_epoch` (0078). No operator env.
+pub const REVIEW_FIX_CAP: u32 = 2;
 
 pub const REVIEW_SLUG_AGY: &str = "agy";
 pub const REVIEW_SLUG_OPENCODE: &str = "opencode";
@@ -57,6 +62,7 @@ pub fn all_phase_ids() -> &'static [&'static str] {
         PHASE_ADVANCE,
         PHASE_ADDRESS_FINDINGS,
         PHASE_ADDRESS_CI,
+        PHASE_ADDRESS_REVIEW,
     ]
 }
 
@@ -80,6 +86,7 @@ pub fn successor(phase: &str) -> Option<&'static str> {
         PHASE_ADVANCE => None,
         PHASE_ADDRESS_FINDINGS => Some(PHASE_CROSS_MODEL),
         PHASE_ADDRESS_CI => Some(PHASE_CI_WAIT),
+        PHASE_ADDRESS_REVIEW => Some(PHASE_CI_WAIT),
         _ => None,
     }
 }
@@ -112,6 +119,7 @@ pub fn is_grok_bound(phase: &str) -> bool {
             | PHASE_ADVANCE
             | PHASE_ADDRESS_FINDINGS
             | PHASE_ADDRESS_CI
+            | PHASE_ADDRESS_REVIEW
     )
 }
 
@@ -306,7 +314,13 @@ mod tests {
         assert!(!canonical_phases().contains(&PHASE_ADDRESS_CI));
         assert_eq!(CI_FIX_CAP, 2);
         assert!(all_phase_ids().contains(&PHASE_ADDRESS_CI));
-        assert_eq!(all_phase_ids().len(), canonical_phases().len() + 2);
+        assert!(is_canonical(PHASE_ADDRESS_REVIEW));
+        assert_eq!(successor(PHASE_ADDRESS_REVIEW), Some(PHASE_CI_WAIT));
+        assert!(is_grok_bound(PHASE_ADDRESS_REVIEW));
+        assert!(!canonical_phases().contains(&PHASE_ADDRESS_REVIEW));
+        assert_eq!(REVIEW_FIX_CAP, 2);
+        assert!(all_phase_ids().contains(&PHASE_ADDRESS_REVIEW));
+        assert_eq!(all_phase_ids().len(), canonical_phases().len() + 3);
     }
 
     fn record_at(path: &std::path::Path) -> crate::registry::ProjectRecord {
@@ -328,6 +342,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }

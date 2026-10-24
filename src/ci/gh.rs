@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
+
 use crate::config::ENV_COORDINATOR_GH_BIN;
 use crate::error::{CoordinatorError, Result};
 
 use super::backend::{
-    AutoPublishResult, CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend, CiTarget,
-    LabelOutcome, MergeResult, MergeStateStatus, PrHint,
+    AuthorKind, AutoPublishResult, CheckBucket, CheckItem, CheckSnapshot, CheckView, CiBackend,
+    CiTarget, LabelOutcome, MergeResult, MergeStateStatus, PrHint, ReviewCommentView,
+    ReviewSnapshot, ReviewThreadView, ReviewView,
 };
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,6 +28,73 @@ const PR_VIEW_JSON_FIELDS: &str =
 
 /// `gh pr checks --json` fields. The manual has no log field (fetched 2026-10-06).
 const PR_CHECKS_JSON_FIELDS: &str = "bucket,name,state,description,link";
+
+pub(crate) const REVIEW_THREADS: usize = 50;
+pub(crate) const REVIEW_COMMENTS_PER_THREAD: usize = 20;
+pub(crate) const REVIEW_BODIES: usize = 30;
+pub(crate) const REVIEW_RATE_FLOOR: u64 = 500;
+pub(crate) const PARSE_BODY_SCALARS: usize = 4096;
+
+/// One request. `last: 50` threads, `last: 20` comments, `last: 30` reviews; no
+/// `--paginate` (nested cursors would be N+1). `reviews.nodes.comments { totalCount }`
+/// dedupes a review body against the line threads that already carry it.
+pub(crate) const REVIEW_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  rateLimit { remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      headRefName
+      headRefOid
+      baseRefName
+      baseRefOid
+      isDraft
+      state
+      reviewDecision
+      author { login __typename }
+      reviewThreads(last: 50) {
+        totalCount
+        pageInfo { hasPreviousPage hasNextPage }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          comments(last: 20) {
+            totalCount
+            nodes {
+              id
+              bodyText
+              createdAt
+              updatedAt
+              isMinimized
+              url
+              author { login __typename }
+              authorAssociation
+            }
+          }
+        }
+      }
+      reviews(last: 30) {
+        totalCount
+        nodes {
+          id
+          state
+          bodyText
+          createdAt
+          submittedAt
+          updatedAt
+          isMinimized
+          url
+          author { login __typename }
+          authorAssociation
+          comments { totalCount }
+        }
+      }
+    }
+  }
+}"#;
 
 /// Pure argv for `gh pr list --head` (no spawn). `state` is `open` then `merged`.
 fn pr_list_head_args(branch: &str, state: &str) -> Vec<String> {
@@ -146,6 +216,38 @@ impl CiBackend for GhCli {
         gh_ok(cwd, &["pr", "edit", n.as_str(), "--add-label", label])?;
         Ok(LabelOutcome::Applied)
     }
+
+    fn review_comments(&self, cwd: &Path, pr_number: u64) -> Result<ReviewSnapshot> {
+        let args = review_comments_args(pr_number);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = gh_capture(cwd, &refs)?;
+        if out.exit == 4 {
+            return Err(CoordinatorError::Message("gh auth required".into()));
+        }
+        if !out.ok {
+            return Ok(ReviewSnapshot::unavailable(format!("gh exit {}", out.exit)));
+        }
+        match parse_review_snapshot(&out.stdout) {
+            Ok(snap) => Ok(snap),
+            Err(e) => Ok(ReviewSnapshot::unavailable(e.to_string())),
+        }
+    }
+}
+
+/// Pure argv for the one bounded review read. No `--paginate`.
+pub(crate) fn review_comments_args(pr_number: u64) -> Vec<String> {
+    vec![
+        "api".into(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={REVIEW_QUERY}"),
+        "-F".into(),
+        "owner={owner}".into(),
+        "-F".into(),
+        "name={repo}".into(),
+        "-F".into(),
+        format!("number={pr_number}"),
+    ]
 }
 
 /// `gh_capture` reports a non-zero exit as `ok: false`, never `Err`; this maps it to `Err`.
@@ -584,6 +686,7 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
             url: url.trim().to_string(),
             is_draft: false,
             merged: false,
+            closed: false,
             head_oid: Some(head),
             merge_state: MergeStateStatus::Unspecified,
             head_ref: branch.clone(),
@@ -712,6 +815,7 @@ fn parse_pr_view(stdout: &str) -> Result<Option<CiTarget>> {
     let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("");
     let merged = state.eq_ignore_ascii_case("merged")
         || v.get("mergedAt").map(|x| !x.is_null()).unwrap_or(false);
+    let closed = state.eq_ignore_ascii_case("closed") && !merged;
     let head_oid = v
         .get("headRefOid")
         .and_then(|x| x.as_str())
@@ -736,11 +840,235 @@ fn parse_pr_view(stdout: &str) -> Result<Option<CiTarget>> {
         url,
         is_draft,
         merged,
+        closed,
         head_oid,
         merge_state,
         head_ref,
         title,
     }))
+}
+
+fn graphql_unavailable(root: &serde_json::Value) -> Option<String> {
+    let errors = root.get("errors").and_then(|e| e.as_array())?;
+    if errors.is_empty() {
+        return None;
+    }
+    let first = errors
+        .first()
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("graphql errors");
+    Some(truncate(first))
+}
+
+fn opt_string(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_dt(v: &serde_json::Value, key: &str) -> Result<chrono::DateTime<Utc>> {
+    let raw = v
+        .get(key)
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| CoordinatorError::Message(format!("review json: missing {key}")))?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|e| CoordinatorError::Message(format!("review json: bad {key}: {e}")))
+}
+
+fn opt_dt(v: &serde_json::Value, key: &str) -> Result<Option<chrono::DateTime<Utc>>> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => parse_dt(v, key).map(Some),
+    }
+}
+
+fn author_of(v: &serde_json::Value) -> (Option<String>, AuthorKind) {
+    let Some(author) = v.get("author").filter(|a| !a.is_null()) else {
+        return (None, AuthorKind::Other);
+    };
+    let login = opt_string(author, "login");
+    let kind = match author.get("__typename").and_then(|x| x.as_str()) {
+        Some("User") => AuthorKind::User,
+        Some("Bot") => AuthorKind::Bot,
+        _ => AuthorKind::Other,
+    };
+    (login, kind)
+}
+
+fn parse_review_comment(v: &serde_json::Value) -> Result<ReviewCommentView> {
+    let (author_login, author_kind) = author_of(v);
+    Ok(ReviewCommentView {
+        id: opt_string(v, "id").unwrap_or_default(),
+        body: super::review::truncate_scalars_with_ellipsis(
+            v.get("bodyText").and_then(|x| x.as_str()).unwrap_or(""),
+            PARSE_BODY_SCALARS,
+        ),
+        author_login,
+        author_kind,
+        association: opt_string(v, "authorAssociation"),
+        created_at: parse_dt(v, "createdAt")?,
+        updated_at: parse_dt(v, "updatedAt")?,
+        minimized: v
+            .get("isMinimized")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        url: opt_string(v, "url").unwrap_or_default(),
+    })
+}
+
+fn parse_review_thread(v: &serde_json::Value) -> Result<ReviewThreadView> {
+    let comments = v
+        .get("comments")
+        .and_then(|c| c.get("nodes"))
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(parse_review_comment)
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(ReviewThreadView {
+        id: opt_string(v, "id").unwrap_or_default(),
+        is_resolved: v
+            .get("isResolved")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        is_outdated: v
+            .get("isOutdated")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        path: opt_string(v, "path").unwrap_or_default(),
+        line: v
+            .get("line")
+            .and_then(|x| x.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+        comments,
+        comment_count: v
+            .get("comments")
+            .and_then(|c| c.get("totalCount"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+    })
+}
+
+fn parse_review_body(v: &serde_json::Value) -> Result<ReviewView> {
+    let (author_login, author_kind) = author_of(v);
+    Ok(ReviewView {
+        id: opt_string(v, "id").unwrap_or_default(),
+        state: opt_string(v, "state").unwrap_or_default(),
+        body: super::review::truncate_scalars_with_ellipsis(
+            v.get("bodyText").and_then(|x| x.as_str()).unwrap_or(""),
+            PARSE_BODY_SCALARS,
+        ),
+        author_login,
+        author_kind,
+        association: opt_string(v, "authorAssociation"),
+        created_at: parse_dt(v, "createdAt")?,
+        submitted_at: opt_dt(v, "submittedAt")?,
+        updated_at: parse_dt(v, "updatedAt")?,
+        minimized: v
+            .get("isMinimized")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        url: opt_string(v, "url").unwrap_or_default(),
+        line_comment_count: v
+            .get("comments")
+            .and_then(|c| c.get("totalCount"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+    })
+}
+
+/// Parse the one bounded GraphQL payload. Any top-level `errors` (even alongside
+/// partial `data`) is unavailable, never a clean surface.
+pub(crate) fn parse_review_snapshot(stdout: &str) -> Result<ReviewSnapshot> {
+    let root: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|e| CoordinatorError::Message(format!("review json: {e}")))?;
+    if let Some(reason) = graphql_unavailable(&root) {
+        return Ok(ReviewSnapshot::unavailable(reason));
+    }
+    let Some(pr) = root
+        .get("data")
+        .and_then(|d| d.get("repository"))
+        .and_then(|r| r.get("pullRequest"))
+        .filter(|v| !v.is_null())
+    else {
+        return Ok(ReviewSnapshot::unavailable("graphql: no pullRequest"));
+    };
+    let threads_node = pr.get("reviewThreads");
+    let threads_total = threads_node
+        .and_then(|t| t.get("totalCount"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let has_previous = threads_node
+        .and_then(|t| t.get("pageInfo"))
+        .and_then(|p| p.get("hasPreviousPage"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let threads = threads_node
+        .and_then(|t| t.get("nodes"))
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(parse_review_thread)
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let reviews_node = pr.get("reviews");
+    let reviews_total = reviews_node
+        .and_then(|r| r.get("totalCount"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let reviews = reviews_node
+        .and_then(|r| r.get("nodes"))
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(parse_review_body)
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let truncated = threads_total > REVIEW_THREADS as u64
+        || has_previous
+        || threads
+            .iter()
+            .any(|t| t.comment_count > REVIEW_COMMENTS_PER_THREAD as u64)
+        || reviews_total > REVIEW_BODIES as u64;
+    let viewer_login = root
+        .get("data")
+        .and_then(|d| d.get("viewer"))
+        .and_then(|v| opt_string(v, "login"));
+    let rate_remaining = root
+        .get("data")
+        .and_then(|d| d.get("rateLimit"))
+        .and_then(|r| r.get("remaining"))
+        .and_then(|x| x.as_u64());
+    Ok(ReviewSnapshot {
+        pr_number: pr.get("number").and_then(|x| x.as_u64()).unwrap_or(0),
+        head_ref: opt_string(pr, "headRefName").unwrap_or_default(),
+        head_oid: opt_string(pr, "headRefOid").unwrap_or_default(),
+        base_ref: opt_string(pr, "baseRefName").unwrap_or_default(),
+        base_oid: opt_string(pr, "baseRefOid").unwrap_or_default(),
+        review_decision: opt_string(pr, "reviewDecision"),
+        viewer_login,
+        author_login: author_of(pr).0,
+        author_kind: author_of(pr).1,
+        rate_remaining,
+        threads,
+        reviews,
+        truncated,
+        unavailable: None,
+    })
 }
 
 #[cfg(test)]
@@ -1076,6 +1404,23 @@ fn resolve_push_remote_from_inputs(
 
 fn git_push_args(remote: &str, branch: &str) -> Vec<String> {
     vec!["push".into(), "-u".into(), remote.into(), branch.into()]
+}
+
+/// Resolve the push remote through the shipped order. `None` means no GitHub remote.
+pub(crate) fn push_remote(cwd: &Path) -> Result<Option<String>> {
+    resolve_live_push_remote(cwd)
+}
+
+/// Push `branch` to `remote`. `None` is success; `Some(reason)` is a bounded failure.
+pub(crate) fn git_push(cwd: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    let args = git_push_args(remote, branch);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_process_timeout(Path::new("git"), &refs, cwd, GIT_PUSH_TIMEOUT)?;
+    if out.ok {
+        Ok(None)
+    } else {
+        Ok(Some(truncate(&out.stderr)))
+    }
 }
 
 fn pr_create_args(
@@ -1856,6 +2201,7 @@ mod parse_tests {
             url: String::new(),
             is_draft: false,
             merged: true,
+            closed: false,
             head_oid: None,
             merge_state: MergeStateStatus::Unspecified,
             head_ref: head.into(),
@@ -2212,5 +2558,272 @@ mod live {
         ));
         let second = GhCli.ensure_label(&cwd, n, "ai-reviewed").unwrap();
         assert_eq!(second, LabelOutcome::AlreadyPresent);
+    }
+
+    fn comment_json(id: &str, login: &str, body: &str, updated: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "bodyText": body,
+            "createdAt": "2026-10-24T00:00:00Z",
+            "updatedAt": updated,
+            "isMinimized": false,
+            "url": format!("https://example/comment/{id}"),
+            "author": {"login": login, "__typename": "User"},
+            "authorAssociation": "MEMBER"
+        })
+    }
+
+    fn thread_json(
+        id: &str,
+        resolved: bool,
+        comments: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let count = comments.len();
+        serde_json::json!({
+            "id": id,
+            "isResolved": resolved,
+            "isOutdated": false,
+            "path": "src/lib.rs",
+            "line": 7,
+            "comments": {"totalCount": count, "nodes": comments}
+        })
+    }
+
+    fn review_json(id: &str, state: &str, body: &str, line_comments: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "state": state,
+            "bodyText": body,
+            "createdAt": "2026-10-24T00:00:00Z",
+            "submittedAt": "2026-10-24T00:01:00Z",
+            "updatedAt": "2026-10-24T00:01:00Z",
+            "isMinimized": false,
+            "url": format!("https://example/review/{id}"),
+            "author": {"login": "alice", "__typename": "User"},
+            "authorAssociation": "OWNER",
+            "comments": {"totalCount": line_comments}
+        })
+    }
+
+    fn gql_pr(pr: serde_json::Value) -> String {
+        serde_json::json!({
+            "data": {
+                "viewer": {"login": "pipeline"},
+                "rateLimit": {"remaining": 4999, "resetAt": "2026-10-24T01:00:00Z"},
+                "repository": {"pullRequest": pr}
+            }
+        })
+        .to_string()
+    }
+
+    fn full_pr(
+        threads: Vec<serde_json::Value>,
+        reviews: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "number": 78,
+            "headRefName": "track/0078-x",
+            "headRefOid": "head78",
+            "baseRefName": "main",
+            "baseRefOid": "base78",
+            "isDraft": false,
+            "state": "OPEN",
+            "reviewDecision": "CHANGES_REQUESTED",
+            "author": {"login": "alice", "__typename": "User"},
+            "reviewThreads": {
+                "totalCount": threads.len(),
+                "pageInfo": {"hasPreviousPage": false, "hasNextPage": false},
+                "nodes": threads
+            },
+            "reviews": {
+                "totalCount": reviews.len(),
+                "nodes": reviews
+            }
+        })
+    }
+
+    #[test]
+    fn graphql_snapshot_parses_threads_reviews_and_viewer() {
+        let stdout = gql_pr(full_pr(
+            vec![thread_json(
+                "T1",
+                false,
+                vec![comment_json(
+                    "C1",
+                    "alice",
+                    "please fix",
+                    "2026-10-24T00:02:00Z",
+                )],
+            )],
+            vec![review_json("R1", "CHANGES_REQUESTED", "body", 0)],
+        ));
+        let snap = parse_review_snapshot(&stdout).unwrap();
+        assert!(snap.unavailable.is_none());
+        assert_eq!(snap.pr_number, 78);
+        assert_eq!(snap.head_ref, "track/0078-x");
+        assert_eq!(snap.head_oid, "head78");
+        assert_eq!(snap.viewer_login.as_deref(), Some("pipeline"));
+        assert_eq!(snap.author_login.as_deref(), Some("alice"));
+        assert_eq!(snap.threads.len(), 1);
+        assert_eq!(snap.threads[0].comments[0].body, "please fix");
+        assert_eq!(snap.reviews[0].state, "CHANGES_REQUESTED");
+        assert_eq!(snap.rate_remaining, Some(4999));
+    }
+
+    #[test]
+    fn graphql_reviews_carry_is_minimized_and_nullable_submitted_at() {
+        let mut review = review_json("R1", "CHANGES_REQUESTED", "body", 0);
+        review["isMinimized"] = serde_json::json!(true);
+        review["submittedAt"] = serde_json::Value::Null;
+        let snap = parse_review_snapshot(&gql_pr(full_pr(Vec::new(), vec![review]))).unwrap();
+        assert!(snap.reviews[0].minimized);
+        assert!(snap.reviews[0].submitted_at.is_none());
+    }
+
+    #[test]
+    fn graphql_null_author_parses_as_other() {
+        let mut comment = comment_json("C1", "ghost", "body", "2026-10-24T00:00:00Z");
+        comment["author"] = serde_json::Value::Null;
+        let snap = parse_review_snapshot(&gql_pr(full_pr(
+            vec![thread_json("T1", false, vec![comment])],
+            Vec::new(),
+        )))
+        .unwrap();
+        assert_eq!(snap.threads[0].comments[0].author_kind, AuthorKind::Other);
+        assert!(snap.threads[0].comments[0].author_login.is_none());
+    }
+
+    #[test]
+    fn graphql_errors_are_fail_open_at_the_reader() {
+        let stdout = serde_json::json!({"errors": [{"message": "boom"}]}).to_string();
+        let snap = parse_review_snapshot(&stdout).unwrap();
+        assert!(
+            snap.unavailable
+                .as_deref()
+                .is_some_and(|r| r.contains("boom"))
+        );
+    }
+
+    #[test]
+    fn graphql_partial_data_plus_errors_is_unavailable() {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&gql_pr(full_pr(Vec::new(), Vec::new()))).unwrap();
+        v["errors"] = serde_json::json!([{"message": "partial"}]);
+        let snap = parse_review_snapshot(&v.to_string()).unwrap();
+        assert!(snap.unavailable.is_some());
+        assert_eq!(snap.pr_number, 0);
+    }
+
+    #[test]
+    fn graphql_thread_total_count_over_cap_sets_truncated() {
+        let mut pr = full_pr(Vec::new(), Vec::new());
+        pr["reviewThreads"]["totalCount"] = serde_json::json!(51);
+        assert!(parse_review_snapshot(&gql_pr(pr)).unwrap().truncated);
+        let mut pr = full_pr(Vec::new(), Vec::new());
+        pr["reviewThreads"]["pageInfo"]["hasPreviousPage"] = serde_json::json!(true);
+        assert!(parse_review_snapshot(&gql_pr(pr)).unwrap().truncated);
+    }
+
+    #[test]
+    fn graphql_reviews_total_count_over_cap_sets_truncated() {
+        let mut pr = full_pr(Vec::new(), Vec::new());
+        pr["reviews"]["totalCount"] = serde_json::json!(31);
+        assert!(parse_review_snapshot(&gql_pr(pr)).unwrap().truncated);
+    }
+
+    #[test]
+    fn graphql_thread_with_more_than_20_comments_sets_truncated() {
+        let mut thread = thread_json("T1", false, Vec::new());
+        thread["comments"]["totalCount"] = serde_json::json!(21);
+        let snap = parse_review_snapshot(&gql_pr(full_pr(vec![thread], Vec::new()))).unwrap();
+        assert!(snap.truncated);
+    }
+
+    #[test]
+    fn graphql_review_line_comment_count_is_parsed() {
+        let snap = parse_review_snapshot(&gql_pr(full_pr(
+            Vec::new(),
+            vec![review_json("R1", "CHANGES_REQUESTED", "body", 2)],
+        )))
+        .unwrap();
+        assert_eq!(snap.reviews[0].line_comment_count, 2);
+    }
+
+    #[test]
+    fn graphql_body_is_capped_at_parse_time() {
+        let long = "x".repeat(PARSE_BODY_SCALARS + 50);
+        let snap = parse_review_snapshot(&gql_pr(full_pr(
+            vec![thread_json(
+                "T1",
+                false,
+                vec![comment_json("C1", "alice", &long, "2026-10-24T00:00:00Z")],
+            )],
+            Vec::new(),
+        )))
+        .unwrap();
+        let body = &snap.threads[0].comments[0].body;
+        assert!(body.chars().count() <= PARSE_BODY_SCALARS);
+        assert!(body.ends_with('…'));
+    }
+
+    #[test]
+    fn graphql_rate_remaining_is_kept() {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&gql_pr(full_pr(Vec::new(), Vec::new()))).unwrap();
+        v["data"]["rateLimit"]["remaining"] = serde_json::json!(499);
+        let snap = parse_review_snapshot(&v.to_string()).unwrap();
+        assert_eq!(snap.rate_remaining, Some(499));
+    }
+
+    #[test]
+    fn review_args_use_one_graphql_request_with_placeholders() {
+        let args = review_comments_args(78);
+        assert_eq!(args[0], "api");
+        assert_eq!(args[1], "graphql");
+        assert!(args.iter().any(|a| a == "owner={owner}"));
+        assert!(args.iter().any(|a| a == "name={repo}"));
+        assert!(args.iter().any(|a| a == "number=78"));
+        assert!(!args.iter().any(|a| a == "--paginate"));
+        assert_eq!(args.iter().filter(|a| a.starts_with("query=")).count(), 1);
+    }
+
+    #[test]
+    fn review_query_requests_review_comment_counts() {
+        let normalized = REVIEW_QUERY
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let start = normalized.find("reviews(").expect("reviews selection");
+        let mut depth = 0usize;
+        let mut end = normalized.len();
+        for (i, ch) in normalized[start..].char_indices() {
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end = start + i + 1;
+                    break;
+                }
+            }
+        }
+        let selection = &normalized[start..end];
+        assert!(selection.contains("comments { totalCount }"), "{selection}");
+        assert!(normalized.contains("reviewThreads(last: 50)"));
+        let thread_start = normalized.find("comments(last: 20)").unwrap();
+        let thread_tail = &normalized[thread_start..];
+        assert!(thread_tail[..thread_tail.find('}').unwrap()].contains("totalCount"));
+    }
+
+    #[test]
+    fn parse_pr_view_closed_is_distinct_from_merged() {
+        let json = r#"{"number":8,"url":"https://example/pr/8","isDraft":false,"state":"CLOSED","headRefOid":"abc"}"#;
+        match parse_pr_view(json).unwrap().unwrap() {
+            CiTarget::PullRequest { closed, merged, .. } => {
+                assert!(closed);
+                assert!(!merged);
+            }
+            _ => panic!("expected PR"),
+        }
     }
 }
