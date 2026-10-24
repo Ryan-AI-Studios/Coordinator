@@ -2335,7 +2335,14 @@ mod route_tests {
         assert_eq!(saved.review_fix_attempts, 1);
         assert_eq!(saved.phase, PHASE_ADDRESS_REVIEW);
         assert_eq!(saved.review_route.as_ref().unwrap().routed.len(), 1);
-        // A racing tick with the pre-route snapshot reads again and latches nothing.
+        // A racing tick whose saved phase is still ci-wait must be stopped by the latch
+        // re-check, not only by the phase guard.
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            st.phase = PHASE_CI_WAIT.into();
+            save_run_state(&r, &st)
+        })
+        .unwrap();
         let second =
             try_route_review_comments(&r, &state, &target(78), dir.path(), &b, Utc::now()).unwrap();
         assert!(matches!(second, RouteOutcome::Hold { .. }));
