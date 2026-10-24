@@ -2147,10 +2147,12 @@ mod tests {
         let batch = render_batch(&candidates, 78, "head78", 1);
         assert!(!batch.comments.is_empty());
         assert!(batch.prompt.chars().count() <= ADDRESS_REVIEW_CONTEXT_CAP);
-        assert!(batch
-            .comments
-            .iter()
-            .all(|c| c.body.chars().count() <= MAX_BODY_SCALARS));
+        assert!(
+            batch
+                .comments
+                .iter()
+                .all(|c| c.body.chars().count() <= MAX_BODY_SCALARS)
+        );
         for line in batch.prompt.lines().filter(|l| l.starts_with("> ")) {
             assert!(!line.trim_start_matches("> ").is_empty() || line == "> ");
         }
@@ -2666,7 +2668,9 @@ mod route_tests {
         let _ =
             try_route_review_comments(&r, &state, &target(78), dir.path(), &b, Utc::now()).unwrap();
         let saved = load_run_state(&r).unwrap();
-        let route = saved.review_route.expect("first poll must create the stamp");
+        let route = saved
+            .review_route
+            .expect("first poll must create the stamp");
         assert_eq!(route.pr_number, 78);
         assert_eq!(route.last_result, Some(ReviewPollResult::Clean));
         assert!(route.last_poll_at.is_some());
