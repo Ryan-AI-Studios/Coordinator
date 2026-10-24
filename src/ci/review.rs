@@ -2121,11 +2121,12 @@ mod tests {
             })
             .collect();
         let batch = render_batch(&candidates, 78, "head78", 1);
-        assert!(!batch.comments.is_empty());
+        assert_eq!(batch.comments.len(), 8);
         assert!(batch.prompt.chars().count() <= ADDRESS_REVIEW_CONTEXT_CAP);
         assert!(batch.prompt.contains("Do not run `git push`"));
         assert!(batch.prompt.contains("Blocked:"));
         for c in &batch.comments {
+            assert!(batch.prompt.contains(&c.key), "missing {}", c.key);
             assert!(c.body.chars().count() <= MAX_BODY_SCALARS + 8);
         }
     }
@@ -2146,6 +2147,10 @@ mod tests {
         let batch = render_batch(&candidates, 78, "head78", 1);
         assert!(!batch.comments.is_empty());
         assert!(batch.prompt.chars().count() <= ADDRESS_REVIEW_CONTEXT_CAP);
+        assert!(batch
+            .comments
+            .iter()
+            .all(|c| c.body.chars().count() <= MAX_BODY_SCALARS));
         for line in batch.prompt.lines().filter(|l| l.starts_with("> ")) {
             assert!(!line.trim_start_matches("> ").is_empty() || line == "> ");
         }
