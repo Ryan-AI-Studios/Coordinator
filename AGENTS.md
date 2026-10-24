@@ -57,7 +57,8 @@ Control Plane entrypoints: `project add|list|show|set|scan` (`--auto-merge true|
 **Serve supervision (0116 + 0122, OD-116-7).** The policy is **one logon task plus one periodic
 health-first nudge**, not "exactly one task". `CoordinatorServe` (Windows logon task,
 `coordinator.exe serve --port 7420`, interactive user) owns the machine ticker;
-`CoordinatorServeNudge` repeats every 5 minutes, probes `/health` with a 1500 ms bound, and runs
+`CoordinatorServeNudge` repeats every 5 minutes, probes `/health` with a **3000 ms** bound (above the
+Windows SYN-retransmission budget, ~2.0 s per refused loopback connect), and runs
 `schtasks.exe /Run /TN CoordinatorServe` **only** when nothing answers. Install/uninstall/verify and the
 two-part maintenance stop are in the README section of that name. `coordinator serve-nudge` never
 binds, never launches serve, never writes the lease, and never stops or kills anything; duplicate
