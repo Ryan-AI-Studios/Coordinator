@@ -182,6 +182,26 @@ pub fn execution_skill_path(record: &ProjectRecord, canonical: &str) -> PathBuf 
     skill_markdown(&root, &dir_name)
 }
 
+/// Explicit-epoch execution skill. Does not read run state.
+pub fn execution_skill_path_for_epoch(
+    record: &ProjectRecord,
+    epoch: u64,
+    canonical: &str,
+) -> PathBuf {
+    let dir_name = skill_directory_name(record, canonical);
+    let paths = crate::layout::resolve(record);
+    let fallback = paths.execution_repo.clone().unwrap_or(paths.workspace_root);
+    let root = if crate::worktree::isolation_enabled(record).unwrap_or(false) {
+        match crate::worktree::epoch_dir(record, epoch) {
+            Ok(dir) if dir.is_dir() => dir,
+            _ => fallback,
+        }
+    } else {
+        fallback
+    };
+    skill_markdown(&root, &dir_name)
+}
+
 /// Chosen file when one exists, otherwise the primary path and `false`.
 pub fn chosen_workspace_skill(record: &ProjectRecord, canonical: &str) -> (PathBuf, bool) {
     let (primary, fallback) = workspace_skill_candidates(record, canonical);

@@ -1286,6 +1286,22 @@ Move-Item -Force $tmp $dst
 
 **Grok / other CLI hooks:** same file contract; prefer `source=file` for hooks. The Grok ACP adapter writes `source=adapter` after a successful (or failed) prompt when a phase is Running. Hooks need `/hooks-trust` if used.
 
+## Trusted evidence
+
+Coordinator can record a product-owned snapshot of the skill files a phase names, at
+`{state_dir}/trusted-evidence/current.json`, and journal one line when a no-change stop sees that
+snapshot still match. The snapshot is not a verdict. It does not change whether the leg fails,
+blocks, or succeeds.
+
+| ID | Risk | Severity | Why it is accepted |
+|---|---|---|---|
+| **R1** | A same-user process (including the harness) can forge a valid snapshot and digest | **High** | Out of the threat model; no same-machine mechanism fixes it. Mitigated only by the non-elevation invariant (§9.2): a forged `Current` cannot produce success, cannot release a hold, cannot authorize anything, and can at most add a journal line. "One writer" is an authorization rule, not an adversary guarantee. |
+| **R3** | Create-then-delete or delete-then-recreate of a skill mid-leg is not detectable; the bracket is only two endpoints | Medium | Accept: the bracket is still strictly stronger than turn text. The design says "at epoch start and at decision", never "throughout". A future per-inject capture would need an owner decision (OD-100-1 fixes epoch/session start). |
+| **R6** | The artifact proves materialization, not write access or loading — so it cannot justify a general "leg was blocked" classification | **High (scope)** | This is the design conclusion (§0). Review question RQ1. A write-access probe or OS sandbox is a possible future owner decision, not a capability of this artifact. |
+
+The file proves materialization and the two endpoints. It does not prove write access, in-harness
+loading, or that the state held between the endpoints.
+
 ## Tools (product cwd only)
 
 ```powershell

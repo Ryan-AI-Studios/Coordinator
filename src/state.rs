@@ -1083,6 +1083,51 @@ pub(crate) fn persist_lock_held() -> bool {
     PERSIST_LOCK_DEPTH.with(std::cell::Cell::get) > 0
 }
 
+thread_local! {
+    static RUN_STATE_LOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static RUN_STATE_LOCK_PROJECT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct RunStateLockScope(());
+
+impl RunStateLockScope {
+    fn enter(project_id: &str) -> Self {
+        RUN_STATE_LOCK_DEPTH.with(|depth| {
+            let next = depth.get().saturating_add(1);
+            depth.set(next);
+            if next == 1 {
+                RUN_STATE_LOCK_PROJECT
+                    .with(|slot| *slot.borrow_mut() = Some(project_id.to_string()));
+            }
+        });
+        Self(())
+    }
+}
+
+impl Drop for RunStateLockScope {
+    fn drop(&mut self) {
+        RUN_STATE_LOCK_DEPTH.with(|depth| {
+            let next = depth.get().saturating_sub(1);
+            depth.set(next);
+            if next == 0 {
+                RUN_STATE_LOCK_PROJECT.with(|slot| *slot.borrow_mut() = None);
+            }
+        });
+    }
+}
+
+/// Whether this thread is inside `with_run_state_lock`.
+pub(crate) fn run_state_lock_held() -> bool {
+    RUN_STATE_LOCK_DEPTH.with(std::cell::Cell::get) > 0
+}
+
+/// Depth is held and the stored project id is `project_id`.
+pub(crate) fn run_state_lock_held_for(project_id: &str) -> bool {
+    run_state_lock_held()
+        && RUN_STATE_LOCK_PROJECT.with(|slot| slot.borrow().as_deref() == Some(project_id))
+}
+
 /// Cross-process exclusive lock for run-state mutation (mkdir is atomic).
 ///
 /// Held across load → decide → save so concurrent CLI vs serve first-commit-wins.
@@ -1114,7 +1159,9 @@ where
     loop {
         match std::fs::create_dir(&lock_path) {
             Ok(()) => {
+                let scope = RunStateLockScope::enter(&record.id);
                 let result = f();
+                drop(scope);
                 let _ = std::fs::remove_dir(&lock_path);
                 return result;
             }

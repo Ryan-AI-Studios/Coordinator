@@ -34,6 +34,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut file = fs::File::create(&tmp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        #[cfg(test)]
+        apply_atomic_write_hook(path)?;
         replace_file(&tmp_path, path)?;
         Ok(())
     })();
@@ -83,6 +85,80 @@ fn replace_file(from: &Path, to: &Path) -> Result<()> {
         // POSIX rename replaces the destination atomically on the same filesystem.
         fs::rename(from, to)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATOMIC_WRITE_HOOK: std::cell::RefCell<Option<AtomicWriteHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+type AtomicWriteAction = Box<dyn FnMut(&str) -> std::io::Result<()>>;
+
+#[cfg(test)]
+struct AtomicWriteHook {
+    filter: String,
+    action: Option<AtomicWriteAction>,
+}
+
+#[cfg(test)]
+fn apply_atomic_write_hook(path: &Path) -> Result<()> {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return Ok(());
+    };
+    let name = name.to_string();
+    let action = ATOMIC_WRITE_HOOK.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let hook = guard.as_mut()?;
+        if !hook.filter.is_empty() && hook.filter != name {
+            return None;
+        }
+        hook.action.take()
+    });
+    let Some(mut action) = action else {
+        return Ok(());
+    };
+    let result = action(&name);
+    ATOMIC_WRITE_HOOK.with(|slot| {
+        if let Ok(mut guard) = slot.try_borrow_mut()
+            && let Some(hook) = guard.as_mut()
+        {
+            hook.action = Some(action);
+        }
+    });
+    result.map_err(Into::into)
+}
+
+/// Arms the `atomic_write` seam for this thread. An empty filter matches every file name.
+#[cfg(test)]
+pub(crate) struct AtomicWriteHookGuard;
+
+#[cfg(test)]
+impl AtomicWriteHookGuard {
+    pub(crate) fn arm(
+        filter: impl Into<String>,
+        action: impl FnMut(&str) -> std::io::Result<()> + 'static,
+    ) -> Self {
+        ATOMIC_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(AtomicWriteHook {
+                filter: filter.into(),
+                action: Some(Box::new(action)),
+            });
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for AtomicWriteHookGuard {
+    fn drop(&mut self) {
+        ATOMIC_WRITE_HOOK.with(|slot| {
+            if let Ok(mut guard) = slot.try_borrow_mut() {
+                *guard = None;
+            }
+        });
     }
 }
 

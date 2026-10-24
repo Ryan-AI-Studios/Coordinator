@@ -18,6 +18,7 @@ pub mod self_check;
 pub mod shipped;
 pub mod stall_paging;
 pub mod timeouts;
+pub mod trusted_evidence;
 pub mod watchdog;
 
 use serde::{Deserialize, Serialize};
@@ -744,7 +745,7 @@ fn start_or_park(
             if journal_unreadable {
                 crate::progress_log::append(record, "reuse", "reuse: receipt unreadable");
             }
-            auto_start(state, id);
+            auto_start(record, state, id);
             crate::outcome::clear_active_outcome_file(record);
             drive::clear_plan_review_artifacts(
                 record,
@@ -941,7 +942,7 @@ pub fn on_gate_retry(record: &ProjectRecord, state: &mut RunState, outcome: &Pha
     );
 }
 
-pub fn auto_start(state: &mut RunState, track_id: &str) {
+pub fn auto_start(record: &ProjectRecord, state: &mut RunState, track_id: &str) {
     // 0098: never release a Blocked hold or mutate the held state.
     if state.failure_class == Some(FailureClass::Blocked) {
         return;
@@ -972,6 +973,11 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.review_route = None;
     reset_phase_clock(state);
     state.last_event = format!("workflow: auto-start {track_id}");
+    trusted_evidence::write_for_epoch(
+        record,
+        state,
+        trusted_evidence::ProducerHook::WorkflowAutoStart,
+    );
 }
 
 /// Resume after `advance` succeeded while Paused.
@@ -1013,7 +1019,7 @@ pub fn commit_probed_successor(
     }
     let kept_hash = state.last_applied_outcome_hash.clone();
     let closed = probe.closed_epoch;
-    auto_start(&mut state, &probe.successor_id);
+    auto_start(record, &mut state, &probe.successor_id);
     state.last_applied_outcome_hash = kept_hash;
     if reuse::probe_accepts(&probe.successor_id, &probe.head_sha, answer) {
         state.phase = graph::PHASE_CI_WAIT.into();
@@ -1297,7 +1303,7 @@ mod tests {
         state.phase_started_at = Some(chrono::Utc::now());
         let snap = state.clone();
 
-        auto_start(&mut state, "0100");
+        auto_start(&r, &mut state, "0100");
         assert_eq!(state.run_epoch, snap.run_epoch);
         assert_eq!(state.track_id, snap.track_id);
         assert_eq!(state.failure_class, snap.failure_class);

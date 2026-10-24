@@ -247,6 +247,11 @@ fn begin_fresh_run(
         state.track_id = fresh.track_arg;
     }
     state.run_epoch = state.run_epoch.saturating_add(1);
+    crate::workflow::trusted_evidence::write_for_epoch(
+        record,
+        state,
+        crate::workflow::trusted_evidence::ProducerHook::RunBeginFreshRun,
+    );
     state.phase_started_at = Some(chrono::Utc::now());
     state.total_paused_ms = 0;
     state.pause_started_at = None;
@@ -738,18 +743,20 @@ mod tests {
         )
         .unwrap();
         let mut state = RunState::idle(&r.id);
-        let view = begin_fresh_run(
-            &r,
-            &mut state,
-            FreshRun {
-                track_arg: Some("0101".into()),
-                driver: WorkflowDriver::Adapter,
-                picked: false,
-                archive_slugs: Vec::new(),
-                journal_unreadable: false,
-                ci_wait: Some((7, "abc".into())),
-            },
-        )
+        let view = with_run_state_lock(&r, || {
+            begin_fresh_run(
+                &r,
+                &mut state,
+                FreshRun {
+                    track_arg: Some("0101".into()),
+                    driver: WorkflowDriver::Adapter,
+                    picked: false,
+                    archive_slugs: Vec::new(),
+                    journal_unreadable: false,
+                    ci_wait: Some((7, "abc".into())),
+                },
+            )
+        })
         .unwrap();
         assert_eq!(view.phase, crate::workflow::graph::PHASE_CI_WAIT);
         let saved = load_run_state(&r).unwrap();
@@ -762,18 +769,20 @@ mod tests {
     fn ci_wait_resume_unresolved_keeps_none_and_journals() {
         let (_ws, _repo, r) = fresh_ci_fixture("`not-a-target`");
         let mut state = RunState::idle(&r.id);
-        begin_fresh_run(
-            &r,
-            &mut state,
-            FreshRun {
-                track_arg: Some("0101".into()),
-                driver: WorkflowDriver::Adapter,
-                picked: false,
-                archive_slugs: Vec::new(),
-                journal_unreadable: false,
-                ci_wait: Some((7, "abc".into())),
-            },
-        )
+        with_run_state_lock(&r, || {
+            begin_fresh_run(
+                &r,
+                &mut state,
+                FreshRun {
+                    track_arg: Some("0101".into()),
+                    driver: WorkflowDriver::Adapter,
+                    picked: false,
+                    archive_slugs: Vec::new(),
+                    journal_unreadable: false,
+                    ci_wait: Some((7, "abc".into())),
+                },
+            )
+        })
         .unwrap();
         let saved = load_run_state(&r).unwrap();
         assert!(saved.delivery_target.is_none());
