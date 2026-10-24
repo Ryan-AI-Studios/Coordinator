@@ -1312,9 +1312,23 @@ mod tests {
 
     #[test]
     fn probe_health_absent_on_closed_port() {
-        let port = refused_port();
-        assert_eq!(probe_now(port), PortHealth::Absent);
-        assert!(!coordinator_serve_listening(port));
+        // A just-released ephemeral port can be re-bound by a concurrent test, so
+        // retry: the arm must reach `Absent` for at least one genuinely closed port.
+        let mut last = PortHealth::Healthy;
+        for _ in 0..10 {
+            let port = refused_port();
+            last = probe_now(port);
+            if last == PortHealth::Absent {
+                assert!(!coordinator_serve_listening(port));
+                return;
+            }
+            assert_ne!(
+                last,
+                PortHealth::Healthy,
+                "a closed port must never read as Healthy"
+            );
+        }
+        panic!("closed loopback port classified {last:?}, expected Absent");
     }
 
     #[test]

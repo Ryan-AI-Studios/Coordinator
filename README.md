@@ -262,8 +262,8 @@ Scheduled Task `CoordinatorServe`, which runs the installed `coordinator.exe ser
 logon, and the periodic nudge `CoordinatorServeNudge`, which probes health every five minutes and
 asks Task Scheduler to run `CoordinatorServe` only when no coordinator answers. Neither is a Windows
 service or a resident loop; **nothing autonomous kills a live serve**. This is the **OD-116-7**
-amendment to OD-116-1 ("exactly one Windows logon Scheduled Task"): **one logon task plus one
-periodic health-first nudge**.
+amendment to OD-116-1 ("exactly one Windows logon Scheduled Task"):
+**one logon task plus one periodic health-first nudge**.
 
 `Start-ScheduledTask -TaskName CoordinatorServe` remains the supported on-demand start. The logon
 task is the only owner of the machine ticker; `RestartOnFailure` (3 attempts, 1 min apart) is

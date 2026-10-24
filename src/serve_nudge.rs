@@ -922,9 +922,11 @@ mod tests {
             map_schtasks_status(Some(0), b"", b"").unwrap(),
             StartOutcome::Requested
         );
-        for code in SCHTASKS_ALREADY_RUNNING {
+        assert_eq!(SCHTASKS_ALREADY_RUNNING, &[267_009, 267_039]);
+        // Literal codes, not the constant: shrinking the allow-list must fail here.
+        for code in [267_009, 267_039] {
             assert_eq!(
-                map_schtasks_status(Some(*code), b"", b"").unwrap(),
+                map_schtasks_status(Some(code), b"", b"").unwrap(),
                 StartOutcome::AlreadyRunning,
                 "code {code} means the request was satisfied"
             );
