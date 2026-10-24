@@ -204,10 +204,7 @@ pub fn probe_serve_health(port: u16, timeout: Duration) -> PortHealth {
         Err(ureq::Error::StatusCode(_)) => return PortHealth::Foreign,
         // A responder spoke something that is not HTTP (TLS/SSH banner, garbage).
         Err(ureq::Error::Protocol(_)) => return PortHealth::Foreign,
-        Err(ureq::Error::Io(e))
-            if e.kind() == std::io::ErrorKind::ConnectionRefused
-                || e.kind() == std::io::ErrorKind::NotFound =>
-        {
+        Err(ureq::Error::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             return PortHealth::Absent;
         }
         Err(ureq::Error::ConnectionFailed) | Err(ureq::Error::HostNotFound) => {
