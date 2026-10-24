@@ -1319,6 +1319,9 @@ mod tests {
     // ---- 0124 health-bound calibration -------------------------------------
 
     #[test]
+    // The pin is the point: both sides are constants, so clippy's assertion-on-constant
+    // lint would otherwise forbid the only deterministic discriminator in this track.
+    #[allow(clippy::assertions_on_constants)]
     fn health_bound_is_pinned_above_the_windows_refusal_budget() {
         // Floor guard, not the margin argument: the 2171 ms worst sample is 29 ms below this
         // floor; the real 0.83 s / 38 % margin lives in the constant's doc comment. Windows
