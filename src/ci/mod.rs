@@ -262,6 +262,10 @@ pub fn drive_with(
     {
         return Ok(view);
     }
+    // 0125: a pending ci-fix push ends this tick. The pre-push snapshot must not reach checks.
+    if let fix::CiFixDelivery::Done(view) = fix::deliver_ci_fix_push(record, state, &target)? {
+        return Ok(view);
+    }
 
     if let CiTarget::PullRequest { is_draft: true, .. } = &target {
         persist_watch(record, Some("ci-wait: waiting (draft PR)"), |ci| {
@@ -307,6 +311,17 @@ pub fn drive_with(
                 ),
             );
         }
+        if let Some(local) = state.ci.as_ref().and_then(|c| c.ci_fix_pushed_sha.clone()) {
+            return apply_failure(
+                record,
+                state,
+                FailureClass::CiFailed,
+                format!(
+                    "ci-push: PR #{number} merged before the CI fix head was observed (local {} on {head_ref})",
+                    &local[..local.len().min(7)]
+                ),
+            );
+        }
         persist_watch(record, None, |ci| {
             apply_target(ci, &target);
             ci.merge = Some("done".into());
@@ -323,6 +338,20 @@ pub fn drive_with(
     if state.ci.as_ref().and_then(|c| c.merge.as_deref()) == Some("done")
         || state.ci.as_ref().and_then(|c| c.merge.as_deref()) == Some("queued")
     {
+        if let Some(local) = state.ci.as_ref().and_then(|c| c.ci_fix_pushed_sha.clone()) {
+            let short = &local[..local.len().min(7)];
+            let event = match &target {
+                CiTarget::PullRequest {
+                    number, head_ref, ..
+                } => format!(
+                    "ci-push: PR #{number} merged before the CI fix head was observed (local {short} on {head_ref})"
+                ),
+                CiTarget::HeadSha { .. } => format!(
+                    "ci-push: merged #0 before the CI fix head was observed (local {short} on head)"
+                ),
+            };
+            return apply_failure(record, state, FailureClass::CiFailed, event);
+        }
         let queued = state.ci.as_ref().and_then(|c| c.merge.as_deref()) == Some("queued");
         let msg = match &target {
             CiTarget::PullRequest {
@@ -346,6 +375,9 @@ pub fn drive_with(
     }
 
     if let review::Delivery::Done(view) = review::wait_for_pushed_head(record, state, &target)? {
+        return Ok(view);
+    }
+    if let fix::CiFixDelivery::Done(view) = fix::wait_for_ci_fix_head(record, state, &target)? {
         return Ok(view);
     }
 
@@ -447,8 +479,13 @@ fn finish_green(
         load_run_state(record)
             .ok()
             .and_then(|s| s.ci)
-            .is_none_or(|c| c.review_push_pending.is_none() && c.review_pushed_sha.is_none()),
-        "0078: finish_green reached with a pending or unobserved review push"
+            .is_none_or(|c| {
+                c.review_push_pending.is_none()
+                    && c.review_pushed_sha.is_none()
+                    && c.ci_fix_push_pending.is_none()
+                    && c.ci_fix_pushed_sha.is_none()
+            }),
+        "finish_green reached with a pending or unobserved review or ci-fix push"
     );
     match target {
         CiTarget::HeadSha { .. } => {
@@ -8062,5 +8099,536 @@ mod tests {
             .filter(|ent| ent.file_name().to_string_lossy().starts_with("FAILURE"))
             .count();
         assert_eq!(failure_files, 1);
+    }
+
+    fn arm_ci_fix(r: &ProjectRecord, base: &str, head: &str, attempts: u32) {
+        with_run_state_lock(r, || {
+            let mut st = load_run_state(r)?;
+            st.ci_fix_attempts = attempts;
+            st.ci_fix_request = Some(crate::state::CiFixRequest {
+                pr_number: 7,
+                from_sha: base.into(),
+                checks: vec![crate::state::CiFixCheck {
+                    name: "ci".into(),
+                    bucket: "fail".into(),
+                    description: "red".into(),
+                    link: String::new(),
+                }],
+            });
+            let mut ci = st.ci.take().unwrap_or_default();
+            ci.ci_fix_push_pending = Some(head.into());
+            ci.ci_fix_pushed_sha = None;
+            ci.review_push_pending = None;
+            ci.review_pushed_sha = None;
+            st.ci = Some(ci);
+            save_run_state(r, &st)
+        })
+        .unwrap();
+    }
+
+    fn arm_ci_fix_pushed(r: &ProjectRecord, sha: &str) {
+        with_run_state_lock(r, || {
+            let mut st = load_run_state(r)?;
+            let mut ci = st.ci.take().unwrap_or_default();
+            ci.ci_fix_push_pending = None;
+            ci.ci_fix_pushed_sha = Some(sha.into());
+            ci.review_push_pending = None;
+            ci.review_pushed_sha = None;
+            st.ci = Some(ci);
+            save_run_state(r, &st)
+        })
+        .unwrap();
+    }
+
+    struct ClearPushPresets;
+
+    impl Drop for ClearPushPresets {
+        fn drop(&mut self) {
+            fix::clear_push_presets();
+        }
+    }
+
+    #[test]
+    fn ci_fix_push_updates_the_bare_remote() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        arm_ci_fix(&r, &base, &head, 1);
+        let st = load_run_state(&r).unwrap();
+        let out = fix::deliver_ci_fix_push(&r, &st, &owned_pr_target(7)).unwrap();
+        assert!(matches!(out, fix::CiFixDelivery::Done(None)), "{out:?}");
+        let st = load_run_state(&r).unwrap();
+        let ci = st.ci.as_ref().unwrap();
+        assert!(ci.ci_fix_push_pending.is_none());
+        assert_eq!(
+            ci.ci_fix_pushed_sha.as_deref(),
+            Some(rev_parse(&repo).as_str())
+        );
+        assert!(st.ci_fix_request.is_none());
+        assert_eq!(st.ci_fix_attempts, 1);
+        assert!(ci.review_push_pending.is_none());
+        assert!(ci.review_pushed_sha.is_none());
+        assert_eq!(st.status, RunStatus::Running);
+        let remote_tip = String::from_utf8(
+            git_ok(bare.path(), &["rev-parse", "refs/heads/track/0010-Fixture"]).stdout,
+        )
+        .unwrap();
+        assert_eq!(remote_tip.trim(), rev_parse(&repo));
+    }
+
+    #[test]
+    fn ci_fix_push_tick_holds_and_does_not_evaluate_pre_push_checks() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        arm_ci_fix(&r, &base, &head, 1);
+        let mut target = owned_pr_target(7);
+        if let CiTarget::PullRequest { head_oid, .. } = &mut target {
+            *head_oid = Some(base.clone());
+        }
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(target)));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Fail)])));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none(), "{view:?}");
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(st.ci_fix_attempts, 1);
+        assert!(st.ci_fix_request.is_none());
+        let ci = st.ci.as_ref().unwrap();
+        assert!(ci.ci_fix_push_pending.is_none());
+        assert_eq!(
+            ci.ci_fix_pushed_sha.as_deref(),
+            Some(rev_parse(&repo).as_str())
+        );
+        assert!(ci.review_push_pending.is_none());
+        assert!(ci.review_pushed_sha.is_none());
+        assert_eq!(counts.checks_n(), 0);
+        assert_eq!(counts.pr_files_n(), 0);
+        let remote_tip = String::from_utf8(
+            git_ok(bare.path(), &["rev-parse", "refs/heads/track/0010-Fixture"]).stdout,
+        )
+        .unwrap();
+        assert_eq!(remote_tip.trim(), head);
+    }
+
+    fn ci_fix_with_rejected_remote(r: &ProjectRecord) -> String {
+        jump_ci_wait(r, WorkflowDriver::Adapter);
+        let repo = r.execution_repo.clone().unwrap();
+        git_ok(&repo, &["switch", "-c", "track/0010-Fixture"]);
+        let base = rev_parse(&repo);
+        std::fs::write(repo.join("f.txt"), "ci fix\n").unwrap();
+        git_ok(&repo, &["commit", "-am", "ci fix"]);
+        let head = rev_parse(&repo);
+        let not_a_repo = repo.join("not-a-repo");
+        std::fs::write(&not_a_repo, "x").unwrap();
+        git_ok(
+            &repo,
+            &["remote", "add", "origin", not_a_repo.to_str().unwrap()],
+        );
+        arm_ci_fix(r, &base, &head, 2);
+        head
+    }
+
+    #[test]
+    fn ci_fix_push_retry_does_not_spend_ci_fix_cap() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        ci_fix_with_rejected_remote(&r);
+        let st = load_run_state(&r).unwrap();
+        let out = fix::deliver_ci_fix_push(&r, &st, &owned_pr_target(7)).unwrap();
+        assert!(matches!(out, fix::CiFixDelivery::Done(None)), "{out:?}");
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.ci_fix_attempts, 2);
+        assert!(st.ci_fix_request.is_some());
+        let ci = st.ci.as_ref().unwrap();
+        assert_eq!(ci.ci_fix_push_attempts, 1);
+        assert!(ci.ci_fix_push_pending.is_some());
+        assert!(
+            st.last_event.contains("retry 1/3"),
+            "last_event={}",
+            st.last_event
+        );
+        assert!(st.last_event.starts_with("ci-push:"), "{}", st.last_event);
+    }
+
+    #[test]
+    fn ci_fix_push_third_failure_stops() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        ci_fix_with_rejected_remote(&r);
+        for attempt in 0..3 {
+            let st = load_run_state(&r).unwrap();
+            let out = fix::deliver_ci_fix_push(&r, &st, &owned_pr_target(7)).unwrap();
+            if attempt < 2 {
+                assert!(
+                    matches!(out, fix::CiFixDelivery::Done(None)),
+                    "{attempt}: {out:?}"
+                );
+                assert_eq!(load_run_state(&r).unwrap().ci_fix_attempts, 2);
+            } else {
+                assert!(
+                    matches!(out, fix::CiFixDelivery::Done(Some(ref view)) if view.status == RunStatus::Stopped),
+                    "{out:?}"
+                );
+                let st = load_run_state(&r).unwrap();
+                assert_eq!(st.status, RunStatus::Stopped);
+                assert_eq!(st.failure_class, Some(FailureClass::CiFailed));
+                assert_eq!(st.ci_fix_attempts, 2);
+                assert!(
+                    st.last_event.contains("(3/3)"),
+                    "last_event={}",
+                    st.last_event
+                );
+                assert!(st.last_event.contains("ci-push:"), "{}", st.last_event);
+            }
+        }
+    }
+
+    fn preset_transport(message: &str) {
+        fix::preset_next_git_push(Err(crate::error::CoordinatorError::Message(message.into())));
+    }
+
+    #[test]
+    fn ci_fix_push_transport_err_retries_then_stops() {
+        let _g = poll_env();
+        let _presets = ClearPushPresets;
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        arm_ci_fix(&r, &base, &head, 2);
+        let long = format!("ci-wait: git timed out {}", "x".repeat(180));
+        assert!(long.chars().count() > 160);
+        for attempt in 0..3 {
+            preset_transport(&long);
+            let st = load_run_state(&r).unwrap();
+            let out = fix::deliver_ci_fix_push(&r, &st, &owned_pr_target(7));
+            assert!(out.is_ok(), "{out:?}");
+            let out = out.unwrap();
+            let st = load_run_state(&r).unwrap();
+            assert_eq!(st.ci_fix_attempts, 2);
+            let reason = st
+                .last_event
+                .strip_prefix("ci-push: ")
+                .and_then(|rest| rest.split(" (").next())
+                .unwrap_or("");
+            assert!(
+                reason.chars().count() <= 160,
+                "reason len {} event {}",
+                reason.chars().count(),
+                st.last_event
+            );
+            assert!(
+                !st.last_event.contains(&"x".repeat(180)),
+                "{}",
+                st.last_event
+            );
+            if attempt < 2 {
+                assert!(matches!(out, fix::CiFixDelivery::Done(None)), "{out:?}");
+                assert!(
+                    st.last_event.contains(&format!("retry {}/3", attempt + 1)),
+                    "{}",
+                    st.last_event
+                );
+                assert_eq!(st.status, RunStatus::Running);
+            } else {
+                assert!(
+                    matches!(out, fix::CiFixDelivery::Done(Some(ref view)) if view.status == RunStatus::Stopped),
+                    "{out:?}"
+                );
+                assert_eq!(st.failure_class, Some(FailureClass::CiFailed));
+                assert!(st.last_event.contains("(3/3)"), "{}", st.last_event);
+            }
+        }
+        let refs = crate::git_command::command()
+            .args(["show-ref"])
+            .current_dir(bare.path())
+            .output()
+            .unwrap();
+        assert!(
+            refs.stdout.is_empty(),
+            "preset Err must not push: {}",
+            String::from_utf8_lossy(&refs.stdout)
+        );
+    }
+
+    #[test]
+    fn ci_fix_push_remote_err_is_a_retry() {
+        let _g = poll_env();
+        let _presets = ClearPushPresets;
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        arm_ci_fix(&r, &base, &head, 2);
+        fix::preset_next_push_remote(Err(crate::error::CoordinatorError::Message(
+            "ci-wait: git timed out".into(),
+        )));
+        let st = load_run_state(&r).unwrap();
+        let out = fix::deliver_ci_fix_push(&r, &st, &owned_pr_target(7));
+        assert!(out.is_ok(), "{out:?}");
+        assert!(matches!(out.unwrap(), fix::CiFixDelivery::Done(None)));
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.ci_fix_attempts, 2);
+        assert_eq!(st.ci.as_ref().unwrap().ci_fix_push_attempts, 1);
+        assert!(
+            st.last_event.contains("retry 1/3"),
+            "last_event={}",
+            st.last_event
+        );
+        assert!(
+            !st.last_event.contains("no GitHub remote"),
+            "{}",
+            st.last_event
+        );
+        assert!(st.last_event.contains("ci-wait: git timed out"));
+    }
+
+    #[test]
+    fn merged_before_ci_fix_push_is_not_success() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        arm_ci_fix(&r, "abc111", "0123456789abcdef", 1);
+        let mut target = owned_pr_target(7);
+        if let CiTarget::PullRequest { merged, .. } = &mut target {
+            *merged = true;
+        }
+        let st = load_run_state(&r).unwrap();
+        let out = fix::deliver_ci_fix_push(&r, &st, &target).unwrap();
+        assert!(
+            matches!(out, fix::CiFixDelivery::Done(Some(view)) if view.status == RunStatus::Stopped)
+        );
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            st.last_event
+                .contains("merged before the CI fix was delivered"),
+            "{}",
+            st.last_event
+        );
+        assert!(!st.last_event.contains("already merged"));
+        assert!(st.ci_fix_request.is_some());
+        assert!(st.ci.as_ref().unwrap().ci_fix_push_pending.is_some());
+    }
+
+    #[test]
+    fn closed_before_ci_fix_push_stops() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        arm_ci_fix(&r, "abc111", "0123456789abcdef", 1);
+        let st = load_run_state(&r).unwrap();
+        let out = fix::deliver_ci_fix_push(&r, &st, &pr_closed(7)).unwrap();
+        assert!(
+            matches!(out, fix::CiFixDelivery::Done(Some(view)) if view.status == RunStatus::Stopped)
+        );
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            st.last_event
+                .contains("closed before the CI fix was delivered"),
+            "{}",
+            st.last_event
+        );
+        assert!(!st.last_event.contains("merged"));
+        assert!(st.ci_fix_request.is_some());
+        assert!(st.ci.as_ref().unwrap().ci_fix_push_pending.is_some());
+    }
+
+    #[test]
+    fn closed_after_ci_fix_push_stops() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        arm_ci_fix_pushed(&r, "0123456789abcdef");
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr_closed(7))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Fail)])));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("stop");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            view.last_event
+                .contains("closed before the CI fix head was observed"),
+            "{}",
+            view.last_event
+        );
+        assert!(!view.last_event.contains("merged"), "{}", view.last_event);
+        assert!(
+            !view.last_event.contains("head moved"),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(counts.checks_n(), 0);
+    }
+
+    #[test]
+    fn pushed_head_mismatch_holds_then_stops() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        arm_ci_fix_pushed(&r, "0123456789abcdef");
+        {
+            let s = ScriptedBackend::new();
+            s.push_resolve(Ok(Some(owned_pr_target(7))));
+            s.push_snapshot(Ok(items(&[("ci", CheckBucket::Fail)])));
+            let (_hook, counts) = hook(s);
+            let view = crate::workflow::tick(&r).unwrap();
+            assert!(view.is_none(), "{view:?}");
+            assert_eq!(counts.checks_n(), 0);
+        }
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.status, RunStatus::Running);
+        assert_eq!(st.last_event, "ci-wait: waiting for pushed CI fix head");
+        assert!(st.ci.as_ref().unwrap().ci_fix_pushed_sha.is_some());
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            if let Some(ci) = st.ci.as_mut() {
+                ci.ci_fix_push_waiting_since = Some(Utc::now() - chrono::Duration::seconds(601));
+                ci.last_poll_at = None;
+            }
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Fail)])));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("stop");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            view.last_event.contains("head moved"),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(counts.checks_n(), 0);
+    }
+
+    #[test]
+    fn matching_head_clears_the_marker_and_reaches_checks() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), false);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        arm_ci_fix_pushed(&r, "abc");
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("green");
+        assert!(
+            view.last_event.contains("merge skipped"),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(counts.checks_n(), 1);
+        let ci = load_run_state(&r).unwrap().ci.unwrap();
+        assert!(ci.ci_fix_pushed_sha.is_none());
+        assert!(ci.ci_fix_push_waiting_since.is_none());
+    }
+
+    #[test]
+    fn merged_after_ci_fix_push_before_head_observation_stops() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        arm_ci_fix_pushed(&r, "0123456789abcdef");
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(possessive_merged(7))));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("stop");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            view.last_event
+                .contains("merged before the CI fix head was observed"),
+            "{}",
+            view.last_event
+        );
+        assert!(!view.last_event.contains("already merged"));
+        assert_ne!(view.failure_class, Some(FailureClass::ReviewComments));
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.checks_n(), 0);
+    }
+
+    #[test]
+    fn head_sha_merge_marker_with_ci_fix_push_stops() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            let mut ci = st.ci.take().unwrap_or_default();
+            ci.merge = Some("done".into());
+            ci.ci_fix_pushed_sha = Some("abcdef1234567890".into());
+            st.ci = Some(ci);
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(CiTarget::HeadSha {
+            sha: "other".into(),
+        })));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("stop");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        assert!(
+            view.last_event.contains(
+                "ci-push: merged #0 before the CI fix head was observed (local abcdef1 on head)"
+            ),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.checks_n(), 0);
+    }
+
+    #[test]
+    fn review_delivery_still_owns_review_markers() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        arm_committed_fix(&r, bare.path(), |repo| {
+            std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+            std::fs::write(repo.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+        });
+        let out = run_delivery(&r, Ok(vec![".github/workflows/ci.yml".into()]));
+        assert!(
+            matches!(out, review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped)
+        );
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.failure_class, Some(FailureClass::ReviewComments));
+        assert!(st.last_event.contains("review-push:"), "{}", st.last_event);
+        assert!(st.ci.as_ref().unwrap().review_push_pending.is_some());
+        assert!(st.ci.as_ref().unwrap().ci_fix_push_pending.is_none());
     }
 }

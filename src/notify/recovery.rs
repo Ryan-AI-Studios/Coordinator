@@ -22,7 +22,7 @@ pub fn recommended_action(class: FailureClass) -> &'static str {
         }
         FailureClass::Timeout => "Increase the phase budget or split the work; then re-run.",
         FailureClass::CiFailed => {
-            "Do not merge. Inspect CI; re-run after fix (0010). Opt-in address-ci is off or its cap is exhausted (0071)."
+            "Do not merge. Inspect CI; re-run after fix (0010). Opt-in address-ci is off or its cap is exhausted (0071). If `last_event` begins `ci-push:`, the CI fix is committed on the track branch but not delivered - fix the named push error and push it, or push the branch by hand, before re-running; a fresh run starts at `plan` and does not re-push. A `ci-push: PR #N merged|closed` stop means the PR ended before the fix landed - reopen or open a new PR for that branch (0125)."
         }
         FailureClass::SkillMissing => {
             "Create the missing skill file or set skill_aliases; do not blind-retry."
@@ -70,7 +70,7 @@ mod tests {
         );
         assert_eq!(
             recommended_action(FailureClass::CiFailed),
-            "Do not merge. Inspect CI; re-run after fix (0010). Opt-in address-ci is off or its cap is exhausted (0071)."
+            "Do not merge. Inspect CI; re-run after fix (0010). Opt-in address-ci is off or its cap is exhausted (0071). If `last_event` begins `ci-push:`, the CI fix is committed on the track branch but not delivered - fix the named push error and push it, or push the branch by hand, before re-running; a fresh run starts at `plan` and does not re-push. A `ci-push: PR #N merged|closed` stop means the PR ended before the fix landed - reopen or open a new PR for that branch (0125)."
         );
         assert_eq!(
             recommended_action(FailureClass::SkillMissing),

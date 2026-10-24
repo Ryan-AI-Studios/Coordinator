@@ -756,6 +756,10 @@ mod tests {
         assert!(address_ci.contains("git push"), "{address_ci}");
         assert!(address_ci.contains("gh pr create"), "{address_ci}");
         assert!(address_ci.contains("gh pr merge"), "{address_ci}");
+        assert!(
+            address_ci.contains("Coordinator pushes the branch"),
+            "{address_ci}"
+        );
         assert!(!address_ci.contains("self-check:"), "{address_ci}");
     }
 

@@ -154,7 +154,7 @@ Adapter injects name the phase skill as `{workspace|execution}/.agents/skills/<p
 
 **`address-findings`:** after a cross-model GateFail, adapter injects this named phase (implementor Role Binding + implement/onboarding skill paths), then a fresh gate; cap 2 then `difficulty` Stop.
 
-**`address-ci`:** opt-in route when the ci-wait gate fails this run's owned PR (implementor, cap 2, 1800s). `project set --ci-fix-routing true|false` turns it on. `COORDINATOR_CI_FIX=off` forces it off.
+**`address-ci`:** opt-in route when the ci-wait gate fails this run's owned PR (implementor, cap 2, 1800s). `project set --ci-fix-routing true|false` turns it on. `COORDINATOR_CI_FIX=off` forces it off. The engine pushes that commit (`git push -u`, three attempts) and waits until `headRefOid` matches; a missing head declines without spending the cap.
 
 **`address-review`:** opt-in route when this run's owned PR has an allowlisted unresolved review
 thread or `CHANGES_REQUESTED` review body (implementor, successor `ci-wait`, 1800s, cap 2;

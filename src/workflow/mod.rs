@@ -166,7 +166,11 @@ pub fn on_success(
 
     if state.phase == graph::PHASE_ADDRESS_CI {
         match crate::ci::fix::classify_diff(record, state) {
-            crate::ci::fix::DiffClass::Changed => {}
+            crate::ci::fix::DiffClass::Changed { head } => {
+                let mut ci = state.ci.take().unwrap_or_default();
+                ci.ci_fix_push_pending = Some(head);
+                state.ci = Some(ci);
+            }
             crate::ci::fix::DiffClass::Empty { sha } => {
                 let message = format!("address-ci: no diff from {sha}");
                 stop_address_ci(state, &message);
@@ -3387,9 +3391,10 @@ mod tests {
             from_sha: base,
             checks: Vec::new(),
         });
+        let head = impl_git(sibling.path(), &["rev-parse", "HEAD"]);
         assert_eq!(
             crate::ci::fix::classify_diff(&record, &state),
-            crate::ci::fix::DiffClass::Changed
+            crate::ci::fix::DiffClass::Changed { head }
         );
     }
 

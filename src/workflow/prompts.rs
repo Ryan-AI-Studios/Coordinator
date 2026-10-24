@@ -567,6 +567,7 @@ fn address_ci_body(record: &ProjectRecord) -> String {
          PR #{pr}\n\
          from_sha: {sha}\n\
          Commit a real diff against `from_sha` and end the turn.\n\
+         Coordinator pushes the branch.\n\
          Do not run `git push`, `gh pr create`, or `gh pr merge`.\n\
          Do not load the implement-track publish loop.\n\
          Failing required checks:\n",

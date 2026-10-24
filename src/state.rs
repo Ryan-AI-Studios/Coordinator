@@ -358,6 +358,18 @@ pub struct CiWatchState {
     /// 0078: first tick that waited for the pushed head (10 minute bound).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_push_waiting_since: Option<DateTime<Utc>>,
+    /// 0125: the `address-ci` commit that still has to be pushed by the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_fix_push_pending: Option<String>,
+    /// 0125: the actual pushed tip. Cleared when the PR head matches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_fix_pushed_sha: Option<String>,
+    /// 0125: consecutive failed ci-fix push attempts (cap 3). Not `ci_fix_attempts`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub ci_fix_push_attempts: u32,
+    /// 0125: first tick that waited for the pushed CI-fix head (10 minute bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_fix_push_waiting_since: Option<DateTime<Utc>>,
 }
 
 /// One failing check from the judged slice handed to `address-ci` (0071).
