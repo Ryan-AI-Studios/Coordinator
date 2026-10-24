@@ -169,30 +169,74 @@ pub fn wait_for_outcome(record: &ProjectRecord, timeout_secs: Option<u64>) -> Re
     }
 }
 
+/// Observable answer from a loopback `/health` probe. The caller decides policy;
+/// this type never equates "TCP accepted" with health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortHealth {
+    /// A coordinator answered with valid `/health` JSON within the bound.
+    Healthy,
+    /// Connection refused / connect failure / host not found.
+    Absent,
+    /// TCP accepted but no valid answer before the bound (starting, slow, hung,
+    /// silent, reset, truncated body).
+    Unresponsive,
+    /// A responder that is not a coordinator (other service, non-JSON HTTP body,
+    /// 4xx/5xx, or protocol-level garbage such as a TLS/SSH banner).
+    Foreign,
+}
+
+/// Bounded, service-specific probe of `http://127.0.0.1:{port}/health`.
+///
+/// `Healthy` requires JSON `{ok:true, service:"coordinator"}` within `timeout`.
+/// A bare TCP listener is `Unresponsive`, never `Healthy`; a responding but
+/// broken coordinator is never reported `Absent`.
+pub fn probe_serve_health(port: u16, timeout: Duration) -> PortHealth {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .max_redirects(0)
+        .proxy(None)
+        .build()
+        .into();
+    let mut resp = match agent.get(&url).call() {
+        Ok(resp) => resp,
+        // An HTTP listener answered, but not with success: not us.
+        Err(ureq::Error::StatusCode(_)) => return PortHealth::Foreign,
+        // A responder spoke something that is not HTTP (TLS/SSH banner, garbage).
+        Err(ureq::Error::Protocol(_)) => return PortHealth::Foreign,
+        Err(ureq::Error::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return PortHealth::Absent;
+        }
+        Err(ureq::Error::ConnectionFailed) | Err(ureq::Error::HostNotFound) => {
+            return PortHealth::Absent;
+        }
+        Err(ureq::Error::Timeout(_)) => return PortHealth::Unresponsive,
+        Err(_) => return PortHealth::Unresponsive,
+    };
+    // A body read failure on a 200 (truncated body, reset, over-limit) is
+    // `Unresponsive`, never `Absent`: a responding-but-broken coordinator must not
+    // make a start eligible.
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return PortHealth::Unresponsive;
+    };
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(value)
+            if value.get("ok") == Some(&serde_json::Value::Bool(true))
+                && value.get("service").and_then(|s| s.as_str()) == Some("coordinator") =>
+        {
+            PortHealth::Healthy
+        }
+        _ => PortHealth::Foreign,
+    }
+}
+
 /// True when Coordinator `serve` answers `/health` on `127.0.0.1:{port}`.
 ///
 /// Requires JSON `{ ok: true, service: "coordinator" }`. Connection refused,
 /// timeout, non-JSON, or a non-coordinator occupant is `false` (caller ticks).
 pub fn coordinator_serve_listening(port: u16) -> bool {
     const PROBE: Duration = Duration::from_millis(200);
-    let url = format!("http://127.0.0.1:{port}/health");
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(PROBE))
-        .max_redirects(0)
-        .proxy(None)
-        .build()
-        .into();
-    let Ok(mut resp) = agent.get(&url).call() else {
-        return false;
-    };
-    let Ok(body) = resp.body_mut().read_to_string() else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return false;
-    };
-    v.get("ok") == Some(&serde_json::Value::Bool(true))
-        && v.get("service").and_then(|s| s.as_str()) == Some("coordinator")
+    matches!(probe_serve_health(port, PROBE), PortHealth::Healthy)
 }
 
 /// How CLI `run` looks for an already-on `serve`.
@@ -1192,6 +1236,178 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         port
+    }
+
+    // ---- 0122 classifier ---------------------------------------------------
+
+    /// Raw loopback responder for the classifier arms `spawn_health_hold` cannot
+    /// express (status codes, protocol garbage, truncated bodies, silence).
+    struct RawHold {
+        pub port: u16,
+        stop: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl Drop for RawHold {
+        fn drop(&mut self) {
+            if let Some(tx) = self.stop.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// `silent = true` accepts and never answers (keeps the socket open).
+    fn spawn_raw_responder(response: &'static [u8], silent: bool) -> RawHold {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let mut held: Vec<std::net::TcpStream> = Vec::new();
+            loop {
+                if rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut buf = [0u8; 2048];
+                        let _ = stream.read(&mut buf);
+                        if silent {
+                            held.push(stream);
+                        } else {
+                            let _ = stream.write_all(response);
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(held);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        RawHold {
+            port,
+            stop: Some(tx),
+        }
+    }
+
+    fn probe_now(port: u16) -> PortHealth {
+        probe_serve_health(port, Duration::from_millis(500))
+    }
+
+    #[test]
+    fn probe_health_healthy_coordinator_json() {
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
+        assert_eq!(probe_now(hold.port), PortHealth::Healthy);
+        assert!(coordinator_serve_listening(hold.port));
+    }
+
+    #[test]
+    fn probe_health_absent_on_closed_port() {
+        // A just-released ephemeral port can be re-bound by a concurrent test, so
+        // retry: the arm must reach `Absent` for at least one genuinely closed port.
+        let mut last = PortHealth::Healthy;
+        for _ in 0..10 {
+            let port = refused_port();
+            last = probe_now(port);
+            if last == PortHealth::Absent {
+                assert!(!coordinator_serve_listening(port));
+                return;
+            }
+            assert_ne!(
+                last,
+                PortHealth::Healthy,
+                "a closed port must never read as Healthy"
+            );
+        }
+        panic!("closed loopback port classified {last:?}, expected Absent");
+    }
+
+    #[test]
+    fn probe_health_foreign_on_other_service() {
+        let hold = spawn_health_hold(r#"{"ok":true,"service":"other"}"#);
+        assert_eq!(probe_now(hold.port), PortHealth::Foreign);
+        assert!(!coordinator_serve_listening(hold.port));
+    }
+
+    #[test]
+    fn probe_health_foreign_on_ok_false() {
+        let hold = spawn_health_hold(r#"{"ok":false,"service":"coordinator"}"#);
+        assert_eq!(probe_now(hold.port), PortHealth::Foreign);
+        assert!(!coordinator_serve_listening(hold.port));
+    }
+
+    #[test]
+    fn probe_health_foreign_on_http_error() {
+        let hold = spawn_raw_responder(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            false,
+        );
+        assert_eq!(probe_now(hold.port), PortHealth::Foreign);
+        assert!(!coordinator_serve_listening(hold.port));
+    }
+
+    #[test]
+    fn probe_health_foreign_on_protocol_garbage() {
+        let hold = spawn_raw_responder(b"SSH-2.0-OpenSSH_9.0\r\n", false);
+        assert_eq!(
+            probe_now(hold.port),
+            PortHealth::Foreign,
+            "a non-HTTP banner is a responder, not absence"
+        );
+    }
+
+    #[test]
+    fn probe_health_unresponsive_on_truncated_body() {
+        let hold = spawn_raw_responder(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"ok\"",
+            false,
+        );
+        assert_eq!(
+            probe_now(hold.port),
+            PortHealth::Unresponsive,
+            "a broken body must never be Absent or Healthy"
+        );
+        assert!(!coordinator_serve_listening(hold.port));
+    }
+
+    #[test]
+    fn probe_health_unresponsive_on_silent_listener() {
+        let hold = spawn_raw_responder(b"", true);
+        assert_eq!(
+            probe_serve_health(hold.port, Duration::from_millis(100)),
+            PortHealth::Unresponsive
+        );
+    }
+
+    #[test]
+    fn probe_health_unresponsive_on_bare_tcp() {
+        let hold = spawn_raw_responder(b"", true);
+        assert_ne!(probe_now(hold.port), PortHealth::Healthy);
+        assert_eq!(probe_now(hold.port), PortHealth::Unresponsive);
+    }
+
+    #[test]
+    fn coordinator_serve_listening_matches_healthy_only() {
+        for body in [
+            r#"{"ok":true,"service":"coordinator"}"#,
+            r#"{"ok":true,"service":"other"}"#,
+            r#"{"ok":false,"service":"coordinator"}"#,
+            "not json at all",
+        ] {
+            let hold = spawn_health_hold(body);
+            let healthy = probe_now(hold.port) == PortHealth::Healthy;
+            assert_eq!(
+                coordinator_serve_listening(hold.port),
+                healthy,
+                "boolean must be true only for the coordinator JSON: {body}"
+            );
+        }
     }
 
     #[test]
