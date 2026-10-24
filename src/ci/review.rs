@@ -118,8 +118,6 @@ pub(crate) enum CandidateKind {
 pub(crate) struct Candidate {
     pub item: OpenItem,
     pub kind: CandidateKind,
-    /// The latched content is unchanged; only a delivered repair makes this a re-route.
-    pub same_content: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -721,7 +719,6 @@ pub(crate) fn classify_open(
             None => out.push(Candidate {
                 item: item.clone(),
                 kind: CandidateKind::New,
-                same_content: false,
             }),
             Some(entry)
                 if entry.source_comment_id != item.comment_id
@@ -730,15 +727,15 @@ pub(crate) fn classify_open(
                 out.push(Candidate {
                     item: item.clone(),
                     kind: CandidateKind::PushedBack,
-                    same_content: false,
                 });
             }
             Some(_) => {
                 if route_ready {
+                    // Unchanged content after a delivered repair stays a candidate.
+                    // At the cap that candidate stops; it is not a latch-only hold.
                     out.push(Candidate {
                         item: item.clone(),
                         kind: CandidateKind::PushedBack,
-                        same_content: true,
                     });
                 } else {
                     counts.latched += 1;
@@ -754,6 +751,27 @@ fn route_ready(state: &RunState) -> bool {
         .ci
         .as_ref()
         .is_none_or(|ci| ci.review_push_pending.is_none() && ci.review_pushed_sha.is_none())
+}
+
+/// Rewind both poll gates so the next tick must read. Test-only: production stamps
+/// `last_poll_at` and the 120s gate is what a missing rewind would hide.
+#[cfg(test)]
+pub(crate) fn force_review_poll_due(record: &ProjectRecord) {
+    let now = Utc::now();
+    with_run_state_lock(record, || {
+        let mut saved = load_run_state(record)?;
+        if let Some(route) = saved.review_route.as_mut() {
+            route.last_poll_at =
+                Some(now - chrono::Duration::milliseconds(REVIEW_POLL_MIN_MS + 1_000));
+        }
+        if let Some(ci) = saved.ci.as_mut() {
+            let interval = ci.next_interval_ms.unwrap_or(1).max(1);
+            ci.last_poll_at = Some(now - chrono::Duration::milliseconds(interval as i64));
+            ci.next_interval_ms = Some(1);
+        }
+        save_run_state(record, &saved)
+    })
+    .expect("force review poll due");
 }
 
 fn stored_result(state: &RunState, pr_number: u64, now: DateTime<Utc>) -> Option<ReviewPollResult> {
@@ -1080,18 +1098,8 @@ pub(crate) fn try_route_review_comments(
             return Ok(LockedRouting::Declined);
         }
         if saved.review_fix_attempts >= REVIEW_FIX_CAP {
-            if filtered.iter().all(|(_, c)| c.same_content) {
-                stamp_open(
-                    &mut saved,
-                    routed,
-                    "review-comments: unresolved thread waiting",
-                );
-                save_run_state(record, &saved)?;
-                return Ok(LockedRouting::Hold(
-                    StatusView::from_record(record, &saved),
-                    "review-comments: unresolved thread waiting".into(),
-                ));
-            }
+            // A still-open item after the second repair round stops; it never holds and
+            // never becomes mergeable.
             return Ok(LockedRouting::Exhausted(open_count(&snapshot)));
         }
         if routed.len() + filtered.len() > LATCH_MAX {
@@ -2117,7 +2125,6 @@ mod tests {
             .map(|item| Candidate {
                 item,
                 kind: CandidateKind::New,
-                same_content: false,
             })
             .collect();
         let batch = render_batch(&candidates, 78, "head78", 1);
@@ -2141,7 +2148,6 @@ mod tests {
             .map(|item| Candidate {
                 item,
                 kind: CandidateKind::New,
-                same_content: false,
             })
             .collect();
         let batch = render_batch(&candidates, 78, "head78", 1);
@@ -2326,29 +2332,97 @@ mod route_tests {
 
     #[test]
     fn human_thread_routes_once_then_latches() {
+        use crate::ci::backend::{CallCounts, RecordingBackend};
+        use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
         let r = record(dir.path(), true);
         let state = seed(dir.path(), 0, Vec::new(), None, None);
-        let b = backend(snap(vec![human_thread()], Vec::new()));
+        let scripted = backend(snap(vec![human_thread()], Vec::new()));
+        // Second programmed read: the forced-due tick must call the backend again.
+        scripted.push_reviews(Ok(snap(vec![human_thread()], Vec::new())));
+        let recorded = RecordingBackend::wrap(Arc::new(scripted));
+        let counts: CallCounts = recorded.counts.clone();
+        let now = Utc::now();
         let first =
-            try_route_review_comments(&r, &state, &target(78), dir.path(), &b, Utc::now()).unwrap();
+            try_route_review_comments(&r, &state, &target(78), dir.path(), &recorded, now).unwrap();
         assert!(matches!(first, RouteOutcome::Routed(_)));
         let saved = load_run_state(&r).unwrap();
         assert_eq!(saved.review_fix_attempts, 1);
         assert_eq!(saved.phase, PHASE_ADDRESS_REVIEW);
         assert_eq!(saved.review_route.as_ref().unwrap().routed.len(), 1);
-        // A racing tick whose saved phase is still ci-wait must be stopped by the latch
-        // re-check, not only by the phase guard.
+        assert!(saved.review_route.as_ref().unwrap().last_poll_at.is_some());
+        // The fresh stamp must suppress a second read. A racing caller that has not
+        // observed the latch still replays; the dedupe is not what blocks this tick.
         with_run_state_lock(&r, || {
             let mut st = load_run_state(&r)?;
             st.phase = PHASE_CI_WAIT.into();
             save_run_state(&r, &st)
         })
         .unwrap();
+        let mut racing = load_run_state(&r).unwrap();
+        if let Some(route) = racing.review_route.as_mut() {
+            route.routed.clear();
+        }
+        let suppressed =
+            try_route_review_comments(&r, &racing, &target(78), dir.path(), &recorded, now)
+                .unwrap();
+        assert!(matches!(suppressed, RouteOutcome::Hold { .. }));
+        assert_eq!(
+            counts.review_comments_n(),
+            1,
+            "a fresh stamp must not re-read"
+        );
+        assert_eq!(load_run_state(&r).unwrap().review_fix_attempts, 1);
+        // Forced-due: rewind the persisted review stamp and the CI poll gate, then
+        // read again. The latch on disk still drops the racing New candidate.
+        force_review_poll_due(&r);
+        let due = load_run_state(&r).unwrap();
+        let stamped = due.review_route.as_ref().unwrap().last_poll_at.unwrap();
+        assert!(
+            (Utc::now() - stamped).num_milliseconds() > REVIEW_POLL_MIN_MS,
+            "the persisted review gate must be rewound"
+        );
+        assert_eq!(due.ci.as_ref().unwrap().next_interval_ms, Some(1));
+        let mut caller = due;
+        if let Some(route) = caller.review_route.as_mut() {
+            route.routed.clear();
+        }
         let second =
-            try_route_review_comments(&r, &state, &target(78), dir.path(), &b, Utc::now()).unwrap();
+            try_route_review_comments(&r, &caller, &target(78), dir.path(), &recorded, Utc::now())
+                .unwrap();
         assert!(matches!(second, RouteOutcome::Hold { .. }));
         assert_eq!(load_run_state(&r).unwrap().review_fix_attempts, 1);
+        assert_eq!(
+            counts.review_comments_n(),
+            2,
+            "forced-due second tick reads again and still does not route"
+        );
+    }
+
+    #[test]
+    fn force_review_poll_due_rewinds_both_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = record(dir.path(), true);
+        let _ = seed(dir.path(), 0, Vec::new(), None, None);
+        let now = Utc::now();
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            let route = st.review_route.as_mut().unwrap();
+            route.last_poll_at = Some(now);
+            route.last_result = Some(ReviewPollResult::Open);
+            let ci = st.ci.as_mut().unwrap();
+            ci.last_poll_at = Some(now);
+            ci.next_interval_ms = Some(5_000);
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        force_review_poll_due(&r);
+        let saved = load_run_state(&r).unwrap();
+        let review_at = saved.review_route.unwrap().last_poll_at.unwrap();
+        let ci = saved.ci.unwrap();
+        assert!((Utc::now() - review_at).num_milliseconds() > REVIEW_POLL_MIN_MS);
+        assert_eq!(ci.next_interval_ms, Some(1));
+        assert!(ci.last_poll_at.unwrap() < Utc::now());
     }
 
     #[test]
@@ -2396,6 +2470,34 @@ mod route_tests {
     fn stored_cap_with_all_candidates_latched_declines_not_exhausted() {
         let dir = tempfile::tempdir().unwrap();
         let r = record(dir.path(), true);
+        let saved = seed(
+            dir.path(),
+            2,
+            vec![latch("T1", "C1", "2026-10-24T00:02:00Z", 2)],
+            None,
+            None,
+        );
+        // Racing tick: the caller has not observed the latch, so classify emits New and
+        // the lock drops it. `filtered` is empty, which must hold before the cap check.
+        // A PushedBack same-content candidate stays in `filtered` and stops instead.
+        let mut caller = saved;
+        if let Some(route) = caller.review_route.as_mut() {
+            route.routed.clear();
+        }
+        let b = backend(snap(vec![human_thread()], Vec::new()));
+        let outcome =
+            try_route_review_comments(&r, &caller, &target(78), dir.path(), &b, Utc::now())
+                .unwrap();
+        assert!(matches!(outcome, RouteOutcome::Hold { .. }));
+        let after = load_run_state(&r).unwrap();
+        assert_eq!(after.review_fix_attempts, 2);
+        assert!(after.failure_class.is_none());
+    }
+
+    #[test]
+    fn same_content_open_thread_at_cap_is_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = record(dir.path(), true);
         let state = seed(
             dir.path(),
             2,
@@ -2406,7 +2508,7 @@ mod route_tests {
         let b = backend(snap(vec![human_thread()], Vec::new()));
         let outcome =
             try_route_review_comments(&r, &state, &target(78), dir.path(), &b, Utc::now()).unwrap();
-        assert!(matches!(outcome, RouteOutcome::Hold { .. }));
+        assert!(matches!(outcome, RouteOutcome::Exhausted { open: 1 }));
         assert_eq!(load_run_state(&r).unwrap().review_fix_attempts, 2);
     }
 

@@ -6809,6 +6809,57 @@ mod tests {
     }
 
     #[test]
+    fn latched_open_thread_does_not_merge_and_reroutes() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_gate(
+            &r,
+            1,
+            vec![latch_thread("T1", "C1", "2026-10-24T00:02:00Z")],
+        );
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            if let Some(ci) = st.ci.as_mut() {
+                ci.review_push_pending = None;
+                ci.review_pushed_sha = None;
+            }
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let before = load_run_state(&r).unwrap();
+        assert!(
+            before.ci.as_ref().is_none_or(|ci| {
+                ci.review_push_pending.is_none() && ci.review_pushed_sha.is_none()
+            }),
+            "push markers must be clear before the round-2 re-route"
+        );
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s.push_reviews(Ok(review_snap(
+            7,
+            "track/0010-Fixture",
+            vec![open_thread("T1", "please fix")],
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("route");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_REVIEW);
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(load_run_state(&r).unwrap().review_fix_attempts, 2);
+    }
+
+    #[test]
     fn resolved_second_round_merges() {
         let _g = poll_env();
         let dir = tempdir().unwrap();
@@ -7968,7 +8019,7 @@ mod tests {
     }
 
     #[test]
-    fn green_pr_with_latched_open_thread_at_cap_holds_not_merges() {
+    fn open_thread_after_cap_stops_review_comments() {
         let _g = poll_env();
         let dir = tempdir().unwrap();
         let mut r = rec(dir.path(), true);
@@ -7996,9 +8047,17 @@ mod tests {
             vec![open_thread("T1", "please fix")],
         )));
         let (_hook, counts) = hook(s);
-        let view = crate::workflow::tick(&r).unwrap();
-        assert!(view.is_none(), "{view:?}");
+        let view = crate::workflow::tick(&r).unwrap().expect("stop");
+        assert_eq!(view.failure_class, Some(FailureClass::ReviewComments));
+        assert!(view.last_event.contains("unresolved after address-review"));
         assert_eq!(counts.merge_n(), 0);
-        assert_eq!(counts.review_comments_n(), 1);
+        assert_eq!(load_run_state(&r).unwrap().review_fix_attempts, 2);
+        let artifact = crate::notify::artifact::existing_path(&r).expect("one artifact");
+        let failure_files = std::fs::read_dir(artifact.parent().expect("state dir"))
+            .unwrap()
+            .filter_map(|ent| ent.ok())
+            .filter(|ent| ent.file_name().to_string_lossy().starts_with("FAILURE"))
+            .count();
+        assert_eq!(failure_files, 1);
     }
 }
