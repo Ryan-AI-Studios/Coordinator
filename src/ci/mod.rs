@@ -7686,6 +7686,9 @@ mod tests {
         .unwrap();
         let s = ScriptedBackend::new();
         s.push_resolve(Ok(Some(owned_pr_target(7))));
+        // The programmed resolve is invisible until the backend is installed. Without
+        // the hook, tick falls through to gh, gets no PR, and returns before stamp_poll.
+        let (_hook, _counts) = hook(s);
         let _ = crate::workflow::tick(&r).unwrap();
         let ci = load_run_state(&r).unwrap().ci.unwrap();
         assert!(ci.last_poll_at.is_some());
