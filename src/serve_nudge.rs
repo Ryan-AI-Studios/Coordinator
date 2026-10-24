@@ -375,11 +375,26 @@ pub fn lock_nudge(home: &Path) -> std::io::Result<Option<std::fs::File>> {
 
 /// Append one line, rotating at [`LOG_MAX_BYTES`] (one archive kept). Every error
 /// is ignored: logging never fails a run.
+///
+/// Only the nudge that holds the OS lock rotates; see [`append_log_unlocked`].
 pub fn append_log(home: &Path, line: &str) {
+    append_log_inner(home, line, true);
+}
+
+/// Append without rotating. Used by an invocation that could **not** take the OS
+/// lock (another nudge holds it): the holder owns rotation, so two runs can never
+/// rotate the same file, and a single append cannot exceed the bound by more than
+/// one line before the holder's next rotation.
+pub fn append_log_unlocked(home: &Path, line: &str) {
+    append_log_inner(home, line, false);
+}
+
+fn append_log_inner(home: &Path, line: &str, rotate: bool) {
     use std::io::Write;
 
     let path = home.join(LOG_NAME);
-    if let Ok(meta) = std::fs::metadata(&path)
+    if rotate
+        && let Ok(meta) = std::fs::metadata(&path)
         && meta.len() >= LOG_MAX_BYTES
     {
         let rotated = home.join(format!("{LOG_NAME}.1"));
@@ -535,7 +550,7 @@ pub fn run_cli() -> Result<NudgeAction> {
         Ok(lock) => lock,
         Err(e) => {
             let detail = format!("lock {LOCK_NAME}: {e}");
-            append_log(
+            append_log_unlocked(
                 &home,
                 &format!(
                     "{} action=setup-error detail={}",
@@ -579,7 +594,14 @@ pub fn run_cli() -> Result<NudgeAction> {
             return Err(e);
         }
     };
-    append_log(&home, &log_line(&action, &trace, Utc::now()));
+    let line = log_line(&action, &trace, Utc::now());
+    if lock.is_some() {
+        // The lock holder owns rotation and the append.
+        append_log(&home, &line);
+    } else {
+        // Overlap: another nudge holds the lock, so this run must not rotate.
+        append_log_unlocked(&home, &line);
+    }
     // `lock` stays alive until here on purpose: the append above is inside it.
     drop(lock);
     Ok(action)
@@ -1221,6 +1243,21 @@ mod tests {
         let active = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         assert!(active < LOG_MAX_BYTES, "active log stayed small: {active}");
         assert!(ctx.log().contains("action=healthy"));
+    }
+
+    #[test]
+    fn overlap_append_does_not_rotate() {
+        let ctx = Ctx::new();
+        let path = ctx.home().join(LOG_NAME);
+        std::fs::write(&path, vec![b'x'; LOG_MAX_BYTES as usize]).unwrap();
+        append_log_unlocked(ctx.home(), "2026-10-23T12:00:00Z action=overlap");
+        assert!(
+            !ctx.home().join(format!("{LOG_NAME}.1")).exists(),
+            "a non-holder must never rotate: the lock holder owns it"
+        );
+        assert!(ctx.log().contains("action=overlap"));
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(len < LOG_MAX_BYTES + 200, "one extra line at most: {len}");
     }
 
     #[test]
