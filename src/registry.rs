@@ -64,6 +64,8 @@ pub struct ProjectSetOptions {
     pub self_continuation: Option<bool>,
     /// Omit = leave unchanged. Route the ci-wait gate's failing checks into address-ci (track 0071; slice unified in 0079).
     pub ci_fix_routing: Option<bool>,
+    /// Omit = leave unchanged. Route owned-PR review comments into `address-review` (0078).
+    pub review_comment_routing: Option<bool>,
     /// Overlay keys (None = no overlay). Merge; does not replace the map.
     pub phase_timeouts_secs: Option<BTreeMap<String, u64>>,
     /// Wipe the project timeout map before overlay.
@@ -134,6 +136,10 @@ pub struct ProjectRecord {
     /// Missing field on old records = off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ci_fix_routing: bool,
+    /// Opt-in route from owned-PR review comments into same-epoch `address-review` (0078).
+    /// Missing field on old records = off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review_comment_routing: bool,
     /// Canonical skill name → directory segment. Empty omits the key on save.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skill_aliases: BTreeMap<String, String>,
@@ -403,6 +409,7 @@ impl Registry {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases,
             created_at: Utc::now(),
         };
@@ -474,6 +481,9 @@ impl Registry {
         }
         if let Some(v) = opts.ci_fix_routing {
             rec.ci_fix_routing = v;
+        }
+        if let Some(v) = opts.review_comment_routing {
+            rec.review_comment_routing = v;
         }
         // Clears first, then overlay so clear-all + plan=3600 leaves only plan.
         if opts.clear_phase_timeouts {
@@ -1190,6 +1200,45 @@ mod tests {
         assert!(
             !text.contains("ci_fix_routing"),
             "false ci_fix_routing must omit the key: {text}"
+        );
+    }
+
+    #[test]
+    fn review_comment_routing_omits_false() {
+        let proj = tempdir().unwrap();
+        let mut reg = Registry::default();
+        let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        assert!(!rec.review_comment_routing);
+        let on = reg
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    review_comment_routing: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(on.review_comment_routing);
+        let home = tempdir().unwrap();
+        let reg_path = home.path().join("registry.json");
+        reg.save(&reg_path).unwrap();
+        assert!(Registry::load(&reg_path).unwrap().projects[0].review_comment_routing);
+        let mut r = Registry::load(&reg_path).unwrap();
+        let off = r
+            .set(
+                &rec.id,
+                ProjectSetOptions {
+                    review_comment_routing: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!off.review_comment_routing);
+        r.save(&reg_path).unwrap();
+        let text = std::fs::read_to_string(&reg_path).unwrap();
+        assert!(
+            !text.contains("review_comment_routing"),
+            "false review_comment_routing must omit the key: {text}"
         );
     }
 

@@ -13,6 +13,7 @@
 pub mod backend;
 pub mod fix;
 pub mod gh;
+pub mod review;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -254,6 +255,14 @@ pub fn drive_with(
 
     persist_target(record, &target, &cwd)?;
 
+    // 0078 delivery: the engine pushes an `address-review` commit before the draft and
+    // merged early-returns, so a PR that ended is named instead of reported as success.
+    if let review::Delivery::Done(view) =
+        review::deliver_pending_push(record, state, &target, backend)?
+    {
+        return Ok(view);
+    }
+
     if let CiTarget::PullRequest { is_draft: true, .. } = &target {
         persist_watch(record, Some("ci-wait: waiting (draft PR)"), |ci| {
             apply_target(ci, &target);
@@ -270,11 +279,34 @@ pub fn drive_with(
 
     if let CiTarget::PullRequest {
         merged: true,
+        closed: false,
         number,
         head_ref,
         ..
     } = &target
     {
+        // A delivered review commit whose head was never observed is not a green merge.
+        if state
+            .ci
+            .as_ref()
+            .and_then(|c| c.review_pushed_sha.clone())
+            .is_some()
+        {
+            let local = state
+                .ci
+                .as_ref()
+                .and_then(|c| c.review_pushed_sha.clone())
+                .unwrap_or_default();
+            return apply_failure(
+                record,
+                state,
+                FailureClass::ReviewComments,
+                format!(
+                    "review-push: PR #{number} merged before the review head was observed (local {} on {head_ref})",
+                    &local[..local.len().min(7)]
+                ),
+            );
+        }
         persist_watch(record, None, |ci| {
             apply_target(ci, &target);
             ci.merge = Some("done".into());
@@ -313,6 +345,10 @@ pub fn drive_with(
         return apply_success(record, state, msg, OutcomeSource::Adapter);
     }
 
+    if let review::Delivery::Done(view) = review::wait_for_pushed_head(record, state, &target)? {
+        return Ok(view);
+    }
+
     let snap = match backend.checks(&cwd, &target) {
         Ok(s) => s,
         Err(e) => return classify_backend_err(record, state, e),
@@ -339,6 +375,32 @@ pub fn drive_with(
         apply_target(ci, &target);
         stamp_poll(ci, now, &summary, &key, interval);
     })?;
+
+    // 0078 route: only a clean review surface may fall through to Green/merge. A Fail keeps
+    // 0071's precedence on purpose, and routing off never calls the reader.
+    if review::enabled(record) && !matches!(decision, Decision::Fail { .. }) {
+        // Delivery and the pushed-head wait may have cleared their markers in this tick;
+        // route on the persisted view, never the pre-delivery snapshot.
+        let route_state = load_run_state(record).unwrap_or_else(|_| state.clone());
+        match review::try_route_review_comments(record, &route_state, &target, &cwd, backend, now)?
+        {
+            review::RouteOutcome::Routed(view) => return Ok(Some(*view)),
+            review::RouteOutcome::Stopped(view) => return Ok(Some(*view)),
+            review::RouteOutcome::Exhausted { open } => {
+                return apply_failure(
+                    record,
+                    state,
+                    FailureClass::ReviewComments,
+                    format!("review-comments: unresolved after address-review ({open} open, 2/2)"),
+                );
+            }
+            review::RouteOutcome::Hold { reason } => {
+                persist_watch(record, Some(&reason), |_| {})?;
+                return Ok(None);
+            }
+            review::RouteOutcome::Clean => {}
+        }
+    }
 
     match decision {
         Decision::Pending { event, .. } => {
@@ -381,6 +443,13 @@ fn finish_green(
     target: &CiTarget,
     _summary: &str,
 ) -> Result<Option<StatusView>> {
+    debug_assert!(
+        load_run_state(record)
+            .ok()
+            .and_then(|s| s.ci)
+            .is_none_or(|c| c.review_push_pending.is_none() && c.review_pushed_sha.is_none()),
+        "0078: finish_green reached with a pending or unobserved review push"
+    );
     match target {
         CiTarget::HeadSha { .. } => {
             persist_watch(record, None, |ci| {
@@ -873,7 +942,7 @@ fn due_for_poll(state: &RunState, now: chrono::DateTime<Utc>) -> bool {
     now >= due
 }
 
-fn elapsed(state: &RunState, now: chrono::DateTime<Utc>) -> Duration {
+pub(crate) fn elapsed(state: &RunState, now: chrono::DateTime<Utc>) -> Duration {
     state.effective_running_elapsed(now)
 }
 
@@ -1008,14 +1077,14 @@ fn latch_sha_from_target(target: &CiTarget) -> Option<String> {
     }
 }
 
-enum MutationGate {
+pub(crate) enum MutationGate {
     Go,
     /// `None` is a hold (stay Running). `Some` is a permission failure view.
     Stop(Option<Box<StatusView>>),
 }
 
 /// Allow and Report clear the restore flag and fall through. Hold stays in `ci-wait`.
-fn release_for_mutation(
+pub(crate) fn release_for_mutation(
     record: &ProjectRecord,
     state: &RunState,
     decision: &crate::policy::GateDecision,
@@ -1331,7 +1400,7 @@ fn apply_target(ci: &mut CiWatchState, target: &CiTarget) {
     }
 }
 
-fn stamp_poll(
+pub(crate) fn stamp_poll(
     ci: &mut CiWatchState,
     now: chrono::DateTime<Utc>,
     summary: &str,
@@ -1372,7 +1441,7 @@ fn persist_target(record: &ProjectRecord, target: &CiTarget, repo: &Path) -> Res
     persist_watch(record, None, |ci| apply_target(ci, target)).map(|_| ())
 }
 
-fn persist_watch(
+pub(crate) fn persist_watch(
     record: &ProjectRecord,
     last_event: Option<&str>,
     f: impl FnOnce(&mut CiWatchState),
@@ -1412,7 +1481,7 @@ fn apply_success(
 }
 
 /// Stop with the spec §3.4 Permission arm. Zero mutations happened before this call.
-fn apply_mutation_refusal(
+pub(crate) fn apply_mutation_refusal(
     record: &ProjectRecord,
     state: &RunState,
     action: &str,
@@ -1431,7 +1500,7 @@ fn apply_mutation_refusal(
     apply_failure(record, state, FailureClass::Permission, message)
 }
 
-fn apply_failure(
+pub(crate) fn apply_failure(
     record: &ProjectRecord,
     state: &RunState,
     class: FailureClass,
@@ -1751,6 +1820,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
@@ -1836,11 +1906,20 @@ mod tests {
             url: format!("https://example/pr/{n}"),
             is_draft: draft,
             merged,
+            closed: false,
             head_oid: Some("abc".into()),
             merge_state,
             head_ref: "track/0010-Fixture".into(),
             title: String::new(),
         }
+    }
+
+    fn pr_closed(n: u64) -> CiTarget {
+        let mut target = pr(n, false, false);
+        if let CiTarget::PullRequest { closed, .. } = &mut target {
+            *closed = true;
+        }
+        target
     }
 
     fn pair_items(pairs: &[(&str, CheckBucket)]) -> Vec<CheckItem> {
@@ -5308,6 +5387,7 @@ mod tests {
             url: "https://example/pr/71".into(),
             is_draft: false,
             merged: false,
+            closed: false,
             head_oid: Some("abc111".into()),
             merge_state: MergeStateStatus::Clean,
             head_ref: head_ref.into(),
@@ -6049,6 +6129,13 @@ mod tests {
             self.labels.lock().unwrap().push(cwd.to_path_buf());
             self.inner.ensure_label(cwd, pr_number, label)
         }
+        fn review_comments(
+            &self,
+            cwd: &Path,
+            pr_number: u64,
+        ) -> Result<crate::ci::backend::ReviewSnapshot> {
+            self.inner.review_comments(cwd, pr_number)
+        }
     }
 
     fn cwd_hook(scripted: ScriptedBackend) -> (TestBackendGuard, std::sync::Arc<CwdBackend>) {
@@ -6460,6 +6547,7 @@ mod tests {
             url: "https://example/pr/12".into(),
             is_draft: false,
             merged: false,
+            closed: false,
             head_oid: Some("abc123".into()),
             merge_state: MergeStateStatus::Clean,
             head_ref: "track/0010-Fixture".into(),
@@ -6482,5 +6570,1435 @@ mod tests {
             &repo
         ));
         clear_ci_env();
+    }
+
+    // ---- 0078 review-comment routing / resolution gate ----
+
+    fn owned_pr_target(n: u64) -> CiTarget {
+        let mut t = pr(n, false, false);
+        if let CiTarget::PullRequest {
+            head_ref, title, ..
+        } = &mut t
+        {
+            *head_ref = "track/0010-Fixture".into();
+            *title = "track(0010): fixture".into();
+        }
+        t
+    }
+
+    fn review_comment_fixture(id: &str, body: &str) -> crate::ci::backend::ReviewCommentView {
+        crate::ci::backend::ReviewCommentView {
+            id: id.into(),
+            body: body.into(),
+            author_login: Some("alice".into()),
+            author_kind: crate::ci::backend::AuthorKind::User,
+            association: Some("OWNER".into()),
+            created_at: "2026-10-24T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-10-24T00:02:00Z".parse().unwrap(),
+            minimized: false,
+            url: format!("https://example/{id}"),
+        }
+    }
+
+    fn review_snap(
+        n: u64,
+        head_ref: &str,
+        threads: Vec<crate::ci::backend::ReviewThreadView>,
+    ) -> crate::ci::backend::ReviewSnapshot {
+        crate::ci::backend::ReviewSnapshot {
+            pr_number: n,
+            head_ref: head_ref.into(),
+            head_oid: "abc".into(),
+            base_ref: "main".into(),
+            base_oid: "base".into(),
+            review_decision: None,
+            viewer_login: Some("pipeline".into()),
+            author_login: Some("alice".into()),
+            author_kind: crate::ci::backend::AuthorKind::User,
+            rate_remaining: Some(4999),
+            threads,
+            reviews: Vec::new(),
+            truncated: false,
+            unavailable: None,
+        }
+    }
+
+    fn open_thread(id: &str, body: &str) -> crate::ci::backend::ReviewThreadView {
+        crate::ci::backend::ReviewThreadView {
+            id: id.into(),
+            is_resolved: false,
+            is_outdated: false,
+            path: "src/lib.rs".into(),
+            line: Some(7),
+            comments: vec![review_comment_fixture("C1", body)],
+            comment_count: 1,
+        }
+    }
+
+    fn clean_review(n: u64) -> crate::ci::backend::ReviewSnapshot {
+        review_snap(n, "track/0010-Fixture", Vec::new())
+    }
+
+    fn seed_gate(r: &ProjectRecord, attempts: u32, routed: Vec<crate::state::RoutedReviewItem>) {
+        with_run_state_lock(r, || {
+            let mut st = load_run_state(r)?;
+            st.review_fix_attempts = attempts;
+            st.review_route = Some(crate::state::ReviewRouteState {
+                pr_number: 7,
+                routed,
+                last_poll_at: None,
+                last_result: None,
+                read_failures: 0,
+            });
+            save_run_state(r, &st)
+        })
+        .unwrap();
+    }
+
+    fn latch_thread(id: &str, comment_id: &str, updated: &str) -> crate::state::RoutedReviewItem {
+        crate::state::RoutedReviewItem {
+            key: format!("pr:7:thread:{id}"),
+            round: 1,
+            routed_at: Utc::now(),
+            source_comment_id: comment_id.into(),
+            source_updated_at: updated.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn green_owned_pr_with_actionable_comment_does_not_merge() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s.push_reviews(Ok(review_snap(
+            7,
+            "track/0010-Fixture",
+            vec![open_thread("T1", "please fix")],
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("route");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_REVIEW);
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(counts.merge_n(), 0);
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.review_fix_attempts, 1);
+        assert!(crate::notify::artifact::existing_path(&r).is_none());
+    }
+
+    #[test]
+    fn green_pr_flag_off_merges_as_before() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("merge");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_eq!(counts.merge_n(), 1);
+        assert_eq!(counts.review_comments_n(), 0);
+    }
+
+    struct EnvOff {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvOff {
+        fn enter() -> Self {
+            let prev = std::env::var_os(crate::ci::review::ENV_REVIEW_COMMENTS);
+            unsafe {
+                std::env::set_var(crate::ci::review::ENV_REVIEW_COMMENTS, "off");
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for EnvOff {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(crate::ci::review::ENV_REVIEW_COMMENTS, v),
+                    None => std::env::remove_var(crate::ci::review::ENV_REVIEW_COMMENTS),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn green_pr_env_off_merges_as_before() {
+        let _g = poll_env();
+        let _env = EnvOff::enter();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("merge");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_eq!(counts.merge_n(), 1);
+        assert_eq!(counts.review_comments_n(), 0);
+    }
+
+    #[test]
+    fn green_pr_with_latched_open_thread_does_not_merge() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_gate(
+            &r,
+            1,
+            vec![latch_thread("T1", "C1", "2026-10-24T00:02:00Z")],
+        );
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s.push_reviews(Ok(review_snap(
+            7,
+            "track/0010-Fixture",
+            vec![open_thread("T1", "please fix")],
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("route");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_REVIEW);
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(load_run_state(&r).unwrap().review_fix_attempts, 2);
+    }
+
+    #[test]
+    fn resolved_second_round_merges() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_gate(
+            &r,
+            1,
+            vec![latch_thread("T1", "C1", "2026-10-24T00:02:00Z")],
+        );
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s.push_reviews(Ok(clean_review(7)));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("merge");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_eq!(counts.merge_n(), 1);
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .review_route
+                .unwrap()
+                .last_result,
+            Some(crate::state::ReviewPollResult::Clean)
+        );
+    }
+
+    #[test]
+    fn green_pr_clean_read_merges() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s.push_reviews(Ok(clean_review(7)));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("merge");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_eq!(counts.merge_n(), 1);
+    }
+
+    #[test]
+    fn green_pr_poll_gate_expiry_forces_one_fresh_read_then_merges() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_gate(&r, 0, Vec::new());
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            let route = st.review_route.as_mut().unwrap();
+            route.last_result = Some(crate::state::ReviewPollResult::Clean);
+            route.last_poll_at = Some(Utc::now() - chrono::Duration::milliseconds(121_000));
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s.push_reviews(Ok(clean_review(7)));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("merge");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_eq!(counts.review_comments_n(), 1);
+        assert_eq!(counts.merge_n(), 1);
+    }
+
+    #[test]
+    fn pending_pr_routes_and_does_not_merge() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pending)],
+            MergeStateStatus::Unstable,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s.push_reviews(Ok(review_snap(
+            7,
+            "track/0010-Fixture",
+            vec![open_thread("T1", "please fix")],
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("route");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_REVIEW);
+        assert_eq!(counts.merge_n(), 0);
+    }
+
+    #[test]
+    fn fail_keeps_ci_precedence_and_does_not_route_review() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Fail)])));
+        s.push_reviews(Ok(review_snap(
+            7,
+            "track/0010-Fixture",
+            vec![open_thread("T1", "please fix")],
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("ci fail");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::CiFailed));
+        assert_eq!(counts.review_comments_n(), 0);
+        assert_eq!(counts.merge_n(), 0);
+    }
+
+    #[test]
+    fn head_sha_never_reads_reviews() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(CiTarget::HeadSha { sha: "abc".into() })));
+        s.push_snapshot(Ok(items(&[("ci", CheckBucket::Pass)])));
+        let (_hook, counts) = hook(s);
+        let _ = crate::workflow::tick(&r).unwrap();
+        assert_eq!(counts.review_comments_n(), 0);
+    }
+
+    #[test]
+    fn non_owned_pr_never_reads_reviews() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(pr(7, false, false))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let _ = crate::workflow::tick(&r).unwrap();
+        assert_eq!(counts.review_comments_n(), 0);
+    }
+
+    #[test]
+    fn route_poll_is_rate_limited_by_last_poll_at() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pending)],
+            MergeStateStatus::Unstable,
+        )));
+        s.push_reviews(Ok(clean_review(7)));
+        let (_hook, counts) = hook(s);
+        let _ = crate::workflow::tick(&r).unwrap();
+        let _ = crate::workflow::tick(&r).unwrap();
+        assert_eq!(counts.review_comments_n(), 1);
+    }
+
+    #[test]
+    fn route_exhausted_stops_with_review_comments() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_gate(
+            &r,
+            2,
+            vec![latch_thread("T1", "C1", "2026-10-24T00:02:00Z")],
+        );
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s.push_reviews(Ok(review_snap(
+            7,
+            "track/0010-Fixture",
+            vec![open_thread("T2", "new issue")],
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("exhausted");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::ReviewComments));
+        assert!(view.last_event.contains("unresolved after address-review"));
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.review_comments_n(), 1);
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+    }
+
+    #[test]
+    fn file_wait_driver_never_reads_reviews() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::FileWait);
+        let s = ScriptedBackend::new();
+        let (_hook, counts) = hook(s);
+        let _ = crate::workflow::tick(&r).unwrap();
+        assert_eq!(counts.review_comments_n(), 0);
+    }
+
+    fn rev_parse(repo: &std::path::Path) -> String {
+        String::from_utf8(git_ok(repo, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn delivery_fixture(r: &ProjectRecord, bare: &std::path::Path) -> (std::path::PathBuf, String) {
+        jump_ci_wait(r, WorkflowDriver::Adapter);
+        let repo = r.execution_repo.clone().unwrap();
+        git_ok(&repo, &["switch", "-c", "track/0010-Fixture"]);
+        let base = rev_parse(&repo);
+        std::fs::write(repo.join("f.txt"), "review fix\n").unwrap();
+        git_ok(&repo, &["commit", "-am", "review fix"]);
+        git_ok(bare, &["init", "--bare"]);
+        git_ok(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        (repo, base)
+    }
+
+    fn arm_delivery(r: &ProjectRecord, base: &str, head: &str) {
+        with_run_state_lock(r, || {
+            let mut st = load_run_state(r)?;
+            st.review_fix_attempts = 1;
+            st.review_fix_request = Some(crate::state::ReviewFixRequest {
+                pr_number: 7,
+                from_sha: base.into(),
+                comments: vec![crate::state::ReviewComment {
+                    key: "pr:7:thread:T1".into(),
+                    kind: "thread".into(),
+                    author: "alice".into(),
+                    path: "f.txt".into(),
+                    line: Some(1),
+                    body: "> please fix".into(),
+                    url: "u".into(),
+                    updated_at: Utc::now(),
+                }],
+            });
+            let mut ci = st.ci.take().unwrap_or_default();
+            ci.review_push_pending = Some(head.into());
+            st.ci = Some(ci);
+            save_run_state(r, &st)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn changed_address_review_pushes_and_advances() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        arm_delivery(&r, &base, &head);
+        let backend = ScriptedBackend::new();
+        backend.push_files(Ok(vec!["f.txt".into()]));
+        let st = load_run_state(&r).unwrap();
+        let out = review::deliver_pending_push(&r, &st, &owned_pr_target(7), &backend).unwrap();
+        assert!(matches!(out, review::Delivery::Continue));
+        let st = load_run_state(&r).unwrap();
+        let ci = st.ci.as_ref().unwrap();
+        assert!(ci.review_push_pending.is_none());
+        assert_eq!(ci.review_pushed_sha.as_deref(), Some(head.as_str()));
+        assert!(st.review_fix_request.is_none());
+        let remote_tip = String::from_utf8(
+            git_ok(bare.path(), &["rev-parse", "refs/heads/track/0010-Fixture"]).stdout,
+        )
+        .unwrap();
+        assert_eq!(remote_tip.trim(), head);
+    }
+
+    #[test]
+    fn pushed_sha_is_the_actual_tip_not_the_captured_head() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        arm_delivery(&r, &base, "deadbeef");
+        let backend = ScriptedBackend::new();
+        backend.push_files(Ok(vec!["f.txt".into()]));
+        let st = load_run_state(&r).unwrap();
+        let _ = review::deliver_pending_push(&r, &st, &owned_pr_target(7), &backend).unwrap();
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .ci
+                .unwrap()
+                .review_pushed_sha
+                .as_deref(),
+            Some(head.as_str())
+        );
+    }
+
+    #[test]
+    fn wrong_branch_push_is_refused() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        arm_delivery(&r, &base, &head);
+        git_ok(&repo, &["switch", "-c", "not-a-track"]);
+        let backend = ScriptedBackend::new();
+        backend.push_files(Ok(vec!["f.txt".into()]));
+        let st = load_run_state(&r).unwrap();
+        let out = review::deliver_pending_push(&r, &st, &owned_pr_target(7), &backend).unwrap();
+        assert!(
+            matches!(out, review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped)
+        );
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.failure_class, Some(FailureClass::ReviewComments));
+        assert!(st.last_event.contains("is not the PR head"));
+    }
+
+    fn arm_committed_fix(
+        r: &ProjectRecord,
+        bare: &std::path::Path,
+        mutate: impl FnOnce(&std::path::Path),
+    ) -> (String, String) {
+        let (repo, base) = delivery_fixture(r, bare);
+        mutate(&repo);
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-m", "fix"]);
+        let head = rev_parse(&repo);
+        arm_delivery(r, &base, &head);
+        (base, head)
+    }
+
+    fn run_delivery(r: &ProjectRecord, files: Result<Vec<String>>) -> review::Delivery {
+        let backend = ScriptedBackend::new();
+        backend.push_files(files);
+        let st = load_run_state(r).unwrap();
+        review::deliver_pending_push(r, &st, &owned_pr_target(7), &backend).unwrap()
+    }
+
+    #[test]
+    fn review_fix_workflow_change_is_refused() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let (_base, _head) = arm_committed_fix(&r, bare.path(), |repo| {
+            std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+            std::fs::write(repo.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+        });
+        assert!(matches!(
+            run_delivery(&r, Ok(vec![".github/workflows/ci.yml".into()])),
+            review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped
+        ));
+    }
+
+    #[test]
+    fn review_fix_manifest_change_is_refused() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        arm_committed_fix(&r, bare.path(), |repo| {
+            std::fs::write(repo.join("Cargo.toml"), "[package]\n").unwrap();
+        });
+        assert!(matches!(
+            run_delivery(&r, Ok(vec!["Cargo.toml".into()])),
+            review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped
+        ));
+    }
+
+    #[test]
+    fn review_fix_rename_of_a_workflow_is_refused() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        arm_committed_fix(&r, bare.path(), |repo| {
+            std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+            std::fs::create_dir_all(repo.join("src")).unwrap();
+            std::fs::write(repo.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+            git_ok(repo, &["add", ".github/workflows/ci.yml"]);
+            git_ok(repo, &["commit", "-m", "workflow"]);
+            git_ok(repo, &["mv", ".github/workflows/ci.yml", "src/helper.yaml"]);
+        });
+        assert!(matches!(
+            run_delivery(&r, Ok(vec!["src/mod.rs".into()])),
+            review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped
+        ));
+    }
+
+    #[test]
+    fn review_fix_new_root_level_file_is_refused() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        arm_committed_fix(&r, bare.path(), |repo| {
+            std::fs::write(repo.join("evil.sh"), "x\n").unwrap();
+        });
+        assert!(matches!(
+            run_delivery(&r, Ok(vec!["f.txt".into()])),
+            review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped
+        ));
+    }
+
+    #[test]
+    fn review_fix_outside_pr_files_is_refused() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        arm_committed_fix(&r, bare.path(), |repo| {
+            std::fs::write(repo.join("other.txt"), "x\n").unwrap();
+        });
+        assert!(matches!(
+            run_delivery(&r, Ok(vec!["f.txt".into()])),
+            review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped
+        ));
+    }
+
+    #[test]
+    fn review_fix_unreadable_pr_files_is_refused() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        arm_committed_fix(&r, bare.path(), |repo| {
+            std::fs::write(repo.join("f.txt"), "another\n").unwrap();
+        });
+        let out = run_delivery(
+            &r,
+            Err(crate::error::CoordinatorError::Message("no".into())),
+        );
+        assert!(
+            matches!(out, review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped)
+        );
+        assert!(
+            load_run_state(&r)
+                .unwrap()
+                .last_event
+                .contains("pr_files unreadable")
+        );
+    }
+
+    #[test]
+    fn no_remote_stops_with_review_comments() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let repo = r.execution_repo.clone().unwrap();
+        git_ok(&repo, &["switch", "-c", "track/0010-Fixture"]);
+        let base = rev_parse(&repo);
+        std::fs::write(repo.join("f.txt"), "fix\n").unwrap();
+        git_ok(&repo, &["commit", "-am", "fix"]);
+        let head = rev_parse(&repo);
+        arm_delivery(&r, &base, &head);
+        let out = run_delivery(&r, Ok(vec!["f.txt".into()]));
+        assert!(
+            matches!(out, review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped)
+        );
+        assert!(
+            load_run_state(&r)
+                .unwrap()
+                .last_event
+                .contains("no GitHub remote")
+        );
+    }
+
+    #[test]
+    fn merged_before_push_stops_with_review_comments() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        arm_delivery(&r, "base", "head");
+        let mut target = owned_pr_target(7);
+        if let CiTarget::PullRequest { merged, .. } = &mut target {
+            *merged = true;
+        }
+        let st = load_run_state(&r).unwrap();
+        let backend = ScriptedBackend::new();
+        let out = review::deliver_pending_push(&r, &st, &target, &backend).unwrap();
+        assert!(
+            matches!(out, review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped)
+        );
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.failure_class, Some(FailureClass::ReviewComments));
+        assert!(
+            st.last_event
+                .contains("merged before the review fix was delivered")
+        );
+        assert!(!st.last_event.contains("already merged"));
+    }
+
+    #[test]
+    fn closed_before_push_stops_with_review_comments() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        arm_delivery(&r, "base", "head");
+        let st = load_run_state(&r).unwrap();
+        let backend = ScriptedBackend::new();
+        let out = review::deliver_pending_push(&r, &st, &pr_closed(7), &backend).unwrap();
+        assert!(
+            matches!(out, review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped)
+        );
+        assert!(
+            load_run_state(&r)
+                .unwrap()
+                .last_event
+                .contains("closed before the review fix was delivered")
+        );
+    }
+
+    #[test]
+    fn merged_after_push_before_head_observation_stops() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            let mut ci = st.ci.take().unwrap_or_default();
+            ci.review_pushed_sha = Some("pushed".into());
+            st.ci = Some(ci);
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(possessive_merged(7))));
+        s.push_reviews(Ok(clean_review(7)));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("stop");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::ReviewComments));
+        assert!(
+            view.last_event
+                .contains("before the review head was observed")
+        );
+        assert_eq!(counts.merge_n(), 0);
+    }
+
+    fn possessive_merged(n: u64) -> CiTarget {
+        let mut t = owned_pr_target(n);
+        if let CiTarget::PullRequest { merged, .. } = &mut t {
+            *merged = true;
+        }
+        t
+    }
+
+    #[test]
+    fn force_pushed_head_stops_review_comments() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            let mut ci = st.ci.take().unwrap_or_default();
+            ci.review_pushed_sha = Some("never-matches".into());
+            ci.review_push_waiting_since = Some(Utc::now() - chrono::Duration::seconds(601));
+            st.ci = Some(ci);
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_reviews(Ok(clean_review(7)));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("stop");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::ReviewComments));
+        assert!(view.last_event.contains("head moved"));
+        assert_eq!(counts.merge_n(), 0);
+    }
+
+    #[test]
+    fn push_failure_retries_then_stops_with_review_comments() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bad_remote = tempdir().unwrap();
+        let not_a_repo = bad_remote.path().join("not-a-repo");
+        std::fs::write(&not_a_repo, "x").unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let repo = r.execution_repo.clone().unwrap();
+        git_ok(&repo, &["switch", "-c", "track/0010-Fixture"]);
+        let base = rev_parse(&repo);
+        std::fs::write(repo.join("f.txt"), "fix\n").unwrap();
+        git_ok(&repo, &["commit", "-am", "fix"]);
+        let head = rev_parse(&repo);
+        git_ok(
+            &repo,
+            &["remote", "add", "origin", not_a_repo.to_str().unwrap()],
+        );
+        arm_delivery(&r, &base, &head);
+        let backend = ScriptedBackend::new();
+        for _ in 0..4 {
+            backend.push_files(Ok(vec!["f.txt".into()]));
+        }
+        for attempt in 0..3 {
+            let st = load_run_state(&r).unwrap();
+            let out = review::deliver_pending_push(&r, &st, &owned_pr_target(7), &backend).unwrap();
+            if attempt < 2 {
+                assert!(
+                    matches!(out, review::Delivery::Done(None)),
+                    "{attempt}: {out:?}"
+                );
+                assert_eq!(
+                    load_run_state(&r)
+                        .unwrap()
+                        .ci
+                        .as_ref()
+                        .unwrap()
+                        .review_push_attempts,
+                    attempt + 1
+                );
+            } else {
+                assert!(
+                    matches!(out, review::Delivery::Done(Some(view)) if view.status == RunStatus::Stopped)
+                );
+                let st = load_run_state(&r).unwrap();
+                assert_eq!(st.failure_class, Some(FailureClass::ReviewComments));
+                assert!(
+                    st.last_event.contains("(3/3)"),
+                    "last_event={}",
+                    st.last_event
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transient_push_failure_self_heals() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let broken = bare.path().join("broken-remote");
+        std::fs::write(&broken, "x").unwrap();
+        let r = rec(dir.path(), true);
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        git_ok(
+            &repo,
+            &["remote", "set-url", "origin", broken.to_str().unwrap()],
+        );
+        arm_delivery(&r, &base, &head);
+        let backend = ScriptedBackend::new();
+        for _ in 0..3 {
+            backend.push_files(Ok(vec!["f.txt".into()]));
+        }
+        let st = load_run_state(&r).unwrap();
+        let first = review::deliver_pending_push(&r, &st, &owned_pr_target(7), &backend).unwrap();
+        assert!(matches!(first, review::Delivery::Done(None)), "{first:?}");
+        assert_eq!(
+            load_run_state(&r)
+                .unwrap()
+                .ci
+                .as_ref()
+                .unwrap()
+                .review_push_attempts,
+            1
+        );
+        git_ok(
+            &repo,
+            &["remote", "set-url", "origin", bare.path().to_str().unwrap()],
+        );
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            if let Some(ci) = st.ci.as_mut() {
+                ci.review_push_attempts = 0;
+            }
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let st = load_run_state(&r).unwrap();
+        let second = review::deliver_pending_push(&r, &st, &owned_pr_target(7), &backend).unwrap();
+        assert!(
+            matches!(second, review::Delivery::Continue),
+            "second push should heal"
+        );
+        assert!(
+            load_run_state(&r)
+                .unwrap()
+                .ci
+                .unwrap()
+                .review_pushed_sha
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pushed_head_waits_then_takes_the_green_path() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            let mut ci = st.ci.take().unwrap_or_default();
+            ci.review_pushed_sha = Some("newhead".into());
+            st.ci = Some(ci);
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let (_hook, counts) = hook(s);
+        let first = crate::workflow::tick(&r).unwrap();
+        assert!(first.is_none());
+        assert_eq!(counts.merge_n(), 0);
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.last_event, "ci-wait: waiting for pushed review head");
+        assert!(st.ci.as_ref().unwrap().last_poll_at.is_some());
+        // Now the PR reports the pushed head.
+        let mut new_target = owned_pr_target(7);
+        if let CiTarget::PullRequest { head_oid, .. } = &mut new_target {
+            *head_oid = Some("newhead".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let s2 = ScriptedBackend::new();
+        s2.push_resolve(Ok(Some(new_target)));
+        s2.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s2.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s2.push_reviews(Ok(clean_review(7)));
+        let (_hook2, counts2) = hook(s2);
+        let view = crate::workflow::tick(&r).unwrap().expect("merged");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_eq!(counts2.merge_n(), 1);
+    }
+
+    #[test]
+    fn pushed_head_wait_stamps_the_ci_poll() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            let mut ci = st.ci.take().unwrap_or_default();
+            ci.review_pushed_sha = Some("newhead".into());
+            ci.last_poll_at = None;
+            st.ci = Some(ci);
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        let _ = crate::workflow::tick(&r).unwrap();
+        let ci = load_run_state(&r).unwrap().ci.unwrap();
+        assert!(ci.last_poll_at.is_some());
+        assert_eq!(ci.next_interval_ms, Some(1));
+    }
+
+    #[test]
+    fn policy_hold_defers_the_review_push() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.state_policies = vec![rule(
+            crate::policy::NAME_FAILURES,
+            crate::policy::PolicyAction::RequireApproval,
+        )];
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        arm_delivery(&r, &base, &head);
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            st.consecutive_failures.insert("0010".into(), 5);
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        let backend = ScriptedBackend::new();
+        backend.push_files(Ok(vec!["f.txt".into()]));
+        let st = load_run_state(&r).unwrap();
+        let out = review::deliver_pending_push(&r, &st, &owned_pr_target(7), &backend).unwrap();
+        assert!(matches!(out, review::Delivery::Done(None)));
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.last_event, "review-push: policy hold");
+        assert!(st.ci.as_ref().unwrap().review_push_pending.is_some());
+        assert!(st.state_gate.is_some());
+        let refs = crate::git_command::command()
+            .args(["show-ref"])
+            .current_dir(bare.path())
+            .output()
+            .unwrap();
+        assert!(refs.stdout.is_empty(), "nothing may be pushed under a hold");
+    }
+
+    fn seed_address_review(r: &ProjectRecord, from_sha: &str) {
+        jump_ci_wait(r, WorkflowDriver::Adapter);
+        with_run_state_lock(r, || {
+            let mut st = load_run_state(r)?;
+            let repo = r.execution_repo.clone().unwrap();
+            st.phase = graph::PHASE_ADDRESS_REVIEW.into();
+            st.review_fix_attempts = 1;
+            st.review_fix_request = Some(crate::state::ReviewFixRequest {
+                pr_number: 7,
+                from_sha: from_sha.into(),
+                comments: Vec::new(),
+            });
+            st.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+                r,
+                "0010",
+                st.run_epoch,
+                graph::PHASE_ADDRESS_REVIEW,
+                &repo,
+            ));
+            save_run_state(r, &st)
+        })
+        .unwrap();
+    }
+
+    fn succeed_address_review(r: &ProjectRecord) -> StatusView {
+        let phase = graph::PHASE_ADDRESS_REVIEW;
+        crate::outcome::write_and_apply(
+            r,
+            crate::outcome::PhaseOutcome::success(
+                phase,
+                OutcomeSource::Adapter,
+                Some("fixed".into()),
+                None,
+                Some(load_run_state(r).unwrap().run_epoch),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn zero_diff_address_review_stops_with_review_comments() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let repo = seed_ci_delivery(&r, "0010");
+        let head = {
+            std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+            rev_parse(&repo)
+        };
+        seed_address_review(&r, &head);
+        let view = succeed_address_review(&r);
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::ReviewComments));
+        assert_eq!(
+            view.last_event,
+            format!("address-review: no diff from {head}")
+        );
+    }
+
+    #[test]
+    fn zero_diff_artifact_carries_review_comments() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let repo = seed_ci_delivery(&r, "0010");
+        let head = {
+            std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+            rev_parse(&repo)
+        };
+        seed_address_review(&r, &head);
+        let _ = succeed_address_review(&r);
+        let shown = crate::notify::artifact::read(&r).unwrap().unwrap();
+        assert!(
+            shown.body.contains("failure_class: review_comments"),
+            "{}",
+            shown.body
+        );
+        assert!(
+            shown
+                .body
+                .contains("Resolve or address the open review comments"),
+            "{}",
+            shown.body
+        );
+    }
+
+    #[test]
+    fn artifact_names_review_comments() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let path = dir.path().join("FAILURE.md");
+        let event = crate::notify::NotifyEvent {
+            project_id: r.id.clone(),
+            track_id: Some("0078".into()),
+            phase: graph::PHASE_ADDRESS_REVIEW.into(),
+            failure_class: FailureClass::ReviewComments,
+            message: Some("review-push: no GitHub remote".into()),
+            last_event: "review-push: no GitHub remote".into(),
+            artifact_path: path.clone(),
+            written_at: Utc::now(),
+            run_epoch: 1,
+        };
+        crate::notify::artifact::write_event(&event).unwrap();
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(body.contains("failure_class: review_comments"), "{body}");
+        assert!(
+            body.contains("Resolve or address the open review comments"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn unreadable_diff_address_review_stops() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        seed_ci_delivery(&r, "0010");
+        seed_address_review(&r, "0123456789abcdef0123456789abcdef01234567");
+        let view = succeed_address_review(&r);
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::ReviewComments));
+        assert_eq!(view.last_event, "address-review: diff unreadable");
+    }
+
+    #[test]
+    fn truncated_green_pr_does_not_merge() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let mut snap = review_snap(7, "track/0010-Fixture", vec![open_thread("T1", "fix")]);
+        snap.truncated = true;
+        s.push_reviews(Ok(snap));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("stop");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::ReviewComments));
+        assert!(view.last_event.contains("truncated"));
+        assert_eq!(counts.merge_n(), 0);
+        assert!(crate::notify::artifact::existing_path(&r).is_some());
+    }
+
+    #[test]
+    fn reviews_total_count_over_cap_stops_without_merge() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let mut snap = clean_review(7);
+        snap.truncated = true;
+        s.push_reviews(Ok(snap));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("stop");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(counts.merge_n(), 0);
+    }
+
+    #[test]
+    fn human_ack_after_route_clears_the_block() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_gate(
+            &r,
+            1,
+            vec![latch_thread("T1", "C1", "2026-10-24T00:02:00Z")],
+        );
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        let mut ack = open_thread("T1", "LGTM");
+        ack.comments[0].updated_at = "2026-10-24T00:05:00Z".parse().unwrap();
+        s.push_reviews(Ok(review_snap(7, "track/0010-Fixture", vec![ack])));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap().expect("merge");
+        assert_eq!(view.phase, graph::PHASE_COMPACT);
+        assert_eq!(counts.merge_n(), 1);
+    }
+
+    #[test]
+    fn cwd_backend_delegates_review_comments() {
+        let dir = tempdir().unwrap();
+        let s = ScriptedBackend::new();
+        s.push_reviews(Ok(clean_review(7)));
+        let backend = CwdBackend::new(s);
+        let snap = backend.review_comments(dir.path(), 7).unwrap();
+        assert_eq!(snap.pr_number, 7);
+        assert_eq!(snap.head_ref, "track/0010-Fixture");
+    }
+
+    #[test]
+    fn push_argv_is_git_push_u_remote_branch() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        let (repo, base) = delivery_fixture(&r, bare.path());
+        let head = rev_parse(&repo);
+        arm_delivery(&r, &base, &head);
+        let backend = ScriptedBackend::new();
+        backend.push_files(Ok(vec!["f.txt".into()]));
+        let st = load_run_state(&r).unwrap();
+        let _ = review::deliver_pending_push(&r, &st, &owned_pr_target(7), &backend).unwrap();
+        let remote_tip = String::from_utf8(
+            git_ok(bare.path(), &["rev-parse", "refs/heads/track/0010-Fixture"]).stdout,
+        )
+        .unwrap();
+        assert_eq!(remote_tip.trim(), head);
+        let upstream = String::from_utf8(
+            git_ok(
+                &repo,
+                &["rev-parse", "--abbrev-ref", "track/0010-Fixture@{upstream}"],
+            )
+            .stdout,
+        )
+        .unwrap();
+        assert_eq!(upstream.trim(), "origin/track/0010-Fixture");
+    }
+
+    #[test]
+    fn fresh_run_clears_the_review_latch_and_gate() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path(), true);
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_gate(
+            &r,
+            1,
+            vec![latch_thread("T1", "C1", "2026-10-24T00:02:00Z")],
+        );
+        with_run_state_lock(&r, || {
+            let mut st = load_run_state(&r)?;
+            let mut ci = st.ci.take().unwrap_or_default();
+            ci.review_push_pending = Some("x".into());
+            ci.review_pushed_sha = Some("y".into());
+            st.ci = Some(ci);
+            st.review_fix_request = Some(crate::state::ReviewFixRequest {
+                pr_number: 7,
+                from_sha: "abc".into(),
+                comments: Vec::new(),
+            });
+            st.status = RunStatus::Idle;
+            save_run_state(&r, &st)
+        })
+        .unwrap();
+        run_with_driver(&r, Some("0010".into()), WorkflowDriver::Adapter).unwrap();
+        let st = load_run_state(&r).unwrap();
+        assert_eq!(st.review_fix_attempts, 0);
+        assert!(st.review_fix_request.is_none());
+        assert!(st.review_route.is_none());
+        if let Some(ci) = st.ci.as_ref() {
+            assert!(ci.review_push_pending.is_none());
+            assert!(ci.review_pushed_sha.is_none());
+        }
+    }
+
+    #[test]
+    fn green_pr_with_latched_open_thread_at_cap_holds_not_merges() {
+        let _g = poll_env();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path(), true);
+        r.review_comment_routing = true;
+        jump_ci_wait(&r, WorkflowDriver::Adapter);
+        seed_gate(
+            &r,
+            2,
+            vec![latch_thread("T1", "C1", "2026-10-24T00:02:00Z")],
+        );
+        let s = ScriptedBackend::new();
+        s.push_resolve(Ok(Some(owned_pr_target(7))));
+        s.push_snapshot(Ok(required_clean(
+            &[("ci", CheckBucket::Pass)],
+            MergeStateStatus::Clean,
+        )));
+        s.push_merge(Ok(MergeResult {
+            ok: true,
+            queued: false,
+            message: "merged".into(),
+        }));
+        s.push_reviews(Ok(review_snap(
+            7,
+            "track/0010-Fixture",
+            vec![open_thread("T1", "please fix")],
+        )));
+        let (_hook, counts) = hook(s);
+        let view = crate::workflow::tick(&r).unwrap();
+        assert!(view.is_none(), "{view:?}");
+        assert_eq!(counts.merge_n(), 0);
+        assert_eq!(counts.review_comments_n(), 1);
     }
 }

@@ -24,8 +24,8 @@ use crate::registry::ProjectRecord;
 use crate::state::{RunState, with_run_state_lock};
 
 use super::graph::{
-    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_CI_WAIT, PHASE_CROSS_MODEL, PHASE_IMPLEMENT,
-    resolve_track_dir,
+    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_ADDRESS_REVIEW, PHASE_CI_WAIT,
+    PHASE_CROSS_MODEL, PHASE_IMPLEMENT, resolve_track_dir,
 };
 
 /// Stable resolution-error prefix (diagnostics and tests key on it).
@@ -36,7 +36,7 @@ pub const RESOLUTION_PREFIX: &str = "leg repo unresolved:";
 pub fn prepares_target(phase: &str) -> bool {
     matches!(
         phase,
-        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS | PHASE_ADDRESS_CI
+        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS | PHASE_ADDRESS_CI | PHASE_ADDRESS_REVIEW
     )
 }
 
@@ -1442,6 +1442,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: BTreeMap::new(),
             created_at: Utc::now(),
         }
@@ -2057,12 +2058,14 @@ mod tests {
             PHASE_IMPLEMENT,
             PHASE_ADDRESS_FINDINGS,
             PHASE_ADDRESS_CI,
+            PHASE_ADDRESS_REVIEW,
             PHASE_CROSS_MODEL,
             PHASE_CI_WAIT,
         ] {
             assert!(uses_delivery_target(phase), "{phase}");
         }
         assert!(prepares_target(PHASE_ADDRESS_CI));
+        assert!(prepares_target(PHASE_ADDRESS_REVIEW));
         for phase in [
             crate::workflow::graph::PHASE_PLAN,
             crate::workflow::graph::PHASE_FOLD,
@@ -2265,5 +2268,94 @@ mod tests {
         assert!(same_delivery_repo(&a, &b));
         a.declared_path = dir.path().join("other");
         assert!(!same_delivery_repo(&a, &b));
+    }
+}
+
+#[cfg(test)]
+mod review_wiring_tests {
+    use super::*;
+    use crate::workflow::block;
+    use crate::workflow::graph;
+
+    fn record(path: &Path) -> ProjectRecord {
+        ProjectRecord {
+            id: "proj-0078".into(),
+            path: path.to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: Some(path.to_path_buf()),
+            execution_repos: Default::default(),
+            state_dir: None,
+            auto_merge: true,
+            phase_timeouts_secs: Default::default(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            review_comment_routing: false,
+            skill_aliases: Default::default(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn address_review_is_a_prepared_side_loop() {
+        assert!(graph::is_canonical(graph::PHASE_ADDRESS_REVIEW));
+        assert_eq!(
+            graph::successor(graph::PHASE_ADDRESS_REVIEW),
+            Some(graph::PHASE_CI_WAIT)
+        );
+        assert!(graph::is_grok_bound(graph::PHASE_ADDRESS_REVIEW));
+        assert!(!graph::canonical_phases().contains(&graph::PHASE_ADDRESS_REVIEW));
+        assert_eq!(
+            crate::harness::roles::phase_role_key(graph::PHASE_ADDRESS_REVIEW),
+            Some(graph::ROLE_IMPLEMENTOR)
+        );
+        assert!(block::phase_allowed(graph::PHASE_ADDRESS_REVIEW));
+        assert_eq!(
+            crate::workflow::timeouts::default_timeout_secs(graph::PHASE_ADDRESS_REVIEW),
+            1800
+        );
+        assert!(prepares_target(graph::PHASE_ADDRESS_REVIEW));
+        assert!(uses_delivery_target(graph::PHASE_ADDRESS_REVIEW));
+        assert_eq!(graph::REVIEW_FIX_CAP, 2);
+    }
+
+    #[test]
+    fn address_review_uses_the_prepared_target_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = record(dir.path());
+        rec.execution_repo = Some(dir.path().to_path_buf());
+        let target = seeded_delivery_target(
+            &rec,
+            "0078",
+            1,
+            crate::workflow::graph::PHASE_ADDRESS_REVIEW,
+            dir.path(),
+        );
+        assert!(paths_same(&target.sample_path, dir.path()));
+        assert_eq!(target.phase, crate::workflow::graph::PHASE_ADDRESS_REVIEW);
+        assert!(prepares_target(&target.phase));
+    }
+
+    #[test]
+    fn address_review_installs_the_target_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = record(dir.path());
+        rec.execution_repo = Some(dir.path().to_path_buf());
+        let target = seeded_delivery_target(
+            &rec,
+            "0078",
+            1,
+            crate::workflow::graph::PHASE_ADDRESS_REVIEW,
+            dir.path(),
+        );
+        assert!(paths_same(&target.prompt_path, dir.path()));
+        assert!(paths_same(&target.sample_path, dir.path()));
+        assert!(!target.planning_only);
     }
 }

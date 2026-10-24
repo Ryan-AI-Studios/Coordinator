@@ -8,8 +8,9 @@ use crate::layout::LayoutProfile;
 use crate::registry::{ProjectAddOptions, ProjectRecord};
 use crate::state::{RunStatus, STOP_LAST_EVENT, StatusView, TickerView};
 use crate::workflow::graph::{
-    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_CI_WAIT, PHASE_IMPLEMENT, PHASE_PLAN_REVIEW,
-    REVIEW_SLUG_AGY, REVIEW_SLUG_OPENCODE, canonical_phases, is_canonical, is_stub_phase,
+    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_ADDRESS_REVIEW, PHASE_CI_WAIT, PHASE_IMPLEMENT,
+    PHASE_PLAN_REVIEW, REVIEW_SLUG_AGY, REVIEW_SLUG_OPENCODE, canonical_phases, is_canonical,
+    is_stub_phase,
 };
 
 /// Mock `article[data-state]` values (0003 visual contract).
@@ -157,7 +158,7 @@ pub fn phase_chips(view: &StatusView) -> Vec<PhaseChip> {
             })
             .collect();
     }
-    if current == PHASE_ADDRESS_CI {
+    if current == PHASE_ADDRESS_CI || current == PHASE_ADDRESS_REVIEW {
         let idx = canonical_phases()
             .iter()
             .position(|p| *p == PHASE_CI_WAIT)
@@ -169,7 +170,7 @@ pub fn phase_chips(view: &StatusView) -> Vec<PhaseChip> {
                 let (label, kind) = if i < idx {
                     ((*phase).to_string(), ChipKind::Done)
                 } else if i == idx {
-                    (PHASE_ADDRESS_CI.to_string(), ChipKind::Current)
+                    (current.to_string(), ChipKind::Current)
                 } else {
                     ((*phase).to_string(), ChipKind::Next)
                 };
@@ -498,6 +499,9 @@ pub const SELF_CHECK_ROW_LABEL: &str = "Self-check";
 /// CI-gate repair row on the project card (0071). Logic stays attempt-based.
 pub const CI_FIX_ROW_LABEL: &str = "CI fix";
 
+/// Review-comment repair row on the project card (0078).
+pub const REVIEW_FIX_ROW_LABEL: &str = "Review fix";
+
 /// Text for the State gate row. `None` when the run has no alert.
 pub fn state_gate_row(view: &StatusView) -> Option<String> {
     let gate = view.state_gate.as_ref()?;
@@ -522,6 +526,22 @@ pub fn ci_fix_row(view: &StatusView) -> Option<String> {
     Some(format!(
         "attempt {n}/{}",
         crate::workflow::graph::CI_FIX_CAP
+    ))
+}
+
+/// Text for the review-fix row. `None` until this epoch has entered `address-review`.
+pub fn review_fix_row(view: &StatusView) -> Option<String> {
+    let n = view
+        .workflow
+        .as_ref()
+        .map(|w| w.review_fix_attempts)
+        .unwrap_or(0);
+    if n == 0 {
+        return None;
+    }
+    Some(format!(
+        "attempt {n}/{}",
+        crate::workflow::graph::REVIEW_FIX_CAP
     ))
 }
 
@@ -813,12 +833,34 @@ mod tests {
             pending_roles: Vec::new(),
             address_findings_attempts: 0,
             ci_fix_attempts: 1,
+            review_fix_attempts: 0,
         });
         let row = ci_fix_row(&view).unwrap();
         assert_eq!(row, "attempt 1/2");
         assert_ne!(CI_FIX_ROW_LABEL, AUTO_START_ROW_LABEL);
         assert_ne!(CI_FIX_ROW_LABEL, STATE_GATE_ROW_LABEL);
         assert_ne!(CI_FIX_ROW_LABEL, SELF_CHECK_ROW_LABEL);
+    }
+
+    #[test]
+    fn status_surface_shows_review_fix_row_and_chip() {
+        let mut view = view(RunStatus::Running, PHASE_ADDRESS_REVIEW, None, None);
+        assert!(review_fix_row(&view).is_none());
+        view.workflow = Some(WorkflowView {
+            id: Some("canonical_v1".into()),
+            driver: "adapter".into(),
+            pending_roles: Vec::new(),
+            address_findings_attempts: 0,
+            ci_fix_attempts: 0,
+            review_fix_attempts: 2,
+        });
+        assert_eq!(review_fix_row(&view).as_deref(), Some("attempt 2/2"));
+        assert_eq!(REVIEW_FIX_ROW_LABEL, "Review fix");
+        let chips = phase_chips(&view);
+        let current = chips.iter().find(|c| c.kind == ChipKind::Current).unwrap();
+        assert_eq!(current.label, PHASE_ADDRESS_REVIEW);
+        // `ui/app.rs` renders both rows beside each other from these model values.
+        assert_eq!(REVIEW_FIX_ROW_LABEL, "Review fix");
     }
 
     #[test]
@@ -839,6 +881,7 @@ mod tests {
             pending_roles: vec![REVIEW_SLUG_AGY.into()],
             address_findings_attempts: 0,
             ci_fix_attempts: 0,
+            review_fix_attempts: 0,
         });
         v.harness = Some(HarnessStatusBundle {
             grok: Some(GrokHarnessStatus {
@@ -1003,6 +1046,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }
@@ -1182,6 +1226,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         };

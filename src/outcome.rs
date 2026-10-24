@@ -80,10 +80,13 @@ pub enum FailureClass {
     /// 0098: the leg declared a terminal prerequisite block in its turn text. The run
     /// stops and the project holds until `failure resolve`.
     Blocked,
+    /// 0078: unresolved owned-PR review comments, a capped `address-review` leg, a
+    /// truncated/rate-limited/unreadable surface, or a review push that could not land.
+    ReviewComments,
 }
 
 impl FailureClass {
-    pub const ALL: [FailureClass; 10] = [
+    pub const ALL: [FailureClass; 11] = [
         Self::Permission,
         Self::ModelExhaustion,
         Self::Difficulty,
@@ -94,6 +97,7 @@ impl FailureClass {
         Self::ReviewNeverSettles,
         Self::Gate,
         Self::Blocked,
+        Self::ReviewComments,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -108,6 +112,7 @@ impl FailureClass {
             Self::ReviewNeverSettles => "review_never_settles",
             Self::Gate => "gate",
             Self::Blocked => "blocked",
+            Self::ReviewComments => "review_comments",
         }
     }
 
@@ -123,6 +128,7 @@ impl FailureClass {
             "review_never_settles" => Ok(Self::ReviewNeverSettles),
             "gate" => Ok(Self::Gate),
             "blocked" => Ok(Self::Blocked),
+            "review_comments" => Ok(Self::ReviewComments),
             other => Err(CoordinatorError::Message(format!(
                 "unknown failure_class: {other}"
             ))),
@@ -786,7 +792,7 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
             project_id: record.id.clone(),
             track_id: state.track_id.clone(),
             phase: state.phase.clone(),
-            failure_class: FailureClass::CiFailed,
+            failure_class: state.failure_class.unwrap_or(FailureClass::CiFailed),
             message: Some(message),
             last_event: state.last_event.clone(),
             artifact_path,
@@ -1112,6 +1118,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
@@ -1389,9 +1396,15 @@ mod tests {
     }
 
     #[test]
-    fn failure_class_all_is_ten_with_blocked_last_and_serde_blocked() {
-        assert_eq!(FailureClass::ALL.len(), 10);
+    fn failure_class_all_is_eleven_with_blocked_at_nine_and_serde_blocked() {
+        assert_eq!(FailureClass::ALL.len(), 11);
         assert_eq!(FailureClass::ALL[9], FailureClass::Blocked);
+        assert_eq!(FailureClass::ALL[10], FailureClass::ReviewComments);
+        assert_eq!(FailureClass::ReviewComments.as_str(), "review_comments");
+        assert_eq!(
+            FailureClass::parse("review_comments").unwrap(),
+            FailureClass::ReviewComments
+        );
         assert_eq!(FailureClass::Blocked.as_str(), "blocked");
         assert_eq!(
             FailureClass::parse("blocked").unwrap(),

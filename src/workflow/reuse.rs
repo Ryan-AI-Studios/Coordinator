@@ -797,6 +797,8 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }
@@ -1231,6 +1233,8 @@ mod tests {
                 url: String::new(),
                 is_draft: false,
                 merged: false,
+
+                closed: false,
                 head_oid: None,
                 merge_state: MergeStateStatus::Unknown,
                 head_ref: "track/0083-Relaunch".into(),

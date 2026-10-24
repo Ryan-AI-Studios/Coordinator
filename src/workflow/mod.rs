@@ -180,6 +180,33 @@ pub fn on_success(
         }
     }
 
+    if state.phase == graph::PHASE_ADDRESS_REVIEW {
+        match crate::ci::review::classify_diff(record, state) {
+            crate::ci::review::DiffOutcome::Changed { head } => {
+                let mut ci = state.ci.take().unwrap_or_default();
+                ci.review_push_pending = Some(head);
+                state.ci = Some(ci);
+            }
+            crate::ci::review::DiffOutcome::Empty => {
+                let message = format!(
+                    "address-review: no diff from {}",
+                    state
+                        .review_fix_request
+                        .as_ref()
+                        .map(|r| r.from_sha.as_str())
+                        .unwrap_or("")
+                );
+                stop_address_review(state, &message);
+                return AddressCiFollowUp::Stopped { message };
+            }
+            crate::ci::review::DiffOutcome::Unreadable => {
+                let message = "address-review: diff unreadable".to_string();
+                stop_address_review(state, &message);
+                return AddressCiFollowUp::Stopped { message };
+            }
+        }
+    }
+
     if state.phase == graph::PHASE_ADVANCE {
         if let Some(probe) = apply_advance(record, state) {
             return AddressCiFollowUp::ReuseProbe(Box::new(probe));
@@ -359,6 +386,14 @@ fn apply_checkpoint_refusal(state: &mut RunState, error: &CoordinatorError) {
 fn stop_address_ci(state: &mut RunState, message: &str) {
     state.status = RunStatus::Stopped;
     state.failure_class = Some(FailureClass::CiFailed);
+    state.phase_started_at = None;
+    state.pause_started_at = None;
+    state.last_event = message.to_string();
+}
+
+fn stop_address_review(state: &mut RunState, message: &str) {
+    state.status = RunStatus::Stopped;
+    state.failure_class = Some(FailureClass::ReviewComments);
     state.phase_started_at = None;
     state.pause_started_at = None;
     state.last_event = message.to_string();
@@ -928,6 +963,9 @@ pub fn auto_start(state: &mut RunState, track_id: &str) {
     state.address_findings_attempts = 0;
     state.ci_fix_attempts = 0;
     state.ci_fix_request = None;
+    state.review_fix_attempts = 0;
+    state.review_fix_request = None;
+    state.review_route = None;
     reset_phase_clock(state);
     state.last_event = format!("workflow: auto-start {track_id}");
 }
@@ -1223,6 +1261,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         }

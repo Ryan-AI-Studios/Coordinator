@@ -272,6 +272,9 @@ fn begin_fresh_run(
     state.address_findings_attempts = 0;
     state.ci_fix_attempts = 0;
     state.ci_fix_request = None;
+    state.review_fix_attempts = 0;
+    state.review_fix_request = None;
+    state.review_route = None;
     state.sticky_ready_ids =
         crate::workflow::conductor_md::capture_sticky_ready_ids(record, &state.sticky_ready_ids);
     if fresh.picked {
@@ -587,6 +590,7 @@ mod tests {
             state_policies: Vec::new(),
             self_continuation: false,
             ci_fix_routing: false,
+            review_comment_routing: false,
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: Utc::now(),
         }

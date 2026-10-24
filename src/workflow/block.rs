@@ -24,8 +24,8 @@
 //! to contain a terminal line can stop the leg. There is no natural-language classifier.
 
 use crate::workflow::graph::{
-    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_ADVANCE, PHASE_FOLD, PHASE_IMPLEMENT,
-    PHASE_PLAN,
+    PHASE_ADDRESS_CI, PHASE_ADDRESS_FINDINGS, PHASE_ADDRESS_REVIEW, PHASE_ADVANCE, PHASE_FOLD,
+    PHASE_IMPLEMENT, PHASE_PLAN,
 };
 
 /// Longest accepted reason, in Unicode scalars.
@@ -54,6 +54,7 @@ pub fn phases() -> &'static [&'static str] {
         PHASE_IMPLEMENT,
         PHASE_ADDRESS_FINDINGS,
         PHASE_ADDRESS_CI,
+        PHASE_ADDRESS_REVIEW,
         PHASE_ADVANCE,
     ]
 }

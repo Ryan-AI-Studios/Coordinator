@@ -523,6 +523,9 @@ pub enum ProjectCommands {
         /// true | false (omit = leave unchanged). Route the ci-wait gate's failing checks into address-ci.
         #[arg(long = "ci-fix-routing", value_parser = parse_auto_merge)]
         ci_fix_routing: Option<bool>,
+        /// true | false (omit = leave unchanged). Route owned-PR review comments into address-review.
+        #[arg(long = "review-comment-routing", value_parser = parse_auto_merge)]
+        review_comment_routing: Option<bool>,
         /// Repeatable. Canonical phase id or `plan_review_slot` = seconds (>0).
         #[arg(long = "phase-timeout", value_name = "PHASE=SECS", value_parser = parse_phase_timeout)]
         phase_timeouts: Vec<(String, u64)>,
@@ -743,6 +746,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                 worktree_isolation,
                 self_continuation,
                 ci_fix_routing,
+                review_comment_routing,
                 phase_timeouts,
                 clear_phase_timeout,
                 clear_phase_timeouts,
@@ -796,6 +800,7 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     worktree_isolation,
                     self_continuation,
                     ci_fix_routing,
+                    review_comment_routing,
                     phase_timeouts_secs,
                     clear_phase_timeouts,
                     clear_phase_timeout,
@@ -2032,6 +2037,50 @@ mod tests {
             add.get_arguments()
                 .all(|a| a.get_id().as_str() != "ci_fix_routing"),
             "add must not grow --ci-fix-routing"
+        );
+        assert!(
+            set.get_arguments()
+                .any(|a| a.get_id() == "review_comment_routing"),
+            "set --review-comment-routing"
+        );
+        assert!(
+            add.get_arguments()
+                .all(|a| a.get_id().as_str() != "review_comment_routing"),
+            "add must not grow --review-comment-routing"
+        );
+    }
+
+    #[test]
+    fn project_set_review_comment_routing() {
+        let cli = Cli::try_parse_from([
+            "coordinator",
+            "project",
+            "set",
+            "--review-comment-routing",
+            "true",
+        ])
+        .expect("parse");
+        match cli.command {
+            Commands::Project {
+                action:
+                    ProjectCommands::Set {
+                        review_comment_routing,
+                        ..
+                    },
+                ..
+            } => assert_eq!(review_comment_routing, Some(true)),
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn add_must_not_grow_review_comment_routing() {
+        let mut cmd = Cli::command();
+        let project = cmd.find_subcommand_mut("project").unwrap();
+        let add = project.find_subcommand_mut("add").unwrap();
+        assert!(
+            add.get_arguments()
+                .all(|a| a.get_id().as_str() != "review_comment_routing")
         );
     }
 
