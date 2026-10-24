@@ -719,6 +719,8 @@ pub fn status_after_wait(record: &ProjectRecord) -> Result<StatusView> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 0124: bind the closed-port test to the production bound instead of a copy.
+    use crate::serve_nudge::HEALTH_TIMEOUT_MS;
     use crate::config::{
         ENV_COORDINATOR_HOME, ENV_OUTCOME_POLL_MS, ENV_STUB_PHASE_TIMEOUT_SECS, MachineConfig,
         save_machine_config, test_env_lock,
@@ -1300,6 +1302,11 @@ mod tests {
         probe_serve_health(port, Duration::from_millis(500))
     }
 
+    /// The bound the shipped nudge actually probes with (0124).
+    fn probe_production(port: u16) -> PortHealth {
+        probe_serve_health(port, Duration::from_millis(HEALTH_TIMEOUT_MS))
+    }
+
     #[test]
     fn probe_health_healthy_coordinator_json() {
         let hold = spawn_health_hold(r#"{"ok":true,"service":"coordinator"}"#);
@@ -1311,10 +1318,14 @@ mod tests {
     fn probe_health_absent_on_closed_port() {
         // A just-released ephemeral port can be re-bound by a concurrent test, so
         // retry: the arm must reach `Absent` for at least one genuinely closed port.
+        // 0124 F1: probe at the production bound, not at 500 ms. Below the Windows
+        // SYN-retransmission budget a refusal reads as a timeout, so the old bound
+        // made this test luck. Three attempts is enough now that the bound is above
+        // the refusal; ten attempts only hid a slow host and cost ~30 s when red.
         let mut last = PortHealth::Healthy;
-        for _ in 0..10 {
+        for _ in 0..3 {
             let port = refused_port();
-            last = probe_now(port);
+            last = probe_production(port);
             if last == PortHealth::Absent {
                 assert!(!coordinator_serve_listening(port));
                 return;
@@ -1325,7 +1336,44 @@ mod tests {
                 "a closed port must never read as Healthy"
             );
         }
-        panic!("closed loopback port classified {last:?}, expected Absent");
+        panic!(
+            "closed loopback port classified {last:?} at {HEALTH_TIMEOUT_MS} ms, expected Absent"
+        );
+    }
+
+    #[test]
+    fn probe_production_bound_classifies_a_closed_port_absent() {
+        // A just-released ephemeral port can be re-bound by a concurrent test; retry a few
+        // distinct ports. Each attempt may take ~2.05 s on a slow-refusal host.
+        let mut last = PortHealth::Healthy;
+        for _ in 0..3 {
+            let port = refused_port();
+            last = probe_production(port);
+            if last == PortHealth::Absent {
+                assert!(!coordinator_serve_listening(port));
+                return;
+            }
+            assert_ne!(
+                last,
+                PortHealth::Healthy,
+                "a closed port must never read as Healthy"
+            );
+        }
+        panic!(
+            "closed loopback port classified {last:?} at {HEALTH_TIMEOUT_MS} ms, expected Absent"
+        );
+    }
+
+    #[test]
+    fn probe_production_bound_still_times_out_instead_of_absent() {
+        // TCP accepted, never answered: the longer bound must NOT turn silence into Absent.
+        let hold = spawn_raw_responder(b"", true);
+        let started = std::time::Instant::now();
+        let health = probe_production(hold.port);
+        let elapsed = started.elapsed(); // capture before the 200 ms listening probe
+        assert_eq!(health, PortHealth::Unresponsive);
+        assert!(!coordinator_serve_listening(hold.port));
+        assert!(elapsed >= Duration::from_millis(HEALTH_TIMEOUT_MS - 100));
     }
 
     #[test]

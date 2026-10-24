@@ -1306,6 +1306,73 @@ mod tests {
         assert_eq!(skipped["action"], "skip-unresponsive");
     }
 
+    // ---- 0124 health-bound calibration -------------------------------------
+
+    #[test]
+    fn health_bound_is_pinned_above_the_windows_refusal_budget() {
+        // Floor guard, not the margin argument: the 2171 ms worst sample is 29 ms below this
+        // floor; the real 0.83 s / 38 % margin lives in the constant's doc comment. Windows
+        // retries the SYN after an RST until its connect-retransmission budget is spent, so a
+        // refused loopback connect takes ~2.03 s (4 attempts) on current builds; ureq 3.4.0 with
+        // the product's builder returns Io(ConnectionRefused) only when the bound exceeds it.
+        assert_eq!(HEALTH_TIMEOUT_MS, 3_000);
+        assert!(
+            HEALTH_TIMEOUT_MS > 2_200,
+            "bound must exceed the measured ~2.17 s refusal; got {HEALTH_TIMEOUT_MS} ms"
+        );
+    }
+
+    #[test]
+    fn startup_grace_and_whole_run_stay_under_the_task_limit() {
+        // The real loop is 60 probes with a sleep after all but the last:
+        // 60 x 3000 + 59 x 500 = 209 500 ms today. The three constants are pinned below and
+        // in T1, so the honest grace is derivable; this test bounds the RUN, not just the grace.
+        let grace = u64::from(STARTUP_GRACE_POLLS) * HEALTH_TIMEOUT_MS
+            + (u64::from(STARTUP_GRACE_POLLS) - 1) * STARTUP_POLL_MS;
+        assert!(
+            grace < 300_000,
+            "grace ceiling {grace} ms must stay under the PT5M ExecutionTimeLimit"
+        );
+
+        // Whole-run ceiling: up to two classify probes + wrapper//Run/log + the conservative
+        // grace. 218 000 ms today; a future 4400 ms bump fails this, while 4000 ms passes
+        // (280 000) - which is why 4000 was rejected on margin, not on a PT5M breach.
+        let run = 2 * HEALTH_TIMEOUT_MS
+            + 2_000
+            + u64::from(STARTUP_GRACE_POLLS) * (HEALTH_TIMEOUT_MS + STARTUP_POLL_MS);
+        assert!(
+            run < 300_000,
+            "whole run {run} ms must stay under the PT5M ExecutionTimeLimit"
+        );
+
+        // The constants and the loop that consumes them.
+        assert_eq!(STARTUP_GRACE_POLLS, 60);
+        assert_eq!(STARTUP_POLL_MS, 500);
+        let prod = production_half();
+        assert!(
+            prod.contains("for poll in 0..STARTUP_GRACE_POLLS"),
+            "the grace loop must be bounded by STARTUP_GRACE_POLLS"
+        );
+        assert!(
+            prod.contains("from_millis(STARTUP_POLL_MS)"),
+            "the grace sleep must use STARTUP_POLL_MS"
+        );
+    }
+
+    #[test]
+    fn health_bound_is_wired_into_the_probe() {
+        let prod = production_half();
+        assert!(
+            prod.contains("Duration::from_millis(HEALTH_TIMEOUT_MS)"),
+            "the probe closure must pass the named constant"
+        );
+        assert!(!prod.contains("from_millis(1_500)"), "no stale 1500 ms literal");
+        assert!(
+            !prod.contains("from_millis(3_000)"),
+            "no duplicated 3000 ms literal"
+        );
+    }
+
     // ---- production-half source guards -------------------------------------
 
     fn production_half() -> &'static str {
