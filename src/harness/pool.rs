@@ -2210,6 +2210,23 @@ fn apply_block_declaration(
     }
 }
 
+fn trusted_evidence_verdict(
+    record: &ProjectRecord,
+    prepared: &PreparedInjection,
+) -> Option<crate::workflow::trusted_evidence::Evidence> {
+    let record = record.clone();
+    let prepared = prepared.clone();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        crate::workflow::trusted_evidence::read(&record, &prepared)
+    })) {
+        Ok(evidence) => Some(evidence),
+        Err(payload) => {
+            std::mem::forget(payload);
+            None
+        }
+    }
+}
+
 /// `no_change` is the unchanged-tree verdict (0095) computed beside the prompt, where the session
 /// cwd is known. `Some` turns a would-be success into a `HarnessCrash` failure.
 ///
@@ -2280,6 +2297,7 @@ async fn apply_turn_checked(
                     } else {
                         Some(pr.text.clone())
                     };
+                    let mut trusted: Option<crate::workflow::trusted_evidence::Evidence> = None;
                     let next = if injected_phase == crate::workflow::graph::PHASE_ADVANCE {
                         match crate::workflow::prompts::parse_next_track_line(&pr.text) {
                             Some(Some(id)) => Some(id),
@@ -2373,6 +2391,15 @@ async fn apply_turn_checked(
                                 Some(m) => {
                                     error = Some(m.clone());
                                     failure_class = Some(FailureClass::HarnessCrash);
+                                    if state.driver == crate::workflow::WorkflowDriver::Adapter
+                                        && crate::harness::no_change::applies(
+                                            &state,
+                                            injected_phase,
+                                        )
+                                        && let Some(prepared) = prepared
+                                    {
+                                        trusted = trusted_evidence_verdict(record, prepared);
+                                    }
                                     PhaseOutcome::failure(
                                         injected_phase,
                                         FailureClass::HarnessCrash,
@@ -2392,7 +2419,22 @@ async fn apply_turn_checked(
                         }
                     };
                     match apply_outcome(record, outcome, prepared, harness.clone())? {
-                        Ok(view) => status = Some(view),
+                        Ok(view) => {
+                            if let Some(crate::workflow::trusted_evidence::Evidence::Current(cur)) =
+                                trusted
+                            {
+                                crate::progress_log::append(
+                                    record,
+                                    "evidence",
+                                    &format!(
+                                        "current epoch={} phase={injected_phase} facts={}",
+                                        cur.run_epoch,
+                                        cur.facts.len()
+                                    ),
+                                );
+                            }
+                            status = Some(view);
+                        }
                         Err(skip_view) => return Ok(skip_view),
                     }
                     applied = true;
@@ -12468,5 +12510,651 @@ mod tests {
                 (name, body)
             })
             .collect()
+    }
+
+    fn scrub_stamps(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::new();
+        let mut index = 0;
+        while index < chars.len() {
+            if stamp_at(&chars[index..]) {
+                out.push_str("STAMP");
+                while index < chars.len() && !chars[index].is_whitespace() {
+                    index += 1;
+                }
+            } else {
+                out.push(chars[index]);
+                index += 1;
+            }
+        }
+        out
+    }
+
+    fn stamp_at(chars: &[char]) -> bool {
+        chars.len() >= 20
+            && chars[0].is_ascii_digit()
+            && chars[1].is_ascii_digit()
+            && chars[2].is_ascii_digit()
+            && chars[3].is_ascii_digit()
+            && chars[4] == '-'
+            && chars[10] == 'T'
+    }
+
+    fn scrub_json(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove("updated_at");
+                map.remove("written_at");
+                map.remove("last_applied_outcome_hash");
+                for child in map.values_mut() {
+                    scrub_json(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    scrub_json(child);
+                }
+            }
+            serde_json::Value::String(text) if stamp_at(&text.chars().collect::<Vec<_>>()) => {
+                *text = "STAMP".into();
+            }
+            _ => {}
+        }
+    }
+
+    fn leg_segment(before: &[u8], record: &ProjectRecord) -> String {
+        let path = crate::progress_log::path(record);
+        let after = std::fs::read(&path).unwrap_or_default();
+        let start = before.len().min(after.len());
+        String::from_utf8_lossy(&after[start..]).to_string()
+    }
+
+    fn evidence_details(segment: &str) -> Vec<String> {
+        segment
+            .lines()
+            .filter_map(|line| line.split("  evidence  ").nth(1).map(str::to_string))
+            .collect()
+    }
+
+    async fn no_change_turn(
+        rec: &ProjectRecord,
+        prepared: Option<&crate::workflow::execution_repo::PreparedInjection>,
+        manual: bool,
+    ) -> HarnessPromptView {
+        let msg = crate::harness::no_change::no_change_message("implement", "codex", None);
+        apply_turn_checked(
+            rec,
+            Ok(PromptResult {
+                text: "tree unchanged".into(),
+                stop_reason: Some("end_turn".into()),
+            }),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            Some(msg),
+            prepared,
+            None,
+            manual,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn trusted_evidence_no_evidence_matches_current_decision() {
+        let _guard = test_env_lock();
+        let (rec, _home, proj) = implement_leg_fixture(crate::workflow::graph::PHASE_IMPLEMENT);
+        crate::progress_log::set_test_rotate_bytes(Some(u64::MAX));
+        struct ClearRotate;
+        impl Drop for ClearRotate {
+            fn drop(&mut self) {
+                crate::progress_log::set_test_rotate_bytes(None);
+            }
+        }
+        let _pin = ClearRotate;
+        let baseline = crate::state::load_run_state(&rec).unwrap();
+        let prepared = crate::workflow::execution_repo::PreparedInjection::for_target(target_for(
+            &rec,
+            &baseline,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            proj.path(),
+        ));
+        let root = crate::state::resolve_state_dir(&rec)
+            .unwrap()
+            .join("trusted-evidence");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(crate::notify::artifact::path(&rec).unwrap());
+        let journal_before = std::fs::read(crate::progress_log::path(&rec)).unwrap_or_default();
+        let absent = no_change_turn(&rec, Some(&prepared), false).await;
+        let absent_segment = leg_segment(&journal_before, &rec);
+        let absent_state = crate::state::load_run_state(&rec).unwrap();
+        let absent_failure = crate::notify::artifact::read(&rec).unwrap().unwrap().body;
+        assert!(evidence_details(&absent_segment).is_empty());
+        assert_eq!(absent.failure_class, Some(FailureClass::HarnessCrash));
+        assert!(absent.applied);
+
+        crate::state::save_run_state(&rec, &baseline).unwrap();
+        let _ = std::fs::remove_file(crate::notify::artifact::path(&rec).unwrap());
+        crate::state::with_run_state_lock(&rec, || {
+            crate::workflow::trusted_evidence::write_for_epoch(
+                &rec,
+                &baseline,
+                crate::workflow::trusted_evidence::ProducerHook::WorkflowAutoStart,
+            );
+            Ok(())
+        })
+        .unwrap();
+        let journal_before = std::fs::read(crate::progress_log::path(&rec)).unwrap_or_default();
+        let current = no_change_turn(&rec, Some(&prepared), false).await;
+        let current_segment = leg_segment(&journal_before, &rec);
+        let current_state = crate::state::load_run_state(&rec).unwrap();
+        let current_failure = crate::notify::artifact::read(&rec).unwrap().unwrap().body;
+        let details = evidence_details(&current_segment);
+        assert_eq!(details.len(), 1);
+        assert!(details[0].starts_with(&format!(
+            "current epoch={} phase=implement facts=",
+            baseline.run_epoch
+        )));
+        assert_eq!(current.failure_class, absent.failure_class);
+        assert_eq!(current.error, absent.error);
+        assert_eq!(current.applied, absent.applied);
+        assert_eq!(current.text, absent.text);
+        let mut absent_view = serde_json::to_value(&absent).unwrap();
+        let mut current_view = serde_json::to_value(&current).unwrap();
+        scrub_json(&mut absent_view);
+        scrub_json(&mut current_view);
+        assert_eq!(absent_view, current_view);
+        let mut absent_state_json = serde_json::to_value(&absent_state).unwrap();
+        let mut current_state_json = serde_json::to_value(&current_state).unwrap();
+        scrub_json(&mut absent_state_json);
+        scrub_json(&mut current_state_json);
+        assert_eq!(absent_state_json, current_state_json);
+        assert_eq!(
+            scrub_stamps(&absent_failure),
+            scrub_stamps(&current_failure)
+        );
+        let mut absent_lines: Vec<_> = absent_segment
+            .lines()
+            .filter(|line| !line.contains("  evidence  "))
+            .map(scrub_stamps)
+            .collect();
+        let mut current_lines: Vec<_> = current_segment
+            .lines()
+            .filter(|line| !line.contains("  evidence  "))
+            .map(scrub_stamps)
+            .collect();
+        absent_lines.sort();
+        current_lines.sort();
+        assert_eq!(absent_lines, current_lines);
+        let message = crate::harness::no_change::no_change_message("implement", "codex", None);
+        let golden_last_event = if message.chars().count() <= 200 {
+            format!(
+                "outcome: failure class=harness_crash phase=implement source=adapter — {message}"
+            )
+        } else {
+            let truncated: String = message.chars().take(200).collect();
+            format!(
+                "outcome: failure class=harness_crash phase=implement source=adapter — {truncated}…"
+            )
+        };
+        assert_eq!(
+            golden_last_event,
+            "outcome: failure class=harness_crash phase=implement source=adapter — implement leg produced no changes: phase implement, harness codex, session mode adapter-default, last permission signal none; the tree is exactly as the leg found it. If the plan was already satisfied…"
+        );
+        assert_eq!(absent_state.last_event, golden_last_event);
+        assert_eq!(current_state.last_event, golden_last_event);
+        assert_eq!(absent_state.status, crate::state::RunStatus::Stopped);
+        assert_eq!(absent_state.phase, crate::workflow::graph::PHASE_IMPLEMENT);
+        assert!(absent_state.phase_started_at.is_none());
+        assert_eq!(message, GOLDEN_NO_CHANGE_ERROR);
+        assert_golden_no_change_view(&absent, baseline.run_epoch, "absent");
+        assert_golden_no_change_view(&current, baseline.run_epoch, "current");
+        assert_eq!(absent.error.as_deref(), Some(message.as_str()));
+        assert_eq!(current.error.as_deref(), Some(message.as_str()));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    const GOLDEN_NO_CHANGE_ERROR: &str = "implement leg produced no changes: phase implement, harness codex, session mode adapter-default, last permission signal none; the tree is exactly as the leg found it. If the plan was already satisfied, advance by hand; otherwise the adapter may be sandboxed read-only.";
+    const GOLDEN_LAST_EVENT: &str = "outcome: failure class=harness_crash phase=implement source=adapter — implement leg produced no changes: phase implement, harness codex, session mode adapter-default, last permission signal none; the tree is exactly as the leg found it. If the plan was already satisfied…";
+
+    fn assert_golden_no_change_view(view: &HarnessPromptView, epoch: u64, label: &str) {
+        assert_eq!(view.text.as_deref(), Some("tree unchanged"), "{label}");
+        assert_eq!(view.stop_reason.as_deref(), Some("end_turn"), "{label}");
+        assert!(view.applied, "{label}");
+        assert_eq!(view.skipped, None, "{label}");
+        assert_eq!(
+            view.error.as_deref(),
+            Some(GOLDEN_NO_CHANGE_ERROR),
+            "{label}"
+        );
+        assert_eq!(
+            view.failure_class,
+            Some(FailureClass::HarnessCrash),
+            "{label}"
+        );
+        let status = view.status.as_ref().expect(label);
+        assert_eq!(status.status, crate::state::RunStatus::Stopped, "{label}");
+        assert_eq!(
+            status.phase,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            "{label}"
+        );
+        assert_eq!(status.run_epoch, epoch, "{label}");
+        assert_eq!(
+            status.failure_class,
+            Some(FailureClass::HarnessCrash),
+            "{label}"
+        );
+        assert_eq!(status.last_event, GOLDEN_LAST_EVENT, "{label}");
+        assert!(status.phase_started_at.is_none(), "{label}");
+        assert!(status.ci.is_none(), "{label}");
+        assert!(status.review.is_none(), "{label}");
+        assert!(status.stall.is_none(), "{label}");
+        assert!(status.next_track.is_none(), "{label}");
+        let workflow = status.workflow.as_ref().expect(label);
+        assert_eq!(
+            workflow.id.as_deref(),
+            Some(crate::workflow::graph::WORKFLOW_ID),
+            "{label}"
+        );
+        assert_eq!(workflow.driver, "adapter", "{label}");
+        assert!(workflow.pending_roles.is_empty(), "{label}");
+        let harness = view.harness.as_ref().expect(label);
+        assert!(harness.alive, "{label}");
+        assert_eq!(harness.session_id.as_deref(), Some("sess-apply"), "{label}");
+        assert!(harness.cwd.is_none(), "{label}");
+        assert!(!harness.supports_compact, "{label}");
+        assert!(harness.pid.is_none(), "{label}");
+        assert_eq!(harness.adapter, "grok", "{label}");
+        assert!(harness.context_usage.is_none(), "{label}");
+        assert!(harness.last_signal.is_none(), "{label}");
+        assert!(harness.last_tool_title.is_none(), "{label}");
+        assert!(harness.model.is_none(), "{label}");
+        assert!(harness.bin.is_none(), "{label}");
+    }
+
+    async fn assert_silent_leg(
+        rec: &ProjectRecord,
+        prepared: Option<&crate::workflow::execution_repo::PreparedInjection>,
+        message: &str,
+        label: &str,
+    ) -> HarnessPromptView {
+        let before = std::fs::read(crate::progress_log::path(rec)).unwrap_or_default();
+        let view = no_change_turn(rec, prepared, false).await;
+        let details = evidence_details(&leg_segment(&before, rec));
+        assert!(details.is_empty(), "{label} appended {details:?}");
+        assert_eq!(
+            view.failure_class,
+            Some(FailureClass::HarnessCrash),
+            "{label}"
+        );
+        assert_eq!(view.text.as_deref(), Some("tree unchanged"), "{label}");
+        assert_eq!(view.stop_reason.as_deref(), Some("end_turn"), "{label}");
+        assert_eq!(view.skipped, None, "{label}");
+        assert_eq!(message, GOLDEN_NO_CHANGE_ERROR, "{label}");
+        let state = crate::state::load_run_state(rec).unwrap();
+        assert_golden_no_change_view(&view, state.run_epoch, label);
+        assert_eq!(state.last_event, GOLDEN_LAST_EVENT, "{label}");
+        assert_eq!(state.status, crate::state::RunStatus::Stopped, "{label}");
+        assert_eq!(
+            state.phase,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            "{label}"
+        );
+        assert_eq!(
+            state.failure_class,
+            Some(FailureClass::HarnessCrash),
+            "{label}"
+        );
+        view
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn trusted_evidence_every_no_evidence_reason_is_silent() {
+        let _guard = test_env_lock();
+        let (rec, _home, proj) = implement_leg_fixture(crate::workflow::graph::PHASE_IMPLEMENT);
+        let baseline = crate::state::load_run_state(&rec).unwrap();
+        let prepared = crate::workflow::execution_repo::PreparedInjection::for_target(target_for(
+            &rec,
+            &baseline,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            proj.path(),
+        ));
+        let message = crate::harness::no_change::no_change_message("implement", "codex", None);
+        let restore = || {
+            crate::state::save_run_state(&rec, &baseline).unwrap();
+            if let Ok(path) = crate::notify::artifact::path(&rec) {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        let root = crate::state::resolve_state_dir(&rec)
+            .unwrap()
+            .join("trusted-evidence");
+        let leaf = root.join("current.json");
+
+        crate::progress_log::set_test_rotate_bytes(Some(u64::MAX));
+        struct ClearRotate;
+        impl Drop for ClearRotate {
+            fn drop(&mut self) {
+                crate::progress_log::set_test_rotate_bytes(None);
+            }
+        }
+        let _pin = ClearRotate;
+        let _ = std::fs::remove_dir_all(&root);
+        assert_silent_leg(&rec, Some(&prepared), &message, "absent").await;
+        restore();
+
+        let mut wrong = baseline.clone();
+        wrong.run_epoch = baseline.run_epoch.saturating_add(3);
+        crate::state::with_run_state_lock(&rec, || {
+            crate::workflow::trusted_evidence::write_for_epoch(
+                &rec,
+                &wrong,
+                crate::workflow::trusted_evidence::ProducerHook::RunBeginFreshRun,
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_silent_leg(&rec, Some(&prepared), &message, "wrong-epoch").await;
+        restore();
+
+        let skill = crate::workflow::reuse::execution_skill_path_for_epoch(
+            &rec,
+            baseline.run_epoch,
+            "implement",
+        );
+        if let Some(parent) = skill.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&skill, "before\n").unwrap();
+        crate::state::with_run_state_lock(&rec, || {
+            crate::workflow::trusted_evidence::write_for_epoch(
+                &rec,
+                &baseline,
+                crate::workflow::trusted_evidence::ProducerHook::RunBeginFreshRun,
+            );
+            Ok(())
+        })
+        .unwrap();
+        std::fs::write(&skill, "after\n").unwrap();
+        assert_silent_leg(&rec, Some(&prepared), &message, "fact-drifted").await;
+        restore();
+
+        crate::state::with_run_state_lock(&rec, || {
+            crate::workflow::trusted_evidence::write_for_epoch(
+                &rec,
+                &baseline,
+                crate::workflow::trusted_evidence::ProducerHook::RunBeginFreshRun,
+            );
+            Ok(())
+        })
+        .unwrap();
+        std::fs::write(&leaf, b"{").unwrap();
+        assert_silent_leg(&rec, Some(&prepared), &message, "malformed").await;
+        restore();
+
+        crate::state::with_run_state_lock(&rec, || {
+            crate::workflow::trusted_evidence::write_for_epoch(
+                &rec,
+                &baseline,
+                crate::workflow::trusted_evidence::ProducerHook::RunBeginFreshRun,
+            );
+            Ok(())
+        })
+        .unwrap();
+        let raced = leaf.clone();
+        let _race = crate::workflow::trusted_evidence::BetweenReadsGuard::arm(move || {
+            std::fs::write(&raced, b"{\"replaced\":true}").unwrap();
+        });
+        assert_silent_leg(&rec, Some(&prepared), &message, "capture-race").await;
+        drop(_race);
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn trusted_evidence_current_oversize_still_journals_one_line() {
+        let _guard = test_env_lock();
+        let (rec, _home, _proj) = implement_leg_fixture(crate::workflow::graph::PHASE_IMPLEMENT);
+        let baseline = crate::state::load_run_state(&rec).unwrap();
+        for name in ["implement", "onboarding"] {
+            let path = crate::workflow::reuse::execution_skill_path_for_epoch(
+                &rec,
+                baseline.run_epoch,
+                name,
+            );
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, "x").unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(crate::workflow::trusted_evidence::SKILL_MAX_BYTES + 1)
+                .unwrap();
+        }
+        crate::state::with_run_state_lock(&rec, || {
+            crate::workflow::trusted_evidence::write_for_epoch(
+                &rec,
+                &baseline,
+                crate::workflow::trusted_evidence::ProducerHook::RunBeginFreshRun,
+            );
+            Ok(())
+        })
+        .unwrap();
+        let prepared = crate::workflow::execution_repo::PreparedInjection {
+            project_id: rec.id.clone(),
+            run_epoch: baseline.run_epoch,
+            phase: baseline.phase.clone(),
+            track_id: baseline.track_id.clone(),
+            target: None,
+        };
+        let before = std::fs::read(crate::progress_log::path(&rec)).unwrap_or_default();
+        let view = no_change_turn(&rec, Some(&prepared), false).await;
+        let details = evidence_details(&leg_segment(&before, &rec));
+        assert_eq!(details.len(), 1);
+        assert!(details[0].contains("facts=2"));
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn trusted_evidence_reader_stays_off_other_arms_and_panic_is_silent() {
+        let _guard = test_env_lock();
+        let (rec, _home, proj) = implement_leg_fixture(crate::workflow::graph::PHASE_IMPLEMENT);
+        crate::progress_log::set_test_rotate_bytes(Some(u64::MAX));
+        struct ClearRotate;
+        impl Drop for ClearRotate {
+            fn drop(&mut self) {
+                crate::progress_log::set_test_rotate_bytes(None);
+            }
+        }
+        let _pin = ClearRotate;
+        let baseline = crate::state::load_run_state(&rec).unwrap();
+        let prepared = crate::workflow::execution_repo::PreparedInjection::for_target(target_for(
+            &rec,
+            &baseline,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            proj.path(),
+        ));
+        let counter = crate::workflow::trusted_evidence::ReadCounterGuard::arm();
+        let restore = || {
+            crate::state::save_run_state(&rec, &baseline).unwrap();
+            if let Ok(path) = crate::notify::artifact::path(&rec) {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+
+        let before = counter.count();
+        let _ = no_change_turn(&rec, None, false).await;
+        assert_eq!(counter.count(), before);
+        restore();
+
+        let before = counter.count();
+        apply_turn_checked(
+            &rec,
+            Ok(PromptResult {
+                text: "done".into(),
+                stop_reason: Some("end_turn".into()),
+            }),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(counter.count(), before);
+        restore();
+
+        let before = counter.count();
+        let _ = no_change_turn(&rec, Some(&prepared), true).await;
+        assert_eq!(counter.count(), before);
+
+        let before = counter.count();
+        apply_turn_checked(
+            &rec,
+            Ok(PromptResult {
+                text: "Blocked: a real reason".into(),
+                stop_reason: Some("end_turn".into()),
+            }),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(counter.count(), before);
+        restore();
+
+        let before = counter.count();
+        apply_turn_checked(
+            &rec,
+            Ok(PromptResult {
+                text: "Error: boom".into(),
+                stop_reason: Some("end_turn".into()),
+            }),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            None,
+            Some(&prepared),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(counter.count(), before);
+        restore();
+
+        let mut stub = baseline.clone();
+        stub.driver = crate::workflow::WorkflowDriver::Stub;
+        crate::state::save_run_state(&rec, &stub).unwrap();
+        let before = counter.count();
+        let _ = no_change_turn(&rec, Some(&prepared), false).await;
+        assert_eq!(counter.count(), before);
+        restore();
+
+        let mut waiting = baseline.clone();
+        waiting.driver = crate::workflow::WorkflowDriver::FileWait;
+        crate::state::save_run_state(&rec, &waiting).unwrap();
+        let before = counter.count();
+        let _ = no_change_turn(&rec, Some(&prepared), false).await;
+        assert_eq!(counter.count(), before);
+        restore();
+
+        let mut checking = rec.clone();
+        checking.self_continuation = true;
+        let before = counter.count();
+        apply_turn_checked(
+            &checking,
+            Ok(PromptResult {
+                text: "self-check: continue finding=none action=progress".into(),
+                stop_reason: Some("end_turn".into()),
+            }),
+            harness_stub(),
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            SpawnTally::default(),
+            Some("tree unchanged".into()),
+            Some(&prepared),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(counter.count(), before);
+        restore();
+
+        let before = counter.count();
+        let _panic = crate::workflow::trusted_evidence::PanicOnceGuard::arm();
+        let before_journal = std::fs::read(crate::progress_log::path(&rec)).unwrap_or_default();
+        let panicked = no_change_turn(&rec, Some(&prepared), false).await;
+        assert_eq!(counter.count(), before + 1);
+        assert!(evidence_details(&leg_segment(&before_journal, &rec)).is_empty());
+        assert_eq!(panicked.failure_class, Some(FailureClass::HarnessCrash));
+        drop(_panic);
+        restore();
+
+        crate::state::with_run_state_lock(&rec, || {
+            crate::workflow::trusted_evidence::write_for_epoch(
+                &rec,
+                &baseline,
+                crate::workflow::trusted_evidence::ProducerHook::RunBeginFreshRun,
+            );
+            Ok(())
+        })
+        .unwrap();
+        let rec_hook = rec.clone();
+        let _stale = crate::workflow::trusted_evidence::AfterReadGuard::arm(move || {
+            crate::state::with_run_state_lock(&rec_hook, || {
+                let mut state = crate::state::load_run_state(&rec_hook)?;
+                state.run_epoch = state.run_epoch.saturating_add(1);
+                crate::state::save_run_state(&rec_hook, &state)
+            })
+            .unwrap();
+        });
+        let before_journal = std::fs::read(crate::progress_log::path(&rec)).unwrap_or_default();
+        let stale = no_change_turn(&rec, Some(&prepared), false).await;
+        assert!(evidence_details(&leg_segment(&before_journal, &rec)).is_empty());
+        assert!(!stale.applied);
+        assert_eq!(stale.skipped, Some(true));
+        drop(_stale);
+
+        let active = crate::progress_log::path(&rec);
+        let prefix = std::fs::read(&active).unwrap_or_default();
+        let recorded = prefix.len();
+        restore();
+        crate::state::with_run_state_lock(&rec, || {
+            crate::workflow::trusted_evidence::write_for_epoch(
+                &rec,
+                &baseline,
+                crate::workflow::trusted_evidence::ProducerHook::RunBeginFreshRun,
+            );
+            Ok(())
+        })
+        .unwrap();
+        let _ = no_change_turn(&rec, Some(&prepared), false).await;
+        let after = std::fs::read(&active).unwrap_or_default();
+        assert_eq!(crate::progress_log::path(&rec), active);
+        assert!(after.len() >= recorded);
+        assert_eq!(&after[..recorded], &prefix[..]);
+        assert!(String::from_utf8_lossy(&after).contains("  evidence  "));
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
     }
 }
