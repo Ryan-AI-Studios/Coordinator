@@ -240,46 +240,54 @@ fn persist_blocks(record: &ProjectRecord) -> Result<Option<String>> {
     }
 }
 
-/// Delete every checkpoint ref for this project. A failed delete is journalled.
-pub(crate) fn reap_completed(record: &ProjectRecord) -> Result<()> {
+/// Delete checkpoint refs for the entry being reaped. A failed delete is journalled.
+///
+/// On a book, only refs whose epoch equals `entry.run_epoch` are deleted, including
+/// when no run scope is set. A singular file, or an unreadable book, deletes every
+/// checkpoint ref for the project.
+pub(crate) fn reap_completed(record: &ProjectRecord, entry: &RunState) -> Result<()> {
     match crate::state::load_run_book(record) {
         Ok(crate::state::RunBook::Many(_)) => {
-            let Some(epoch) = crate::state::active_run_epoch() else {
-                return Ok(());
-            };
-            reap(record, |found| found == Some(epoch))
+            reap(record, entry, |found| found == Some(entry.run_epoch))
         }
-        _ => reap(record, |_| true),
+        Ok(crate::state::RunBook::One(_)) | Err(_) => reap(record, entry, |_| true),
     }
 }
 
 /// Delete checkpoint epochs strictly older than `next_epoch - 1`.
 ///
-/// Epochs that do not parse are kept. Commit timestamps are not read.
-pub(crate) fn reap_abandoned(record: &ProjectRecord, next_epoch: u64) -> Result<()> {
+/// `entry` supplies the delivery repo. The epoch predicate is unchanged:
+/// epochs that do not parse are kept, and commit timestamps are not read.
+pub(crate) fn reap_abandoned(
+    record: &ProjectRecord,
+    entry: &RunState,
+    next_epoch: u64,
+) -> Result<()> {
     let keep_from = next_epoch.saturating_sub(1);
     let owned = match crate::state::load_run_book(record) {
         Ok(crate::state::RunBook::Many(envelope)) => envelope
             .runs
             .iter()
-            .map(|entry| entry.run_epoch)
+            .map(|run| run.run_epoch)
             .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
-    reap(record, |epoch| {
+    reap(record, entry, |epoch| {
         epoch.is_some_and(|n| n < keep_from && !owned.contains(&n))
     })
 }
 
-fn reap(record: &ProjectRecord, drop_epoch: impl Fn(Option<u64>) -> bool) -> Result<()> {
-    // Candidates: the stored delivery target, the current primary/epoch, and every
+fn reap(
+    record: &ProjectRecord,
+    entry: &RunState,
+    drop_epoch: impl Fn(Option<u64>) -> bool,
+) -> Result<()> {
+    // Candidates: the entry being reaped, the current primary/epoch, and every
     // registered binding. Each is deduped by `paths_same`; one repo's failure is journalled
     // and never fails the advance.
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(state) = load_run_state(record)
-        && let Some(target) = state.delivery_target
-    {
-        candidates.push(target.sample_path);
+    if let Some(target) = &entry.delivery_target {
+        candidates.push(target.sample_path.clone());
     }
     if let Some(cwd) = git_cwd(record) {
         candidates.push(cwd);
@@ -1315,7 +1323,7 @@ mod tests {
                 &["update-ref", &ref_name(&rec.id, epoch), &sha],
             );
         }
-        reap_completed(&rec).unwrap();
+        reap_completed(&rec, &RunState::idle(&rec.id)).unwrap();
         let listed = git_stdout(
             repo.path(),
             &[
@@ -1408,7 +1416,7 @@ mod tests {
             repo.path(),
             &["update-ref", &ref_name(&rec.id, 4), &old_sha],
         );
-        reap_abandoned(&rec, 3).unwrap();
+        reap_abandoned(&rec, &RunState::idle(&rec.id), 3).unwrap();
         let listed = git_stdout(
             repo.path(),
             &[
@@ -1609,7 +1617,7 @@ mod tests {
         let name = ref_name(&rec.id, 1);
         git_cmd(primary.path(), &["update-ref", &name, "HEAD"]);
         git_cmd(sibling.path(), &["update-ref", &name, "HEAD"]);
-        reap_completed(&rec).unwrap();
+        reap_completed(&rec, &RunState::idle(&rec.id)).unwrap();
         for repo in [primary.path(), sibling.path()] {
             let out = git(repo, &["rev-parse", "--verify", "--quiet", &name]).unwrap();
             assert!(!out.ok, "ref survived in {}", repo.display());
@@ -1622,10 +1630,136 @@ mod tests {
         let unknown = init_repo();
         let name = ref_name(&rec.id, 1);
         git_cmd(unknown.path(), &["update-ref", &name, "HEAD"]);
-        reap_completed(&rec).unwrap();
+        reap_completed(&rec, &RunState::idle(&rec.id)).unwrap();
         assert_eq!(
             git_stdout(unknown.path(), &["rev-parse", &name]),
             head(unknown.path())
+        );
+    }
+
+    /// Repo A is entry 4's delivery target. Repo B is entry 5's. A third git repo is the
+    /// singular `execution_repo` and the only `execution_repos` binding. On an unscoped
+    /// book, `git_cwd` is `None`, so A and B are candidates only through the passed entry.
+    struct BookReap {
+        a: TempDir,
+        b: TempDir,
+        _third: TempDir,
+        _ws: TempDir,
+        _state: TempDir,
+        rec: ProjectRecord,
+        entry_4: RunState,
+    }
+
+    fn delivery_entry(rec: &ProjectRecord, epoch: u64, track: &str, repo: &Path) -> RunState {
+        let mut state = RunState::idle(&rec.id);
+        state.run_epoch = epoch;
+        state.track_id = Some(track.into());
+        state.delivery_target = Some(crate::workflow::execution_repo::seeded_delivery_target(
+            rec,
+            track,
+            epoch,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            repo,
+        ));
+        state
+    }
+
+    fn book_reap_fixture() -> BookReap {
+        let a = init_repo();
+        let b = init_repo();
+        let third = init_repo();
+        let ws = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut rec = record(
+            ws.path().to_path_buf(),
+            Some(third.path().to_path_buf()),
+            Some(state_dir.path().to_path_buf()),
+            false,
+        );
+        rec.execution_repos
+            .insert("third".into(), third.path().to_path_buf());
+        ensure_state_dir(&rec).unwrap();
+        let entry_4 = delivery_entry(&rec, 4, "0004", a.path());
+        let entry_5 = delivery_entry(&rec, 5, "0005", b.path());
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![entry_4.clone(), entry_5]),
+        )
+        .unwrap();
+        BookReap {
+            a,
+            b,
+            _third: third,
+            _ws: ws,
+            _state: state_dir,
+            rec,
+            entry_4,
+        }
+    }
+
+    fn assert_unscoped_book_candidates(fx: &BookReap) {
+        assert!(
+            !fx.rec.execution_repos.is_empty(),
+            "the third repo must be an execution_repos candidate"
+        );
+        for binding in fx.rec.execution_repos.values() {
+            assert!(
+                !crate::workflow::execution_repo::paths_same(fx.a.path(), binding),
+                "repo A is an execution_repos candidate"
+            );
+            assert!(
+                !crate::workflow::execution_repo::paths_same(fx.b.path(), binding),
+                "repo B is an execution_repos candidate"
+            );
+        }
+        assert!(git_cwd(&fx.rec).is_none());
+        let err = load_run_state(&fx.rec).unwrap_err();
+        assert!(err.to_string().contains("ambiguous run"), "{err}");
+        assert!(crate::state::active_run_epoch().is_none());
+    }
+
+    #[test]
+    fn book_reap_completed_deletes_epoch_only_in_the_entrys_repo() {
+        let fx = book_reap_fixture();
+        assert_unscoped_book_candidates(&fx);
+        let epoch_4 = ref_name(&fx.rec.id, 4);
+        let epoch_5 = ref_name(&fx.rec.id, 5);
+        git_cmd(fx.a.path(), &["update-ref", &epoch_4, "HEAD"]);
+        git_cmd(fx.b.path(), &["update-ref", &epoch_4, "HEAD"]);
+        git_cmd(fx.b.path(), &["update-ref", &epoch_5, "HEAD"]);
+        reap_completed(&fx.rec, &fx.entry_4).unwrap();
+        assert!(
+            !ref_exists(fx.a.path(), &epoch_4),
+            "entry 4's epoch must be deleted in its own repo"
+        );
+        assert!(
+            ref_exists(fx.b.path(), &epoch_4),
+            "epoch 4 in the sibling must survive; scanning that repo would delete it"
+        );
+        assert!(ref_exists(fx.b.path(), &epoch_5));
+    }
+
+    #[test]
+    fn book_reap_abandoned_keeps_owned_epoch_and_skips_the_sibling() {
+        let fx = book_reap_fixture();
+        assert_unscoped_book_candidates(&fx);
+        let epoch_1 = ref_name(&fx.rec.id, 1);
+        let epoch_4 = ref_name(&fx.rec.id, 4);
+        git_cmd(fx.a.path(), &["update-ref", &epoch_1, "HEAD"]);
+        git_cmd(fx.a.path(), &["update-ref", &epoch_4, "HEAD"]);
+        git_cmd(fx.b.path(), &["update-ref", &epoch_1, "HEAD"]);
+        reap_abandoned(&fx.rec, &fx.entry_4, 6).unwrap();
+        assert!(
+            !ref_exists(fx.a.path(), &epoch_1),
+            "unowned epoch 1 must be deleted in the passed entry's repo"
+        );
+        assert!(
+            ref_exists(fx.a.path(), &epoch_4),
+            "an epoch the book owns must survive"
+        );
+        assert!(
+            ref_exists(fx.b.path(), &epoch_1),
+            "the sibling repo must not be scanned"
         );
     }
 
