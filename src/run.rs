@@ -62,10 +62,7 @@ enum RunPrep {
 
 enum SecondRun {
     No,
-    Yes {
-        adopt_addr: Option<String>,
-        isolation: bool,
-    },
+    Yes { adopt_addr: Option<String> },
 }
 
 struct FreshRun {
@@ -126,19 +123,16 @@ pub(crate) fn run_with_origin(
 }
 
 fn second_run_preflight(record: &ProjectRecord) -> Result<SecondRun> {
-    let isolation = crate::worktree::isolation_enabled(record).unwrap_or(false);
-    if !isolation {
-        return Ok(SecondRun::No);
-    }
     match crate::state::load_run_book(record)? {
         crate::state::RunBook::One(state)
             if matches!(state.status, RunStatus::Running | RunStatus::Paused) =>
         {
-            let adopt_addr = crate::harness::pool::second_run_adopt_addr(record, state.run_epoch)?;
-            Ok(SecondRun::Yes {
-                adopt_addr,
-                isolation: true,
-            })
+            let adopt_addr = if crate::worktree::isolation_enabled(record).unwrap_or(false) {
+                crate::harness::pool::second_run_adopt_addr(record, state.run_epoch)?
+            } else {
+                None
+            };
+            Ok(SecondRun::Yes { adopt_addr })
         }
         crate::state::RunBook::Many(envelope)
             if envelope
@@ -146,10 +140,7 @@ fn second_run_preflight(record: &ProjectRecord) -> Result<SecondRun> {
                 .iter()
                 .any(|entry| matches!(entry.status, RunStatus::Running | RunStatus::Paused)) =>
         {
-            Ok(SecondRun::Yes {
-                adopt_addr: None,
-                isolation: true,
-            })
+            Ok(SecondRun::Yes { adopt_addr: None })
         }
         _ => Ok(SecondRun::No),
     }
@@ -328,14 +319,34 @@ fn prepare_run_locked(
     second: SecondRun,
 ) -> Result<RunPrep> {
     ensure_state_dir(record)?;
-    if let SecondRun::Yes {
-        adopt_addr,
-        isolation,
-    } = &second
+    if let SecondRun::Yes { adopt_addr } = &second
         && crate::state::any_entry_live(record)?
     {
-        return admit_second_run(record, track_id, driver, adopt_addr.clone(), *isolation);
+        // The preflight read is stale. `COORDINATOR_WORKTREE` can change before
+        // this lock, and isolation off must stay `InvalidTransition`.
+        let isolation = crate::worktree::isolation_enabled(record)?;
+        if isolation {
+            return admit_second_run(record, track_id, driver, adopt_addr.clone(), isolation);
+        }
+        // A singular Running row keeps today's `from` (`RunStatus`'s display).
+        // A live book cannot fall through: unscoped load is `ambiguous run`.
+        if crate::state::load_run_book(record)?.is_book() {
+            return Err(CoordinatorError::InvalidTransition {
+                action: "run",
+                from: "Running".into(),
+            });
+        }
     }
+    let retain = match crate::state::load_run_book(record)? {
+        crate::state::RunBook::Many(envelope) if !crate::state::any_entry_live(record)? => {
+            envelope.runs.iter().map(|entry| entry.run_epoch).max()
+        }
+        _ => None,
+    };
+    let _retained = match retain {
+        Some(epoch) => Some(crate::state::RunScope::enter(epoch)?),
+        None => None,
+    };
     let state = load_run_state(record)?;
     if let Some(err) = blocked_hold(record, &state) {
         return Err(err);
@@ -413,6 +424,11 @@ fn finish_probed_run(
     ctx: &RunProbeCtx,
     answer: &Result<Option<crate::workflow::reuse::ResumePr>>,
 ) -> Result<StatusView> {
+    let _retained = if crate::state::load_run_book(record)?.is_book() {
+        Some(crate::state::RunScope::enter(ctx.snap_epoch)?)
+    } else {
+        None
+    };
     let mut state = load_run_state(record)?;
     if state.run_epoch != ctx.snap_epoch
         || state.track_id != ctx.snap_track
@@ -1252,6 +1268,120 @@ mod tests {
     }
 
     #[test]
+    fn locked_prepare_rereads_isolation_before_admit() {
+        let _guard = crate::config::test_env_lock();
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path());
+        r.worktree_isolation = true;
+        let mut first = crate::state::RunState::idle(&r.id);
+        first.run_epoch = 2;
+        first.status = RunStatus::Running;
+        first.track_id = Some("A".into());
+        let mut second = crate::state::RunState::idle(&r.id);
+        second.run_epoch = 4;
+        second.status = RunStatus::Running;
+        second.track_id = Some("B".into());
+        crate::state::write_run_book(&r, &crate::state::RunEnvelope::new(0, vec![first, second]))
+            .unwrap();
+        unsafe {
+            std::env::set_var(crate::worktree::ENV_WORKTREE, "off");
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var(crate::worktree::ENV_WORKTREE);
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        let prepared = with_run_state_lock(&r, || {
+            prepare_run_locked(
+                &r,
+                Some("C".into()),
+                WorkflowDriver::Stub,
+                false,
+                SecondRun::Yes { adopt_addr: None },
+            )
+        });
+        assert!(
+            matches!(
+                prepared,
+                Err(CoordinatorError::InvalidTransition { action: "run", .. })
+            ),
+            "isolation off admitted a second run"
+        );
+        let crate::state::RunBook::Many(envelope) = crate::state::load_run_book(&r).unwrap() else {
+            panic!("isolation off collapsed the book");
+        };
+        assert_eq!(envelope.runs.len(), 2);
+    }
+
+    #[test]
+    fn isolation_off_live_book_is_invalid_transition() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let mut first = crate::state::RunState::idle(&r.id);
+        first.run_epoch = 2;
+        first.status = RunStatus::Running;
+        first.track_id = Some("A".into());
+        let mut second = crate::state::RunState::idle(&r.id);
+        second.run_epoch = 4;
+        second.status = RunStatus::Running;
+        second.track_id = Some("B".into());
+        crate::state::write_run_book(&r, &crate::state::RunEnvelope::new(0, vec![first, second]))
+            .unwrap();
+        let err = run(&r, Some("C".into())).unwrap_err();
+        match err {
+            CoordinatorError::InvalidTransition { action: "run", .. } => {}
+            other => panic!("expected InvalidTransition, got {other}"),
+        }
+        let crate::state::RunBook::Many(envelope) = crate::state::load_run_book(&r).unwrap() else {
+            panic!("isolation off collapsed the book");
+        };
+        assert_eq!(envelope.runs.len(), 2);
+    }
+
+    #[test]
+    fn bare_run_retains_the_greatest_idle_epoch() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let mut low = crate::state::RunState::idle(&r.id);
+        low.run_epoch = 2;
+        low.status = RunStatus::Stopped;
+        low.track_id = Some("A".into());
+        let mut high = crate::state::RunState::idle(&r.id);
+        high.run_epoch = 9;
+        high.status = RunStatus::Idle;
+        high.track_id = Some("B".into());
+        crate::state::write_run_book(&r, &crate::state::RunEnvelope::new(0, vec![low, high]))
+            .unwrap();
+        let view = run(&r, None).unwrap();
+        assert_eq!(
+            view.run_epoch, 10,
+            "restart did not continue the greatest epoch"
+        );
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.track_id.as_deref(), Some("B"));
+        let crate::state::RunBook::Many(envelope) = crate::state::load_run_book(&r).unwrap() else {
+            panic!("bare run collapsed the book");
+        };
+        let low = envelope
+            .runs
+            .iter()
+            .find(|entry| entry.run_epoch == 2)
+            .unwrap();
+        assert_eq!(low.status, RunStatus::Stopped);
+        assert_eq!(low.track_id.as_deref(), Some("A"));
+        assert!(envelope.runs.iter().any(|entry| {
+            entry.run_epoch == 10
+                && entry.status == RunStatus::Running
+                && entry.track_id.as_deref() == Some("B")
+        }));
+        assert_eq!(envelope.runs.len(), 2);
+    }
+
+    #[test]
     fn idempotent_re_stop() {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
@@ -1414,13 +1544,16 @@ mod tests {
             b"outcome-a",
         )
         .unwrap();
-        let review = crate::workflow::drive::write_review_markdown(
-            &r,
-            "agy",
-            Some("Verdict: pass\n\nreal report\n"),
-        )
-        .unwrap();
+        let report = "## Verdict: PASS\n\n## Findings\n\nnone\n";
+        crate::review::write_reports(&r, &first, "codex", report).unwrap();
+        let review = state_dir.join("reviews").join("cross-model-codex.md");
         let review_bytes = std::fs::read(&review).unwrap();
+        assert!(
+            std::str::from_utf8(&review_bytes)
+                .unwrap()
+                .contains("Verdict: PASS"),
+            "production writer did not leave a cross-model report"
+        );
         std::fs::create_dir_all(state_dir.join("trusted-evidence")).unwrap();
         std::fs::write(
             state_dir.join("trusted-evidence").join("current.json"),
@@ -1457,7 +1590,7 @@ mod tests {
                 state_dir
                     .join("reviews")
                     .join(&epoch_name)
-                    .join("agy-review.md")
+                    .join("cross-model-codex.md")
             )
             .unwrap(),
             review_bytes

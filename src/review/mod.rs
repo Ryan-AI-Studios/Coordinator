@@ -528,7 +528,12 @@ fn run_tier(
     }
 }
 
-fn write_reports(record: &ProjectRecord, state: &RunState, slug: &str, body: &str) -> Result<()> {
+pub(crate) fn write_reports(
+    record: &ProjectRecord,
+    state: &RunState,
+    slug: &str,
+    body: &str,
+) -> Result<()> {
     let text = normalize_newlines(body);
     let dir = crate::workflow::bundle::reviews_dir(record)?;
     std::fs::create_dir_all(&dir)?;

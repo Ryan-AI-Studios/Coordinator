@@ -3640,6 +3640,9 @@ mod tests {
 
     #[test]
     fn shared_tree_both_finish() {
+        // Default primary is codex. Pin a private home so a parallel test cannot
+        // point COORDINATOR_HOME at a config whose first tier is a different slug.
+        let _home = IsolatedHome::enter();
         let ws = tempdir().unwrap();
         let repo = init_exec_repo();
         let ignore = repo.path().join(".gitignore");
@@ -3851,7 +3854,7 @@ mod tests {
                     .unwrap()
                     .join("reviews")
                     .join(epoch.to_string())
-                    .join("cross-model-claude.md");
+                    .join("cross-model-codex.md");
                 let body = std::fs::read_to_string(&report).unwrap_or_default();
                 assert!(
                     body.contains("Verdict: PASS"),

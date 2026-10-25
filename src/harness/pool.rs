@@ -2294,8 +2294,17 @@ pub(crate) fn restore_singular_sidecars(record: &ProjectRecord, epoch: u64) -> R
 }
 
 /// Sync snapshot for `StatusView` (in-process pool, else persist file).
+///
+/// A book is not answered from the parent pool. That map is keyed only by
+/// `project_id`, so it can be the other epoch's session. A scoped call reads
+/// `sessions/{epoch}/harness-grok.json`.
 pub fn status_bundle_sync(record: &ProjectRecord) -> Option<HarnessStatusBundle> {
-    if let Some(pool) = POOL.get()
+    let book_open = matches!(
+        crate::state::load_run_book(record),
+        Ok(crate::state::RunBook::Many(_))
+    );
+    if !book_open
+        && let Some(pool) = POOL.get()
         && let Ok(mut guard) = pool.try_lock()
         && let Some(s) = guard.status_of(&record.id)
     {
@@ -3439,7 +3448,15 @@ pub(crate) struct PersistLive {
 
 /// `Err` is unreadable/corrupt — **not** absent. `session_bound` treats it as bound.
 pub(crate) fn persist_live(record: &ProjectRecord) -> Result<Option<PersistLive>> {
-    let Some(handle) = load_persist(record)? else {
+    persist_live_at(record, crate::state::active_run_epoch())
+}
+
+/// Like [`persist_live`], for one epoch's session file. `Err` is unreadable.
+pub(crate) fn persist_live_at(
+    record: &ProjectRecord,
+    epoch: Option<u64>,
+) -> Result<Option<PersistLive>> {
+    let Some(handle) = load_persist_at(record, epoch)? else {
         return Ok(None);
     };
     Ok(Some(PersistLive {
@@ -13939,6 +13956,65 @@ mod holder_command_tests {
             super::holder_rpc_bounded(addr, &super::HoldRequest::Ping),
             Ok(resp) if resp.ok
         )
+    }
+
+    #[tokio::test]
+    async fn scoped_status_reads_the_epoch_persist_not_the_parent_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        std::fs::create_dir_all(rec.state_dir.as_ref().unwrap()).unwrap();
+        let mut first = crate::state::RunState::idle(&rec.id);
+        first.run_epoch = 2;
+        first.status = crate::state::RunStatus::Running;
+        let mut second = crate::state::RunState::idle(&rec.id);
+        second.run_epoch = 5;
+        second.status = crate::state::RunStatus::Running;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![first, second]),
+        )
+        .unwrap();
+        let epoch_cwd = dir.path().join("epoch-5");
+        std::fs::create_dir_all(&epoch_cwd).unwrap();
+        let session = rec.state_dir.as_ref().unwrap().join("sessions").join("5");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("harness-grok.json"),
+            serde_json::json!({
+                "version": 1,
+                "project_id": rec.id,
+                "adapter": "grok",
+                "alive": true,
+                "session_id": "epoch-5",
+                "cwd": epoch_cwd,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let pool_cwd = dir.path().join("pool-cwd");
+        std::fs::create_dir_all(&pool_cwd).unwrap();
+        let pooled = crate::harness::grok::GrokSession::start_mock(
+            pool_cwd,
+            crate::harness::grok::mock_handshake_ok("pool-sess"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), pooled).await;
+        assert!(
+            status_bundle_sync(&rec).is_none(),
+            "an unscoped book answered from the parent pool"
+        );
+        let scoped = {
+            let _scope = crate::state::RunScope::enter(5).unwrap();
+            status_bundle_sync(&rec)
+        };
+        global_pool().lock().await.remove(&rec.id);
+        let grok = scoped
+            .expect("scoped status missing")
+            .grok
+            .expect("no harness");
+        assert_eq!(grok.session_id.as_deref(), Some("epoch-5"));
     }
 
     #[test]

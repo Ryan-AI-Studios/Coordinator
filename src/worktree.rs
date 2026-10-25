@@ -116,6 +116,7 @@ pub fn prepare_epoch_in(record: &ProjectRecord, next_epoch: u64, isolation: bool
             && !paths_same(child, &target)
             && !replaced_by_next_epoch(record, child, &target)
             && !book_live_tree(record, child)
+            && !session_bound(record, child)
     }) {
         return Err(CoordinatorError::Message(format!(
             "worktree: epoch still live at {}",
@@ -364,7 +365,29 @@ fn replaced_by_next_epoch(record: &ProjectRecord, path: &Path, target: &Path) ->
     }
 }
 
+fn worktree_epoch(record: &ProjectRecord, path: &Path) -> Option<u64> {
+    let epoch = path.file_name()?.to_str()?.parse().ok()?;
+    let root = worktrees_root(record).ok()?;
+    path.parent()
+        .is_some_and(|parent| paths_same(parent, &root))
+        .then_some(epoch)
+}
+
 fn session_bound(record: &ProjectRecord, path: &Path) -> bool {
+    // A book scoped to the epoch being prepared must still see the sibling's
+    // own session file. The active scope would otherwise look unbound.
+    if let Ok(crate::state::RunBook::Many(_)) = crate::state::load_run_book(record)
+        && let Some(epoch) = worktree_epoch(record, path)
+    {
+        return match crate::harness::pool::persist_live_at(record, Some(epoch)) {
+            Err(_) => true,
+            Ok(Some(live)) => {
+                live.cwd.as_ref().is_some_and(|cwd| paths_same(cwd, path))
+                    && (live.alive || live.prompt_in_flight)
+            }
+            Ok(None) => false,
+        };
+    }
     // An unreadable persist is bound: keep the tree rather than guess.
     let Ok(snap) = crate::harness::pool::persist_live(record) else {
         return true;
@@ -1963,5 +1986,51 @@ mod tests {
         prepare_epoch_in(&rec, 4, true).unwrap();
         assert!(tree.is_dir(), "A's ci-wait tree was removed");
         assert!(epoch_dir(&rec, 4).unwrap().is_dir());
+    }
+
+    #[test]
+    fn prepare_keeps_idle_sibling_whose_holder_still_owns_the_tree() {
+        let repo = init_repo();
+        let state = tempfile::tempdir().unwrap();
+        let rec = record(
+            repo.path().to_path_buf(),
+            Some(repo.path().to_path_buf()),
+            Some(state.path().to_path_buf()),
+            true,
+        );
+        prepare_epoch_in(&rec, 2, true).unwrap();
+        let tree = epoch_dir(&rec, 2).unwrap();
+        let mut idle = crate::state::RunState::idle(&rec.id);
+        idle.run_epoch = 2;
+        idle.status = RunStatus::Idle;
+        idle.track_id = Some("A".into());
+        let mut next = crate::state::RunState::idle(&rec.id);
+        next.run_epoch = 5;
+        next.status = RunStatus::Running;
+        next.track_id = Some("B".into());
+        crate::state::write_run_book(&rec, &crate::state::RunEnvelope::new(0, vec![idle, next]))
+            .unwrap();
+        let session = state.path().join("sessions").join("2");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("harness-grok.json"),
+            serde_json::json!({
+                "version": 1,
+                "project_id": rec.id,
+                "adapter": "grok",
+                "alive": true,
+                "cwd": tree,
+                "session_id": "sess-2",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let _scope = crate::state::RunScope::enter(5).unwrap();
+        prepare_epoch_in(&rec, 5, true).unwrap();
+        assert!(
+            tree.is_dir(),
+            "idle sibling worktree was removed while its holder persist is alive"
+        );
+        assert!(epoch_dir(&rec, 5).unwrap().is_dir());
     }
 }
