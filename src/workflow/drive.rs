@@ -2276,6 +2276,13 @@ mod tests {
             let s = pool.get_mut(&r.id).unwrap();
             s.mock_written().unwrap().len()
         };
+        // Re-assert the binding after the mock start. A parallel inject proof
+        // can leave this process on the default grok planner, and CI has no
+        // `grok` on PATH.
+        home.write_bindings(|b| {
+            b.get_mut(ROLE_PLANNER).unwrap().harness = "opencode".into();
+            b.get_mut(ROLE_PLANNER).unwrap().command = "opencode".into();
+        });
         let view = tick(&r).unwrap().expect("permission");
         assert_eq!(view.failure_class, Some(FailureClass::Permission));
         assert!(
@@ -3910,17 +3917,36 @@ mod tests {
     fn inject_thread_prompts_its_own_epoch() {
         let home = tempdir().unwrap();
         let dir = tempdir().unwrap();
-        struct ClearCapture;
+        struct ClearCapture {
+            prev_home: Option<std::ffi::OsString>,
+            prev_bin: Option<std::ffi::OsString>,
+        }
         impl Drop for ClearCapture {
             fn drop(&mut self) {
+                let _guard = test_env_lock();
                 crate::harness::pool::INJECT_RESOLVE_CAPTURE
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 *crate::harness::pool::INJECT_HOME
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                unsafe {
+                    match self.prev_home.take() {
+                        Some(value) => {
+                            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, value);
+                        }
+                        None => std::env::remove_var(crate::config::ENV_COORDINATOR_HOME),
+                    }
+                    match self.prev_bin.take() {
+                        Some(value) => std::env::set_var(crate::harness::grok::ENV_GROK_BIN, value),
+                        None => std::env::remove_var(crate::harness::grok::ENV_GROK_BIN),
+                    }
+                }
             }
         }
-        let _capture = ClearCapture;
+        let _capture = ClearCapture {
+            prev_home: std::env::var_os(crate::config::ENV_COORDINATOR_HOME),
+            prev_bin: std::env::var_os(crate::harness::grok::ENV_GROK_BIN),
+        };
         let _guard = test_env_lock();
         unsafe {
             std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
