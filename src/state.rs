@@ -293,9 +293,14 @@ pub struct ReviewWatchState {
     pub attempted: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
-    /// `PASS` | `PASS_WITH_LOWS` | `FAIL` | `DEGRADED_PUBLISH`
+    /// `PASS` | `PASS_WITH_LOWS` | `FAIL` | `DEGRADED_PUBLISH`.
+    /// `DEGRADED_PUBLISH` is the no-verdict degrade only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<String>,
+    /// `adapter-error` or `review-unavailable` when a no-verdict token was chosen.
+    /// Omitted when `None`, so older `run-state.json` files still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degrade_reason: Option<String>,
     /// Relative name e.g. `review.codex.md`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<String>,
@@ -308,6 +313,21 @@ pub struct ReviewWatchState {
     /// Slot-quality duds (`file (bytes)`). Additive; empty omits from JSON.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub duds: Vec<String>,
+}
+
+impl ReviewWatchState {
+    /// Stored degrade token only when the verdict is the no-verdict degrade
+    /// and the token is one of the two known values.
+    pub(crate) fn publish_degrade_token(&self) -> Option<&str> {
+        if self.verdict.as_deref() != Some("DEGRADED_PUBLISH") {
+            return None;
+        }
+        match self.degrade_reason.as_deref() {
+            Some("adapter-error") => Some("adapter-error"),
+            Some("review-unavailable") => Some("review-unavailable"),
+            _ => None,
+        }
+    }
 }
 
 /// Persisted `ci-wait` watcher (additive; old run-state.json loads as None).
@@ -1782,6 +1802,33 @@ mod tests {
         let back: ReviewWatchState =
             serde_json::from_str(&serde_json::to_string(&rv).unwrap()).unwrap();
         assert_eq!(back.reviewed_oid.as_deref(), Some("abc"));
+        assert!(back.degrade_reason.is_none());
+        assert!(
+            !serde_json::to_string(&ReviewWatchState {
+                verdict: Some("FAIL".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .contains("degrade_reason")
+        );
+        let stored = ReviewWatchState {
+            verdict: Some("DEGRADED_PUBLISH".into()),
+            degrade_reason: Some("adapter-error".into()),
+            ..Default::default()
+        };
+        let round: ReviewWatchState =
+            serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
+        assert_eq!(round.degrade_reason.as_deref(), Some("adapter-error"));
+        assert_eq!(stored.publish_degrade_token(), Some("adapter-error"));
+        assert!(
+            ReviewWatchState {
+                verdict: Some("FAIL".into()),
+                degrade_reason: Some("adapter-error".into()),
+                ..Default::default()
+            }
+            .publish_degrade_token()
+            .is_none()
+        );
     }
 
     use chrono::Utc;

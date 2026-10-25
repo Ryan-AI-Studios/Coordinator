@@ -168,7 +168,14 @@ fn parse_markdown(text: &str) -> ParsedVerdict {
     ParsedVerdict::Unparseable
 }
 
-fn strip_verdict_heading(line: &str) -> Option<&str> {
+/// First trimmed line this heading accepts, or `None` when the body has none.
+pub(crate) fn verdict_source_line(body: &str) -> Option<&str> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| strip_verdict_heading(line).is_some())
+}
+
+pub(crate) fn strip_verdict_heading(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     if bytes.len() < 10 {
         return None;

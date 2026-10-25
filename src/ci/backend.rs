@@ -327,6 +327,19 @@ pub trait CiBackend: Send + Sync {
         head_oid: Option<&str>,
     ) -> Result<MergeResult>;
     fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult>;
+    /// Publish, keeping a no-verdict degrade token for the PR body.
+    ///
+    /// The default drops the token and calls [`CiBackend::try_auto_publish`].
+    /// Wrappers that forward to an inner backend override this so the token
+    /// is not discarded before that inner override.
+    fn try_auto_publish_noted(
+        &self,
+        cwd: &Path,
+        track_id: &str,
+        _degrade_reason: Option<&str>,
+    ) -> Result<AutoPublishResult> {
+        self.try_auto_publish(cwd, track_id)
+    }
     /// File paths changed by the PR itself (the input the external stepper reads).
     fn pr_files(&self, cwd: &Path, pr_number: u64) -> Result<Vec<String>>;
     /// Apply `label` to the PR unless it is already there or the repo lacks it.
@@ -661,6 +674,17 @@ impl CiBackend for RecordingBackend {
     fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
         self.counts.publish.fetch_add(1, Ordering::SeqCst);
         self.inner.try_auto_publish(cwd, track_id)
+    }
+
+    fn try_auto_publish_noted(
+        &self,
+        cwd: &Path,
+        track_id: &str,
+        degrade_reason: Option<&str>,
+    ) -> Result<AutoPublishResult> {
+        self.counts.publish.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .try_auto_publish_noted(cwd, track_id, degrade_reason)
     }
 
     fn pr_files(&self, cwd: &Path, pr_number: u64) -> Result<Vec<String>> {

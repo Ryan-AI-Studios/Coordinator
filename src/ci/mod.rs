@@ -1295,7 +1295,11 @@ fn try_auto_publish_target(
         )?;
         return Ok(AutoPublishDrive::Wait);
     }
-    match backend.try_auto_publish(cwd, numeric) {
+    let degrade_reason = state
+        .review
+        .as_ref()
+        .and_then(crate::state::ReviewWatchState::publish_degrade_token);
+    match backend.try_auto_publish_noted(cwd, numeric, degrade_reason) {
         Ok(AutoPublishResult::Opened(target)) => {
             let n = match &target {
                 CiTarget::PullRequest { number, .. } => *number,
@@ -6158,6 +6162,16 @@ mod tests {
         fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
             self.publishes.lock().unwrap().push(cwd.to_path_buf());
             self.inner.try_auto_publish(cwd, track_id)
+        }
+        fn try_auto_publish_noted(
+            &self,
+            cwd: &Path,
+            track_id: &str,
+            degrade_reason: Option<&str>,
+        ) -> Result<AutoPublishResult> {
+            self.publishes.lock().unwrap().push(cwd.to_path_buf());
+            self.inner
+                .try_auto_publish_noted(cwd, track_id, degrade_reason)
         }
         fn pr_files(&self, cwd: &Path, pr_number: u64) -> Result<Vec<String>> {
             self.inner.pr_files(cwd, pr_number)

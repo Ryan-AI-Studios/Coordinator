@@ -4,7 +4,8 @@
 //! Grok prompt. Default `cargo test` uses a scripted backend.
 //!
 //! 0101: the reviewer cwd/prompt and `reviewed_oid` use the track delivery target. A
-//! resolution failure is `permission` with no backend call. Publish-only degrade checks
+//! resolution failure is `permission` with no backend call. A parsed FAIL is
+//! `review-failed` and never publishes. A no-verdict degrade checks
 //! `checkpoint::committable_dirt` in the target; a planning-only target never degrades.
 
 pub mod backend;
@@ -147,11 +148,8 @@ pub fn drive_with(
         .map(|r| r.attempted.clone())
         .unwrap_or_default();
 
-    let mut saw_exhaustion = false;
-    let mut saw_crash = false;
     let mut saw_permission = false;
-    let mut any_started = false;
-    let mut last_note = String::new();
+    let mut tally = NoVerdict::default();
 
     for role in cross_model_roles() {
         let Some(binding) = bindings.get(*role) else {
@@ -173,7 +171,7 @@ pub fn drive_with(
                 }
             })?;
             saw_permission = true;
-            last_note = format!("empty command ({slug})");
+            tally.last_note = format!("empty command ({slug})");
             continue;
         }
 
@@ -184,7 +182,7 @@ pub fn drive_with(
             "codex" | "claude" | "opencode"
         ) {
             saw_permission = true;
-            last_note = format!(
+            tally.last_note = format!(
                 "tier {role} harness {slug} is unsupported (allowed: codex, claude, opencode; \
                  this tier previously ran codex instead)"
             );
@@ -196,7 +194,7 @@ pub fn drive_with(
             &load_run_state(record).unwrap_or_else(|_| state.clone()),
         );
         if remaining < MIN_TIER_BUDGET {
-            if !any_started {
+            if tally.started == 0 {
                 return apply_failure(
                     record,
                     state,
@@ -245,28 +243,21 @@ pub fn drive_with(
             remaining_timeout: remaining,
         };
 
-        any_started = true;
+        tally.started = tally.started.saturating_add(1);
         let t0 = Instant::now();
-        let class = match run_tier(record, state, backend, &req, slug, t0)? {
-            TierEval::Finished { class, body } => {
-                let degrade = class == TierClass::GateFail
-                    && parse::is_publish_only_fail(&body)
-                    && !target.planning_only
-                    && publish_preconditions_ok(track_dir.as_deref(), &target.sample_path);
-                let (verdict, event) = if degrade {
-                    (
-                        "DEGRADED_PUBLISH",
-                        format!("cross-model: degraded to ci-wait (publish-only ({slug}))"),
-                    )
-                } else {
-                    match class {
-                        TierClass::Pass => ("PASS", format!("cross-model: pass ({slug})")),
-                        TierClass::PassWithLows => (
-                            "PASS_WITH_LOWS",
-                            format!("cross-model: pass with lows ({slug})"),
-                        ),
-                        _ => ("FAIL", format!("cross-model: gate failed ({slug})")),
-                    }
+        match run_tier(record, state, backend, &req, slug, t0)? {
+            TierEval::Finished {
+                class,
+                body,
+                dud_reason,
+            } => {
+                let (verdict, event) = match class {
+                    TierClass::Pass => ("PASS", format!("cross-model: pass ({slug})")),
+                    TierClass::PassWithLows => (
+                        "PASS_WITH_LOWS",
+                        format!("cross-model: pass with lows ({slug})"),
+                    ),
+                    _ => ("FAIL", gate_fail_event(&body, dud_reason)),
                 };
                 let reviewed_oid = if target.planning_only {
                     None
@@ -278,24 +269,22 @@ pub fn drive_with(
                     rv.verdict = Some(verdict.into());
                     rv.report = Some(format!("review.{slug}.md"));
                     rv.reviewed_oid = reviewed_oid;
+                    rv.degrade_reason = None;
                 })?;
-                return if class == TierClass::GateFail && !degrade {
+                return if class == TierClass::GateFail {
                     apply_failure(record, state, FailureClass::Difficulty, event)
                 } else {
                     apply_success(record, state, event, OutcomeSource::Adapter)
                 };
             }
-            TierEval::FallThrough { class, note } => {
-                last_note = note;
-                class
+            TierEval::FallThrough {
+                class,
+                note,
+                dud_reason,
+                backend_err,
+            } => {
+                tally.observe(class, note, dud_reason, backend_err);
             }
-        };
-
-        match class {
-            TierClass::Exhaustion => saw_exhaustion = true,
-            TierClass::Permission => saw_permission = true,
-            TierClass::Crash => saw_crash = true,
-            TierClass::Pass | TierClass::PassWithLows | TierClass::GateFail => {}
         }
     }
 
@@ -303,7 +292,7 @@ pub fn drive_with(
         record,
         &load_run_state(record).unwrap_or_else(|_| state.clone()),
     );
-    if remaining < MIN_TIER_BUDGET && !any_started {
+    if remaining < MIN_TIER_BUDGET && tally.started == 0 {
         return apply_failure(
             record,
             state,
@@ -312,36 +301,46 @@ pub fn drive_with(
         );
     }
     if remaining < MIN_TIER_BUDGET {
-        let msg = if last_note.is_empty() {
+        let msg = if tally.last_note.is_empty() {
             "cross-model: timeout (remaining < 60s)".into()
         } else {
-            format!("cross-model: timeout (remaining < 60s); {last_note}")
+            format!(
+                "cross-model: timeout (remaining < 60s); {}",
+                tally.last_note
+            )
         };
         return apply_failure(record, state, FailureClass::Timeout, msg);
     }
 
-    if saw_exhaustion {
-        let msg = if last_note.is_empty() {
-            "cross-model: all tiers exhausted".into()
+    if tally.started == 0 {
+        if saw_permission {
+            return apply_failure(
+                record,
+                state,
+                FailureClass::Permission,
+                "cross-model: all reviewers unavailable".into(),
+            );
+        }
+        let msg = if tally.last_note.is_empty() {
+            "cross-model: all reviewers failed".into()
         } else {
-            format!("cross-model: all tiers exhausted ({last_note})")
+            format!("cross-model: all reviewers failed ({})", tally.last_note)
         };
-        return apply_failure(record, state, FailureClass::ModelExhaustion, msg);
+        return apply_failure(record, state, FailureClass::HarnessCrash, msg);
     }
-    if saw_permission && !saw_crash {
-        return apply_failure(
-            record,
-            state,
-            FailureClass::Permission,
-            "cross-model: all reviewers unavailable".into(),
-        );
-    }
-    let crash_msg = if last_note.is_empty() {
-        "cross-model: all reviewers failed".into()
-    } else {
-        format!("cross-model: all reviewers failed ({last_note})")
-    };
-    apply_failure(record, state, FailureClass::HarnessCrash, crash_msg)
+
+    let track_dir = state
+        .track_id
+        .as_deref()
+        .and_then(|id| graph::resolve_track_dir(record, id));
+    apply_no_verdict(
+        record,
+        state,
+        target.planning_only,
+        &target.sample_path,
+        track_dir.as_deref(),
+        &tally,
+    )
 }
 
 fn remaining_budget(record: &ProjectRecord, state: &RunState) -> Duration {
@@ -377,8 +376,170 @@ fn class_name(class: TierClass) -> &'static str {
 }
 
 enum TierEval {
-    Finished { class: TierClass, body: String },
-    FallThrough { class: TierClass, note: String },
+    Finished {
+        class: TierClass,
+        body: String,
+        dud_reason: Option<&'static str>,
+    },
+    FallThrough {
+        class: TierClass,
+        note: String,
+        dud_reason: Option<&'static str>,
+        backend_err: bool,
+    },
+}
+
+#[derive(Default)]
+struct NoVerdict {
+    saw_exhaustion: bool,
+    saw_crash: bool,
+    saw_permission: bool,
+    saw_adapter: bool,
+    saw_unavailable: bool,
+    started: u32,
+    duds: u32,
+    last_dud_reason: Option<&'static str>,
+    last_note: String,
+}
+
+impl NoVerdict {
+    fn observe(
+        &mut self,
+        class: TierClass,
+        note: String,
+        dud_reason: Option<&'static str>,
+        backend_err: bool,
+    ) {
+        self.last_note = note;
+        if let Some(reason) = dud_reason {
+            self.duds = self.duds.saturating_add(1);
+            self.last_dud_reason = Some(reason);
+            self.saw_crash = true;
+            return;
+        }
+        if backend_err {
+            self.saw_adapter = true;
+        }
+        match class {
+            TierClass::Exhaustion => {
+                self.saw_exhaustion = true;
+                self.saw_unavailable = true;
+            }
+            TierClass::Permission => {
+                self.saw_permission = true;
+                self.saw_unavailable = true;
+            }
+            TierClass::Crash => {
+                self.saw_crash = true;
+                self.saw_adapter = true;
+            }
+            TierClass::Pass | TierClass::PassWithLows | TierClass::GateFail => {}
+        }
+    }
+}
+
+fn gate_fail_event(body: &str, dud_reason: Option<&str>) -> String {
+    let line = parse::verdict_source_line(body).unwrap_or_else(|| {
+        body.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("FAIL")
+    });
+    let mut event = format!("review-failed: {line}");
+    if let Some(reason) = dud_reason {
+        event.push_str("; evidence-incomplete: ");
+        event.push_str(reason);
+    }
+    event
+}
+
+fn no_verdict_failure(tally: &NoVerdict) -> (FailureClass, String) {
+    if tally.saw_exhaustion {
+        let msg = if tally.last_note.is_empty() {
+            "cross-model: all tiers exhausted".into()
+        } else {
+            format!("cross-model: all tiers exhausted ({})", tally.last_note)
+        };
+        return (FailureClass::ModelExhaustion, msg);
+    }
+    if tally.saw_permission && !tally.saw_crash {
+        return (
+            FailureClass::Permission,
+            "cross-model: all reviewers unavailable".into(),
+        );
+    }
+    let msg = if tally.last_note.is_empty() {
+        "cross-model: all reviewers failed".into()
+    } else {
+        format!("cross-model: all reviewers failed ({})", tally.last_note)
+    };
+    (FailureClass::HarnessCrash, msg)
+}
+
+fn evidence_nonempty(track_dir: Option<&Path>) -> bool {
+    let Some(dir) = track_dir else {
+        return false;
+    };
+    match std::fs::read_to_string(dir.join("evidence.md")) {
+        Ok(text) => !text.trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
+fn apply_no_verdict(
+    record: &ProjectRecord,
+    state: &RunState,
+    planning_only: bool,
+    sample_path: &Path,
+    track_dir: Option<&Path>,
+    tally: &NoVerdict,
+) -> Result<Option<StatusView>> {
+    let all_duds = tally.started > 0 && tally.duds == tally.started;
+    let token = if tally.saw_adapter {
+        Some("adapter-error")
+    } else if tally.saw_unavailable {
+        Some("review-unavailable")
+    } else {
+        None
+    };
+    let Some(token) = token else {
+        let (class, msg) = if all_duds {
+            let reason = tally.last_dud_reason.unwrap_or("missing required section");
+            (
+                FailureClass::HarnessCrash,
+                format!("evidence-incomplete: {reason}"),
+            )
+        } else {
+            no_verdict_failure(tally)
+        };
+        return apply_failure(record, state, class, msg);
+    };
+    let can_degrade = !planning_only && publish_preconditions_ok(track_dir, sample_path);
+    let reviewed_oid = if planning_only || !can_degrade {
+        None
+    } else {
+        exec_head_oid(sample_path)
+    };
+    persist_review(record, |rv| {
+        rv.degrade_reason = Some(token.to_string());
+        if can_degrade {
+            rv.verdict = Some("DEGRADED_PUBLISH".into());
+            rv.reviewed_oid = reviewed_oid;
+        }
+    })?;
+    if can_degrade {
+        return apply_success(
+            record,
+            state,
+            format!("cross-model: review-degrade: {token}"),
+            OutcomeSource::Adapter,
+        );
+    }
+    let (class, mut msg) = no_verdict_failure(tally);
+    if !evidence_nonempty(track_dir) {
+        msg = "evidence-incomplete: evidence.md".into();
+    }
+    apply_failure(record, state, class, msg)
 }
 
 fn review_body(result: &ReviewResult) -> &str {
@@ -458,6 +619,8 @@ fn run_tier(
                 return Ok(TierEval::FallThrough {
                     class: classify_error(&e.to_string()),
                     note: truncate_msg(&format!("{slug}: {e}")),
+                    dud_reason: None,
+                    backend_err: true,
                 });
             }
         };
@@ -476,22 +639,43 @@ fn run_tier(
                 s.last_event = truncate_msg(&format!("reviewer stall ({slug})"));
             })?;
         }
+        let class = classify_result(&result);
+        let body = review_body(&result);
+        if class == TierClass::GateFail {
+            let dud_reason = match slot_quality::check(
+                slot_quality::SlotFamily::CrossModel,
+                body,
+                state.track_id.as_deref(),
+            ) {
+                Ok(()) => None,
+                Err(dud) => {
+                    let file = format!("review.{slug}.md");
+                    record_slot_dud(record, &file, dud.bytes)?;
+                    Some(dud.reason)
+                }
+            };
+            write_reports(record, state, slug, body)?;
+            return Ok(TierEval::Finished {
+                class,
+                body: body.to_string(),
+                dud_reason,
+            });
+        }
         if result.exit == 124 || spawn::is_reviewer_stall(&result.stderr) {
-            let class = classify_result(&result);
             return Ok(TierEval::FallThrough {
                 class,
                 note: truncate_msg(&format!("{slug}: {}", classify_note(&result, class))),
+                dud_reason: None,
+                backend_err: false,
             });
         }
 
-        let class = classify_result(&result);
-        let body = review_body(&result);
-        let would_persist = matches!(
-            class,
-            TierClass::Pass | TierClass::PassWithLows | TierClass::GateFail
-        );
+        let would_persist = matches!(class, TierClass::Pass | TierClass::PassWithLows);
         let schema_dud = crate::review::parse::is_schema_only_json(body);
-        if (schema_dud || would_persist)
+        let exit0_unparseable = result.exit == 0
+            && parse::parse_report(&result.last_message, &result.stdout)
+                == ParsedVerdict::Unparseable;
+        if (schema_dud || would_persist || exit0_unparseable)
             && let Err(dud) = slot_quality::check(
                 slot_quality::SlotFamily::CrossModel,
                 body,
@@ -512,6 +696,8 @@ fn run_tier(
             return Ok(TierEval::FallThrough {
                 class: TierClass::Crash,
                 note: truncate_msg(&slot_quality::dud_message(&file, dud.bytes)),
+                dud_reason: Some(dud.reason),
+                backend_err: false,
             });
         }
         if would_persist {
@@ -519,11 +705,14 @@ fn run_tier(
             return Ok(TierEval::Finished {
                 class,
                 body: body.to_string(),
+                dud_reason: None,
             });
         }
         return Ok(TierEval::FallThrough {
             class,
             note: truncate_msg(&format!("{slug}: {}", classify_note(&result, class))),
+            dud_reason: None,
+            backend_err: false,
         });
     }
 }
@@ -548,17 +737,10 @@ pub(crate) fn write_reports(
     Ok(())
 }
 
-/// 0080/0101: the publish-only degrade requires real evidence and a committable-clean
+/// 0080/0101: the no-verdict degrade requires real evidence and a committable-clean
 /// target. `committable_dirt` ignores CRLF phantoms (deferred row 148).
 fn publish_preconditions_ok(track_dir: Option<&Path>, sample_path: &Path) -> bool {
-    let Some(dir) = track_dir else {
-        return false;
-    };
-    let evidence = match std::fs::read_to_string(dir.join("evidence.md")) {
-        Ok(s) => !s.trim().is_empty(),
-        Err(_) => false,
-    };
-    evidence
+    evidence_nonempty(track_dir)
         && crate::checkpoint::committable_dirt(sample_path)
             .map(|paths| paths.is_empty())
             .unwrap_or(false)
@@ -817,6 +999,22 @@ mod tests {
         (g, counts)
     }
 
+    fn install_ci_backend() -> (crate::ci::TestBackendGuard, crate::ci::backend::CallCounts) {
+        let wrapped = crate::ci::backend::RecordingBackend::wrap(Arc::new(
+            crate::ci::backend::ScriptedBackend::new(),
+        ));
+        let counts = wrapped.counts.clone();
+        let guard = crate::ci::install_test_backend(Arc::new(wrapped));
+        (guard, counts)
+    }
+
+    fn degrade_reason(r: &ProjectRecord) -> Option<String> {
+        load_run_state(r)
+            .unwrap()
+            .review
+            .and_then(|rv| rv.degrade_reason)
+    }
+
     fn adapter_env() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
         let home = tempdir().unwrap();
         let g = test_env_lock();
@@ -974,12 +1172,13 @@ mod tests {
         let view = crate::workflow::tick(&r).unwrap().expect("fail");
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::ModelExhaustion));
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
         assert!(
-            view.last_event.contains("all tiers exhausted")
-                && view.last_event.contains("opencode: exhausted"),
+            view.last_event.contains("evidence-incomplete: evidence.md"),
             "last_event={}",
             view.last_event
         );
+        assert_eq!(degrade_reason(&r).as_deref(), Some("review-unavailable"));
         assert!(crate::notify::artifact::existing_path(&r).is_some());
         assert_eq!(counts.n(), 3);
         clear_env();
@@ -1099,6 +1298,7 @@ mod tests {
             .push_ok(fail_text())
             .push_ok(pass_text());
         let (_hook, counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
         crate::workflow::tick(&r).unwrap().expect("bounce1");
         write_and_apply(
             &r,
@@ -1126,16 +1326,21 @@ mod tests {
         let view = crate::workflow::tick(&r).unwrap().expect("cap");
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::Difficulty));
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
         assert!(
             view.last_event.contains("address-findings exhausted"),
             "last_event={}",
             view.last_event
         );
+        assert!(view.last_event.contains("review-failed: ## Verdict: FAIL"));
+        assert!(!view.last_event.contains("degraded"), "{}", view.last_event);
         assert!(crate::notify::artifact::existing_path(&r).is_some());
         assert_eq!(counts.n(), 3);
+        assert_eq!(publish.publish_n(), 0);
         let none = crate::workflow::tick(&r).unwrap();
         assert!(none.is_none());
         assert_eq!(counts.n(), 3);
+        assert_eq!(publish.publish_n(), 0);
         clear_env();
     }
 
@@ -1153,12 +1358,19 @@ mod tests {
             .push_ok(fail_text())
             .push_ok(pass_text());
         let (_hook, counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
         let view = crate::workflow::tick(&r).unwrap().expect("cap");
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::Difficulty));
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
         assert!(view.last_event.contains("address-findings exhausted"));
+        assert!(view.last_event.contains("review-failed: ## Verdict: FAIL"));
         assert!(crate::notify::artifact::existing_path(&r).is_some());
         assert_eq!(counts.n(), 1);
+        assert_eq!(publish.publish_n(), 0);
+        let again = crate::workflow::tick(&r).unwrap();
+        assert!(again.is_none());
+        assert_eq!(publish.publish_n(), 0);
         clear_env();
     }
 
@@ -1253,6 +1465,8 @@ mod tests {
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::Timeout));
         assert_eq!(counts.n(), 0);
+        assert!(degrade_reason(&r).is_none());
+        assert!(!view.last_event.contains("review-degrade:"));
         clear_env();
     }
 
@@ -1578,21 +1792,23 @@ mod tests {
         jump_cross_model(&r, WorkflowDriver::Adapter);
         let scripted = ScriptedBackend::new().push_ok(publish_fail_body());
         let (_hook, counts) = hook(scripted);
-        let view = crate::workflow::tick(&r).unwrap().expect("degrade");
-        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("bounce");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
         assert_ne!(view.status, RunStatus::Stopped);
         assert!(crate::notify::artifact::existing_path(&r).is_none());
         assert!(
-            view.last_event
-                .contains("degraded to ci-wait (publish-only"),
+            view.last_event.contains("review-failed: ## Verdict: FAIL"),
             "last_event={}",
             view.last_event
         );
-        assert_eq!(
-            view.review.as_ref().and_then(|rv| rv.verdict.as_deref()),
-            Some("DEGRADED_PUBLISH")
-        );
+        assert!(view.last_event.contains("address-findings 1/2"));
+        assert!(!view.last_event.contains("degraded"), "{}", view.last_event);
+        assert!(!view.last_event.contains("DEGRADED_PUBLISH"));
+        assert!(degrade_reason(&r).is_none());
         assert_eq!(counts.n(), 1);
+        assert_eq!(publish.publish_n(), 0);
         clear_env();
     }
 
@@ -1657,12 +1873,18 @@ mod tests {
         };
         let scripted = ScriptedBackend::new().push_ok(body);
         let (_hook, _counts) = hook(scripted);
-        let view = crate::workflow::tick(&r).unwrap().expect("degrade");
-        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
-        assert_eq!(
-            view.review.as_ref().and_then(|rv| rv.verdict.as_deref()),
-            Some("DEGRADED_PUBLISH")
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("bounce");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert!(
+            view.last_event.contains("review-failed: ## Verdict: FAIL"),
+            "last_event={}",
+            view.last_event
         );
+        assert!(view.last_event.contains("address-findings 1/2"));
+        assert!(!view.last_event.contains("DEGRADED_PUBLISH"));
+        assert!(degrade_reason(&r).is_none());
+        assert_eq!(publish.publish_n(), 0);
         clear_env();
     }
 
@@ -1815,16 +2037,18 @@ mod tests {
         save_run_state(&r, &state).unwrap();
         let scripted = ScriptedBackend::new().push_ok(publish_fail_body());
         let (_hook, counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
         let view = crate::workflow::tick(&r).unwrap().expect("fail");
         assert_ne!(view.phase, graph::PHASE_CI_WAIT);
         assert!(!view.last_event.contains("degraded"), "{}", view.last_event);
         assert!(
-            view.last_event.contains("gate failed"),
+            view.last_event.contains("review-failed"),
             "phase={} event={}",
             view.phase,
             view.last_event
         );
         assert_eq!(counts.n(), 1);
+        assert_eq!(publish.publish_n(), 0);
         clear_env();
     }
 
@@ -1879,6 +2103,399 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    fn assert_stopped_fail_publishes_nothing(body: ReviewResult) {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let mut s = load_run_state(&r).unwrap();
+        s.address_findings_attempts = graph::ADDRESS_FINDINGS_CAP;
+        save_run_state(&r, &s).unwrap();
+        let scripted = ScriptedBackend::new().push_ok(body).push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("cap");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::Difficulty));
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            view.last_event.contains("review-failed: ## Verdict: FAIL"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(view.last_event.contains("address-findings exhausted"));
+        assert!(!view.last_event.contains("degraded"), "{}", view.last_event);
+        assert!(!view.last_event.contains("DEGRADED_PUBLISH"));
+        assert!(degrade_reason(&r).is_none());
+        assert_eq!(counts.n(), 1);
+        assert_eq!(publish.publish_n(), 0);
+        let again = crate::workflow::tick(&r).unwrap();
+        assert!(again.is_none());
+        assert_eq!(publish.publish_n(), 0);
+        clear_env();
+    }
+
+    #[test]
+    fn fail_at_cap_publish_shaped_makes_zero_publish_calls() {
+        assert_stopped_fail_publishes_nothing(publish_fail_body());
+    }
+
+    #[test]
+    fn fail_at_cap_lifecycle_p1_makes_zero_publish_calls() {
+        assert_stopped_fail_publishes_nothing(ReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: "## Verdict: FAIL\n\n## Findings\n\n| P1 | PR not squash-merged |\n"
+                .into(),
+        });
+    }
+
+    #[test]
+    fn fail_at_cap_prose_p1_makes_zero_publish_calls() {
+        assert_stopped_fail_publishes_nothing(ReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: "## Verdict: FAIL\n\n## Findings\n\n**P1-1: product defect**\n".into(),
+        });
+    }
+
+    #[test]
+    fn publish_shaped_fail_under_cap_bounces_without_publish() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new().push_ok(publish_fail_body());
+        let (_hook, _counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("bounce");
+        assert_eq!(view.phase, graph::PHASE_ADDRESS_FINDINGS);
+        assert!(view.last_event.contains("review-failed: ## Verdict: FAIL"));
+        assert!(view.last_event.contains("address-findings 1/2"));
+        assert_eq!(publish.publish_n(), 0);
+        assert_eq!(graph::ADDRESS_FINDINGS_CAP, 2);
+        clear_env();
+    }
+
+    fn missing_verdict_result() -> ReviewResult {
+        ReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: "## Findings\n\nThe report never states a verdict heading.\n".into(),
+        }
+    }
+
+    fn push_ok_times(scripted: &ScriptedBackend, result: &ReviewResult, n: usize) {
+        for _ in 0..n {
+            scripted.push(Ok(result.clone()));
+        }
+    }
+
+    #[test]
+    fn missing_verdict_heading_is_evidence_incomplete() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let body = missing_verdict_result();
+        let checked = crate::review::slot_quality::check(
+            crate::review::slot_quality::SlotFamily::CrossModel,
+            &body.last_message,
+            Some("0011"),
+        );
+        let reason = checked.expect_err("slot").reason;
+        assert_eq!(reason, "missing ## Verdict:");
+        let scripted = ScriptedBackend::new();
+        push_ok_times(&scripted, &body, 6);
+        let (_hook, counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("incomplete");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            view.last_event
+                .contains(&format!("evidence-incomplete: {reason}")),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(counts.n(), 6);
+        assert_eq!(publish.publish_n(), 0);
+        let _again = crate::workflow::tick(&r).unwrap();
+        assert_eq!(publish.publish_n(), 0);
+        clear_env();
+    }
+
+    #[test]
+    fn adapter_error_without_evidence_is_evidence_incomplete() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), false);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let (_hook, _counts) = hook(ScriptedBackend::new());
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("incomplete");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            view.last_event.contains("evidence-incomplete: evidence.md"),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(publish.publish_n(), 0);
+        let _again = crate::workflow::tick(&r).unwrap();
+        assert_eq!(publish.publish_n(), 0);
+
+        let dir2 = tempdir().unwrap();
+        let r2 = rec_clean_exec(dir2.path(), true);
+        std::fs::write(
+            dir2.path()
+                .join("conductor")
+                .join("0011-Example")
+                .join("evidence.md"),
+            " \n\t",
+        )
+        .unwrap();
+        jump_cross_model(&r2, WorkflowDriver::Adapter);
+        let (_hook2, _counts2) = hook(ScriptedBackend::new());
+        let view2 = crate::workflow::tick(&r2).unwrap().expect("blank");
+        assert_ne!(view2.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            view2
+                .last_event
+                .contains("evidence-incomplete: evidence.md"),
+            "last_event={}",
+            view2.last_event
+        );
+        assert_eq!(publish.publish_n(), 0);
+        clear_env();
+    }
+
+    #[test]
+    fn adapter_error_with_evidence_degrades_and_records_reason() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let (_hook, _counts) = hook(ScriptedBackend::new());
+        let (_ci, _publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("degrade");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(
+            view.review.as_ref().and_then(|rv| rv.verdict.as_deref()),
+            Some("DEGRADED_PUBLISH")
+        );
+        assert_eq!(degrade_reason(&r).as_deref(), Some("adapter-error"));
+        assert!(
+            view.last_event.contains("review-degrade: adapter-error"),
+            "last_event={}",
+            view.last_event
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn review_unavailable_records_review_unavailable() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let body = ReviewResult {
+            exit: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: "not logged in".into(),
+        };
+        let (_hook, _counts) = hook(ScriptedBackend::new().push_ok(body));
+        let (_ci, _publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("degrade");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(degrade_reason(&r).as_deref(), Some("review-unavailable"));
+        assert!(
+            view.last_event
+                .contains("review-degrade: review-unavailable"),
+            "last_event={}",
+            view.last_event
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn planning_only_adapter_error_does_not_publish() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let mut state = load_run_state(&r).unwrap();
+        let mut target = state.delivery_target.clone().expect("target");
+        target.planning_only = true;
+        state.delivery_target = Some(target);
+        save_run_state(&r, &state).unwrap();
+        let (_hook, _counts) = hook(ScriptedBackend::new());
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("fail");
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(publish.publish_n(), 0);
+        let _again = crate::workflow::tick(&r).unwrap();
+        assert_eq!(publish.publish_n(), 0);
+        clear_env();
+    }
+
+    #[test]
+    fn fail_on_exit_124_does_not_publish_over_later_pass() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let mut fail = fail_text();
+        fail.exit = 124;
+        fail.stderr = "reviewer stall — no progress for 600s".into();
+        let scripted = ScriptedBackend::new().push_ok(fail).push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("fail");
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            view.last_event.contains("review-failed: ## Verdict: FAIL"),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(counts.n(), 1);
+        assert_eq!(publish.publish_n(), 0);
+        let _again = crate::workflow::tick(&r).unwrap();
+        assert_eq!(publish.publish_n(), 0);
+        clear_env();
+    }
+
+    #[test]
+    fn fail_on_exit_124_slot_dud_keeps_the_reason() {
+        let (_home, _g) = adapter_env();
+        struct ResetMin;
+        impl Drop for ResetMin {
+            fn drop(&mut self) {
+                crate::review::slot_quality::set_test_min_body_bytes(None);
+            }
+        }
+        let _reset = ResetMin;
+        crate::review::slot_quality::set_test_min_body_bytes(Some(10_000));
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let mut fail = fail_text();
+        fail.exit = 124;
+        fail.stderr = "review CLI timed out after 60s".into();
+        let reason = crate::review::slot_quality::check(
+            crate::review::slot_quality::SlotFamily::CrossModel,
+            &fail.last_message,
+            Some("0011"),
+        )
+        .expect_err("too small")
+        .reason;
+        assert_eq!(reason, "too small");
+        let scripted = ScriptedBackend::new().push_ok(fail).push_ok(pass_text());
+        let (_hook, counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("fail");
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            view.last_event.contains("review-failed: ## Verdict: FAIL"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(
+            view.last_event
+                .contains(&format!("evidence-incomplete: {reason}")),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(counts.n(), 1);
+        assert_eq!(publish.publish_n(), 0);
+        clear_env();
+    }
+
+    #[test]
+    fn schema_only_fail_json_is_evidence_incomplete() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let body = ReviewResult {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            last_message: r#"{"verdict":"FAIL"}"#.into(),
+        };
+        let reason = crate::review::slot_quality::check(
+            crate::review::slot_quality::SlotFamily::CrossModel,
+            &body.last_message,
+            Some("0011"),
+        )
+        .expect_err("schema")
+        .reason;
+        assert_eq!(reason, "schema-only verdict JSON");
+        let scripted = ScriptedBackend::new();
+        push_ok_times(&scripted, &body, 6);
+        let (_hook, _counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("incomplete");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            view.last_event
+                .contains("evidence-incomplete: schema-only verdict JSON"),
+            "last_event={}",
+            view.last_event
+        );
+        assert!(degrade_reason(&r).is_none());
+        assert_eq!(publish.publish_n(), 0);
+        let _again = crate::workflow::tick(&r).unwrap();
+        assert_eq!(publish.publish_n(), 0);
+        clear_env();
+    }
+
+    #[test]
+    fn missing_verdict_then_pass_still_wins() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let dud = missing_verdict_result();
+        let scripted = ScriptedBackend::new();
+        scripted.push(Ok(dud.clone()));
+        scripted.push(Ok(dud));
+        scripted.push(Ok(pass_text()));
+        let (_hook, counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("pass");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(view.last_event.contains("cross-model: pass (claude)"));
+        assert_eq!(counts.n(), 3);
+        assert!(degrade_reason(&r).is_none());
+        clear_env();
+    }
+
+    #[test]
+    fn dud_then_backend_err_may_degrade() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let dud = missing_verdict_result();
+        let scripted = ScriptedBackend::new();
+        scripted.push(Ok(dud.clone()));
+        scripted.push(Ok(dud));
+        scripted.push(Err(crate::error::CoordinatorError::Message(
+            "adapter down".into(),
+        )));
+        let (_hook, _counts) = hook(scripted);
+        let view = crate::workflow::tick(&r).unwrap().expect("degrade");
+        assert_eq!(view.phase, graph::PHASE_CI_WAIT);
+        assert_eq!(degrade_reason(&r).as_deref(), Some("adapter-error"));
+        assert!(view.last_event.contains("review-degrade: adapter-error"));
+        clear_env();
     }
 
     #[test]

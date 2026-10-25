@@ -186,7 +186,16 @@ impl CiBackend for GhCli {
     }
 
     fn try_auto_publish(&self, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
-        live_auto_publish(self, cwd, track_id)
+        live_auto_publish(self, cwd, track_id, None)
+    }
+
+    fn try_auto_publish_noted(
+        &self,
+        cwd: &Path,
+        track_id: &str,
+        degrade_reason: Option<&str>,
+    ) -> Result<AutoPublishResult> {
+        live_auto_publish(self, cwd, track_id, degrade_reason)
     }
 
     fn pr_files(&self, cwd: &Path, pr_number: u64) -> Result<Vec<String>> {
@@ -538,7 +547,22 @@ fn skip_terminal(cwd: &Path, event: impl Into<String>) -> AutoPublishResult {
     }
 }
 
-fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPublishResult> {
+fn pr_body_with_degrade(commit_body: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some("adapter-error") => format!("{commit_body}\nreview-degrade: adapter-error"),
+        Some("review-unavailable") => {
+            format!("{commit_body}\nreview-degrade: review-unavailable")
+        }
+        _ => commit_body.to_string(),
+    }
+}
+
+fn live_auto_publish(
+    cli: &GhCli,
+    cwd: &Path,
+    track_id: &str,
+    degrade_reason: Option<&str>,
+) -> Result<AutoPublishResult> {
     let numeric = crate::notify::artifact::numeric_track_id(track_id).unwrap_or(track_id);
 
     let branch = match git_stdout(cwd, &["symbolic-ref", "--short", "HEAD"]) {
@@ -655,11 +679,12 @@ fn live_auto_publish(cli: &GhCli, cwd: &Path, track_id: &str) -> Result<AutoPubl
         Ok(_) => {}
     }
 
-    let body = git_stdout(cwd, &["log", "-1", "--format=%b"])
+    let commit_body = git_stdout(cwd, &["log", "-1", "--format=%b"])
         .ok()
         .map(|b| b.trim().to_string())
         .filter(|b| !b.is_empty())
         .unwrap_or_else(|| DEFAULT_PR_BODY.to_string());
+    let body = pr_body_with_degrade(&commit_body, degrade_reason);
     let repo = owner_repo_for_remote(cwd, &remote);
     let base = if default_branch.is_empty() {
         "main".to_string()
@@ -1810,6 +1835,24 @@ fn truncate(s: &str) -> String {
 #[cfg(test)]
 mod parse_tests {
     use super::*;
+
+    #[test]
+    fn pr_body_with_degrade_appends_only_known_tokens() {
+        let with_adapter = pr_body_with_degrade("commit body", Some("adapter-error"));
+        assert!(with_adapter.contains("commit body"));
+        assert!(with_adapter.contains("review-degrade: adapter-error"));
+        let empty_body = pr_body_with_degrade(DEFAULT_PR_BODY, Some("review-unavailable"));
+        assert!(empty_body.contains(DEFAULT_PR_BODY));
+        assert!(empty_body.contains("review-degrade: review-unavailable"));
+        assert_eq!(
+            pr_body_with_degrade("commit body", Some("FAIL")),
+            "commit body"
+        );
+        assert_eq!(pr_body_with_degrade("commit body", None), "commit body");
+        assert!(!pr_body_with_degrade("commit body", Some("FAIL")).contains("review-degrade:"));
+        assert!(!pr_body_with_degrade("commit body", None).contains("review-degrade:"));
+        assert!(!pr_body_with_degrade("", Some("adapter-error")).contains(DEFAULT_PR_BODY));
+    }
 
     #[test]
     fn pr_list_head_args_open_then_merged_never_closed() {
