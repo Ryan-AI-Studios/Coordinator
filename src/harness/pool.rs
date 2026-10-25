@@ -2309,6 +2309,61 @@ pub fn status_bundle_sync(record: &ProjectRecord) -> Option<HarnessStatusBundle>
     }
 }
 
+/// Armed only by the inject-thread proof. The thread still calls
+/// `resolve_selected`; this only restores the home that proof registered.
+#[cfg(test)]
+pub(crate) static INJECT_RESOLVE_CAPTURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) static INJECT_HOME: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Hold the env lock and point `COORDINATOR_HOME` at the registry the tick
+/// registered. A parallel test can retarget that var after `tick` spawns this
+/// thread; `resolve_selected` then has to run against the registered home.
+#[cfg(test)]
+pub(crate) struct PinnedInjectHome {
+    previous: Option<String>,
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+pub(crate) fn pin_inject_home() -> PinnedInjectHome {
+    if !INJECT_RESOLVE_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) {
+        return PinnedInjectHome {
+            previous: None,
+            _guard: None,
+        };
+    }
+    let guard = crate::config::test_env_lock();
+    let home = INJECT_HOME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let previous = std::env::var(crate::config::ENV_COORDINATOR_HOME).ok();
+    if let Some(home) = home {
+        unsafe { std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home) };
+    }
+    PinnedInjectHome {
+        previous,
+        _guard: Some(guard),
+    }
+}
+
+#[cfg(test)]
+impl Drop for PinnedInjectHome {
+    fn drop(&mut self) {
+        if self._guard.is_none() {
+            return;
+        }
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(crate::config::ENV_COORDINATOR_HOME, value) },
+            None => unsafe { std::env::remove_var(crate::config::ENV_COORDINATOR_HOME) },
+        }
+    }
+}
+
 fn resolve_record(project: Option<&str>, infer_cwd: bool) -> Result<ProjectRecord> {
     crate::api::resolve_selected(project, infer_cwd)
 }
@@ -13822,10 +13877,82 @@ mod holder_command_tests {
         .unwrap();
     }
 
+    fn spawn_real_holder(
+        rec: ProjectRecord,
+        epoch: u64,
+        session_id: &str,
+        use_mutex: bool,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session_id = session_id.to_string();
+        let handle = std::thread::spawn(move || {
+            let _scope = if use_mutex {
+                crate::state::set_holder_epoch(epoch).expect("holder epoch");
+                None
+            } else {
+                Some(crate::state::RunScope::enter(epoch).expect("scope"))
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let cwd = crate::worktree::epoch_dir(&rec, epoch).expect("epoch dir");
+                std::fs::create_dir_all(&cwd).expect("epoch dir");
+                let session = crate::harness::grok::GrokSession::start_mock(
+                    cwd,
+                    crate::harness::grok::mock_handshake_ok(&session_id),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .expect("mock session");
+                let rec_hold = rec.clone();
+                let hold =
+                    tokio::spawn(
+                        async move { super::hold_loop_with_session(rec_hold, session).await },
+                    );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let addr = loop {
+                    if let Ok(Some(handle)) = super::load_persist_at(&rec, Some(epoch))
+                        && let Some(addr) = handle.control_addr.clone()
+                    {
+                        break addr;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        panic!("epoch {epoch} holder never published a control address");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                };
+                tx.send(addr).expect("addr");
+                hold.await.expect("holder join").expect("holder loop");
+            });
+            let _ = _scope;
+        });
+        (handle, rx)
+    }
+
+    fn holder_answers_ping(addr: &str) -> bool {
+        matches!(
+            super::holder_rpc_bounded(addr, &super::HoldRequest::Ping),
+            Ok(resp) if resp.ok
+        )
+    }
+
     #[test]
     fn stop_all_collapses_to_singular_project_key() {
+        struct ReleaseHolder;
+        impl Drop for ReleaseHolder {
+            fn drop(&mut self) {
+                crate::state::release_holder_epoch();
+            }
+        }
+        let _release = ReleaseHolder;
         let dir = tempfile::tempdir().unwrap();
         let rec = record(dir.path());
+        std::fs::create_dir_all(rec.state_dir.as_ref().unwrap()).unwrap();
         let mut first = crate::state::RunState::idle(&rec.id);
         first.run_epoch = 3;
         first.status = crate::state::RunStatus::Running;
@@ -13837,26 +13964,16 @@ mod holder_command_tests {
             &crate::state::RunEnvelope::new(0, vec![first, second]),
         )
         .unwrap();
-        let dropped = rec.state_dir.as_ref().unwrap().join("sessions").join("3");
-        std::fs::create_dir_all(&dropped).unwrap();
-        std::fs::write(
-            dropped.join("harness-grok.json"),
-            format!(
-                r#"{{"version":1,"project_id":"{}","adapter":"grok","supports_compact":true,"alive":false}}"#,
-                rec.id
-            ),
-        )
-        .unwrap();
-        let dead = rec.state_dir.as_ref().unwrap().join("sessions").join("7");
-        std::fs::create_dir_all(&dead).unwrap();
-        std::fs::write(
-            dead.join("harness-grok.json"),
-            format!(
-                r#"{{"version":1,"project_id":"{}","adapter":"grok","supports_compact":true,"alive":false}}"#,
-                rec.id
-            ),
-        )
-        .unwrap();
+        let (thread_a, addr_a) = spawn_real_holder(rec.clone(), 3, "sess-3", true);
+        let (thread_b, addr_b) = spawn_real_holder(rec.clone(), 7, "sess-7", false);
+        let addr_a = addr_a
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .expect("epoch 3 address");
+        let addr_b = addr_b
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .expect("epoch 7 address");
+        assert!(holder_answers_ping(&addr_a), "epoch 3 did not answer Ping");
+        assert!(holder_answers_ping(&addr_b), "epoch 7 did not answer Ping");
         crate::run::stop(&rec).unwrap();
         let text = std::fs::read_to_string(rec.state_dir.as_ref().unwrap().join("run-state.json"))
             .unwrap();
@@ -13866,10 +13983,13 @@ mod holder_command_tests {
             crate::state::load_run_book(&rec).unwrap(),
             crate::state::RunBook::One(_)
         ));
-        assert!(
-            !dropped.join("harness-grok.json").exists(),
-            "dropped session persist survived stop"
-        );
+        let sessions = rec.state_dir.as_ref().unwrap().join("sessions");
+        assert!(!sessions.join("3").join("harness-grok.json").exists());
+        assert!(!sessions.join("7").join("harness-grok.json").exists());
+        assert!(!holder_answers_ping(&addr_a), "epoch 3 still answers Ping");
+        assert!(!holder_answers_ping(&addr_b), "epoch 7 still answers Ping");
+        thread_a.join().expect("epoch 3 thread");
+        thread_b.join().expect("epoch 7 thread");
     }
 
     #[test]
