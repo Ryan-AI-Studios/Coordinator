@@ -981,7 +981,7 @@ fn w_autostart_alias_isolation_and_epoch_dir() {
     state.run_epoch = 3;
     state.failure_class = None;
     crate::state::with_run_state_lock(&world.record, || {
-        crate::workflow::auto_start(&world.record, &mut state, "0124-Next");
+        crate::workflow::auto_start(&world.record, &mut state, "0124-Next", 4);
         Ok(())
     })
     .unwrap();
@@ -1434,18 +1434,18 @@ fn w_failed_save_reuse() {
 fn w_inventory_and_structural_gates() {
     let run = production("src/run.rs");
     let workflow = production("src/workflow/mod.rs");
-    assert_eq!(run.matches("write_for_epoch(").count(), 1);
+    assert_eq!(run.matches("write_for_epoch(").count(), 2);
     assert_eq!(workflow.matches("write_for_epoch(").count(), 1);
     assert_eq!(
         run.matches("state.run_epoch = state.run_epoch.saturating_add(1)")
             .count(),
-        1
+        0
     );
     assert_eq!(
         workflow
             .matches("state.run_epoch = state.run_epoch.saturating_add(1)")
             .count(),
-        1
+        0
     );
     let writer = production("src/workflow/trusted_evidence/writer.rs");
     let reader_src = production("src/workflow/trusted_evidence/reader.rs");

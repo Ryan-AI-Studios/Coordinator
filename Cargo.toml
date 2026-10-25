@@ -29,6 +29,10 @@ dotenvy = "0.15.7"
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.8.1"
 
+[[test]]
+name = "holder_cwd"
+path = "tests/holder_cwd.rs"
+
 [dev-dependencies]
 http-body-util = "0.1.5"
 tempfile = "3.27.0"

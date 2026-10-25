@@ -1,7 +1,9 @@
 //! Per-project run-state persistence under `.coordinator/`.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -94,6 +96,10 @@ pub struct RunState {
     /// Monotonic epoch; incremented each successful `run` into Running.
     #[serde(default)]
     pub run_epoch: u64,
+    /// Highest epoch that must not be allocated again, including one that was dropped.
+    /// Old files load as 0. Zero is omitted so a pre-0073 file stays byte-stable.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub epoch_floor: u64,
     /// 0097: consecutive `fold -> plan-review` re-entries this run (capped). A fold that
     /// rewrites a reviewed artifact must be re-reviewed, but a fold that always rewrites
     /// must not spin: the run stops with `review_never_settles` at the cap.
@@ -459,6 +465,7 @@ impl RunState {
             updated_at: Utc::now(),
             last_event: "idle: no run".into(),
             run_epoch: 0,
+            epoch_floor: 0,
             fold_review_reentries: 0,
             fold_last_pair: None,
             phase_started_at: None,
@@ -723,6 +730,31 @@ pub struct StatusView {
     /// 0117: derived, read-only holder lifecycle (files only, no RPC, no lock).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<crate::harness::reap::HolderLifecycle>,
+    /// One row per book entry. Omitted on a singular file. Only `status()` fills it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<RunSummary>,
+}
+
+/// One live or remembered run inside a status book. The status surface that renders
+/// this list is 0126; the field is the contract `status()` already fills.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunSummary {
+    pub run_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_id: Option<String>,
+    pub phase: String,
+    pub status: RunStatus,
+}
+
+impl RunSummary {
+    pub fn from_state(state: &RunState) -> Self {
+        Self {
+            run_epoch: state.run_epoch,
+            track_id: state.track_id.clone(),
+            phase: state.phase.clone(),
+            status: state.status,
+        }
+    }
 }
 
 /// 0109 status evidence for a project whose registry may have a structured store.
@@ -806,6 +838,10 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 /// Status JSON `workflow` object (0008).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowView {
@@ -872,6 +908,7 @@ impl StatusView {
             registry: None,
             ready: None,
             holder: Some(holder_lifecycle(record, state)),
+            runs: Vec::new(),
         }
     }
 }
@@ -994,19 +1031,452 @@ pub fn run_state_path(record: &ProjectRecord) -> Result<PathBuf> {
     Ok(resolve_state_dir(record)?.join("run-state.json"))
 }
 
-pub fn load_run_state(record: &ProjectRecord) -> Result<RunState> {
-    let path = run_state_path(record)?;
-    if !path.exists() {
-        return Ok(RunState::idle(&record.id));
-    }
-    let text = std::fs::read_to_string(&path)?;
-    let state: RunState = serde_json::from_str(&text)?;
-    Ok(state)
+pub const RUN_BOOK_SCHEMA: &str = "run-book-v1";
+
+/// On-disk run record: one `RunState`, or the envelope while two or more runs
+/// still have to be remembered together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunBook {
+    One(Box<RunState>),
+    Many(RunEnvelope),
 }
 
+/// `{state_dir}/run-state.json` while two or more entries coexist.
+///
+/// `project_id` is not a field of this object, so an older binary fails closed
+/// instead of treating the envelope as one `RunState`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunEnvelope {
+    pub schema: String,
+    #[serde(default)]
+    pub epoch_floor: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_tree_holder: Option<u64>,
+    pub runs: Vec<RunState>,
+}
+
+impl RunEnvelope {
+    pub fn new(epoch_floor: u64, runs: Vec<RunState>) -> Self {
+        Self {
+            schema: RUN_BOOK_SCHEMA.into(),
+            epoch_floor,
+            shared_tree_holder: None,
+            runs,
+        }
+    }
+}
+
+impl RunBook {
+    pub fn is_book(&self) -> bool {
+        matches!(self, Self::Many(_))
+    }
+
+    pub fn epoch_floor(&self) -> u64 {
+        match self {
+            Self::One(state) => state.epoch_floor,
+            Self::Many(envelope) => envelope.epoch_floor,
+        }
+    }
+
+    pub fn shared_tree_holder(&self) -> Option<u64> {
+        match self {
+            Self::One(_) => None,
+            Self::Many(envelope) => envelope.shared_tree_holder,
+        }
+    }
+
+    pub fn entries(&self) -> Vec<&RunState> {
+        match self {
+            Self::One(state) => vec![state.as_ref()],
+            Self::Many(envelope) => envelope.runs.iter().collect(),
+        }
+    }
+
+    pub fn into_entries(self) -> Vec<RunState> {
+        match self {
+            Self::One(state) => vec![*state],
+            Self::Many(envelope) => envelope.runs,
+        }
+    }
+}
+
+/// Book-wide allocator. Empty input with floor 0 returns 1. A singular entry
+/// whose floor is 0 returns `run_epoch + 1`. An epoch `<= epoch_floor` is never
+/// the result, because the result is always `max(floor, max epoch) + 1`.
+pub fn next_run_epoch(entries: &[RunState], epoch_floor: u64) -> u64 {
+    let max_epoch = entries
+        .iter()
+        .map(|entry| entry.run_epoch)
+        .max()
+        .unwrap_or(0);
+    epoch_floor.max(max_epoch).saturating_add(1)
+}
+
+/// Book-wide next epoch. `current` replaces the entry it was loaded from so an
+/// in-memory advance is counted, and a singular file still returns `run_epoch + 1`
+/// when the floor is 0.
+pub fn allocate_next_epoch(record: &ProjectRecord, current: &RunState) -> Result<u64> {
+    match load_run_book(record)? {
+        RunBook::Many(envelope) => {
+            let mut entries = envelope.runs;
+            if let Some(slot) = entries
+                .iter_mut()
+                .find(|entry| entry.run_epoch == current.run_epoch)
+            {
+                *slot = current.clone();
+            } else {
+                entries.push(current.clone());
+            }
+            Ok(next_run_epoch(&entries, envelope.epoch_floor))
+        }
+        RunBook::One(on_disk) => {
+            let floor = current.epoch_floor.max(on_disk.epoch_floor);
+            Ok(next_run_epoch(std::slice::from_ref(current), floor))
+        }
+    }
+}
+
+pub(crate) fn ambiguous_run_error() -> crate::error::CoordinatorError {
+    crate::error::CoordinatorError::Message("ambiguous run".into())
+}
+
+pub(crate) fn unknown_run_epoch_error(epoch: u64) -> crate::error::CoordinatorError {
+    crate::error::CoordinatorError::Message(format!("unknown run epoch {epoch}"))
+}
+
+pub(crate) fn epoch_in_use_error() -> crate::error::CoordinatorError {
+    crate::error::CoordinatorError::Message("epoch in use".into())
+}
+
+/// Process-wide holder epoch. `None` is unset. Epoch 0 is a real idle value,
+/// so it is not the sentinel. A static `OnceLock` cannot be cleared and set again.
+static HOLDER_EPOCH: Mutex<Option<u64>> = Mutex::new(None);
+
+/// Test processes run many holders at once. Only the thread that stored the
+/// epoch observes it, so a parallel test does not load `unknown run epoch`.
+/// The holder binary is one process and does not use this gate.
+#[cfg(test)]
+static HOLDER_EPOCH_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+thread_local! {
+    static PARENT_RUN_SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Parent-process half of [`active_run_epoch`]. The holder process uses the mutex
+/// instead; this scope does not cross into `harness grok hold`.
+#[derive(Debug)]
+pub struct RunScope {
+    previous: Option<u64>,
+    armed: bool,
+}
+
+impl RunScope {
+    /// Enter `epoch`. Nesting the same epoch succeeds. Nesting a different epoch
+    /// returns `ambiguous run` and does not swap.
+    pub fn enter(epoch: u64) -> Result<Self> {
+        let current = PARENT_RUN_SCOPE.with(Cell::get);
+        if let Some(current) = current
+            && current != epoch
+        {
+            return Err(ambiguous_run_error());
+        }
+        PARENT_RUN_SCOPE.with(|slot| slot.set(Some(epoch)));
+        Ok(Self {
+            previous: current,
+            armed: true,
+        })
+    }
+}
+
+impl Drop for RunScope {
+    fn drop(&mut self) {
+        if self.armed {
+            let previous = self.previous;
+            PARENT_RUN_SCOPE.with(|slot| slot.set(previous));
+            self.armed = false;
+        }
+    }
+}
+
+/// Store the holder epoch. The same epoch again is success. A different epoch
+/// returns an error and leaves the previous value in place.
+pub fn set_holder_epoch(epoch: u64) -> Result<()> {
+    let mut slot = HOLDER_EPOCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match *slot {
+        Some(current) if current != epoch => Err(crate::error::CoordinatorError::Message(format!(
+            "holder epoch already {current}; refusing {epoch}"
+        ))),
+        _ => {
+            *slot = Some(epoch);
+            #[cfg(test)]
+            {
+                let mut owner = HOLDER_EPOCH_OWNER
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *owner = Some(std::thread::current().id());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `ReleaseEpoch`: store `None`. Does not touch cancel keys.
+pub fn release_holder_epoch() {
+    let mut slot = HOLDER_EPOCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = None;
+    #[cfg(test)]
+    {
+        let mut owner = HOLDER_EPOCH_OWNER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *owner = None;
+    }
+}
+
+/// Singular files return `Ok(None)` (legacy paths). A book returns the scope epoch.
+/// A book with no scope is `ambiguous run`.
+pub fn active_scope(record: &ProjectRecord) -> Result<Option<u64>> {
+    match load_run_book(record)? {
+        RunBook::One(_) => Ok(None),
+        RunBook::Many(_) => active_run_epoch().ok_or_else(ambiguous_run_error).map(Some),
+    }
+}
+
+/// True when any remembered entry is Running or Paused. Does not require a scope.
+pub fn any_entry_live(record: &ProjectRecord) -> Result<bool> {
+    Ok(load_run_book(record)?
+        .entries()
+        .into_iter()
+        .any(|entry| matches!(entry.status, RunStatus::Running | RunStatus::Paused)))
+}
+
+/// Update the envelope field. A singular file is left unchanged.
+pub fn set_shared_tree_holder(record: &ProjectRecord, holder: Option<u64>) -> Result<()> {
+    let RunBook::Many(mut envelope) = load_run_book(record)? else {
+        return Ok(());
+    };
+    envelope.shared_tree_holder = holder;
+    atomic_write_json(&run_state_path(record)?, &envelope)
+}
+
+/// The only epoch resolver. Holder mutex, then the parent scope, then `None`.
+pub fn active_run_epoch() -> Option<u64> {
+    let slot = HOLDER_EPOCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let epoch = *slot;
+    drop(slot);
+    if holder_epoch_visible()
+        && let Some(epoch) = epoch
+    {
+        return Some(epoch);
+    }
+    PARENT_RUN_SCOPE.with(Cell::get)
+}
+
+fn holder_epoch_visible() -> bool {
+    #[cfg(test)]
+    {
+        let owner = HOLDER_EPOCH_OWNER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *owner == Some(std::thread::current().id())
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+pub fn load_run_book(record: &ProjectRecord) -> Result<RunBook> {
+    let path = run_state_path(record)?;
+    if !path.exists() {
+        return Ok(RunBook::One(Box::new(RunState::idle(&record.id))));
+    }
+    let text = std::fs::read_to_string(&path)?;
+    parse_run_book(&text)
+}
+
+pub fn parse_run_book(text: &str) -> Result<RunBook> {
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    if value.get("schema").and_then(|item| item.as_str()) == Some(RUN_BOOK_SCHEMA) {
+        let envelope: RunEnvelope = serde_json::from_value(value)?;
+        return Ok(RunBook::Many(envelope));
+    }
+    let state: RunState = serde_json::from_value(value)?;
+    Ok(RunBook::One(Box::new(state)))
+}
+
+pub fn load_run_state(record: &ProjectRecord) -> Result<RunState> {
+    match load_run_book(record)? {
+        RunBook::One(state) => {
+            if let Some(epoch) = active_run_epoch()
+                && epoch != state.run_epoch
+            {
+                return Err(unknown_run_epoch_error(epoch));
+            }
+            Ok(*state)
+        }
+        RunBook::Many(envelope) => {
+            let Some(epoch) = active_run_epoch() else {
+                return Err(ambiguous_run_error());
+            };
+            envelope
+                .runs
+                .into_iter()
+                .find(|entry| entry.run_epoch == epoch)
+                .ok_or_else(|| unknown_run_epoch_error(epoch))
+        }
+    }
+}
+
+/// The ordinary writer of `run-state.json`. A book is never replaced by one
+/// `RunState` here. [`collapse_to_singular`] is the only path that does that,
+/// and [`write_run_book`] is the only path that creates or replaces an envelope.
 pub fn save_run_state(record: &ProjectRecord, state: &RunState) -> Result<()> {
     let path = run_state_path(record)?;
-    atomic_write_json(&path, state)
+    if !path.exists() {
+        return atomic_write_json(&path, state);
+    }
+    match load_run_book(record)? {
+        RunBook::One(on_disk) => {
+            if let Some(epoch) = active_run_epoch()
+                && epoch != on_disk.run_epoch
+            {
+                return Err(unknown_run_epoch_error(epoch));
+            }
+            atomic_write_json(&path, state)
+        }
+        RunBook::Many(mut envelope) => {
+            let Some(scope) = active_run_epoch() else {
+                return Err(ambiguous_run_error());
+            };
+            let Some(index) = envelope
+                .runs
+                .iter()
+                .position(|entry| entry.run_epoch == scope)
+            else {
+                return Err(unknown_run_epoch_error(scope));
+            };
+            if state.run_epoch != scope
+                && envelope
+                    .runs
+                    .iter()
+                    .any(|entry| entry.run_epoch == state.run_epoch)
+            {
+                return Err(epoch_in_use_error());
+            }
+            let failures = state.consecutive_failures.clone();
+            let approvals = state.policy_approvals.clone();
+            envelope.runs[index] = state.clone();
+            for entry in &mut envelope.runs {
+                entry.consecutive_failures = failures.clone();
+                entry.policy_approvals = approvals.clone();
+            }
+            atomic_write_json(&path, &envelope)
+        }
+    }
+}
+
+/// Create or replace the envelope. Refuses fewer than two entries so a book
+/// cannot collapse through this path.
+pub fn write_run_book(record: &ProjectRecord, envelope: &RunEnvelope) -> Result<()> {
+    if envelope.schema != RUN_BOOK_SCHEMA {
+        return Err(crate::error::CoordinatorError::Message(
+            "run book schema is not run-book-v1".into(),
+        ));
+    }
+    if envelope.runs.len() < 2 {
+        return Err(crate::error::CoordinatorError::Message(
+            "run book requires two entries".into(),
+        ));
+    }
+    let mut envelope = envelope.clone();
+    broadcast_project_maps(&mut envelope.runs);
+    atomic_write_json(&run_state_path(record)?, &envelope)
+}
+
+/// `ReleaseEpoch` for the entry that would remain, before the run-state lock.
+/// `false` means the book must stay.
+pub fn release_remaining_holder(record: &ProjectRecord, dropping: u64) -> bool {
+    let Ok(RunBook::Many(envelope)) = load_run_book(record) else {
+        return true;
+    };
+    if envelope.runs.len() != 2 {
+        return true;
+    }
+    let Some(kept) = envelope
+        .runs
+        .iter()
+        .find(|entry| entry.run_epoch != dropping)
+    else {
+        return true;
+    };
+    crate::harness::pool::release_kept_holder(record, kept.run_epoch)
+}
+
+/// Drop a Stopped or Idle entry and raise `epoch_floor` so its epoch is not reused.
+/// One remaining entry collapses. A failed singular restore leaves the book untouched.
+pub fn drop_finished_entry(record: &ProjectRecord, epoch: u64) -> Result<()> {
+    let RunBook::Many(mut envelope) = load_run_book(record)? else {
+        return Ok(());
+    };
+    let Some(index) = envelope
+        .runs
+        .iter()
+        .position(|entry| entry.run_epoch == epoch)
+    else {
+        return Ok(());
+    };
+    if matches!(
+        envelope.runs[index].status,
+        RunStatus::Running | RunStatus::Paused
+    ) {
+        return Ok(());
+    }
+    let dropped = envelope.runs[index].run_epoch;
+    envelope.epoch_floor = envelope.epoch_floor.max(dropped);
+    envelope.runs.remove(index);
+    if envelope.runs.len() >= 2 {
+        return write_run_book(record, &envelope);
+    }
+    let mut kept = envelope.runs.pop().ok_or_else(|| {
+        crate::error::CoordinatorError::Message("run book requires two entries".into())
+    })?;
+    kept.epoch_floor = kept.epoch_floor.max(envelope.epoch_floor);
+    if crate::harness::pool::restore_singular_sidecars(record, kept.run_epoch).is_err() {
+        return Ok(());
+    }
+    crate::workflow::trusted_evidence::restore_current_leaf(record, kept.run_epoch);
+    collapse_to_singular(record, &kept)
+}
+
+/// Turn a book into one `RunState` after the collapse checks have passed.
+/// A failed `ReleaseEpoch` must not call this.
+pub fn collapse_to_singular(record: &ProjectRecord, state: &RunState) -> Result<()> {
+    atomic_write_json(&run_state_path(record)?, state)
+}
+
+/// `consecutive_failures` and `policy_approvals` are project-scoped. Copy the
+/// newest entry's maps onto every entry.
+fn broadcast_project_maps(runs: &mut [RunState]) {
+    let Some(source) = runs.iter().max_by_key(|entry| entry.updated_at).cloned() else {
+        return;
+    };
+    for entry in runs.iter_mut() {
+        entry.consecutive_failures = source.consecutive_failures.clone();
+        entry.policy_approvals = source.policy_approvals.clone();
+    }
+}
+
+/// Copy the project-scoped maps from `source` onto `target` (admit).
+pub fn copy_project_maps(target: &mut RunState, source: &RunState) {
+    target.consecutive_failures = source.consecutive_failures.clone();
+    target.policy_approvals = source.policy_approvals.clone();
 }
 
 /// Ensure state dir exists (creates `.coordinator` as needed).
@@ -1865,5 +2335,353 @@ mod tests {
             "the depth is thread-local, so another thread still takes the run-state lock"
         );
         drop(scope);
+    }
+
+    fn running_entry(project_id: &str, epoch: u64, track: &str, phase: &str) -> RunState {
+        let mut state = RunState::idle(project_id);
+        state.status = RunStatus::Running;
+        state.run_epoch = epoch;
+        state.track_id = Some(track.into());
+        state.phase = phase.into();
+        state.last_event = format!("{track}-live");
+        state.parked_next = Some(format!("park-{track}"));
+        state
+    }
+
+    #[test]
+    fn pre_0073_run_state_still_loads() {
+        let dir = tempdir().unwrap();
+        let rec = sample_record(dir.path());
+        ensure_state_dir(&rec).unwrap();
+        let path = run_state_path(&rec).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"project_id":"legacy","status":"Idle","phase":"stub:idle","updated_at":"2026-01-01T00:00:00Z","last_event":"idle"}"#,
+        )
+        .unwrap();
+        let state = load_run_state(&rec).unwrap();
+        assert_eq!(state.epoch_floor, 0);
+        assert_eq!(state.project_id, "legacy");
+        assert_eq!(state.phase, "stub:idle");
+        assert!(matches!(load_run_book(&rec).unwrap(), RunBook::One(_)));
+    }
+
+    #[test]
+    fn book_without_scope_does_not_return_a_sibling_track() {
+        let dir = tempdir().unwrap();
+        let rec = sample_record(dir.path());
+        ensure_state_dir(&rec).unwrap();
+        let a = running_entry(&rec.id, 3, "A", "plan");
+        let b = running_entry(&rec.id, 4, "B", "implement");
+        write_run_book(&rec, &RunEnvelope::new(0, vec![a, b])).unwrap();
+        let err = load_run_state(&rec).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("ambiguous run"), "{text}");
+        assert!(!text.contains("track"), "{text}");
+    }
+
+    #[test]
+    fn unscoped_cwd_refuses_during_a_book() {
+        let dir = tempdir().unwrap();
+        let rec = sample_record(dir.path());
+        ensure_state_dir(&rec).unwrap();
+        write_run_book(
+            &rec,
+            &RunEnvelope::new(
+                0,
+                vec![
+                    running_entry(&rec.id, 3, "A", "plan"),
+                    running_entry(&rec.id, 4, "B", "implement"),
+                ],
+            ),
+        )
+        .unwrap();
+        let err = crate::harness::grok_cwd(&rec).unwrap_err();
+        assert!(err.to_string().contains("ambiguous run"), "{err}");
+        assert!(crate::worktree::product_git_cwd(&rec).is_none());
+    }
+
+    #[test]
+    fn failure_artifact_stays_with_its_epoch() {
+        let dir = tempdir().unwrap();
+        let rec = sample_record(dir.path());
+        ensure_state_dir(&rec).unwrap();
+        write_run_book(
+            &rec,
+            &RunEnvelope::new(
+                0,
+                vec![
+                    running_entry(&rec.id, 3, "A", "plan"),
+                    running_entry(&rec.id, 4, "B", "implement"),
+                ],
+            ),
+        )
+        .unwrap();
+        let path = crate::notify::artifact::path(&rec).unwrap();
+        std::fs::write(&path, "- track_id: B\n- run_epoch: 4\n").unwrap();
+        let _scope = RunScope::enter(3).unwrap();
+        crate::notify::clear_artifact(&rec);
+        assert!(path.is_file());
+        assert!(crate::notify::artifact::existing_path(&rec).is_none());
+        let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap_or_default();
+        assert!(
+            log.contains("failure: left sibling artifact epoch 4"),
+            "{log}"
+        );
+    }
+
+    fn git_seed(path: &Path) {
+        let git = |args: &[&str]| {
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("README.md"), b"seed\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-m", "seed"]);
+    }
+
+    fn successor_probe(epoch: u64, track: &str) -> crate::workflow::reuse::ReuseProbe {
+        crate::workflow::reuse::ReuseProbe {
+            successor_id: "0007".into(),
+            closed_epoch: epoch,
+            snap_epoch: epoch,
+            snap_track: Some(track.into()),
+            snap_status: RunStatus::Running,
+            number: 1,
+            head_sha: "abc".into(),
+            head_ref: "refs/heads/track/0007".into(),
+            repo: None,
+        }
+    }
+
+    #[test]
+    fn dropped_high_epoch_is_not_reused() {
+        let _guard = crate::config::test_env_lock();
+        let dir = tempdir().unwrap();
+        git_seed(dir.path());
+        let mut rec = sample_record(dir.path());
+        rec.worktree_isolation = true;
+        rec.execution_repo = Some(dir.path().to_path_buf());
+        ensure_state_dir(&rec).unwrap();
+        let mut low = running_entry(&rec.id, 2, "A", "plan");
+        low.driver = crate::workflow::WorkflowDriver::Adapter;
+        let mut high = running_entry(&rec.id, 4, "B", "implement");
+        high.status = RunStatus::Idle;
+        write_run_book(&rec, &RunEnvelope::new(0, vec![low, high])).unwrap();
+        drop_finished_entry(&rec, 4).unwrap();
+        let book = load_run_book(&rec).unwrap();
+        assert!(matches!(book, RunBook::One(_)));
+        assert_eq!(book.epoch_floor(), 4);
+        let evidence = resolve_state_dir(&rec).unwrap().join("trusted-evidence");
+        std::fs::create_dir_all(&evidence).unwrap();
+        std::fs::write(evidence.join("4.json"), b"stale-epoch-4").unwrap();
+        let view = with_run_state_lock(&rec, || {
+            crate::workflow::commit_probed_successor(&rec, &successor_probe(2, "A"), &Ok(None))
+        })
+        .unwrap();
+        assert_eq!(view.run_epoch, 5);
+        assert_ne!(view.run_epoch, 4);
+        assert_eq!(
+            std::fs::read(evidence.join("4.json")).unwrap(),
+            b"stale-epoch-4"
+        );
+        let injected = crate::workflow::execution_repo::PreparedInjection {
+            project_id: rec.id.clone(),
+            run_epoch: view.run_epoch,
+            phase: view.phase.clone(),
+            track_id: view.track_id.clone(),
+            target: None,
+        };
+        let read = crate::workflow::trusted_evidence::read(&rec, &injected);
+        match read {
+            crate::workflow::trusted_evidence::Evidence::Current(current) => {
+                assert_eq!(current.run_epoch, 5);
+            }
+            other => panic!("successor read returned {other:?}"),
+        }
+        let tree = crate::worktree::epoch_dir(&rec, 5).unwrap();
+        assert!(tree.is_dir(), "successor worktree was not prepared");
+        assert!(!crate::worktree::epoch_dir(&rec, 4).unwrap().exists());
+    }
+
+    #[test]
+    fn book_save_advances_one_entry() {
+        let dir = tempdir().unwrap();
+        let rec = sample_record(dir.path());
+        ensure_state_dir(&rec).unwrap();
+        let a = running_entry(&rec.id, 3, "A", "plan");
+        let mut b = running_entry(&rec.id, 4, "B", "implement");
+        b.consecutive_failures.insert("B".into(), 2);
+        write_run_book(&rec, &RunEnvelope::new(0, vec![a, b])).unwrap();
+
+        let scope = RunScope::enter(3).unwrap();
+        let mut loaded = load_run_state(&rec).unwrap();
+        assert_eq!(loaded.track_id.as_deref(), Some("A"));
+        loaded.run_epoch = 5;
+        loaded.phase = "fold".into();
+        loaded.last_event = "a-advanced".into();
+        loaded.consecutive_failures.insert("A".into(), 1);
+        save_run_state(&rec, &loaded).unwrap();
+        drop(scope);
+
+        let err = load_run_state(&rec).unwrap_err();
+        assert!(err.to_string().contains("ambiguous run"), "{err}");
+
+        let b_scope = RunScope::enter(4).unwrap();
+        let loaded_b = load_run_state(&rec).unwrap();
+        assert_eq!(loaded_b.phase, "implement");
+        assert_eq!(loaded_b.track_id.as_deref(), Some("B"));
+        assert_eq!(loaded_b.last_event, "B-live");
+        assert_eq!(loaded_b.parked_next.as_deref(), Some("park-B"));
+        assert_eq!(loaded_b.run_epoch, 4);
+        assert_eq!(loaded_b.consecutive_failures.get("A"), Some(&1));
+        assert_eq!(loaded_b.consecutive_failures.get("B"), Some(&2));
+        drop(b_scope);
+
+        let a_scope = RunScope::enter(5).unwrap();
+        let loaded_a = load_run_state(&rec).unwrap();
+        assert_eq!(loaded_a.phase, "fold");
+        assert_eq!(loaded_a.run_epoch, 5);
+        assert_eq!(loaded_a.last_event, "a-advanced");
+        drop(a_scope);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run_state_path(&rec).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(value["schema"], "run-book-v1");
+        assert!(value.get("project_id").is_none());
+        assert_eq!(value["runs"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unscoped_save_and_epoch_collision_write_nothing() {
+        let dir = tempdir().unwrap();
+        let rec = sample_record(dir.path());
+        ensure_state_dir(&rec).unwrap();
+        let a = running_entry(&rec.id, 3, "A", "plan");
+        let b = running_entry(&rec.id, 4, "B", "implement");
+        write_run_book(&rec, &RunEnvelope::new(0, vec![a, b])).unwrap();
+        let before = std::fs::read_to_string(run_state_path(&rec).unwrap()).unwrap();
+
+        let mut stray = running_entry(&rec.id, 3, "A", "plan");
+        stray.last_event = "should-not-land".into();
+        let err = save_run_state(&rec, &stray).unwrap_err();
+        assert!(err.to_string().contains("ambiguous run"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(run_state_path(&rec).unwrap()).unwrap(),
+            before
+        );
+
+        let scope = RunScope::enter(3).unwrap();
+        let mut loaded = load_run_state(&rec).unwrap();
+        loaded.run_epoch = 4;
+        let err = save_run_state(&rec, &loaded).unwrap_err();
+        assert!(err.to_string().contains("epoch in use"), "{err}");
+        drop(scope);
+        assert_eq!(
+            std::fs::read_to_string(run_state_path(&rec).unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn next_run_epoch_includes_stopped_and_the_floor() {
+        assert_eq!(next_run_epoch(&[], 0), 1);
+        let mut running = RunState::idle("p");
+        running.run_epoch = 3;
+        running.status = RunStatus::Running;
+        assert_eq!(next_run_epoch(std::slice::from_ref(&running), 0), 4);
+        let mut stopped = RunState::idle("p");
+        stopped.run_epoch = 4;
+        stopped.status = RunStatus::Stopped;
+        assert_eq!(next_run_epoch(&[running.clone(), stopped], 0), 5);
+        assert_eq!(next_run_epoch(&[running], 4), 5);
+    }
+
+    #[test]
+    fn successor_epoch_skips_sibling_number() {
+        let _guard = crate::config::test_env_lock();
+        let dir = tempdir().unwrap();
+        git_seed(dir.path());
+        let mut rec = sample_record(dir.path());
+        rec.worktree_isolation = true;
+        rec.execution_repo = Some(dir.path().to_path_buf());
+        ensure_state_dir(&rec).unwrap();
+        let holder = running_entry(&rec.id, 3, "A", "advance");
+        let sibling = running_entry(&rec.id, 4, "B", "implement");
+        write_run_book(&rec, &RunEnvelope::new(0, vec![holder, sibling])).unwrap();
+        let view = {
+            let _scope = RunScope::enter(3).unwrap();
+            crate::workflow::commit_probed_successor(&rec, &successor_probe(3, "A"), &Ok(None))
+                .unwrap()
+        };
+        assert_eq!(view.run_epoch, 5);
+        assert_ne!(view.run_epoch, 4);
+        assert!(
+            crate::worktree::epoch_dir(&rec, 5).unwrap().is_dir(),
+            "prepare_epoch was not called with the successor"
+        );
+        assert!(
+            !crate::worktree::epoch_dir(&rec, 4).unwrap().exists(),
+            "prepare_epoch reused B's epoch"
+        );
+        let book = load_run_book(&rec).unwrap();
+        let crate::state::RunBook::Many(envelope) = book else {
+            panic!("successor collapsed the sibling");
+        };
+        let kept = envelope
+            .runs
+            .iter()
+            .find(|entry| entry.track_id.as_deref() == Some("B"))
+            .unwrap();
+        assert_eq!(kept.run_epoch, 4);
+        assert_eq!(kept.phase, "implement");
+        let advanced = envelope
+            .runs
+            .iter()
+            .find(|entry| entry.track_id.as_deref() == Some("0007"))
+            .unwrap();
+        assert_eq!(advanced.run_epoch, 5);
+    }
+
+    #[test]
+    fn run_scope_does_not_swap_a_different_epoch() {
+        let outer = RunScope::enter(2).unwrap();
+        assert_eq!(active_run_epoch(), Some(2));
+        let err = RunScope::enter(9).unwrap_err();
+        assert!(err.to_string().contains("ambiguous run"), "{err}");
+        assert_eq!(active_run_epoch(), Some(2));
+        drop(outer);
+        assert_eq!(active_run_epoch(), None);
+    }
+
+    #[test]
+    fn holder_epoch_refuses_a_different_value_and_clears() {
+        struct ClearHolder;
+        impl Drop for ClearHolder {
+            fn drop(&mut self) {
+                release_holder_epoch();
+            }
+        }
+        let _guard = crate::config::test_env_lock();
+        let _clear = ClearHolder;
+        set_holder_epoch(0).unwrap();
+        set_holder_epoch(0).unwrap();
+        let err = set_holder_epoch(1).unwrap_err();
+        assert!(err.to_string().contains("refusing 1"), "{err}");
+        assert_eq!(active_run_epoch(), Some(0));
+        release_holder_epoch();
+        assert_eq!(active_run_epoch(), None);
     }
 }

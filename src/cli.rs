@@ -438,6 +438,9 @@ pub enum GrokCommands {
     Hold {
         #[arg(long)]
         project: Option<String>,
+        /// Detached-holder epoch. Hidden. Omitted on the one-run path.
+        #[arg(long, hide = true)]
+        epoch: Option<u64>,
     },
 }
 
@@ -1080,8 +1083,8 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
                     let view = block_on(api::cmd_harness_grok_shutdown(project.as_deref(), true))?;
                     println!("{}", serde_json::to_string_pretty(&view)?);
                 }
-                GrokCommands::Hold { project } => {
-                    block_on(api::cmd_harness_grok_hold(project.as_deref()))?;
+                GrokCommands::Hold { project, epoch } => {
+                    block_on(api::cmd_harness_grok_hold(project.as_deref(), epoch))?;
                 }
             },
         },

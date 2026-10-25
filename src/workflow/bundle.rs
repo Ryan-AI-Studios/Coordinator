@@ -15,7 +15,11 @@ pub fn normalize_newlines(s: &str) -> String {
 }
 
 pub fn reviews_dir(record: &ProjectRecord) -> Result<PathBuf> {
-    Ok(resolve_state_dir(record)?.join("reviews"))
+    let base = resolve_state_dir(record)?.join("reviews");
+    match crate::state::active_scope(record)? {
+        Some(epoch) => Ok(base.join(epoch.to_string())),
+        None => Ok(base),
+    }
 }
 
 pub fn review_file(record: &ProjectRecord, slug: &str) -> Result<PathBuf> {

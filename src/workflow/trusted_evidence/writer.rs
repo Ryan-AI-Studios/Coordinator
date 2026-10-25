@@ -50,6 +50,39 @@ pub(crate) fn write_for_epoch(
     write_windows(record, state, hook)
 }
 
+/// While another entry is Running or Paused, the leaf is `{epoch}.json`.
+/// On the 1→2 write, park `current.json` on the first entry's epoch first.
+fn evidence_leaf(record: &ProjectRecord, root: &Path, epoch: u64) -> PathBuf {
+    let current = root.join("current.json");
+    let own = root.join(format!("{epoch}.json"));
+    match crate::state::load_run_book(record) {
+        Ok(crate::state::RunBook::Many(envelope)) => {
+            let sibling_live = envelope.runs.iter().any(|entry| {
+                entry.run_epoch != epoch
+                    && matches!(
+                        entry.status,
+                        crate::state::RunStatus::Running | crate::state::RunStatus::Paused
+                    )
+            });
+            if sibling_live { own } else { current }
+        }
+        _ => current,
+    }
+}
+
+/// Collapse puts the remaining epoch's leaf back at `current.json`.
+pub(crate) fn restore_current_leaf(record: &ProjectRecord, epoch: u64) {
+    let Ok(dir) = crate::state::resolve_state_dir(record) else {
+        return;
+    };
+    let root = dir.join("trusted-evidence");
+    let specific = root.join(format!("{epoch}.json"));
+    let current = root.join("current.json");
+    if specific.is_file() && !current.exists() {
+        let _ = std::fs::rename(specific, current);
+    }
+}
+
 #[cfg(windows)]
 fn write_windows(record: &ProjectRecord, state: &RunState, hook: ProducerHook) -> WriteOutcome {
     let epoch = state.run_epoch;
@@ -65,7 +98,7 @@ fn write_windows(record: &ProjectRecord, state: &RunState, hook: ProducerHook) -
         return WriteOutcome::Failed;
     }
     let root = state_dir.join("trusted-evidence");
-    let leaf = root.join("current.json");
+    let leaf = evidence_leaf(record, &root, epoch);
     if let Err(reason) = guard_dir(&root) {
         journal(record, reason, epoch);
         return WriteOutcome::Failed;

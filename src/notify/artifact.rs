@@ -18,19 +18,53 @@ pub fn path(record: &ProjectRecord) -> Result<PathBuf> {
     Ok(resolve_state_dir(record)?.join("FAILURE.md"))
 }
 
-/// Path if the artifact file currently exists.
+/// Path if this entry owns the artifact. A sibling's `FAILURE.md` is not attached.
 pub fn existing_path(record: &ProjectRecord) -> Option<PathBuf> {
     let p = path(record).ok()?;
-    p.is_file().then_some(p)
+    if !p.is_file() {
+        return None;
+    }
+    if matches!(
+        crate::state::load_run_book(record),
+        Ok(crate::state::RunBook::Many(_))
+    ) {
+        let epoch = crate::state::active_run_epoch()?;
+        let body = std::fs::read_to_string(&p).ok()?;
+        return (parse_metadata(&body).run_epoch == Some(epoch)).then_some(p);
+    }
+    Some(p)
 }
 
-/// Best-effort remove of a leftover Failure Artifact (fresh `run`).
+/// Best-effort remove of this entry's Failure Artifact.
+///
+/// One `FAILURE.md` stays the product. A file that names a sibling is left in place.
 pub fn clear(record: &ProjectRecord) {
-    if let Ok(p) = path(record)
-        && p.exists()
-    {
-        let _ = std::fs::remove_file(&p);
+    let Ok(p) = path(record) else {
+        return;
+    };
+    if !p.exists() {
+        return;
     }
+    if matches!(
+        crate::state::load_run_book(record),
+        Ok(crate::state::RunBook::Many(_))
+    ) {
+        let Some(epoch) = crate::state::active_run_epoch() else {
+            return;
+        };
+        let body = std::fs::read_to_string(&p).unwrap_or_default();
+        if let Some(named) = parse_metadata(&body).run_epoch
+            && named != epoch
+        {
+            crate::progress_log::append(
+                record,
+                "failure",
+                &format!("failure: left sibling artifact epoch {named}"),
+            );
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(&p);
 }
 
 /// Operator ack `last_event` / progress_log detail (0040).

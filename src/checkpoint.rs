@@ -242,7 +242,15 @@ fn persist_blocks(record: &ProjectRecord) -> Result<Option<String>> {
 
 /// Delete every checkpoint ref for this project. A failed delete is journalled.
 pub(crate) fn reap_completed(record: &ProjectRecord) -> Result<()> {
-    reap(record, |_| true)
+    match crate::state::load_run_book(record) {
+        Ok(crate::state::RunBook::Many(_)) => {
+            let Some(epoch) = crate::state::active_run_epoch() else {
+                return Ok(());
+            };
+            reap(record, |found| found == Some(epoch))
+        }
+        _ => reap(record, |_| true),
+    }
 }
 
 /// Delete checkpoint epochs strictly older than `next_epoch - 1`.
@@ -250,7 +258,17 @@ pub(crate) fn reap_completed(record: &ProjectRecord) -> Result<()> {
 /// Epochs that do not parse are kept. Commit timestamps are not read.
 pub(crate) fn reap_abandoned(record: &ProjectRecord, next_epoch: u64) -> Result<()> {
     let keep_from = next_epoch.saturating_sub(1);
-    reap(record, |epoch| epoch.is_some_and(|n| n < keep_from))
+    let owned = match crate::state::load_run_book(record) {
+        Ok(crate::state::RunBook::Many(envelope)) => envelope
+            .runs
+            .iter()
+            .map(|entry| entry.run_epoch)
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    reap(record, |epoch| {
+        epoch.is_some_and(|n| n < keep_from && !owned.contains(&n))
+    })
 }
 
 fn reap(record: &ProjectRecord, drop_epoch: impl Fn(Option<u64>) -> bool) -> Result<()> {

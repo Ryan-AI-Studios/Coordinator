@@ -732,7 +732,8 @@ fn start_or_park(
             archive_slugs,
             journal_unreadable,
         } => {
-            let next_epoch = state.run_epoch.saturating_add(1);
+            let next_epoch = crate::state::allocate_next_epoch(record, state)
+                .unwrap_or_else(|_| state.run_epoch.saturating_add(1));
             if let Err(e) = crate::worktree::prepare_epoch(record, next_epoch) {
                 state.status = RunStatus::Stopped;
                 state.failure_class = Some(FailureClass::HarnessCrash);
@@ -745,7 +746,7 @@ fn start_or_park(
             if journal_unreadable {
                 crate::progress_log::append(record, "reuse", "reuse: receipt unreadable");
             }
-            auto_start(record, state, id);
+            auto_start(record, state, id, next_epoch);
             crate::outcome::clear_active_outcome_file(record);
             drive::clear_plan_review_artifacts(
                 record,
@@ -942,12 +943,12 @@ pub fn on_gate_retry(record: &ProjectRecord, state: &mut RunState, outcome: &Pha
     );
 }
 
-pub fn auto_start(record: &ProjectRecord, state: &mut RunState, track_id: &str) {
+pub fn auto_start(record: &ProjectRecord, state: &mut RunState, track_id: &str, epoch: u64) {
     // 0098: never release a Blocked hold or mutate the held state.
     if state.failure_class == Some(FailureClass::Blocked) {
         return;
     }
-    state.run_epoch = state.run_epoch.saturating_add(1);
+    state.run_epoch = epoch;
     // 0119: a new epoch starts a new entry-id space; the retained entry is never inherited.
     state.plan_review_entry = None;
     state.track_id = Some(track_id.to_string());
@@ -1006,7 +1007,8 @@ pub fn commit_probed_successor(
     {
         return Ok(crate::state::StatusView::from_record(record, &state));
     }
-    let next_epoch = state.run_epoch.saturating_add(1);
+    let next_epoch = crate::state::allocate_next_epoch(record, &state)
+        .unwrap_or_else(|_| state.run_epoch.saturating_add(1));
     if let Err(e) = crate::worktree::prepare_epoch(record, next_epoch) {
         state.status = RunStatus::Stopped;
         state.failure_class = Some(FailureClass::HarnessCrash);
@@ -1019,7 +1021,7 @@ pub fn commit_probed_successor(
     }
     let kept_hash = state.last_applied_outcome_hash.clone();
     let closed = probe.closed_epoch;
-    auto_start(record, &mut state, &probe.successor_id);
+    auto_start(record, &mut state, &probe.successor_id, next_epoch);
     state.last_applied_outcome_hash = kept_hash;
     if reuse::probe_accepts(&probe.successor_id, &probe.head_sha, answer) {
         state.phase = graph::PHASE_CI_WAIT.into();
@@ -1303,7 +1305,7 @@ mod tests {
         state.phase_started_at = Some(chrono::Utc::now());
         let snap = state.clone();
 
-        auto_start(&r, &mut state, "0100");
+        auto_start(&r, &mut state, "0100", 4);
         assert_eq!(state.run_epoch, snap.run_epoch);
         assert_eq!(state.track_id, snap.track_id);
         assert_eq!(state.failure_class, snap.failure_class);
@@ -1622,7 +1624,7 @@ mod tests {
         r.execution_repo = Some(repo.path().to_path_buf());
         conductor_md::write_ready_fixture(dir.path(), "0001").unwrap();
         run_with_driver(&r, Some("0001".into()), WorkflowDriver::Stub).unwrap();
-        let view = wait_for_outcome(&r, Some(15)).unwrap();
+        let view = wait_for_outcome(&r, Some(15), None).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         assert!(
             view.last_event.contains("backlog clear"),
