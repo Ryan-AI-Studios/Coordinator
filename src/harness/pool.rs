@@ -2339,7 +2339,9 @@ pub(crate) struct PinnedInjectHome {
 
 #[cfg(test)]
 pub(crate) fn pin_inject_home() -> PinnedInjectHome {
-    if !INJECT_RESOLVE_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) {
+    // One inject thread consumes the capture. Leaving it armed redirects
+    // every later inject in the process at this home.
+    if !INJECT_RESOLVE_CAPTURE.swap(false, std::sync::atomic::Ordering::AcqRel) {
         return PinnedInjectHome {
             previous: None,
             _guard: None,

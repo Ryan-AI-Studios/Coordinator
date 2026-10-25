@@ -2278,7 +2278,11 @@ mod tests {
         };
         let view = tick(&r).unwrap().expect("permission");
         assert_eq!(view.failure_class, Some(FailureClass::Permission));
-        assert!(view.last_event.contains("no long-lived adapter"));
+        assert!(
+            view.last_event.contains("no long-lived adapter"),
+            "last_event={}",
+            view.last_event
+        );
         let written_after = {
             let mut pool = crate::harness::global_pool().lock().await;
             let s = pool.get_mut(&r.id).unwrap();
