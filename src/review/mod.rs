@@ -454,7 +454,8 @@ fn gate_fail_event(body: &str, dud_reason: Option<&str>) -> String {
 }
 
 fn no_verdict_failure(tally: &NoVerdict) -> (FailureClass, String) {
-    if tally.saw_exhaustion {
+    // Spec: ModelExhaustion only when exhaustion was seen and nothing crashed.
+    if tally.saw_exhaustion && !tally.saw_crash {
         let msg = if tally.last_note.is_empty() {
             "cross-model: all tiers exhausted".into()
         } else {
@@ -1180,6 +1181,35 @@ mod tests {
         );
         assert_eq!(degrade_reason(&r).as_deref(), Some("review-unavailable"));
         assert!(crate::notify::artifact::existing_path(&r).is_some());
+        assert_eq!(counts.n(), 3);
+        clear_env();
+    }
+
+    #[test]
+    fn exhaustion_plus_crash_on_dirty_tree_is_harness_crash() {
+        let (_home, _g) = adapter_env();
+        let dir = tempdir().unwrap();
+        let r = rec_clean_exec(dir.path(), true);
+        std::fs::write(dir.path().join("exec").join("dirty.txt"), "uncommitted").unwrap();
+        jump_cross_model(&r, WorkflowDriver::Adapter);
+        let scripted = ScriptedBackend::new()
+            .push_ok(exhaust_text())
+            .push_ok(timeout_text());
+        let (_hook, counts) = hook(scripted);
+        let (_ci, publish) = install_ci_backend();
+        let view = crate::workflow::tick(&r).unwrap().expect("fail");
+        assert_eq!(view.status, RunStatus::Stopped);
+        assert_eq!(view.failure_class, Some(FailureClass::HarnessCrash));
+        assert_ne!(view.phase, graph::PHASE_CI_WAIT);
+        assert!(
+            !view.last_event.contains("all tiers exhausted"),
+            "last_event={}",
+            view.last_event
+        );
+        assert_eq!(degrade_reason(&r).as_deref(), Some("adapter-error"));
+        assert_eq!(publish.publish_n(), 0);
+        let _again = crate::workflow::tick(&r).unwrap();
+        assert_eq!(publish.publish_n(), 0);
         assert_eq!(counts.n(), 3);
         clear_env();
     }
