@@ -665,6 +665,7 @@ mod tests {
             registry: None,
             ready: None,
             holder: None,
+            runs: Vec::new(),
         }
     }
 

@@ -929,7 +929,7 @@ pub(crate) fn settle_if_conductor_completed(
 /// Block until outcome applied or wait budget expires.
 pub fn cmd_wait(project: Option<&str>, timeout_secs: u64, infer_cwd: bool) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
-    watch::wait_for_outcome(&rec, Some(timeout_secs))
+    watch::wait_for_outcome(&rec, Some(timeout_secs), None)
 }
 
 pub use crate::watch::ServeProbe;
@@ -1018,6 +1018,7 @@ pub(crate) fn cmd_run_cli_request(
     Ok(attach_operator_view(watch::wait_for_outcome(
         &rec,
         opts.timeout_secs,
+        Some(view.run_epoch),
     )?))
 }
 
@@ -1089,8 +1090,8 @@ pub async fn cmd_harness_grok_shutdown(
     crate::harness::shutdown(project, infer_cwd).await
 }
 
-pub async fn cmd_harness_grok_hold(project: Option<&str>) -> Result<()> {
-    crate::harness::hold(project).await
+pub async fn cmd_harness_grok_hold(project: Option<&str>, epoch: Option<u64>) -> Result<()> {
+    crate::harness::hold(project, epoch).await
 }
 
 /// `decision record`. CLI passes `infer_cwd = true`.

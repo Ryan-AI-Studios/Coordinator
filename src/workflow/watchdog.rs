@@ -52,9 +52,13 @@ struct ProgressSidecar {
     tool_in_flight: bool,
 }
 
-/// Sidecar path: same `resolve_state_dir` as `harness-grok.json`.
+/// Sidecar path: singular `harness-progress.json`, or `harness-progress/{epoch}.json` in a book.
 pub fn progress_path(record: &ProjectRecord) -> Result<std::path::PathBuf> {
-    Ok(resolve_state_dir(record)?.join(SIDECAR_NAME))
+    let dir = resolve_state_dir(record)?;
+    match crate::state::active_scope(record)? {
+        Some(epoch) => Ok(dir.join("harness-progress").join(format!("{epoch}.json"))),
+        None => Ok(dir.join(SIDECAR_NAME)),
+    }
 }
 
 /// Delete the progress sidecar (fresh `run` / auto-start). Missing is fine.
@@ -113,6 +117,17 @@ fn note_progress_inner(
     session_id: Option<&str>,
     tool_in_flight: bool,
 ) -> Result<()> {
+    crate::harness::pool::with_persist_lock(record, |_lock| {
+        note_progress_locked(record, kind, session_id, tool_in_flight)
+    })
+}
+
+fn note_progress_locked(
+    record: &ProjectRecord,
+    kind: ProgressKind,
+    session_id: Option<&str>,
+    tool_in_flight: bool,
+) -> Result<()> {
     let now = Utc::now();
     let prev = read_sidecar(record);
     let flip = prev
@@ -130,8 +145,10 @@ fn note_progress_inner(
             return Ok(());
         }
     }
-    let dir = crate::state::ensure_state_dir(record)?;
-    let path = dir.join(SIDECAR_NAME);
+    let path = progress_path(record)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let sidecar = ProgressSidecar {
         version: SIDECAR_VERSION,
         last_progress_at: now,

@@ -10,7 +10,7 @@ mod writer;
 
 pub(crate) use reader::read;
 #[allow(unused_imports)]
-pub(crate) use writer::{WriteOutcome, write_for_epoch};
+pub(crate) use writer::{WriteOutcome, restore_current_leaf, write_for_epoch};
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};

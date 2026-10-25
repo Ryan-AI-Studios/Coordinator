@@ -20,9 +20,7 @@ use crate::harness::pool::{
     self, HolderTermination, Intent, NoSocketWhy, PersistClass, PersistIdentity,
 };
 use crate::registry::ProjectRecord;
-use crate::state::{
-    RunStatus, load_run_state, resolve_state_dir, run_state_path, with_run_state_lock,
-};
+use crate::state::{RunStatus, resolve_state_dir, run_state_path, with_run_state_lock};
 
 /// A terminal run must be quiet for this long before its holder is a candidate.
 pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -434,8 +432,8 @@ fn map_delivery(
 }
 
 fn tick_locked(record: &ProjectRecord, now: DateTime<Utc>) -> ReapOutcome {
-    let state = match load_run_state(record) {
-        Ok(state) => state,
+    let entries = match crate::state::load_run_book(record) {
+        Ok(book) => book.into_entries(),
         Err(e) => {
             warn_once(
                 format!("{}:unreadable-state", record.id),
@@ -447,11 +445,31 @@ fn tick_locked(record: &ProjectRecord, now: DateTime<Utc>) -> ReapOutcome {
             return ReapOutcome::Skipped(ReapSkip::UnreadableState);
         }
     };
+    let mut outcome = ReapOutcome::Skipped(ReapSkip::MissingPersist);
+    let mut reaped = false;
+    for state in entries {
+        let _scope = crate::state::RunScope::enter(state.run_epoch).ok();
+        let one = tick_entry(record, now, &state);
+        if matches!(one, ReapOutcome::Reaped { .. }) {
+            reaped = true;
+            outcome = one;
+        } else if !reaped {
+            outcome = one;
+        }
+    }
+    outcome
+}
+
+fn tick_entry(
+    record: &ProjectRecord,
+    now: DateTime<Utc>,
+    state: &crate::state::RunState,
+) -> ReapOutcome {
     let state_present = run_state_path(record).is_ok_and(|path| path.exists());
     let gate_on = features::is_enabled(Duty::SelfReap);
-    let decision = decide(record, now, &state, state_present, gate_on);
+    let decision = decide(record, now, state, state_present, gate_on);
     let Some(candidate) = decision.candidate else {
-        return ReapOutcome::Skipped(skip_for_reason(record, &decision.lifecycle.reason, &state));
+        return ReapOutcome::Skipped(skip_for_reason(record, &decision.lifecycle.reason, state));
     };
     let identity = candidate.identity;
     match pool::prove_holder(record, &identity, RPC_TIMEOUT) {
@@ -2023,7 +2041,7 @@ mod tests {
                 fixture.set_persist_mtime(persist_old());
             }
 
-            let state = load_run_state(&fixture.record).unwrap();
+            let state = crate::state::load_run_state(&fixture.record).unwrap();
             // A pending start is judged by age: fresh → refuse, aged → discard.
             if expected_why == NoSocketWhy::PendingStart {
                 fixture.set_persist_mtime(Duration::from_secs(1));
@@ -2072,7 +2090,7 @@ mod tests {
 
         let started = Instant::now();
         let decision = crate::state::with_run_state_lock(&fixture.record, || {
-            let state = load_run_state(&fixture.record)?;
+            let state = crate::state::load_run_state(&fixture.record)?;
             Ok(decide(&fixture.record, now, &state, true, true))
         })
         .unwrap();
@@ -2139,5 +2157,103 @@ mod tests {
         let log = fixture.status_log();
         assert!(log.contains("holder-persist-discarded"), "{log}");
         holder.stop();
+    }
+
+    #[test]
+    fn sweep_idle_holder_keeps_running_sibling() {
+        let _guard = test_env_lock();
+        let now = Utc::now();
+        let fixture = Fixture::new(now, RunStatus::Idle, persist_old());
+        let state_dir = fixture.record.state_dir.clone().unwrap();
+        let idle_path = state_dir
+            .join("sessions")
+            .join("2")
+            .join("harness-grok.json");
+        let running_path = state_dir
+            .join("sessions")
+            .join("4")
+            .join("harness-grok.json");
+        std::fs::create_dir_all(idle_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(running_path.parent().unwrap()).unwrap();
+        let idle_holder = ScriptedHolder::start(HolderSpec {
+            session_id: format!("idle-{}", fixture.record.id),
+            cwd: fixture.record.path.clone(),
+            pid: Some(7001),
+            adapter: "grok".into(),
+            behaviour: HolderBehaviour::Normal,
+            persist_path: Some(idle_path.clone()),
+            pin_path: None,
+        });
+        let mut running_holder = ScriptedHolder::start(HolderSpec {
+            session_id: format!("run-{}", fixture.record.id),
+            cwd: fixture.record.path.clone(),
+            pid: Some(7002),
+            adapter: "grok".into(),
+            behaviour: HolderBehaviour::Normal,
+            persist_path: Some(running_path.clone()),
+            pin_path: None,
+        });
+        let write = |path: &std::path::Path, holder: &ScriptedHolder, age: Duration| {
+            let spec = PersistSpec::matching(holder);
+            let body = serde_json::json!({
+                "version": 1,
+                "project_id": fixture.record.id,
+                "session_id": spec.session_id,
+                "cwd": spec.cwd,
+                "pid": spec.pid,
+                "holder_pid": spec.holder_pid,
+                "control_addr": spec.control_addr,
+                "adapter": spec.adapter,
+                "supports_compact": true,
+                "alive": true,
+                "prompt_in_flight": false,
+            });
+            std::fs::write(path, serde_json::to_vec(&body).unwrap()).unwrap();
+            let mtime = SystemTime::now().checked_sub(age).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        };
+        write(&idle_path, &idle_holder, persist_old());
+        write(&running_path, &running_holder, persist_old());
+        let mut idle = crate::state::RunState::idle(&fixture.record.id);
+        idle.run_epoch = 2;
+        idle.status = RunStatus::Idle;
+        idle.updated_at = now - chrono::Duration::from_std(persist_old()).unwrap();
+        let mut running = idle.clone();
+        running.run_epoch = 4;
+        running.status = RunStatus::Running;
+        running.phase = "implement".into();
+        running.updated_at = now;
+        crate::state::write_run_book(
+            &fixture.record,
+            &crate::state::RunEnvelope::new(0, vec![idle, running]),
+        )
+        .unwrap();
+
+        let outcome = tick_project(&fixture.record, now);
+        assert_reaped(&outcome, &idle_holder);
+        assert_eq!(idle_holder.seen_ops(), vec!["ping", "shutdown"]);
+        assert!(
+            running_holder.seen_ops().is_empty(),
+            "running sibling was swept: {:?}",
+            running_holder.seen_ops()
+        );
+        assert!(running_holder.ping(), "running sibling stopped answering");
+        let book = crate::state::load_run_book(&fixture.record).unwrap();
+        let crate::state::RunBook::Many(envelope) = book else {
+            panic!("sweep collapsed the book");
+        };
+        let kept = envelope
+            .runs
+            .iter()
+            .find(|entry| entry.run_epoch == 4)
+            .unwrap();
+        assert_eq!(kept.status, RunStatus::Running);
+        idle_holder.finish();
+        running_holder.stop();
     }
 }

@@ -37,14 +37,31 @@ use crate::error::Result;
 use crate::layout;
 use crate::registry::ProjectRecord;
 
-/// Cwd for Grok: the active epoch worktree when isolation is on and that
-/// directory exists, otherwise `execution_repo` if set, else `workspace_root`.
-pub fn grok_cwd(record: &ProjectRecord) -> PathBuf {
-    if let Some(epoch) = crate::worktree::active_epoch_dir(record) {
-        return epoch;
+/// Cwd for Grok. A singular run uses the active epoch worktree when that
+/// directory exists, otherwise `execution_repo`, otherwise `workspace_root`.
+/// An open book with no scope returns `ambiguous run` and does not fall back.
+pub fn grok_cwd(record: &ProjectRecord) -> Result<PathBuf> {
+    match crate::state::load_run_book(record)? {
+        crate::state::RunBook::Many(_) => {
+            let Some(epoch) = crate::state::active_run_epoch() else {
+                return Err(crate::state::ambiguous_run_error());
+            };
+            let dir = crate::worktree::epoch_dir(record, epoch)?;
+            if !dir.is_dir() {
+                return Err(crate::error::CoordinatorError::Message(format!(
+                    "worktree for epoch {epoch} is missing"
+                )));
+            }
+            Ok(dir)
+        }
+        crate::state::RunBook::One(_) => {
+            if let Some(dir) = crate::worktree::active_epoch_dir(record) {
+                return Ok(dir);
+            }
+            let paths = layout::resolve(record);
+            Ok(paths.execution_repo.unwrap_or(paths.workspace_root))
+        }
     }
-    let paths = layout::resolve(record);
-    paths.execution_repo.unwrap_or(paths.workspace_root)
 }
 
 /// Start (or reuse) a Grok session for the project.
@@ -64,8 +81,9 @@ pub async fn start_with_bin(
     model: Option<String>,
     infer_cwd: bool,
     harness: &str,
+    epoch: Option<u64>,
 ) -> Result<GrokHarnessStatus> {
-    pool::start_with_bin(project, in_process, bin, model, infer_cwd, harness).await
+    pool::start_with_bin(project, in_process, bin, model, infer_cwd, harness, epoch).await
 }
 
 pub async fn prompt(
@@ -99,6 +117,6 @@ pub async fn shutdown(project: Option<&str>, infer_cwd: bool) -> Result<GrokHarn
 }
 
 /// Detached ACP holder loop (hidden CLI).
-pub async fn hold(project: Option<&str>) -> Result<()> {
-    pool::hold_loop(project).await
+pub async fn hold(project: Option<&str>, epoch: Option<u64>) -> Result<()> {
+    pool::hold_loop(project, epoch).await
 }

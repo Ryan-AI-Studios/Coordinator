@@ -54,9 +54,18 @@ pub fn active_epoch_dir(record: &ProjectRecord) -> Option<PathBuf> {
 }
 
 /// Active worktree when that directory exists, otherwise the layout execution repo.
+/// An open book with no scope returns `None` and does not fall back to `execution_repo`.
 pub fn product_git_cwd(record: &ProjectRecord) -> Option<PathBuf> {
+    let book = crate::state::load_run_book(record).ok();
+    let book_open = matches!(book, Some(crate::state::RunBook::Many(_)));
+    if book_open && crate::state::active_run_epoch().is_none() {
+        return None;
+    }
     if let Some(dir) = active_epoch_dir(record) {
         return Some(dir);
+    }
+    if book_open {
+        return None;
     }
     crate::layout::resolve(record).execution_repo
 }
@@ -80,7 +89,13 @@ pub fn cargo_target_dir_for(record: &ProjectRecord, cwd: &Path) -> Option<PathBu
 /// Flag off returns immediately. A git failure leaves run state unsaved. An unproven
 /// holder fails the epoch closed **before** `clear_progress`/`create_dir_all`.
 pub fn prepare_epoch(record: &ProjectRecord, next_epoch: u64) -> Result<()> {
-    if !isolation_enabled(record)? {
+    prepare_epoch_in(record, next_epoch, isolation_enabled(record)?)
+}
+
+/// `isolation` is the flag already read by the caller. A Running or Paused sibling
+/// is not shut down and is not `worktree: epoch still live` unless it owns `next_epoch`.
+pub fn prepare_epoch_in(record: &ProjectRecord, next_epoch: u64, isolation: bool) -> Result<()> {
+    if !isolation {
         return Ok(());
     }
     let exec = execution_repo(record)?;
@@ -100,6 +115,8 @@ pub fn prepare_epoch(record: &ProjectRecord, next_epoch: u64) -> Result<()> {
         is_live(record, child)
             && !paths_same(child, &target)
             && !replaced_by_next_epoch(record, child, &target)
+            && !book_live_tree(record, child)
+            && !session_bound(record, child)
     }) {
         return Err(CoordinatorError::Message(format!(
             "worktree: epoch still live at {}",
@@ -114,6 +131,12 @@ pub fn prepare_epoch(record: &ProjectRecord, next_epoch: u64) -> Result<()> {
             continue;
         }
         remove_worktree(record, &exec, child)?;
+    }
+    if live_book_epoch(record, next_epoch) && crate::state::active_run_epoch() != Some(next_epoch) {
+        return Err(CoordinatorError::Message(format!(
+            "worktree: epoch still live at {}",
+            target.display()
+        )));
     }
     if target_live || (target.is_dir() && registered_worktree(&exec, &target)?) {
         return Ok(());
@@ -157,6 +180,12 @@ pub fn release_if_idle(record: &ProjectRecord, view: &StatusView) {
         return;
     }
     let _ = remove_worktree(record, &exec, &dir);
+    if !crate::state::release_remaining_holder(record, view.run_epoch) {
+        return;
+    }
+    let _ = crate::state::with_run_state_lock(record, || {
+        crate::state::drop_finished_entry(record, view.run_epoch)
+    });
 }
 
 /// Age sweep for Idle and Stopped projects. Does not poll and does not kill sessions.
@@ -171,6 +200,11 @@ pub fn reap_aged(record: &ProjectRecord) -> Result<()> {
     let root = worktrees_root(record)?;
     let max_age = Duration::from_secs(reap_secs());
     for child in numeric_children(&root) {
+        let epoch = child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u64>().ok());
+        let _scope = epoch.and_then(|epoch| crate::state::RunScope::enter(epoch).ok());
         if is_live(record, &child) || !older_than(&child, max_age) {
             continue;
         }
@@ -266,14 +300,54 @@ fn older_than(path: &Path, max_age: Duration) -> bool {
         .is_ok_and(|age| age >= max_age)
 }
 
-fn is_live(record: &ProjectRecord, path: &Path) -> bool {
-    if let Ok(state) = load_run_state(record)
-        && matches!(state.status, RunStatus::Running | RunStatus::Paused)
-        && epoch_dir(record, state.run_epoch).is_ok_and(|dir| paths_same(&dir, path))
-    {
-        return true;
+fn live_status(status: RunStatus) -> bool {
+    matches!(status, RunStatus::Running | RunStatus::Paused)
+}
+
+fn owns_epoch_dir(record: &ProjectRecord, state: &crate::state::RunState, path: &Path) -> bool {
+    epoch_dir(record, state.run_epoch).is_ok_and(|dir| paths_same(&dir, path))
+}
+
+fn book_live_tree(record: &ProjectRecord, path: &Path) -> bool {
+    match crate::state::load_run_book(record) {
+        Ok(crate::state::RunBook::Many(envelope)) => envelope
+            .runs
+            .iter()
+            .any(|entry| live_status(entry.status) && owns_epoch_dir(record, entry, path)),
+        _ => false,
     }
-    session_bound(record, path)
+}
+
+fn live_book_epoch(record: &ProjectRecord, epoch: u64) -> bool {
+    match crate::state::load_run_book(record) {
+        Ok(crate::state::RunBook::Many(envelope)) => envelope
+            .runs
+            .iter()
+            .any(|entry| entry.run_epoch == epoch && live_status(entry.status)),
+        _ => false,
+    }
+}
+
+fn is_live(record: &ProjectRecord, path: &Path) -> bool {
+    match crate::state::load_run_book(record) {
+        Err(_) => true,
+        Ok(crate::state::RunBook::Many(envelope)) => {
+            if envelope
+                .runs
+                .iter()
+                .any(|entry| live_status(entry.status) && owns_epoch_dir(record, entry, path))
+            {
+                return true;
+            }
+            session_bound(record, path)
+        }
+        Ok(crate::state::RunBook::One(state)) => {
+            if live_status(state.status) && owns_epoch_dir(record, &state, path) {
+                return true;
+            }
+            session_bound(record, path)
+        }
+    }
 }
 
 /// The on-disk run still names this directory, and `target` is the epoch that
@@ -282,16 +356,38 @@ fn replaced_by_next_epoch(record: &ProjectRecord, path: &Path, target: &Path) ->
     if paths_same(path, target) || session_bound(record, path) {
         return false;
     }
-    let Ok(state) = load_run_state(record) else {
-        return false;
-    };
-    if !matches!(state.status, RunStatus::Running | RunStatus::Paused) {
-        return false;
+    match crate::state::load_run_book(record) {
+        Err(_) => false,
+        Ok(crate::state::RunBook::Many(_)) => false,
+        Ok(crate::state::RunBook::One(state)) => {
+            live_status(state.status) && owns_epoch_dir(record, &state, path)
+        }
     }
-    epoch_dir(record, state.run_epoch).is_ok_and(|dir| paths_same(&dir, path))
+}
+
+fn worktree_epoch(record: &ProjectRecord, path: &Path) -> Option<u64> {
+    let epoch = path.file_name()?.to_str()?.parse().ok()?;
+    let root = worktrees_root(record).ok()?;
+    path.parent()
+        .is_some_and(|parent| paths_same(parent, &root))
+        .then_some(epoch)
 }
 
 fn session_bound(record: &ProjectRecord, path: &Path) -> bool {
+    // A book scoped to the epoch being prepared must still see the sibling's
+    // own session file. The active scope would otherwise look unbound.
+    if let Ok(crate::state::RunBook::Many(_)) = crate::state::load_run_book(record)
+        && let Some(epoch) = worktree_epoch(record, path)
+    {
+        return match crate::harness::pool::persist_live_at(record, Some(epoch)) {
+            Err(_) => true,
+            Ok(Some(live)) => {
+                live.cwd.as_ref().is_some_and(|cwd| paths_same(cwd, path))
+                    && (live.alive || live.prompt_in_flight)
+            }
+            Ok(None) => false,
+        };
+    }
     // An unreadable persist is bound: keep the tree rather than guess.
     let Ok(snap) = crate::harness::pool::persist_live(record) else {
         return true;
@@ -373,6 +469,13 @@ fn shutdown_under(
             )));
         }
     };
+    if identity
+        .cwd
+        .as_deref()
+        .is_some_and(|cwd| book_live_tree(record, cwd))
+    {
+        return Ok(ShutdownOutcome::Unchanged);
+    }
     let old = PersistRef::new(identity.clone(), mtime);
     if let PersistClass::Addressed { .. } = pool::classify_persist(&identity) {
         let Some(cwd) = identity.cwd.as_deref() else {
@@ -575,7 +678,7 @@ fn shutdown_if_cwd_inner(record: &ProjectRecord, epoch_path: &Path) -> Result<bo
     let old = PersistRef::new(identity.clone(), mtime);
     if let PersistClass::Addressed { .. } = pool::classify_persist(&identity) {
         let Some(cwd) = identity.cwd.as_deref() else {
-            return Ok(true);
+            return Ok(false);
         };
         if !(paths_same(cwd, epoch_path) || path_is_inside(cwd, epoch_path)) {
             // Another epoch's session: nothing here to dispose.
@@ -1849,5 +1952,85 @@ mod tests {
             "the cancel registration stays"
         );
         crate::harness::abort::unregister_cancel_handle(&rec.id);
+    }
+
+    #[test]
+    fn ci_wait_sibling_without_session_keeps_its_tree() {
+        let repo = init_repo();
+        let state = tempfile::tempdir().unwrap();
+        let rec = record(
+            repo.path().to_path_buf(),
+            Some(repo.path().to_path_buf()),
+            Some(state.path().to_path_buf()),
+            true,
+        );
+        prepare_epoch_in(&rec, 2, true).unwrap();
+        let tree = epoch_dir(&rec, 2).unwrap();
+        assert!(tree.is_dir());
+        let mut running = crate::state::RunState::idle(&rec.id);
+        running.run_epoch = 2;
+        running.status = RunStatus::Running;
+        running.phase = crate::workflow::graph::PHASE_CI_WAIT.into();
+        running.track_id = Some("A".into());
+        let mut sibling = running.clone();
+        sibling.run_epoch = 4;
+        sibling.phase = "plan".into();
+        sibling.track_id = Some("B".into());
+        sibling.status = RunStatus::Running;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![running, sibling]),
+        )
+        .unwrap();
+        let _scope = crate::state::RunScope::enter(4).unwrap();
+        prepare_epoch_in(&rec, 4, true).unwrap();
+        assert!(tree.is_dir(), "A's ci-wait tree was removed");
+        assert!(epoch_dir(&rec, 4).unwrap().is_dir());
+    }
+
+    #[test]
+    fn prepare_keeps_idle_sibling_whose_holder_still_owns_the_tree() {
+        let repo = init_repo();
+        let state = tempfile::tempdir().unwrap();
+        let rec = record(
+            repo.path().to_path_buf(),
+            Some(repo.path().to_path_buf()),
+            Some(state.path().to_path_buf()),
+            true,
+        );
+        prepare_epoch_in(&rec, 2, true).unwrap();
+        let tree = epoch_dir(&rec, 2).unwrap();
+        let mut idle = crate::state::RunState::idle(&rec.id);
+        idle.run_epoch = 2;
+        idle.status = RunStatus::Idle;
+        idle.track_id = Some("A".into());
+        let mut next = crate::state::RunState::idle(&rec.id);
+        next.run_epoch = 5;
+        next.status = RunStatus::Running;
+        next.track_id = Some("B".into());
+        crate::state::write_run_book(&rec, &crate::state::RunEnvelope::new(0, vec![idle, next]))
+            .unwrap();
+        let session = state.path().join("sessions").join("2");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("harness-grok.json"),
+            serde_json::json!({
+                "version": 1,
+                "project_id": rec.id,
+                "adapter": "grok",
+                "alive": true,
+                "cwd": tree,
+                "session_id": "sess-2",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let _scope = crate::state::RunScope::enter(5).unwrap();
+        prepare_epoch_in(&rec, 5, true).unwrap();
+        assert!(
+            tree.is_dir(),
+            "idle sibling worktree was removed while its holder persist is alive"
+        );
+        assert!(epoch_dir(&rec, 5).unwrap().is_dir());
     }
 }

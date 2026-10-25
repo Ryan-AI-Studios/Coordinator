@@ -337,12 +337,20 @@ pub fn outcomes_dir(record: &ProjectRecord) -> Result<PathBuf> {
     Ok(resolve_state_dir(record)?.join("outcomes"))
 }
 
+fn scoped_outcomes_dir(record: &ProjectRecord) -> Result<PathBuf> {
+    let base = outcomes_dir(record)?;
+    match crate::state::active_scope(record)? {
+        Some(epoch) => Ok(base.join(epoch.to_string())),
+        None => Ok(base),
+    }
+}
+
 pub fn outcome_current_path(record: &ProjectRecord) -> Result<PathBuf> {
-    Ok(outcomes_dir(record)?.join("current.json"))
+    Ok(scoped_outcomes_dir(record)?.join("current.json"))
 }
 
 pub fn outcome_applied_path(record: &ProjectRecord) -> Result<PathBuf> {
-    Ok(outcomes_dir(record)?.join("current.applied.json"))
+    Ok(scoped_outcomes_dir(record)?.join("current.applied.json"))
 }
 
 pub fn outcome_history_dir(record: &ProjectRecord) -> Result<PathBuf> {
@@ -351,7 +359,7 @@ pub fn outcome_history_dir(record: &ProjectRecord) -> Result<PathBuf> {
 
 /// Reserved layout for parallel role slots (0008); documented only this track.
 pub fn outcome_roles_dir(record: &ProjectRecord) -> Result<PathBuf> {
-    Ok(outcomes_dir(record)?.join("roles"))
+    Ok(scoped_outcomes_dir(record)?.join("roles"))
 }
 
 pub fn ensure_outcomes_dir(record: &ProjectRecord) -> Result<PathBuf> {
@@ -433,12 +441,30 @@ pub fn apply_prepared(
     apply_impl(record, outcome, Some(prepared))
 }
 
+fn outcome_scope(
+    record: &ProjectRecord,
+    epoch: Option<u64>,
+) -> Result<Option<crate::state::RunScope>> {
+    if !matches!(
+        crate::state::load_run_book(record)?,
+        crate::state::RunBook::Many(_)
+    ) {
+        return Ok(None);
+    }
+    match epoch.or_else(crate::state::active_run_epoch) {
+        Some(epoch) if crate::state::active_run_epoch() == Some(epoch) => Ok(None),
+        Some(epoch) => Ok(Some(crate::state::RunScope::enter(epoch)?)),
+        None => Err(crate::state::ambiguous_run_error()),
+    }
+}
+
 fn apply_impl(
     record: &ProjectRecord,
     outcome: PhaseOutcome,
     prepared: Option<&PreparedInjection>,
 ) -> Result<ApplyIdentity> {
     outcome.validate()?;
+    let _scope = outcome_scope(record, outcome.run_epoch)?;
     let mut commit = {
         let _guard = apply_lock()
             .lock()
@@ -502,6 +528,7 @@ pub fn outcome_disposition(
     record: &ProjectRecord,
     outcome: &PhaseOutcome,
 ) -> Result<ApplyDisposition> {
+    let _scope = outcome_scope(record, outcome.run_epoch)?;
     let base = load_run_state(record)?;
     if base.status != RunStatus::Running && base.status != RunStatus::Paused {
         return Ok(ApplyDisposition::Stale(format!(
@@ -844,12 +871,23 @@ fn apply_locked(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<ApplyCo
     })
 }
 
-/// Remove active `current.json` if present (non-fatal).
+/// Remove this entry's active outcome file. A book also removes its applied file.
+/// A book with no scope removes nothing.
 pub fn clear_active_outcome_file(record: &ProjectRecord) {
+    let scoped = match crate::state::active_scope(record) {
+        Ok(scope) => scope,
+        Err(_) => return,
+    };
     if let Ok(current) = outcome_current_path(record)
         && current.exists()
     {
-        let _ = std::fs::remove_file(&current);
+        let _ = std::fs::remove_file(current);
+    }
+    if scoped.is_some()
+        && let Ok(applied) = outcome_applied_path(record)
+        && applied.exists()
+    {
+        let _ = std::fs::remove_file(applied);
     }
 }
 
@@ -957,6 +995,7 @@ pub fn write_and_apply_prepared(
 
 pub fn write_and_apply(record: &ProjectRecord, outcome: PhaseOutcome) -> Result<StatusView> {
     outcome.validate()?;
+    let _scope = outcome_scope(record, outcome.run_epoch)?;
     save_current_outcome(record, &outcome)?;
     match apply(record, outcome) {
         Ok(view) => Ok(view),
@@ -1248,6 +1287,292 @@ mod tests {
         assert!(view.failure_class.is_none());
         assert!(!outcome_current_path(&r).unwrap().exists());
         assert!(outcome_applied_path(&r).unwrap().exists());
+    }
+
+    #[test]
+    fn book_outcome_applies_only_its_epoch() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_stub(&r, Some("0005".into())).unwrap();
+        let base = crate::state::load_run_state(&r).unwrap();
+        let mut first = base.clone();
+        first.run_epoch = 2;
+        first.track_id = Some("0005".into());
+        let mut second = base;
+        second.run_epoch = 4;
+        second.track_id = Some("0006".into());
+        second.phase = first.phase.clone();
+        second.status = RunStatus::Running;
+        crate::state::write_run_book(
+            &r,
+            &crate::state::RunEnvelope::new(0, vec![first.clone(), second.clone()]),
+        )
+        .unwrap();
+        let outcome = PhaseOutcome::success(
+            first.phase.clone(),
+            OutcomeSource::Cli,
+            Some("done".into()),
+            None,
+            Some(2),
+        );
+        let view = write_and_apply(&r, outcome).unwrap();
+        assert_eq!(view.run_epoch, 2);
+        let book = crate::state::load_run_book(&r).unwrap();
+        let crate::state::RunBook::Many(envelope) = book else {
+            panic!("outcome apply collapsed the book");
+        };
+        let kept = envelope
+            .runs
+            .iter()
+            .find(|entry| entry.run_epoch == 4)
+            .unwrap();
+        assert_eq!(kept.status, RunStatus::Running);
+        assert_eq!(kept.phase, second.phase);
+        assert!(!r_state_current(&r));
+    }
+
+    fn spawn_epoch_holder(
+        rec: ProjectRecord,
+        epoch: u64,
+        session_id: &str,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session_id = session_id.to_string();
+        let handle = std::thread::spawn(move || {
+            let _scope = crate::state::RunScope::enter(epoch).expect("scope");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let cwd = crate::worktree::epoch_dir(&rec, epoch).expect("epoch dir");
+                assert!(cwd.is_dir(), "epoch {epoch} worktree missing");
+                let session = crate::harness::grok::GrokSession::start_mock(
+                    cwd,
+                    crate::harness::grok::mock_handshake_ok(&session_id),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .expect("mock session");
+                let rec_hold = rec.clone();
+                let hold = tokio::spawn(async move {
+                    crate::harness::pool::hold_loop_with_session(rec_hold, session).await
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let persist = crate::state::resolve_state_dir(&rec)
+                    .expect("state dir")
+                    .join("sessions")
+                    .join(epoch.to_string())
+                    .join("harness-grok.json");
+                let addr = loop {
+                    if let Some(addr) = std::fs::read_to_string(&persist)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                        .and_then(|body| {
+                            body.get("control_addr")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string)
+                        })
+                        .filter(|addr| !addr.is_empty())
+                    {
+                        break addr;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        panic!("epoch {epoch} holder never published a control address");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                };
+                tx.send(addr).expect("addr");
+                hold.await.expect("holder join").expect("holder loop");
+            });
+            let _ = _scope;
+        });
+        (handle, rx)
+    }
+
+    #[test]
+    fn finishing_one_run_releases_only_that_epoch() {
+        let _guard = crate::config::test_env_lock();
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"seed\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-m", "seed"]);
+        let mut r = rec(repo.path());
+        r.execution_repo = Some(repo.path().to_path_buf());
+        crate::run::run_with_driver(
+            &r,
+            Some("0005".into()),
+            crate::workflow::WorkflowDriver::FileWait,
+        )
+        .unwrap();
+        r.worktree_isolation = true;
+        let base = crate::state::load_run_state(&r).unwrap();
+        let mut first = base.clone();
+        first.run_epoch = 2;
+        first.status = RunStatus::Running;
+        first.phase = crate::workflow::graph::PHASE_ADVANCE.into();
+        first.track_id = Some("0005".into());
+        let mut second = base;
+        second.run_epoch = 4;
+        second.status = RunStatus::Running;
+        second.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+        second.track_id = Some("0006".into());
+        crate::state::write_run_book(
+            &r,
+            &crate::state::RunEnvelope::new(0, vec![first.clone(), second.clone()]),
+        )
+        .unwrap();
+        {
+            let _scope = crate::state::RunScope::enter(2).unwrap();
+            crate::worktree::prepare_epoch_in(&r, 2, true).unwrap();
+        }
+        {
+            let _scope = crate::state::RunScope::enter(4).unwrap();
+            crate::worktree::prepare_epoch_in(&r, 4, true).unwrap();
+        }
+        let tree_a = crate::worktree::epoch_dir(&r, 2).unwrap();
+        let tree_b = crate::worktree::epoch_dir(&r, 4).unwrap();
+        assert!(tree_a.is_dir() && tree_b.is_dir());
+        let (thread_a, addr_a) = spawn_epoch_holder(r.clone(), 2, "sess-2");
+        let (thread_b, addr_b) = spawn_epoch_holder(r.clone(), 4, "sess-4");
+        let addr_a = addr_a
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .expect("epoch 2 address");
+        let addr_b = addr_b
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .expect("epoch 4 address");
+        let ping = |addr: &str,
+                    session: &str,
+                    tree: &std::path::Path|
+         -> std::result::Result<(), String> {
+            let mut stream = std::net::TcpStream::connect(addr).map_err(|e| e.to_string())?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .map_err(|e| e.to_string())?;
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .map_err(|e| e.to_string())?;
+            std::io::Write::write_all(&mut stream, b"{\"op\":\"ping\"}\n")
+                .map_err(|e| e.to_string())?;
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&stream), &mut line)
+                .map_err(|e| e.to_string())?;
+            let body: serde_json::Value =
+                serde_json::from_str(line.trim()).map_err(|_| line.clone())?;
+            if body["ok"] != true {
+                return Err(line);
+            }
+            if body["harness"]["session_id"] != session {
+                return Err(line);
+            }
+            let cwd = body["harness"]["cwd"]
+                .as_str()
+                .ok_or_else(|| line.clone())?;
+            if !crate::worktree::paths_same(std::path::Path::new(cwd), tree) {
+                return Err(format!("holder cwd {cwd} is not {}", tree.display()));
+            }
+            Ok(())
+        };
+        ping(&addr_a, "sess-2", &tree_a).expect("epoch 2 holder did not answer before finish");
+        ping(&addr_b, "sess-4", &tree_b).expect("epoch 4 holder did not answer before finish");
+        let ref_a = format!("refs/coordinator/checkpoints/{}/2", r.id);
+        let ref_b = format!("refs/coordinator/checkpoints/{}/4", r.id);
+        git(&["update-ref", &ref_a, "HEAD"]);
+        git(&["update-ref", &ref_b, "HEAD"]);
+        let outcome = PhaseOutcome::success(
+            crate::workflow::graph::PHASE_ADVANCE,
+            OutcomeSource::Test,
+            None,
+            None,
+            Some(2),
+        );
+        let view = write_and_apply(&r, outcome).unwrap();
+        assert_eq!(view.status, RunStatus::Idle);
+        assert!(
+            view.last_event.contains("backlog clear"),
+            "{}",
+            view.last_event
+        );
+        let a_answers = ping(&addr_a, "sess-2", &tree_a).is_ok();
+        assert!(
+            tree_a.is_dir() || !a_answers,
+            "A's worktree was removed while A still answers Ping"
+        );
+        assert!(
+            !tree_a.is_dir() && !a_answers,
+            "finishing A left the epoch mounted after the holder stopped answering: tree={} ping={a_answers}",
+            tree_a.is_dir()
+        );
+        assert!(tree_b.is_dir(), "B's worktree was removed");
+        let (kept_epoch, kept_status, kept_phase) = match crate::state::load_run_book(&r).unwrap() {
+            crate::state::RunBook::One(state) => (state.run_epoch, state.status, state.phase),
+            crate::state::RunBook::Many(envelope) => {
+                let kept = envelope
+                    .runs
+                    .iter()
+                    .find(|entry| entry.run_epoch == 4)
+                    .expect("B missing from the book");
+                (kept.run_epoch, kept.status, kept.phase.clone())
+            }
+        };
+        assert_eq!(kept_epoch, 4);
+        assert_eq!(kept_status, RunStatus::Running);
+        assert_eq!(kept_phase, crate::workflow::graph::PHASE_IMPLEMENT);
+        let shown = crate::git_command::command()
+            .args(["show-ref", &ref_b])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            shown.status.success(),
+            "B's checkpoint ref was removed: {}",
+            String::from_utf8_lossy(&shown.stderr)
+        );
+        ping(&addr_b, "sess-4", &tree_b).expect("B stopped answering Ping");
+        let shutdown = |addr: &str| {
+            if let Ok(mut stream) = std::net::TcpStream::connect(addr) {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let _ = std::io::Write::write_all(&mut stream, b"{\"op\":\"shutdown\"}\n");
+                let mut line = String::new();
+                let _ =
+                    std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut line);
+            }
+        };
+        shutdown(&addr_a);
+        shutdown(&addr_b);
+        thread_a.join().expect("epoch 2 thread");
+        thread_b.join().expect("epoch 4 thread");
+    }
+
+    fn r_state_current(record: &ProjectRecord) -> bool {
+        crate::state::resolve_state_dir(record)
+            .unwrap()
+            .join("outcomes")
+            .join("current.json")
+            .exists()
     }
 
     #[test]

@@ -54,7 +54,14 @@ fn read_windows(record: &ProjectRecord, injected: &PreparedInjection) -> Evidenc
         PathShape::TooLong => return none(NoEvidenceReason::PathTooLong),
     }
     let root = state_dir.join("trusted-evidence");
-    let leaf = root.join(LEAF_NAME);
+    let mut epoch_name = injected.run_epoch.to_string();
+    epoch_name.push_str(".json");
+    let per_epoch = root.join(epoch_name);
+    let leaf = if per_epoch.is_file() {
+        per_epoch
+    } else {
+        root.join(LEAF_NAME)
+    };
     if utf16_len(&leaf) > super::MAX_PATH_UTF16 {
         return none(NoEvidenceReason::PathTooLong);
     }

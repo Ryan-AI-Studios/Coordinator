@@ -9,7 +9,7 @@
 
 use crate::features::{Duty, is_enabled};
 use crate::registry::ProjectRecord;
-use crate::state::{RunStatus, load_run_state, with_run_state_lock};
+use crate::state::{RunStatus, with_run_state_lock};
 use crate::workflow::conductor_md::{
     parse_conductor_md, placeholder_ready, promote_placeholders_in, ready_aliases_for,
 };
@@ -108,12 +108,17 @@ pub async fn tick_async(record: &ProjectRecord) -> crate::error::Result<Backstop
 
 fn tick_locked(record: &ProjectRecord) -> BackstopOutcome {
     // DoD-2: the refusal is this locked re-read, not a caller-side pre-check.
-    let state = match load_run_state(record) {
-        Ok(state) => state,
+    match crate::state::load_run_book(record) {
+        Ok(book)
+            if book
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry.status, RunStatus::Running | RunStatus::Paused)) =>
+        {
+            return BackstopOutcome::Skipped(BackstopSkip::Active);
+        }
+        Ok(_) => {}
         Err(_) => return BackstopOutcome::Skipped(BackstopSkip::Unreadable),
-    };
-    if matches!(state.status, RunStatus::Running | RunStatus::Paused) {
-        return BackstopOutcome::Skipped(BackstopSkip::Active);
     }
     let dir = crate::layout::resolve(record).conductor_dir;
     match crate::registry_store::with_registry_lock(&dir, || Ok(backstop_locked(record, &dir))) {

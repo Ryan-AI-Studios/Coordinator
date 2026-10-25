@@ -83,6 +83,10 @@ fn poll_once_inner(record: &ProjectRecord) -> Result<Option<StatusView>> {
                 crate::harness::abort::abort_stuck_prompt(
                     record,
                     crate::harness::abort::AbortReason::Timeout,
+                    pre_timeout
+                        .as_ref()
+                        .map(|state| state.run_epoch)
+                        .unwrap_or(0),
                 );
             }
             return Ok(Some(view));
@@ -133,7 +137,23 @@ fn poll_once_inner(record: &ProjectRecord) -> Result<Option<StatusView>> {
 /// - Ok(view) → exit 0 (terminal success **or** failure applied, including timeout)
 /// - Err(WaitBudgetExpired) → exit 2
 /// - other Err → exit 1 / mapped codes
-pub fn wait_for_outcome(record: &ProjectRecord, timeout_secs: Option<u64>) -> Result<StatusView> {
+pub fn wait_for_outcome(
+    record: &ProjectRecord,
+    timeout_secs: Option<u64>,
+    epoch: Option<u64>,
+) -> Result<StatusView> {
+    let _scope = match epoch {
+        Some(epoch) => Some(crate::state::RunScope::enter(epoch)?),
+        None => {
+            if matches!(
+                crate::state::load_run_book(record)?,
+                crate::state::RunBook::Many(_)
+            ) {
+                return Err(crate::state::ambiguous_run_error());
+            }
+            None
+        }
+    };
     let deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
     let interval = outcome_poll_interval();
     let mut last: Option<StatusView> = None;
@@ -432,11 +452,36 @@ pub fn spawn_health_hold(body: &str) -> HealthHold {
 
 /// Async variant for the serve background loop (one project).
 pub async fn poll_once_async(record: &ProjectRecord) -> Result<Option<StatusView>> {
-    // Blocking file/state IO is short; spawn_blocking keeps the runtime responsive.
+    poll_once_scoped(record, None).await
+}
+
+#[cfg(test)]
+pub(crate) static POLL_VISIT_LOG: std::sync::Mutex<Vec<(String, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) static POLL_VISIT_RECORDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+async fn poll_once_scoped(
+    record: &ProjectRecord,
+    epoch: Option<u64>,
+) -> Result<Option<StatusView>> {
     let rec = record.clone();
-    tokio::task::spawn_blocking(move || poll_once(&rec))
-        .await
-        .map_err(|e| CoordinatorError::Message(format!("poll task join: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if POLL_VISIT_RECORDING.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(epoch) = epoch
+        {
+            let mut log = POLL_VISIT_LOG
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            log.push((rec.id.clone(), epoch));
+        }
+        let _scope = epoch.and_then(|epoch| crate::state::RunScope::enter(epoch).ok());
+        poll_once(&rec)
+    })
+    .await
+    .map_err(|e| CoordinatorError::Message(format!("poll task join: {e}")))?
 }
 
 /// Why the ticker did not start anything this tick.
@@ -492,13 +537,18 @@ pub fn try_auto_start(record: &ProjectRecord) -> AutoStartAttempt {
         other => return AutoStartAttempt::Skipped(AutoStartSkip::Policy(other)),
     }
     // Gate (c): fresh run state.
-    let state = match load_run_state(record) {
-        Ok(s) => s,
+    let state = match crate::state::load_run_book(record) {
+        Ok(book) => {
+            if crate::state::any_entry_live(record).unwrap_or(false) {
+                return AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive);
+            }
+            book.into_entries()
+                .into_iter()
+                .max_by_key(|entry| entry.run_epoch)
+                .unwrap_or_else(|| crate::state::RunState::idle(&record.id))
+        }
         Err(_) => return AutoStartAttempt::Skipped(AutoStartSkip::NotEligible),
     };
-    if matches!(state.status, RunStatus::Running | RunStatus::Paused) {
-        return AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive);
-    }
     // Durable dedupe must precede gate (e): `should_pick_next_ready` is true for an
     // empty track_id even when a failure class is present.
     if state.failure_class.is_some() || crate::notify::artifact::existing_path(record).is_some() {
@@ -574,9 +624,7 @@ pub(crate) fn auto_start_after_error(
             AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow)
         }
         E::Io(_) => {
-            let active = load_run_state(record)
-                .map(|s| matches!(s.status, RunStatus::Running | RunStatus::Paused))
-                .unwrap_or(false);
+            let active = crate::state::any_entry_live(record).unwrap_or(false);
             if active {
                 AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
             } else {
@@ -660,15 +708,35 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
         match crate::api::load_registry() {
             Ok(reg) => {
                 for rec in reg.list() {
-                    let state = match load_run_state(rec) {
-                        Ok(s) => s,
-                        Err(_) => continue,
+                    let book = match crate::state::load_run_book(rec) {
+                        Ok(book) => book,
+                        Err(e) => {
+                            eprintln!(
+                                "coordinator: serve: project {} run-state unreadable: {e}",
+                                rec.id
+                            );
+                            continue;
+                        }
                     };
-                    if matches!(state.status, RunStatus::Running | RunStatus::Paused) {
-                        let rec = rec.clone();
-                        let _ = poll_once_async(&rec).await;
+                    let live: Vec<u64> = book
+                        .entries()
+                        .iter()
+                        .filter(|entry| {
+                            matches!(entry.status, RunStatus::Running | RunStatus::Paused)
+                        })
+                        .map(|entry| entry.run_epoch)
+                        .collect();
+                    if !live.is_empty() {
+                        for epoch in live {
+                            let _ = poll_once_scoped(rec, Some(epoch)).await;
+                        }
                         continue;
                     }
+                    let state = book
+                        .into_entries()
+                        .into_iter()
+                        .max_by_key(|entry| entry.run_epoch)
+                        .unwrap_or_else(|| crate::state::RunState::idle(&rec.id));
                     if state.failure_class.is_some()
                         || crate::notify::artifact::existing_path(rec).is_some()
                     {
@@ -897,7 +965,7 @@ mod tests {
             save_current_outcome(&rec, &o).unwrap();
         });
 
-        let view = wait_for_outcome(&r, Some(5)).unwrap();
+        let view = wait_for_outcome(&r, Some(5), None).unwrap();
         handle.join().unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         unsafe {
@@ -916,7 +984,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         crate::run::run_stub(&r, None).unwrap();
-        let view = wait_for_outcome(&r, Some(5)).unwrap();
+        let view = wait_for_outcome(&r, Some(5), None).unwrap();
         assert_eq!(view.status, RunStatus::Stopped);
         assert_eq!(view.failure_class, Some(FailureClass::Timeout));
         unsafe {
@@ -947,7 +1015,7 @@ mod tests {
 
         // Resume: remaining budget continues from freeze (elapsed before pause was ~0).
         run::resume(&r).unwrap();
-        let view = wait_for_outcome(&r, Some(5)).unwrap();
+        let view = wait_for_outcome(&r, Some(5), None).unwrap();
         assert_eq!(view.failure_class, Some(FailureClass::Timeout));
         unsafe {
             std::env::remove_var(ENV_STUB_PHASE_TIMEOUT_SECS);
@@ -985,7 +1053,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
         crate::run::run_stub(&r, None).unwrap();
-        let err = wait_for_outcome(&r, Some(1)).unwrap_err();
+        let err = wait_for_outcome(&r, Some(1), None).unwrap_err();
         assert!(matches!(err, CoordinatorError::WaitBudgetExpired));
         unsafe {
             std::env::remove_var(ENV_STUB_PHASE_TIMEOUT_SECS);
@@ -1029,7 +1097,7 @@ mod tests {
         let _inject = arm_slow_adapter_inject(Duration::from_secs(30));
 
         let started = Instant::now();
-        let err = wait_for_outcome(&r, Some(1)).unwrap_err();
+        let err = wait_for_outcome(&r, Some(1), None).unwrap_err();
         let elapsed = started.elapsed();
         assert!(
             matches!(err, CoordinatorError::WaitBudgetExpired),
@@ -1087,7 +1155,7 @@ mod tests {
         run_with_driver(&r, Some("0013".into()), WorkflowDriver::Adapter).unwrap();
 
         let mut session = crate::harness::GrokSession::start_mock(
-            crate::harness::grok_cwd(&r),
+            crate::harness::grok_cwd(&r).expect("cwd"),
             mock_handshake_ok("sess-hang"),
             Duration::from_secs(2),
         )
@@ -1150,7 +1218,7 @@ mod tests {
         r.execution_repo = Some(repo.path().to_path_buf());
         crate::workflow::conductor_md::write_ready_fixture(dir.path(), "0020").unwrap();
         run_with_driver(&r, Some("0020".into()), WorkflowDriver::Stub).unwrap();
-        let view = wait_for_outcome(&r, None).unwrap();
+        let view = wait_for_outcome(&r, None, None).unwrap();
         assert_eq!(view.status, RunStatus::Idle);
         unsafe {
             std::env::remove_var(ENV_OUTCOME_POLL_MS);
@@ -1169,7 +1237,7 @@ mod tests {
         let r = rec(dir.path());
         crate::run::run_stub(&r, None).unwrap();
         let started = Instant::now();
-        let err = wait_for_outcome(&r, Some(0)).unwrap_err();
+        let err = wait_for_outcome(&r, Some(0), None).unwrap_err();
         assert!(
             matches!(err, CoordinatorError::WaitBudgetExpired),
             "err={err}"
@@ -2512,5 +2580,184 @@ mod tests {
         assert_eq!(st.status, RunStatus::Stopped);
         assert_eq!(st.track_id.as_deref(), Some("0099"));
         assert_eq!(st.run_epoch, 3);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn one_poll_visits_both_and_abort_stays_on_one() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        let (_home, _ws, rec) = auto_start_project(AutoStartPolicy::Never, false, true, None);
+        unsafe {
+            std::env::set_var(ENV_OUTCOME_POLL_MS, "60000");
+            std::env::set_var(ENV_STUB_PHASE_TIMEOUT_SECS, "3600");
+            std::env::set_var(crate::notify::ENV_COORDINATOR_NOTIFY, "off");
+            std::env::set_var(crate::notify::ENV_COORDINATOR_NOTIFY_FLEET, "off");
+        }
+        let mut first = crate::state::RunState::idle(&rec.id);
+        first.run_epoch = 3;
+        first.status = RunStatus::Running;
+        first.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+        first.driver = crate::workflow::WorkflowDriver::Stub;
+        first.workflow = Some(crate::workflow::graph::WORKFLOW_ID.into());
+        first.phase_started_at = Some(chrono::Utc::now());
+        first.track_id = Some("A".into());
+        let mut second = first.clone();
+        second.run_epoch = 5;
+        second.track_id = Some("B".into());
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![first, second]),
+        )
+        .unwrap();
+        super::POLL_VISIT_LOG.lock().unwrap().clear();
+        super::POLL_VISIT_RECORDING.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(serve_poll_loop(rx));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let book = crate::state::load_run_book(&rec).unwrap();
+            let crate::state::RunBook::Many(envelope) = book else {
+                panic!("poll collapsed the book");
+            };
+            let phases: Vec<_> = envelope
+                .runs
+                .iter()
+                .map(|entry| (entry.run_epoch, entry.phase.clone()))
+                .collect();
+            if phases
+                .iter()
+                .all(|(_, phase)| phase == "cross-model-review")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "one poll did not visit both entries: {phases:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let _ = tx.send(true);
+        handle.await.unwrap();
+        let book = crate::state::load_run_book(&rec).unwrap();
+        let crate::state::RunBook::Many(envelope) = book else {
+            panic!("book collapsed after the poll");
+        };
+        for entry in &envelope.runs {
+            assert_eq!(
+                entry.phase, "cross-model-review",
+                "epoch {} was polled more than once",
+                entry.run_epoch
+            );
+        }
+        super::POLL_VISIT_RECORDING.store(false, std::sync::atomic::Ordering::Relaxed);
+        let visits: Vec<u64> = super::POLL_VISIT_LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == &rec.id)
+            .map(|(_, epoch)| *epoch)
+            .collect();
+        assert_eq!(
+            visits.iter().filter(|epoch| **epoch == 3).count(),
+            1,
+            "A's poll count: {visits:?}"
+        );
+        assert_eq!(
+            visits.iter().filter(|epoch| **epoch == 5).count(),
+            1,
+            "B's poll count: {visits:?}"
+        );
+
+        let listen = |path: std::path::PathBuf| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let ops_thread = ops.clone();
+            std::thread::spawn(move || {
+                for _ in 0..8 {
+                    let Ok((stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = std::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                    let op = serde_json::from_str::<serde_json::Value>(line.trim())
+                        .ok()
+                        .and_then(|v| v.get("op").and_then(|op| op.as_str()).map(str::to_string))
+                        .unwrap_or_default();
+                    ops_thread.lock().unwrap().push(op.clone());
+                    let _ = std::io::Write::write_all(&mut writer, b"{\"ok\":true}\n");
+                    if op == "shutdown" {
+                        let _ = std::fs::write(
+                            &path,
+                            br#"{"version":1,"project_id":"x","adapter":"grok","supports_compact":true,"alive":false}"#,
+                        );
+                        break;
+                    }
+                }
+            });
+            (addr, ops)
+        };
+        let state_dir = crate::state::resolve_state_dir(&rec).unwrap();
+        let path_a = state_dir
+            .join("sessions")
+            .join("3")
+            .join("harness-grok.json");
+        let path_b = state_dir
+            .join("sessions")
+            .join("5")
+            .join("harness-grok.json");
+        std::fs::create_dir_all(path_a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(path_b.parent().unwrap()).unwrap();
+        let (addr_a, ops_a) = listen(path_a.clone());
+        let (addr_b, ops_b) = listen(path_b.clone());
+        let body = |addr: &str| {
+            serde_json::json!({
+                "version": 1,
+                "project_id": rec.id,
+                "adapter": "grok",
+                "supports_compact": true,
+                "alive": true,
+                "control_addr": addr,
+                "cwd": rec.path,
+                "session_id": format!("sess-{addr}"),
+            })
+            .to_string()
+        };
+        std::fs::write(&path_a, body(&addr_a)).unwrap();
+        std::fs::write(&path_b, body(&addr_b)).unwrap();
+        let before = {
+            let _scope = crate::state::RunScope::enter(5).unwrap();
+            crate::state::load_run_state(&rec).unwrap()
+        };
+        crate::harness::abort::abort_stuck_prompt_sync(
+            &rec,
+            crate::harness::abort::AbortReason::Timeout,
+            3,
+        );
+        let after = {
+            let _scope = crate::state::RunScope::enter(5).unwrap();
+            crate::state::load_run_state(&rec).unwrap()
+        };
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.track_id, before.track_id);
+        assert!(
+            !ops_b
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|op| op == "cancel" || op == "shutdown"),
+            "abort of A touched B: {:?}",
+            ops_b.lock().unwrap()
+        );
+        assert!(
+            ops_a.lock().unwrap().iter().any(|op| op == "cancel"),
+            "A was not cancelled: {:?}",
+            ops_a.lock().unwrap()
+        );
     }
 }

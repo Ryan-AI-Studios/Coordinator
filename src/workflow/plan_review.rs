@@ -888,6 +888,7 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
 
     let rec = record.clone();
     let spawn_state = load_run_state(record).unwrap_or(live);
+    let run_epoch = spawn_state.run_epoch;
     let remaining = slot_remaining(record, &spawn_state, slug);
     let paths = crate::layout::resolve(record);
     let spawn_track_id = spawn_state.track_id.clone();
@@ -951,7 +952,17 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
         .spawn(move || {
             #[cfg(test)]
             let _inflight = inflight;
-            apply_slot_result(&rec, backend.as_ref(), &req)
+            // The worker is a new thread. The parent's `RunScope` does not follow it,
+            // and an unscoped load during a book is `ambiguous run`.
+            let _scope = match crate::state::RunScope::enter(run_epoch) {
+                Ok(scope) => scope,
+                Err(err) => {
+                    eprintln!("coordinator: plan-review: epoch {run_epoch} scope refused: {err}");
+                    return;
+                }
+            };
+            apply_slot_result(&rec, backend.as_ref(), &req);
+            drop(_scope);
         })
     {
         record_admission_failure(
@@ -3678,6 +3689,70 @@ mod tests {
         wait_agy_consumed(&r);
         assert_eq!(counts.n(), 1);
         assert_eq!(counts.slugs(), vec!["agy".to_string()]);
+    }
+
+    #[test]
+    fn plan_review_worker_applies_inside_its_epoch() {
+        let _env = IsolatedHome::enter();
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "A");
+        let r = rec(dir.path());
+        let mut reviewed = crate::state::RunState::idle(&r.id);
+        reviewed.run_epoch = 2;
+        reviewed.status = crate::state::RunStatus::Running;
+        reviewed.phase = graph::PHASE_PLAN_REVIEW.into();
+        reviewed.driver = WorkflowDriver::Adapter;
+        reviewed.track_id = Some("A".into());
+        reviewed.pending_roles = vec!["agy".into()];
+        reviewed.workflow = Some(graph::WORKFLOW_ID.into());
+        reviewed.adopt_plan_review_entry();
+        let mut sibling = crate::state::RunState::idle(&r.id);
+        sibling.run_epoch = 7;
+        sibling.status = crate::state::RunStatus::Running;
+        sibling.phase = graph::PHASE_IMPLEMENT.into();
+        sibling.driver = WorkflowDriver::Adapter;
+        sibling.track_id = Some("B".into());
+        crate::state::write_run_book(
+            &r,
+            &crate::state::RunEnvelope::new(0, vec![reviewed, sibling]),
+        )
+        .unwrap();
+        let _hook = install_test_backend(
+            &r.id,
+            Arc::new(ScriptedBackend::ok_file(ok_review_body("A"))),
+        );
+        {
+            let _scope = crate::state::RunScope::enter(2).unwrap();
+            let state = load_run_state(&r).unwrap();
+            maybe_spawn_agy(&r, &state).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let review = loop {
+            let _scope = crate::state::RunScope::enter(2).unwrap();
+            let state = load_run_state(&r).unwrap();
+            let path = crate::workflow::bundle::review_file(&r, "agy").unwrap();
+            if path.is_file() {
+                break path;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "plan-review worker did not write A's review: {}",
+                    state.last_event
+                );
+            }
+            drop(_scope);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(
+            review.components().any(|part| part.as_os_str() == "2"),
+            "review landed outside epoch 2: {}",
+            review.display()
+        );
+        let _scope = crate::state::RunScope::enter(7).unwrap();
+        let sibling = load_run_state(&r).unwrap();
+        assert_eq!(sibling.phase, graph::PHASE_IMPLEMENT);
+        assert_eq!(sibling.track_id.as_deref(), Some("B"));
+        assert!(sibling.pending_roles.is_empty());
     }
 
     #[test]

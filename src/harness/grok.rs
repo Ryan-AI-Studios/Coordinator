@@ -3219,7 +3219,7 @@ mod live_tests {
         let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
 
-        let cwd = crate::harness::grok_cwd(&rec);
+        let cwd = crate::harness::grok_cwd(&rec).expect("cwd");
         let mut session = GrokSession::start(cwd, Duration::from_secs(60))
             .await
             .expect("live grok start");
@@ -3257,7 +3257,7 @@ mod live_tests {
         let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
 
-        let cwd = crate::harness::grok_cwd(&rec);
+        let cwd = crate::harness::grok_cwd(&rec).expect("cwd");
         let bin = resolve_cursor_binary().expect("cursor-agent on PATH");
         let mut session =
             GrokSession::start_with_harness(cwd, Duration::from_secs(60), bin, None, "cursor")

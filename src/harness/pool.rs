@@ -289,6 +289,10 @@ enum HoldRequest {
     Status,
     Shutdown,
     Cancel,
+    AdoptEpoch {
+        epoch: u64,
+    },
+    ReleaseEpoch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,10 +317,17 @@ struct HoldResponse {
     /// Prepared-prompt protocol the holder understands. Absent on old holders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepared_protocol: Option<u32>,
+    /// Epoch adoption the holder understands. Absent or 0 refuses a second run.
+    /// This is not [`PREPARED_PROTOCOL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch_protocol: Option<u32>,
 }
 
 /// Current prepared-prompt capability advertised in `Ping`.
 pub const PREPARED_PROTOCOL_VERSION: u32 = 1;
+
+/// Epoch adoption advertised in `Ping`. Not a bump of [`PREPARED_PROTOCOL_VERSION`].
+pub const EPOCH_PROTOCOL_VERSION: u32 = 1;
 
 fn prepared_protocol_supported(protocol: Option<u32>) -> bool {
     protocol.unwrap_or(0) >= PREPARED_PROTOCOL_VERSION
@@ -360,11 +371,36 @@ fn revalidate_target(
 }
 
 pub fn persist_path(record: &ProjectRecord) -> Result<PathBuf> {
-    Ok(resolve_state_dir(record)?.join("harness-grok.json"))
+    persist_path_for(record, crate::state::active_run_epoch())
+}
+
+/// Legacy `{state_dir}/harness-grok.json`, or `sessions/{epoch}/harness-grok.json`
+/// while a book is open. An open book and `epoch == None` is `ambiguous run`.
+pub fn persist_path_for(record: &ProjectRecord, epoch: Option<u64>) -> Result<PathBuf> {
+    let dir = resolve_state_dir(record)?;
+    match crate::state::load_run_book(record)? {
+        crate::state::RunBook::Many(_) => {
+            let Some(epoch) = epoch else {
+                return Err(crate::state::ambiguous_run_error());
+            };
+            Ok(dir
+                .join("sessions")
+                .join(epoch.to_string())
+                .join("harness-grok.json"))
+        }
+        crate::state::RunBook::One(_) => Ok(dir.join("harness-grok.json")),
+    }
 }
 
 fn load_persist(record: &ProjectRecord) -> Result<Option<PersistedGrokHandle>> {
-    let path = persist_path(record)?;
+    load_persist_at(record, crate::state::active_run_epoch())
+}
+
+fn load_persist_at(
+    record: &ProjectRecord,
+    epoch: Option<u64>,
+) -> Result<Option<PersistedGrokHandle>> {
+    let path = persist_path_for(record, epoch)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -574,7 +610,7 @@ impl PersistLock {
     /// The recursion check runs **before** `try_lock`: a nested acquisition on the same
     /// thread must fail fast instead of spending the whole budget and reporting a
     /// misleading timeout.
-    pub(crate) fn acquire(sentinel: &Path, data: &Path) -> Result<Self> {
+    pub(crate) fn acquire(sentinel: &Path, data: impl FnOnce() -> Result<PathBuf>) -> Result<Self> {
         if crate::state::persist_lock_held() {
             return Err(CoordinatorError::Message(format!(
                 "persist-lock-order: recursive persist lock (lock: {})",
@@ -592,10 +628,12 @@ impl PersistLock {
             .map_err(|e| lock_io(e, sentinel))?;
         let started = std::time::Instant::now();
         let budget = persist_lock_budget();
+        let mut resolve = Some(data);
         loop {
             match file.try_lock() {
                 Ok(()) => {
                     let order = crate::state::persist_lock_scope()?;
+                    let data = resolve.take().expect("persist path resolved once")()?;
                     let dir = data
                         .parent()
                         .filter(|p| !p.as_os_str().is_empty())
@@ -605,7 +643,7 @@ impl PersistLock {
                     return Ok(Self {
                         file,
                         dir,
-                        data: data.to_path_buf(),
+                        data,
                         _order: order,
                         _not_send: std::marker::PhantomData,
                     });
@@ -643,7 +681,7 @@ fn lock_persist(record: &ProjectRecord) -> Result<PersistLock> {
     let sentinel =
         persist_lock_path(record).map_err(|e| lock_io(e, Path::new(PERSIST_LOCK_FILE)))?;
     ensure_state_dir(record).map_err(|e| lock_io(e, &sentinel))?;
-    PersistLock::acquire(&sentinel, &persist_path(record)?)
+    PersistLock::acquire(&sentinel, || persist_path(record))
 }
 
 /// The one entry point every persist writer uses. The closure is synchronous, so the
@@ -2008,9 +2046,10 @@ fn remember_fidelity(record: &ProjectRecord, session: &GrokSession) {
     }
 }
 
-/// Holder `Cancel` RPC (no-op if no live control addr).
-pub(crate) async fn holder_cancel(record: &ProjectRecord) -> Result<()> {
-    let Some(h) = load_persist(record)? else {
+/// Holder `Cancel` RPC to that epoch's `control_addr`. A book with no epoch is
+/// `ambiguous run` and does not read the legacy file.
+pub(crate) async fn holder_cancel(record: &ProjectRecord, epoch: Option<u64>) -> Result<()> {
+    let Some(h) = load_persist_at(record, epoch.or_else(crate::state::active_run_epoch))? else {
         return Ok(());
     };
     let Some(addr) = h.control_addr else {
@@ -2020,9 +2059,252 @@ pub(crate) async fn holder_cancel(record: &ProjectRecord) -> Result<()> {
     Ok(())
 }
 
+/// Bounded Adopt / Release / Ping for the parent. Not held under the run-state lock.
+pub(crate) fn adopt_holder_epoch(addr: &str, epoch: u64) -> Result<bool> {
+    Ok(holder_rpc_bounded(addr, &HoldRequest::AdoptEpoch { epoch })?.ok)
+}
+
+pub(crate) fn release_holder_epoch_rpc(addr: &str) -> Result<bool> {
+    Ok(holder_rpc_bounded(addr, &HoldRequest::ReleaseEpoch)?.ok)
+}
+
+/// Release the holder that remains when a book collapses to one entry.
+/// No persist, or a holder that is not alive, is already clear. A missing
+/// address or a refused RPC leaves the book in place.
+pub(crate) fn release_kept_holder(record: &ProjectRecord, epoch: u64) -> bool {
+    let Ok(Some(handle)) = load_persist_at(record, Some(epoch)) else {
+        return true;
+    };
+    if !(handle.alive || handle.prompt_in_flight) {
+        return true;
+    }
+    let Some(addr) = handle.control_addr else {
+        return false;
+    };
+    release_holder_epoch_rpc(&addr).unwrap_or(false)
+}
+
+/// Book-only stop. Absent persist is already gone. A refused or timed-out Shutdown is `Ok(false)`.
+pub(crate) fn shutdown_epoch(record: &ProjectRecord, epoch: u64) -> Result<bool> {
+    let Some(handle) = load_persist_at(record, Some(epoch))? else {
+        return Ok(true);
+    };
+    if !(handle.alive || handle.prompt_in_flight) {
+        return Ok(true);
+    }
+    let Some(addr) = handle.control_addr else {
+        return Ok(false);
+    };
+    let req = HoldRequest::Shutdown;
+    match holder_rpc_bounded(&addr, &req) {
+        Ok(resp) if resp.ok => {}
+        _ => return Ok(false),
+    }
+    let ping = HoldRequest::Ping;
+    match holder_rpc_bounded(&addr, &ping) {
+        Ok(resp) if resp.ok => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+fn holder_rpc_bounded(addr: &str, req: &HoldRequest) -> Result<HoldResponse> {
+    holder_rpc_sync(addr, req, crate::harness::reap::RPC_TIMEOUT)
+        .map_err(|err| CoordinatorError::Message(format!("holder rpc: {}", err.detail)))
+}
+
+/// Ping a singular live holder before a second run. `Ok(None)` means no Adopt is required.
+/// `Ok(Some(addr))` means the caller must Adopt after the book is written.
+pub(crate) fn second_run_adopt_addr(
+    record: &ProjectRecord,
+    first_epoch: u64,
+) -> Result<Option<String>> {
+    let Some(handle) = load_persist(record)? else {
+        return Ok(None);
+    };
+    if !(handle.alive || handle.prompt_in_flight) {
+        return Ok(None);
+    }
+    let Some(addr) = handle.control_addr.clone() else {
+        return Err(CoordinatorError::Message(
+            "holder unproven (no control_addr)".into(),
+        ));
+    };
+    let dir = crate::worktree::epoch_dir(record, first_epoch)?;
+    if handle
+        .cwd
+        .as_ref()
+        .is_none_or(|cwd| !crate::worktree::paths_same(cwd, &dir))
+    {
+        return Err(CoordinatorError::Message(
+            "holder cwd is not the first epoch worktree".into(),
+        ));
+    }
+    let ping = holder_rpc_bounded(&addr, &HoldRequest::Ping)?;
+    if ping.epoch_protocol != Some(EPOCH_PROTOCOL_VERSION) {
+        return Err(CoordinatorError::Message(
+            "holder has no epoch protocol".into(),
+        ));
+    }
+    Ok(Some(addr))
+}
+
+fn move_tracked(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    moved: &mut Vec<(std::path::PathBuf, std::path::PathBuf)>,
+) -> Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    move_into(src, dest)?;
+    moved.push((dest.to_path_buf(), src.to_path_buf()));
+    Ok(())
+}
+
+fn rollback_moves(moved: &[(std::path::PathBuf, std::path::PathBuf)]) {
+    for (dest, src) in moved.iter().rev() {
+        if src.is_dir() {
+            let _ = std::fs::remove_dir(src);
+        }
+        if let Some(parent) = src.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(dest, src);
+    }
+}
+
+fn move_into(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    if dest.exists() {
+        return Err(CoordinatorError::Message(format!(
+            "refusing to replace {}",
+            dest.display()
+        )));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(src, dest)?;
+    Ok(())
+}
+
+/// Move the singular persist and sidecars onto `epoch` before the book is written.
+pub(crate) fn move_singular_sidecars(record: &ProjectRecord, epoch: u64) -> Result<()> {
+    let dir = crate::state::resolve_state_dir(record)?;
+    with_persist_lock(record, |lock| {
+        let mut moved = Vec::new();
+        let result = (|| {
+            let session = dir
+                .join("sessions")
+                .join(epoch.to_string())
+                .join("harness-grok.json");
+            move_tracked(&lock.data, &session, &mut moved)?;
+            move_tracked(
+                &dir.join("harness-progress.json"),
+                &dir.join("harness-progress").join(format!("{epoch}.json")),
+                &mut moved,
+            )?;
+            let outcomes = dir.join("outcomes");
+            let scoped = outcomes.join(epoch.to_string());
+            move_tracked(
+                &outcomes.join("current.json"),
+                &scoped.join("current.json"),
+                &mut moved,
+            )?;
+            move_tracked(
+                &outcomes.join("current.applied.json"),
+                &scoped.join("current.applied.json"),
+                &mut moved,
+            )?;
+            move_tracked(&outcomes.join("roles"), &scoped.join("roles"), &mut moved)?;
+            let reviews = dir.join("reviews");
+            if reviews.is_dir()
+                && reviews
+                    .read_dir()
+                    .ok()
+                    .and_then(|mut it| it.next())
+                    .is_some()
+            {
+                let parked = dir.join(format!(".reviews-move-{epoch}"));
+                move_tracked(&reviews, &parked, &mut moved)?;
+                std::fs::create_dir_all(&reviews)?;
+                move_tracked(&parked, &reviews.join(epoch.to_string()), &mut moved)?;
+            }
+            move_tracked(
+                &dir.join("trusted-evidence").join("current.json"),
+                &dir.join("trusted-evidence").join(format!("{epoch}.json")),
+                &mut moved,
+            )?;
+            Ok(())
+        })();
+        if result.is_err() {
+            rollback_moves(&moved);
+        }
+        result
+    })
+}
+
+/// Inverse of [`move_singular_sidecars`] after a failed Adopt whose Release succeeded.
+pub(crate) fn restore_singular_sidecars(record: &ProjectRecord, epoch: u64) -> Result<()> {
+    let dir = crate::state::resolve_state_dir(record)?;
+    let sentinel = persist_lock_path(record)?;
+    crate::state::ensure_state_dir(record)?;
+    let _lock = PersistLock::acquire(&sentinel, || Ok(dir.join("harness-grok.json")))?;
+    {
+        let session = dir
+            .join("sessions")
+            .join(epoch.to_string())
+            .join("harness-grok.json");
+        move_into(&session, &dir.join("harness-grok.json"))?;
+        move_into(
+            &dir.join("harness-progress").join(format!("{epoch}.json")),
+            &dir.join("harness-progress.json"),
+        )?;
+        let outcomes = dir.join("outcomes");
+        let scoped = outcomes.join(epoch.to_string());
+        move_into(&scoped.join("current.json"), &outcomes.join("current.json"))?;
+        move_into(
+            &scoped.join("current.applied.json"),
+            &outcomes.join("current.applied.json"),
+        )?;
+        move_into(&scoped.join("roles"), &outcomes.join("roles"))?;
+        let nested = dir.join("reviews").join(epoch.to_string());
+        if nested.exists() {
+            let parked = dir.join(format!(".reviews-restore-{epoch}"));
+            move_into(&nested, &parked)?;
+            let reviews = dir.join("reviews");
+            if reviews
+                .read_dir()
+                .ok()
+                .and_then(|mut it| it.next())
+                .is_none()
+            {
+                let _ = std::fs::remove_dir(&reviews);
+            }
+            move_into(&parked, &reviews)?;
+        }
+        move_into(
+            &dir.join("trusted-evidence").join(format!("{epoch}.json")),
+            &dir.join("trusted-evidence").join("current.json"),
+        )?;
+        Ok(())
+    }
+}
+
 /// Sync snapshot for `StatusView` (in-process pool, else persist file).
+///
+/// A book is not answered from the parent pool. That map is keyed only by
+/// `project_id`, so it can be the other epoch's session. A scoped call reads
+/// `sessions/{epoch}/harness-grok.json`.
 pub fn status_bundle_sync(record: &ProjectRecord) -> Option<HarnessStatusBundle> {
-    if let Some(pool) = POOL.get()
+    let book_open = matches!(
+        crate::state::load_run_book(record),
+        Ok(crate::state::RunBook::Many(_))
+    );
+    if !book_open
+        && let Some(pool) = POOL.get()
         && let Ok(mut guard) = pool.try_lock()
         && let Some(s) = guard.status_of(&record.id)
     {
@@ -2033,6 +2315,63 @@ pub fn status_bundle_sync(record: &ProjectRecord) -> Option<HarnessStatusBundle>
             grok: Some(h.to_status()),
         }),
         _ => None,
+    }
+}
+
+/// Armed only by the inject-thread proof. The thread still calls
+/// `resolve_selected`; this only restores the home that proof registered.
+#[cfg(test)]
+pub(crate) static INJECT_RESOLVE_CAPTURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) static INJECT_HOME: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Hold the env lock and point `COORDINATOR_HOME` at the registry the tick
+/// registered. A parallel test can retarget that var after `tick` spawns this
+/// thread; `resolve_selected` then has to run against the registered home.
+#[cfg(test)]
+pub(crate) struct PinnedInjectHome {
+    previous: Option<String>,
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+pub(crate) fn pin_inject_home() -> PinnedInjectHome {
+    // One inject thread consumes the capture. Leaving it armed redirects
+    // every later inject in the process at this home.
+    if !INJECT_RESOLVE_CAPTURE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return PinnedInjectHome {
+            previous: None,
+            _guard: None,
+        };
+    }
+    let guard = crate::config::test_env_lock();
+    let home = INJECT_HOME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let previous = std::env::var(crate::config::ENV_COORDINATOR_HOME).ok();
+    if let Some(home) = home {
+        unsafe { std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home) };
+    }
+    PinnedInjectHome {
+        previous,
+        _guard: Some(guard),
+    }
+}
+
+#[cfg(test)]
+impl Drop for PinnedInjectHome {
+    fn drop(&mut self) {
+        if self._guard.is_none() {
+            return;
+        }
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(crate::config::ENV_COORDINATOR_HOME, value) },
+            None => unsafe { std::env::remove_var(crate::config::ENV_COORDINATOR_HOME) },
+        }
     }
 }
 
@@ -2637,7 +2976,7 @@ async fn spawn_in_process(
     model: Option<String>,
     harness: &str,
 ) -> Result<GrokHarnessStatus> {
-    let cwd = grok_cwd(record);
+    let cwd = grok_cwd(record)?;
     pre_claim(record);
     let claim = claim_start(record, harness)?;
     if let Some(stand_in) = spawn_stand_in(record) {
@@ -2680,7 +3019,7 @@ pub async fn start(
     in_process: bool,
     infer_cwd: bool,
 ) -> Result<GrokHarnessStatus> {
-    start_inner(project, in_process, None, None, infer_cwd, "grok").await
+    start_inner(project, in_process, None, None, infer_cwd, "grok", None).await
 }
 
 /// Adapter ticks pass the already-resolved phase bin / model / harness. CLI start does not.
@@ -2691,8 +3030,18 @@ pub async fn start_with_bin(
     model: Option<String>,
     infer_cwd: bool,
     harness: &str,
+    epoch: Option<u64>,
 ) -> Result<GrokHarnessStatus> {
-    start_inner(project, in_process, Some(bin), model, infer_cwd, harness).await
+    start_inner(
+        project,
+        in_process,
+        Some(bin),
+        model,
+        infer_cwd,
+        harness,
+        epoch,
+    )
+    .await
 }
 
 async fn start_inner(
@@ -2702,6 +3051,7 @@ async fn start_inner(
     model: Option<String>,
     infer_cwd: bool,
     harness: &str,
+    epoch: Option<u64>,
 ) -> Result<GrokHarnessStatus> {
     let rec = resolve_record(project, infer_cwd)?;
     let refuse = crate::harness::abort::should_refuse_reuse(&rec);
@@ -2710,7 +3060,7 @@ async fn start_inner(
         if let Some(s) = pool.status_of(&rec.id)
             && s.alive
         {
-            let want = grok_cwd(&rec);
+            let want = grok_cwd(&rec)?;
             let cwd_mismatch = s
                 .cwd
                 .as_ref()
@@ -2775,7 +3125,7 @@ async fn start_inner(
     if in_process {
         spawn_in_process(&rec, bin, model, harness).await
     } else {
-        start_holder(&rec, project, bin, model, harness).await
+        start_holder(&rec, project, bin, model, harness, epoch).await
     }
 }
 
@@ -2866,7 +3216,10 @@ pub(crate) async fn reuse_or_reap_existing(
             if !crate::harness::reap::cwd_is_owned(record, &identity) {
                 return Err(holder_unproven(record, "identity:cwd-not-owned"));
             }
-            let want = grok_cwd(record);
+            let want = match grok_cwd(record) {
+                Ok(path) => path,
+                Err(_) => return Err(holder_unproven(record, "identity:cwd")),
+            };
             let reuse_ok = identity.alive
                 && identity
                     .cwd
@@ -3097,7 +3450,15 @@ pub(crate) struct PersistLive {
 
 /// `Err` is unreadable/corrupt — **not** absent. `session_bound` treats it as bound.
 pub(crate) fn persist_live(record: &ProjectRecord) -> Result<Option<PersistLive>> {
-    let Some(handle) = load_persist(record)? else {
+    persist_live_at(record, crate::state::active_run_epoch())
+}
+
+/// Like [`persist_live`], for one epoch's session file. `Err` is unreadable.
+pub(crate) fn persist_live_at(
+    record: &ProjectRecord,
+    epoch: Option<u64>,
+) -> Result<Option<PersistLive>> {
+    let Some(handle) = load_persist_at(record, epoch)? else {
         return Ok(None);
     };
     Ok(Some(PersistLive {
@@ -3181,10 +3542,11 @@ fn interpret_persist_after_spawn(h: &PersistedGrokHandle) -> PersistWait {
 
 async fn start_holder(
     record: &ProjectRecord,
-    project: Option<&str>,
+    _project: Option<&str>,
     bin: Option<PathBuf>,
     model: Option<String>,
     harness: &str,
+    epoch: Option<u64>,
 ) -> Result<GrokHarnessStatus> {
     // CLI / HTTP start: implementor-first resolve. Adapter ticks pass the
     // already-resolved phase bin — do not call resolve_grok_binary() there
@@ -3203,11 +3565,12 @@ async fn start_holder(
         return stand_in;
     }
     let mut child = match spawn_holder_process(
-        project.unwrap_or(record.path.to_str().unwrap_or(&record.id)),
+        record,
         bin.as_deref(),
         model.as_deref(),
         harness,
         &claim,
+        epoch,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -3294,31 +3657,36 @@ fn apply_holder_child_env(
     }
 }
 
-fn spawn_holder_process(
-    project_spec: &str,
+pub(crate) fn build_holder_command(
+    record: &ProjectRecord,
     bin: Option<&std::path::Path>,
     model: Option<&str>,
     harness: &str,
     stamp: &PersistRef,
-) -> Result<std::process::Child> {
+    epoch: Option<u64>,
+) -> Result<std::process::Command> {
+    let project_spec = record
+        .path
+        .to_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(record.id.as_str());
     let exe = std::env::current_exe().map_err(|e| {
         CoordinatorError::Message(format!("cannot resolve coordinator executable: {e}"))
     })?;
     let mut cmd = std::process::Command::new(exe);
-    // Inherit COORDINATOR_HOME / COORDINATOR_STATE_DIR so the holder writes
-    // harness-grok.json and harness-progress.json to the same resolve_state_dir
-    // as wait/serve. Do not invent a second location.
     cmd.arg("harness")
         .arg("grok")
         .arg("hold")
         .arg("--project")
-        .arg(project_spec)
-        .stdin(std::process::Stdio::null())
+        .arg(project_spec);
+    if let Some(epoch) = epoch {
+        cmd.arg("--epoch").arg(epoch.to_string());
+        cmd.current_dir(crate::worktree::epoch_dir(record, epoch)?);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     apply_holder_child_env(&mut cmd, bin, model, harness);
-    // The child-only attempt stamp. Set unconditionally, so an inherited operator
-    // value cannot forge a claim.
     cmd.env(
         ENV_HOLDER_ATTEMPT_MTIME,
         stamp_nanos(&stamp.mtime).to_string(),
@@ -3326,10 +3694,21 @@ fn spawn_holder_process(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
         cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
     }
-    cmd.spawn()
+    Ok(cmd)
+}
+
+fn spawn_holder_process(
+    record: &ProjectRecord,
+    bin: Option<&std::path::Path>,
+    model: Option<&str>,
+    harness: &str,
+    stamp: &PersistRef,
+    epoch: Option<u64>,
+) -> Result<std::process::Child> {
+    build_holder_command(record, bin, model, harness, stamp, epoch)?
+        .spawn()
         .map_err(|e| CoordinatorError::Message(format!("failed to spawn grok holder: {e}")))
 }
 
@@ -3349,12 +3728,29 @@ fn inherited_attempt_stamp(record: &ProjectRecord, harness: &str) -> Option<Pers
     Some(PersistRef::new(attempt_identity(record, harness), mtime))
 }
 
-pub async fn hold_loop(project: Option<&str>) -> Result<()> {
+pub async fn hold_loop(project: Option<&str>, epoch: Option<u64>) -> Result<()> {
     let rec = match resolve_record(project, false) {
         Ok(r) => r,
         Err(e) => return Err(e),
     };
-    let cwd = grok_cwd(&rec);
+    if let Some(epoch) = epoch {
+        crate::state::set_holder_epoch(epoch)?;
+        if crate::worktree::isolation_enabled(&rec).unwrap_or(false) {
+            let dir = crate::worktree::epoch_dir(&rec, epoch)?;
+            if !dir.is_dir() {
+                return Err(CoordinatorError::Message(format!(
+                    "worktree for epoch {epoch} is missing"
+                )));
+            }
+            std::env::set_current_dir(&dir)?;
+        }
+    } else if matches!(
+        crate::state::load_run_book(&rec)?,
+        crate::state::RunBook::Many(_)
+    ) {
+        return Err(crate::state::ambiguous_run_error());
+    }
+    let cwd = grok_cwd(&rec)?;
     let model = std::env::var(ENV_GROK_MODEL)
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -3525,6 +3921,7 @@ fn prepared_skip_response(shared: &HolderShared, reason: &str) -> (HoldResponse,
             skipped: Some(true),
             failure_class: None,
             prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
+            epoch_protocol: None,
         },
         false,
     )
@@ -3598,6 +3995,7 @@ async fn handle_prepared_prompt(
             crate::harness::abort::abort_stuck_prompt_sync(
                 record,
                 crate::harness::abort::AbortReason::PromptTimeout,
+                crate::state::active_run_epoch().unwrap_or(0),
             );
         }
     }
@@ -3677,9 +4075,60 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                 skipped: None,
                 failure_class: None,
                 prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
+                epoch_protocol: Some(EPOCH_PROTOCOL_VERSION),
             },
             false,
         ),
+        HoldRequest::AdoptEpoch { epoch } => {
+            let resp = match crate::state::set_holder_epoch(epoch) {
+                Ok(()) => HoldResponse {
+                    ok: true,
+                    error: None,
+                    text: None,
+                    stop_reason: None,
+                    status: None,
+                    harness: None,
+                    applied: None,
+                    skipped: None,
+                    failure_class: None,
+                    prepared_protocol: None,
+                    epoch_protocol: Some(EPOCH_PROTOCOL_VERSION),
+                },
+                Err(err) => HoldResponse {
+                    ok: false,
+                    error: Some(err.to_string()),
+                    text: None,
+                    stop_reason: None,
+                    status: None,
+                    harness: None,
+                    applied: None,
+                    skipped: None,
+                    failure_class: None,
+                    prepared_protocol: None,
+                    epoch_protocol: Some(EPOCH_PROTOCOL_VERSION),
+                },
+            };
+            (resp, false)
+        }
+        HoldRequest::ReleaseEpoch => {
+            crate::state::release_holder_epoch();
+            (
+                HoldResponse {
+                    ok: true,
+                    error: None,
+                    text: None,
+                    stop_reason: None,
+                    status: None,
+                    harness: None,
+                    applied: None,
+                    skipped: None,
+                    failure_class: None,
+                    prepared_protocol: None,
+                    epoch_protocol: Some(EPOCH_PROTOCOL_VERSION),
+                },
+                false,
+            )
+        }
         HoldRequest::Cancel => {
             if let Some(h) = crate::harness::abort::cancel_handle_for(&record.id) {
                 let _ = h.cancel().await;
@@ -3696,6 +4145,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     skipped: None,
                     failure_class: None,
                     prepared_protocol: None,
+                    epoch_protocol: None,
                 },
                 false,
             )
@@ -3713,6 +4163,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     skipped: None,
                     failure_class: None,
                     prepared_protocol: None,
+                    epoch_protocol: None,
                 },
                 false,
             ),
@@ -3729,6 +4180,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                         skipped: None,
                         failure_class: None,
                         prepared_protocol: None,
+                        epoch_protocol: None,
                     },
                     false,
                 ),
@@ -3773,6 +4225,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                             crate::harness::abort::abort_stuck_prompt_sync(
                                 record,
                                 crate::harness::abort::AbortReason::PromptTimeout,
+                                crate::state::active_run_epoch().unwrap_or(0),
                             );
                         }
                     }
@@ -3818,6 +4271,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                         skipped: Some(true),
                         failure_class: None,
                         prepared_protocol: None,
+                        epoch_protocol: None,
                     },
                     false,
                 )
@@ -3842,6 +4296,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                                 skipped: None,
                                 failure_class: None,
                                 prepared_protocol: None,
+                                epoch_protocol: None,
                             },
                             false,
                         )
@@ -3863,6 +4318,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                                 skipped: None,
                                 failure_class: Some(failure_class_for_message(&e.to_string())),
                                 prepared_protocol: None,
+                                epoch_protocol: None,
                             },
                             false,
                         )
@@ -3889,6 +4345,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                     skipped: None,
                     failure_class: None,
                     prepared_protocol: None,
+                    epoch_protocol: None,
                 },
                 true,
             )
@@ -3929,6 +4386,7 @@ fn view_to_hold(view: HarnessPromptView) -> HoldResponse {
         skipped: view.skipped,
         failure_class: view.failure_class,
         prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
+        epoch_protocol: None,
     }
 }
 
@@ -4090,6 +4548,7 @@ async fn prompt_impl(
             crate::harness::abort::abort_stuck_prompt_sync(
                 &rec,
                 crate::harness::abort::AbortReason::PromptTimeout,
+                crate::state::active_run_epoch().unwrap_or(0),
             );
         }
     }
@@ -4214,6 +4673,7 @@ async fn prompt_prepared_holder(
         binding.model.clone(),
         false,
         &binding.harness,
+        crate::state::active_run_epoch(),
     )
     .await
     {
@@ -4835,7 +5295,7 @@ mod tests {
         let rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
 
-        let err = hold_loop(Some(&rec.id)).await.unwrap_err();
+        let err = hold_loop(Some(&rec.id), None).await.unwrap_err();
         let _ = err;
         unsafe {
             match prev_home {
@@ -4883,7 +5343,7 @@ mod tests {
         lines.push(session_update_chunk("ok"));
         lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -4908,7 +5368,7 @@ mod tests {
         let mut lines = mock_handshake_ok("sess-alive");
         lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -4947,7 +5407,7 @@ mod tests {
         run::pause(&rec).unwrap();
 
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-p"),
             Duration::from_secs(2),
         )
@@ -4988,7 +5448,7 @@ mod tests {
         reg.save(&crate::config::registry_path().unwrap()).unwrap();
 
         let mut session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-skip"),
             Duration::from_secs(2),
         )
@@ -5023,7 +5483,7 @@ mod tests {
         let mut lines = mock_handshake_ok("sess-cmp");
         lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -5059,7 +5519,7 @@ mod tests {
         let mut lines = mock_handshake_ok("sess-fail");
         lines.push(crate::harness::grok::rpc_error(4, "broken pipe"));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -5095,7 +5555,7 @@ mod tests {
 
     async fn prompt_after_mock_close(rec: &ProjectRecord, sid: &str) -> HarnessPromptView {
         let mut session = GrokSession::start_mock(
-            crate::harness::grok_cwd(rec),
+            crate::harness::grok_cwd(rec).expect("cwd"),
             mock_handshake_ok(sid),
             Duration::from_secs(2),
         )
@@ -5112,7 +5572,7 @@ mod tests {
         kind: std::io::ErrorKind,
     ) -> HarnessPromptView {
         let mut session = GrokSession::start_mock(
-            crate::harness::grok_cwd(rec),
+            crate::harness::grok_cwd(rec).expect("cwd"),
             mock_handshake_ok(sid),
             Duration::from_secs(2),
         )
@@ -5155,7 +5615,7 @@ mod tests {
         harness: &str,
     ) -> tokio::task::JoinHandle<Result<()>> {
         let session = GrokSession::start_mock_for(
-            cwd.unwrap_or_else(|| crate::harness::grok_cwd(rec)),
+            cwd.unwrap_or_else(|| crate::harness::grok_cwd(rec).expect("cwd")),
             mock_handshake_ok(session_id),
             Duration::from_secs(2),
             harness,
@@ -5256,7 +5716,7 @@ mod tests {
         arm_stdout_phase(&rec, "implement", 0);
 
         let mut session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-cancel-eof"),
             Duration::from_secs(2),
         )
@@ -5452,7 +5912,7 @@ mod tests {
         arm_stdout_phase(&rec, "implement", 0);
 
         let mut session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-cancel-drop"),
             Duration::from_secs(2),
         )
@@ -5500,7 +5960,7 @@ mod tests {
         seed_alive_persist(&rec, "sess-old", false);
 
         let missing = proj.path().join("missing-grok-0091.exe");
-        let started = start_with_bin(Some(&rec.id), true, missing, None, false, "grok").await;
+        let started = start_with_bin(Some(&rec.id), true, missing, None, false, "grok", None).await;
         assert!(started.is_err(), "{started:?}");
         let st = status(Some(&rec.id), false).await.unwrap();
         assert_ne!(st.session_id.as_deref(), Some("sess-old"));
@@ -5534,7 +5994,7 @@ mod tests {
         let mut lines = mock_handshake_ok("sess-rpc-stdout");
         lines.push(crate::harness::grok::rpc_error(4, "stdout closed"));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -6139,7 +6599,7 @@ mod tests {
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         };
-        assert_eq!(grok_cwd(&rec), exec);
+        assert_eq!(grok_cwd(&rec).expect("cwd"), exec);
     }
 
     #[tokio::test]
@@ -6165,7 +6625,7 @@ mod tests {
         let mut lines = mock_handshake_ok("sess-cancel-apply");
         lines.push(rpc_result(4, json!({ "stopReason": "cancelled" })));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -6223,7 +6683,7 @@ mod tests {
         let mut lines = mock_handshake_ok("sess-rec-err");
         lines.push(crate::harness::grok::rpc_error(4, "stdout closed"));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -6265,7 +6725,7 @@ mod tests {
         .unwrap();
 
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-hold"),
             Duration::from_secs(2),
         )
@@ -6327,6 +6787,124 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn holder_cancel_uses_that_epoch_control_addr() {
+        let _guard = test_env_lock();
+        struct ClearHolder;
+        impl Drop for ClearHolder {
+            fn drop(&mut self) {
+                crate::state::release_holder_epoch();
+            }
+        }
+        let _clear = ClearHolder;
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+            std::env::set_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS, "0");
+        }
+        let mut reg = Registry::default();
+        let mut rec = reg.add(proj.path(), ProjectAddOptions::default()).unwrap();
+        rec.worktree_isolation = true;
+        reg.save(&crate::config::registry_path().unwrap()).unwrap();
+        crate::state::ensure_state_dir(&rec).unwrap();
+        let mut first = crate::state::RunState::idle(&rec.id);
+        first.run_epoch = 3;
+        first.status = crate::state::RunStatus::Running;
+        first.phase = crate::workflow::graph::PHASE_PLAN.into();
+        let mut second = first.clone();
+        second.run_epoch = 4;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![first, second]),
+        )
+        .unwrap();
+        crate::state::set_holder_epoch(3).unwrap();
+        let session = GrokSession::start_mock(
+            proj.path().to_path_buf(),
+            mock_handshake_ok("sess-a"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let rec_hold = rec.clone();
+        let hold = tokio::spawn(async move { hold_loop_with_session(rec_hold, session).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let addr = loop {
+            if let Ok(Some(h)) = load_persist_at(&rec, Some(3))
+                && let Some(addr) = h.control_addr
+            {
+                break addr;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("epoch 3 holder never published a control address");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_b = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                let _ = std::io::Write::write_all(&mut writer, b"{\"ok\":true}\n");
+            }
+        });
+        let state_dir = crate::state::resolve_state_dir(&rec).unwrap();
+        let session_dir = state_dir.join("sessions").join("4");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("harness-grok.json"),
+            serde_json::json!({
+                "version": 1,
+                "project_id": rec.id,
+                "adapter": "grok",
+                "supports_compact": true,
+                "alive": true,
+                "control_addr": addr_b,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let prompt_addr = addr.clone();
+        let prompt_task = tokio::spawn(async move {
+            holder_rpc(
+                &prompt_addr,
+                &HoldRequest::Prompt {
+                    text: "hang".into(),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        holder_cancel(&rec, Some(3)).await.unwrap();
+        let prompt_view = tokio::time::timeout(Duration::from_secs(2), prompt_task)
+            .await
+            .expect("prompt task")
+            .expect("join")
+            .expect("rpc");
+        assert_eq!(prompt_view.stop_reason.as_deref(), Some("cancelled"));
+        let ping = holder_rpc(&addr_b, &HoldRequest::Ping).await.unwrap();
+        assert!(ping.ok, "sibling ping failed");
+        let legacy = state_dir.join("harness-grok.json");
+        assert!(
+            !legacy.exists(),
+            "cancel read the legacy persist instead of sessions/3"
+        );
+        let _ = holder_rpc(&addr, &HoldRequest::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), hold).await;
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+            std::env::remove_var(crate::harness::abort::ENV_CANCEL_WAIT_SECS);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn aborted_session_id_skips_error_apply_without_recycle_prefix() {
         let _guard = test_env_lock();
         let home = tempdir().unwrap();
@@ -6355,7 +6933,7 @@ mod tests {
         let mut lines = mock_handshake_ok("sess-stall-skip");
         lines.push(crate::harness::grok::rpc_error(4, "stdout closed"));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -7565,7 +8143,7 @@ mod tests {
         ));
         lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -7752,7 +8330,7 @@ mod tests {
         let mut lines = mock_handshake_ok("sess-manual");
         lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -7852,7 +8430,7 @@ mod tests {
         let mut lines = mock_handshake_ok("sess-prepared-inproc");
         lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             lines,
             Duration::from_secs(2),
         )
@@ -8053,6 +8631,7 @@ mod tests {
             skipped: None,
             failure_class: Some(FailureClass::HarnessCrash),
             prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
+            epoch_protocol: None,
         };
         assert!(structured_prepared_response(&applied));
         let skipped = HoldResponse {
@@ -8066,6 +8645,7 @@ mod tests {
             skipped: Some(true),
             failure_class: None,
             prepared_protocol: Some(PREPARED_PROTOCOL_VERSION),
+            epoch_protocol: None,
         };
         assert!(structured_prepared_response(&skipped));
         let rejected = HoldResponse {
@@ -8079,6 +8659,7 @@ mod tests {
             skipped: None,
             failure_class: None,
             prepared_protocol: None,
+            epoch_protocol: None,
         };
         assert!(!structured_prepared_response(&rejected));
     }
@@ -8766,7 +9347,7 @@ mod tests {
             .add(proj.path(), ProjectAddOptions::default())
             .unwrap();
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-sync"),
             Duration::from_secs(2),
         )
@@ -8938,7 +9519,7 @@ mod tests {
 
     fn mock_session_for(rec: &ProjectRecord, session_id: &str) -> GrokSession {
         futures_lite_block_on(GrokSession::start_mock(
-            crate::harness::grok_cwd(rec),
+            crate::harness::grok_cwd(rec).expect("cwd"),
             mock_handshake_ok(session_id),
             Duration::from_secs(2),
         ))
@@ -9007,7 +9588,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-live"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 Some("127.0.0.1:9".into()),
                 Some(4242),
                 true,
@@ -9070,7 +9651,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-1"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 Some("127.0.0.1:9".into()),
                 Some(4242),
                 true,
@@ -9157,7 +9738,7 @@ mod tests {
         let before = file_bytes(&rec);
 
         let mut session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-child"),
             Duration::from_secs(2),
         )
@@ -9214,7 +9795,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-live"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 Some("127.0.0.1:9".into()),
                 Some(4242),
                 true,
@@ -9235,7 +9816,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-clean-exit"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 None,
                 Some(4242),
                 false,
@@ -9301,7 +9882,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-newer"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 Some("127.0.0.1:9".into()),
                 Some(7),
                 true,
@@ -9567,7 +10148,7 @@ mod tests {
             &make_handle(
                 rec,
                 Some(session),
-                Some(crate::harness::grok_cwd(rec)),
+                Some(crate::harness::grok_cwd(rec).expect("cwd")),
                 Some(addr.to_string()),
                 Some(4242),
                 true,
@@ -9592,7 +10173,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::Normal,
         );
@@ -9614,7 +10195,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::PingMutatePrompt,
         );
@@ -9642,7 +10223,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::PingMutatePrompt,
         );
@@ -9664,7 +10245,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::PingMutateSession,
         );
@@ -9687,7 +10268,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::PingRemovePersist,
         );
@@ -9710,7 +10291,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::PingCorruptPersist,
         );
@@ -9733,7 +10314,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::PingTouchMtime,
         );
@@ -9756,7 +10337,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::ShutdownRejected,
         );
@@ -9779,7 +10360,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::ShutdownNoResponse,
         );
@@ -9802,7 +10383,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::PingPending,
         );
@@ -9826,7 +10407,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::PingFailedStart,
         );
@@ -9862,7 +10443,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::PingNoResponse,
         );
@@ -9937,7 +10518,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::Normal,
         );
@@ -10023,7 +10604,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-exit"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 None,
                 Some(4242),
                 false,
@@ -10054,7 +10635,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-exit"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 None,
                 Some(4242),
                 false,
@@ -10118,7 +10699,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-other",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::Normal,
         );
@@ -10165,7 +10746,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::ShutdownNoExit,
         );
@@ -10188,7 +10769,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::ShutdownMutate,
         );
@@ -10214,7 +10795,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::Normal,
         );
@@ -10226,7 +10807,7 @@ mod tests {
                 &make_handle(
                     &rec_hook,
                     Some("sess-successor"),
-                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some(crate::harness::grok_cwd(&rec_hook).expect("cwd")),
                     Some("127.0.0.1:9".into()),
                     Some(99),
                     true,
@@ -10256,7 +10837,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::ShutdownDelayedExit,
         );
@@ -10281,7 +10862,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::Normal,
         );
@@ -10301,7 +10882,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-other",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::Normal,
         );
@@ -10336,7 +10917,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let rec = record_in(&dir, "recycle-pool-only");
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-pool"),
             Duration::from_secs(2),
         )
@@ -10374,7 +10955,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let rec = record_in(&dir, "recycle-in-process");
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-self"),
             Duration::from_secs(2),
         )
@@ -10387,7 +10968,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-self"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 None,
                 Some(std::process::id()),
                 true,
@@ -10417,7 +10998,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-self"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 None,
                 Some(std::process::id()),
                 true,
@@ -10451,7 +11032,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-self"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 None,
                 Some(std::process::id()),
                 true,
@@ -10495,7 +11076,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::ShutdownMutate,
         );
@@ -10512,7 +11093,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let rec = record_in(&dir, "recycle-self-changed");
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-self"),
             Duration::from_secs(2),
         )
@@ -10524,7 +11105,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-self"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 None,
                 Some(std::process::id()),
                 true,
@@ -10539,7 +11120,7 @@ mod tests {
                 &make_handle(
                     &rec_hook,
                     Some("sess-successor"),
-                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some(crate::harness::grok_cwd(&rec_hook).expect("cwd")),
                     Some("127.0.0.1:9".into()),
                     Some(99),
                     true,
@@ -10566,7 +11147,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::Normal,
         );
@@ -10578,7 +11159,7 @@ mod tests {
                 &make_handle(
                     &rec_hook,
                     Some("sess-successor"),
-                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some(crate::harness::grok_cwd(&rec_hook).expect("cwd")),
                     Some("127.0.0.1:9".into()),
                     Some(99),
                     true,
@@ -10607,13 +11188,13 @@ mod tests {
             let holder = raw_holder(
                 Some(persist_path(&rec).unwrap()),
                 "sess-d",
-                &crate::harness::grok_cwd(&rec),
+                &crate::harness::grok_cwd(&rec).expect("cwd"),
                 4242,
                 mode,
             );
             write_live_handle(&rec, "sess-d", &holder.addr);
             let session = GrokSession::start_mock(
-                crate::harness::grok_cwd(&rec),
+                crate::harness::grok_cwd(&rec).expect("cwd"),
                 mock_handshake_ok("sess-pool"),
                 Duration::from_secs(2),
             )
@@ -10643,7 +11224,7 @@ mod tests {
         std::fs::create_dir_all(persist_path(&rec).unwrap().parent().unwrap()).unwrap();
         std::fs::write(persist_path(&rec).unwrap(), b"{not json").unwrap();
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-pool"),
             Duration::from_secs(2),
         )
@@ -10674,7 +11255,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::ShutdownNoResponse,
         );
@@ -10703,7 +11284,7 @@ mod tests {
         let mut handle = make_handle(
             &rec,
             Some("sess-d"),
-            Some(crate::harness::grok_cwd(&rec)),
+            Some(crate::harness::grok_cwd(&rec).expect("cwd")),
             Some(closed_addr()),
             None,
             true,
@@ -10736,7 +11317,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::ShutdownMutate,
         );
@@ -10759,7 +11340,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::ShutdownNoExit,
         );
@@ -10781,7 +11362,7 @@ mod tests {
         let holder = raw_holder(
             Some(persist_path(&rec).unwrap()),
             "sess-d",
-            &crate::harness::grok_cwd(&rec),
+            &crate::harness::grok_cwd(&rec).expect("cwd"),
             4242,
             RawMode::Normal,
         );
@@ -10793,7 +11374,7 @@ mod tests {
                 &make_handle(
                     &rec_hook,
                     Some("sess-successor"),
-                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some(crate::harness::grok_cwd(&rec_hook).expect("cwd")),
                     Some("127.0.0.1:9".into()),
                     Some(99),
                     true,
@@ -10823,7 +11404,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-self"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 None,
                 Some(std::process::id()),
                 true,
@@ -10838,7 +11419,7 @@ mod tests {
                 &make_handle(
                     &rec_hook,
                     Some("sess-successor"),
-                    Some(crate::harness::grok_cwd(&rec_hook)),
+                    Some(crate::harness::grok_cwd(&rec_hook).expect("cwd")),
                     Some("127.0.0.1:9".into()),
                     Some(99),
                     true,
@@ -10875,7 +11456,7 @@ mod tests {
         let rec = record_in(&dir, "abort-in-process");
         crate::run::run_stub(&rec, Some("0027".into())).unwrap();
         let session = GrokSession::start_mock(
-            crate::harness::grok_cwd(&rec),
+            crate::harness::grok_cwd(&rec).expect("cwd"),
             mock_handshake_ok("sess-self"),
             Duration::from_secs(2),
         )
@@ -10888,7 +11469,7 @@ mod tests {
             &make_handle(
                 &rec,
                 Some("sess-self"),
-                Some(crate::harness::grok_cwd(&rec)),
+                Some(crate::harness::grok_cwd(&rec).expect("cwd")),
                 None,
                 Some(std::process::id()),
                 true,
@@ -10899,6 +11480,7 @@ mod tests {
         crate::harness::abort::abort_stuck_prompt_sync(
             &rec,
             crate::harness::abort::AbortReason::Stall,
+            crate::state::active_run_epoch().unwrap_or(0),
         );
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
         let (now, _) = persist_identity(&rec).unwrap().unwrap();
@@ -10964,11 +11546,13 @@ mod tests {
             let bin = PathBuf::from("missing-0117-holder.exe");
             let first = tokio::spawn({
                 let bin = bin.clone();
-                async move { start_with_bin(Some(&id_a), a_in_process, bin, None, false, "grok").await }
+                async move {
+                    start_with_bin(Some(&id_a), a_in_process, bin, None, false, "grok", None).await
+                }
             });
             let id_b = rec.id.clone();
             let second = tokio::spawn(async move {
-                start_with_bin(Some(&id_b), b_in_process, bin, None, false, "grok").await
+                start_with_bin(Some(&id_b), b_in_process, bin, None, false, "grok", None).await
             });
             let results = [first.await.unwrap(), second.await.unwrap()];
             assert_eq!(
@@ -11021,7 +11605,7 @@ mod tests {
         assert!(crate::harness::abort::should_refuse_reuse(&rec));
 
         let missing = proj.path().join("missing-grok-refuse.exe");
-        let started = start_with_bin(Some(&rec.id), true, missing, None, false, "grok").await;
+        let started = start_with_bin(Some(&rec.id), true, missing, None, false, "grok", None).await;
         let err = started.unwrap_err().to_string();
         assert!(
             !err.contains("persist-missing"),
@@ -11150,12 +11734,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let sentinel = dir.path().join(PERSIST_LOCK_FILE);
         let data = dir.path().join("harness-grok.json");
-        let first = PersistLock::acquire(&sentinel, &data).unwrap();
+        let first = PersistLock::acquire(&sentinel, || Ok(data.clone())).unwrap();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
         let second_sentinel = sentinel.clone();
         let second_data = data.clone();
         let second = std::thread::spawn(move || {
-            let outcome = PersistLock::acquire(&second_sentinel, &second_data);
+            let outcome = PersistLock::acquire(&second_sentinel, || Ok(second_data.clone()));
             let _ = done_tx.send(outcome.is_ok());
         });
         assert!(
@@ -11451,7 +12035,7 @@ mod tests {
             &make_handle(
                 rec,
                 Some("sess-old"),
-                Some(crate::harness::grok_cwd(rec)),
+                Some(crate::harness::grok_cwd(rec).expect("cwd")),
                 Some("127.0.0.1:9".into()),
                 Some(4242),
                 true,
@@ -11675,7 +12259,7 @@ mod tests {
         };
         let sentinel = PathBuf::from(path);
         let _lock =
-            PersistLock::acquire(&sentinel, &sentinel.with_file_name("unused.json")).unwrap();
+            PersistLock::acquire(&sentinel, || Ok(sentinel.with_file_name("unused.json"))).unwrap();
         std::fs::write(marker, b"ready").unwrap();
         // Bounded so a leaked child cannot outlive the test binary for long.
         for _ in 0..30 {
@@ -11864,7 +12448,7 @@ mod tests {
             &make_handle(
                 &rec_flag,
                 Some("sess-flag"),
-                Some(crate::harness::grok_cwd(&rec_flag)),
+                Some(crate::harness::grok_cwd(&rec_flag).expect("cwd")),
                 Some("127.0.0.1:9".into()),
                 Some(4242),
                 true,
@@ -11890,7 +12474,7 @@ mod tests {
         let live = make_handle(
             &rec_w10,
             Some("sess-w10"),
-            Some(crate::harness::grok_cwd(&rec_w10)),
+            Some(crate::harness::grok_cwd(&rec_w10).expect("cwd")),
             Some("127.0.0.1:9".into()),
             Some(4242),
             true,
@@ -13156,5 +13740,456 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }
+    }
+}
+
+#[cfg(test)]
+mod holder_command_tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn record(path: &std::path::Path) -> crate::registry::ProjectRecord {
+        crate::registry::ProjectRecord {
+            id: "holder-cwd".into(),
+            path: path.to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: Some(path.join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: true,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            review_comment_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn two_holders_keep_their_own_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        let stamp = PersistRef::new(attempt_identity(&rec, "grok"), SystemTime::UNIX_EPOCH);
+        let first = build_holder_command(&rec, None, None, "grok", &stamp, Some(3)).unwrap();
+        let second = build_holder_command(&rec, None, None, "grok", &stamp, Some(4)).unwrap();
+        let args = |cmd: &std::process::Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        let first_args = args(&first);
+        let second_args = args(&second);
+        assert!(first_args.windows(2).any(|pair| pair == ["--epoch", "3"]));
+        assert!(second_args.windows(2).any(|pair| pair == ["--epoch", "4"]));
+        assert!(
+            first
+                .get_current_dir()
+                .unwrap()
+                .ends_with(std::path::Path::new("worktrees").join("3"))
+        );
+        assert!(
+            second
+                .get_current_dir()
+                .unwrap()
+                .ends_with(std::path::Path::new("worktrees").join("4"))
+        );
+        let singular = build_holder_command(&rec, None, None, "grok", &stamp, None).unwrap();
+        assert!(!args(&singular).iter().any(|arg| arg == "--epoch"));
+        assert!(singular.get_current_dir().is_none());
+    }
+
+    #[test]
+    fn failed_sidecar_move_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        let state = rec.state_dir.clone().unwrap();
+        std::fs::create_dir_all(state.join("trusted-evidence")).unwrap();
+        std::fs::write(state.join("harness-progress.json"), b"{}").unwrap();
+        std::fs::write(state.join("trusted-evidence").join("3.json"), b"{}").unwrap();
+        std::fs::write(state.join("trusted-evidence").join("current.json"), b"{}").unwrap();
+        let err = move_singular_sidecars(&rec, 3).unwrap_err();
+        assert!(err.to_string().contains("refusing to replace"), "{err}");
+        assert!(state.join("harness-progress.json").is_file());
+        assert!(!state.join("harness-progress").join("3.json").exists());
+    }
+
+    #[test]
+    fn stop_refusal_leaves_the_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        let state_dir = rec.state_dir.clone().unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                let _ = std::io::Write::write_all(&mut writer, b"{\"ok\":true}\n");
+            }
+        });
+        let mut first = crate::state::RunState::idle(&rec.id);
+        first.run_epoch = 3;
+        first.status = crate::state::RunStatus::Running;
+        first.phase = "plan".into();
+        first.track_id = Some("A".into());
+        let mut second = crate::state::RunState::idle(&rec.id);
+        second.run_epoch = 4;
+        second.status = crate::state::RunStatus::Running;
+        second.phase = "implement".into();
+        second.track_id = Some("B".into());
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![first, second]),
+        )
+        .unwrap();
+        let session = state_dir.join("sessions").join("3");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("harness-grok.json"),
+            format!(
+                r#"{{"version":1,"project_id":"{}","adapter":"grok","supports_compact":true,"alive":true,"control_addr":"{addr}"}}"#,
+                rec.id
+            ),
+        )
+        .unwrap();
+        let view = crate::run::stop(&rec).unwrap();
+        assert!(
+            matches!(
+                crate::state::load_run_book(&rec).unwrap(),
+                crate::state::RunBook::Many(_)
+            ),
+            "book collapsed: {view:?}"
+        );
+    }
+
+    fn write_session(rec: &ProjectRecord, epoch: u64, addr: &str, cwd: Option<&std::path::Path>) {
+        let state_dir = rec.state_dir.clone().unwrap();
+        let session = state_dir.join("sessions").join(epoch.to_string());
+        std::fs::create_dir_all(&session).unwrap();
+        let body = serde_json::json!({
+            "version": 1,
+            "project_id": rec.id,
+            "adapter": "grok",
+            "supports_compact": true,
+            "alive": true,
+            "control_addr": addr,
+            "cwd": cwd,
+        });
+        std::fs::write(
+            session.join("harness-grok.json"),
+            serde_json::to_string(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn spawn_real_holder(
+        rec: ProjectRecord,
+        epoch: u64,
+        session_id: &str,
+        use_mutex: bool,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session_id = session_id.to_string();
+        let handle = std::thread::spawn(move || {
+            let _scope = if use_mutex {
+                crate::state::set_holder_epoch(epoch).expect("holder epoch");
+                None
+            } else {
+                Some(crate::state::RunScope::enter(epoch).expect("scope"))
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let cwd = crate::worktree::epoch_dir(&rec, epoch).expect("epoch dir");
+                std::fs::create_dir_all(&cwd).expect("epoch dir");
+                let session = crate::harness::grok::GrokSession::start_mock(
+                    cwd,
+                    crate::harness::grok::mock_handshake_ok(&session_id),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .expect("mock session");
+                let rec_hold = rec.clone();
+                let hold =
+                    tokio::spawn(
+                        async move { super::hold_loop_with_session(rec_hold, session).await },
+                    );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let addr = loop {
+                    if let Ok(Some(handle)) = super::load_persist_at(&rec, Some(epoch))
+                        && let Some(addr) = handle.control_addr.clone()
+                    {
+                        break addr;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        panic!("epoch {epoch} holder never published a control address");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                };
+                tx.send(addr).expect("addr");
+                hold.await.expect("holder join").expect("holder loop");
+            });
+            let _ = _scope;
+        });
+        (handle, rx)
+    }
+
+    fn holder_answers_ping(addr: &str) -> bool {
+        matches!(
+            super::holder_rpc_bounded(addr, &super::HoldRequest::Ping),
+            Ok(resp) if resp.ok
+        )
+    }
+
+    #[tokio::test]
+    async fn scoped_status_reads_the_epoch_persist_not_the_parent_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        std::fs::create_dir_all(rec.state_dir.as_ref().unwrap()).unwrap();
+        let mut first = crate::state::RunState::idle(&rec.id);
+        first.run_epoch = 2;
+        first.status = crate::state::RunStatus::Running;
+        let mut second = crate::state::RunState::idle(&rec.id);
+        second.run_epoch = 5;
+        second.status = crate::state::RunStatus::Running;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![first, second]),
+        )
+        .unwrap();
+        let epoch_cwd = dir.path().join("epoch-5");
+        std::fs::create_dir_all(&epoch_cwd).unwrap();
+        let session = rec.state_dir.as_ref().unwrap().join("sessions").join("5");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("harness-grok.json"),
+            serde_json::json!({
+                "version": 1,
+                "project_id": rec.id,
+                "adapter": "grok",
+                "alive": true,
+                "session_id": "epoch-5",
+                "cwd": epoch_cwd,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let pool_cwd = dir.path().join("pool-cwd");
+        std::fs::create_dir_all(&pool_cwd).unwrap();
+        let pooled = crate::harness::grok::GrokSession::start_mock(
+            pool_cwd,
+            crate::harness::grok::mock_handshake_ok("pool-sess"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        insert_test_session(rec.id.clone(), pooled).await;
+        assert!(
+            status_bundle_sync(&rec).is_none(),
+            "an unscoped book answered from the parent pool"
+        );
+        let scoped = {
+            let _scope = crate::state::RunScope::enter(5).unwrap();
+            status_bundle_sync(&rec)
+        };
+        global_pool().lock().await.remove(&rec.id);
+        let grok = scoped
+            .expect("scoped status missing")
+            .grok
+            .expect("no harness");
+        assert_eq!(grok.session_id.as_deref(), Some("epoch-5"));
+    }
+
+    #[test]
+    fn stop_all_collapses_to_singular_project_key() {
+        struct ReleaseHolder;
+        impl Drop for ReleaseHolder {
+            fn drop(&mut self) {
+                crate::state::release_holder_epoch();
+            }
+        }
+        let _release = ReleaseHolder;
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        std::fs::create_dir_all(rec.state_dir.as_ref().unwrap()).unwrap();
+        let mut first = crate::state::RunState::idle(&rec.id);
+        first.run_epoch = 3;
+        first.status = crate::state::RunStatus::Running;
+        let mut second = crate::state::RunState::idle(&rec.id);
+        second.run_epoch = 7;
+        second.status = crate::state::RunStatus::Paused;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![first, second]),
+        )
+        .unwrap();
+        let (thread_a, addr_a) = spawn_real_holder(rec.clone(), 3, "sess-3", true);
+        let (thread_b, addr_b) = spawn_real_holder(rec.clone(), 7, "sess-7", false);
+        let addr_a = addr_a
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .expect("epoch 3 address");
+        let addr_b = addr_b
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .expect("epoch 7 address");
+        assert!(holder_answers_ping(&addr_a), "epoch 3 did not answer Ping");
+        assert!(holder_answers_ping(&addr_b), "epoch 7 did not answer Ping");
+        crate::run::stop(&rec).unwrap();
+        let text = std::fs::read_to_string(rec.state_dir.as_ref().unwrap().join("run-state.json"))
+            .unwrap();
+        assert!(text.contains("project_id"), "{text}");
+        assert!(!text.contains("run-book-v1"), "{text}");
+        assert!(matches!(
+            crate::state::load_run_book(&rec).unwrap(),
+            crate::state::RunBook::One(_)
+        ));
+        let sessions = rec.state_dir.as_ref().unwrap().join("sessions");
+        assert!(!sessions.join("3").join("harness-grok.json").exists());
+        assert!(!sessions.join("7").join("harness-grok.json").exists());
+        assert!(!holder_answers_ping(&addr_a), "epoch 3 still answers Ping");
+        assert!(!holder_answers_ping(&addr_b), "epoch 7 still answers Ping");
+        thread_a.join().expect("epoch 3 thread");
+        thread_b.join().expect("epoch 7 thread");
+    }
+
+    #[test]
+    fn old_holder_refuses_second_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        let epoch_dir = crate::worktree::epoch_dir(&rec, 3).unwrap();
+        std::fs::create_dir_all(&epoch_dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_t = seen.clone();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                *seen_t.lock().unwrap() = line;
+                let _ = std::io::Write::write_all(&mut writer, b"{\"ok\":true}\n");
+            }
+        });
+        let state_dir = rec.state_dir.clone().unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let body = serde_json::json!({
+            "version": 1,
+            "project_id": rec.id,
+            "adapter": "grok",
+            "supports_compact": true,
+            "alive": true,
+            "control_addr": addr,
+            "cwd": epoch_dir,
+        });
+        std::fs::write(
+            state_dir.join("harness-grok.json"),
+            serde_json::to_string(&body).unwrap(),
+        )
+        .unwrap();
+        let err = second_run_adopt_addr(&rec, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("holder has no epoch protocol"),
+            "{err}"
+        );
+        let line = seen.lock().unwrap().clone();
+        assert!(line.contains("\"ping\""), "{line}");
+        assert!(!line.contains("adopt_epoch"), "{line}");
+    }
+
+    #[test]
+    fn release_epoch_failure_leaves_the_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                let _ = std::io::Write::write_all(&mut writer, b"{\"ok\":false}\n");
+            }
+        });
+        let mut finished = crate::state::RunState::idle(&rec.id);
+        finished.run_epoch = 3;
+        finished.status = crate::state::RunStatus::Stopped;
+        let mut kept = crate::state::RunState::idle(&rec.id);
+        kept.run_epoch = 4;
+        kept.status = crate::state::RunStatus::Running;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![finished, kept]),
+        )
+        .unwrap();
+        write_session(&rec, 4, &addr, None);
+        assert!(!crate::state::release_remaining_holder(&rec, 3));
+        match crate::state::load_run_book(&rec).unwrap() {
+            crate::state::RunBook::Many(envelope) => {
+                let epochs: Vec<u64> = envelope.runs.iter().map(|e| e.run_epoch).collect();
+                assert_eq!(epochs, vec![3, 4]);
+            }
+            crate::state::RunBook::One(_) => panic!("failed ReleaseEpoch collapsed the book"),
+        }
+    }
+
+    #[test]
+    fn stop_idle_holder_leaves_the_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                let _ = std::io::Write::write_all(&mut writer, b"{\"ok\":true}\n");
+            }
+        });
+        let mut idle = crate::state::RunState::idle(&rec.id);
+        idle.run_epoch = 3;
+        idle.status = crate::state::RunStatus::Idle;
+        let mut stopped = crate::state::RunState::idle(&rec.id);
+        stopped.run_epoch = 4;
+        stopped.status = crate::state::RunStatus::Stopped;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![idle, stopped]),
+        )
+        .unwrap();
+        write_session(&rec, 3, &addr, None);
+        crate::run::stop(&rec).unwrap();
+        assert!(
+            matches!(
+                crate::state::load_run_book(&rec).unwrap(),
+                crate::state::RunBook::Many(_)
+            ),
+            "a live idle holder was collapsed"
+        );
     }
 }

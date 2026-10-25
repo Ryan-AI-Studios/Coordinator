@@ -22,6 +22,9 @@ use super::{WorkflowDriver, mark_driven_with_target};
 ///
 /// `cross-model-review` and `ci-wait` still tick while **Paused** (finish current phase).
 pub fn tick(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> {
+    if let Some(waiting) = shared_tree_wait(record)? {
+        return Ok(Some(waiting));
+    }
     let state = load_run_state(record)?;
     let tick_while_paused = state.status == RunStatus::Paused
         && (state.phase == super::graph::PHASE_CROSS_MODEL
@@ -54,6 +57,82 @@ pub fn tick(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> 
         WorkflowDriver::FileWait => Ok(None),
         WorkflowDriver::Adapter => drive_adapter(record, &state),
     }
+}
+
+fn shared_tree_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        super::graph::PHASE_PLAN
+            | super::graph::PHASE_FOLD
+            | super::graph::PHASE_ADVANCE
+            | PHASE_PLAN_REVIEW
+    )
+}
+
+/// First check in [`tick`]. The lowest epoch is only the empty-holder tie-break.
+fn shared_tree_wait(record: &ProjectRecord) -> Result<Option<crate::state::StatusView>> {
+    let crate::state::RunBook::Many(envelope) = crate::state::load_run_book(record)? else {
+        return Ok(None);
+    };
+    let Some(epoch) = crate::state::active_run_epoch() else {
+        return Ok(None);
+    };
+    let Some(entry) = envelope.runs.iter().find(|entry| entry.run_epoch == epoch) else {
+        return Ok(None);
+    };
+    let in_set = shared_tree_phase(&entry.phase);
+    let holder = envelope.shared_tree_holder;
+    if !in_set {
+        if holder == Some(epoch) {
+            let _ = with_run_state_lock(record, || {
+                crate::state::set_shared_tree_holder(record, None)
+            });
+        }
+        return Ok(None);
+    }
+    if holder == Some(epoch) {
+        return Ok(None);
+    }
+    if let Some(held) = holder
+        && envelope.runs.iter().any(|other| {
+            other.run_epoch == held
+                && other.run_epoch != epoch
+                && shared_tree_phase(&other.phase)
+                && matches!(other.status, RunStatus::Running | RunStatus::Paused)
+        })
+    {
+        return wait_for_holder(record, held);
+    }
+    let lowest = envelope
+        .runs
+        .iter()
+        .filter(|other| {
+            shared_tree_phase(&other.phase)
+                && matches!(other.status, RunStatus::Running | RunStatus::Paused)
+        })
+        .map(|other| other.run_epoch)
+        .min();
+    if let Some(lowest) = lowest {
+        if holder != Some(lowest) {
+            let _ = with_run_state_lock(record, || {
+                crate::state::set_shared_tree_holder(record, Some(lowest))
+            });
+        }
+        if lowest != epoch {
+            return wait_for_holder(record, lowest);
+        }
+    }
+    Ok(None)
+}
+
+fn wait_for_holder(record: &ProjectRecord, held: u64) -> Result<Option<crate::state::StatusView>> {
+    with_run_state_lock(record, || {
+        let mut state = load_run_state(record)?;
+        state.last_event = format!("wait: shared tree held by epoch {held}");
+        state.updated_at = chrono::Utc::now();
+        save_run_state(record, &state)?;
+        Ok(Some(crate::state::StatusView::from_record(record, &state)))
+    })
 }
 
 /// Stub phases write one product file into the active epoch worktree.
@@ -493,11 +572,19 @@ fn drive_adapter(
     let model = binding.model.clone();
     let harness = binding.harness.clone();
     let prepared_for_finish = prepared.clone();
+    let run_epoch = state.run_epoch;
+    let hold_epoch = match crate::state::load_run_book(record) {
+        Ok(crate::state::RunBook::Many(_)) => Some(run_epoch),
+        _ => None,
+    };
     // First tick starts the holder Prompt without blocking poll_once. Later ticks
     // are no-ops (`mark_driven`). The holder / pool apply path writes the outcome.
     std::thread::Builder::new()
         .name(format!("adapter-inject-{}", rec.id))
         .spawn(move || {
+            let _scope = crate::state::RunScope::enter(run_epoch).ok();
+            #[cfg(test)]
+            let _home = crate::harness::pool::pin_inject_home();
             let result = block_on_async(async {
                 if recycle_mismatch
                     && let Err(e) = crate::harness::pool::recycle_without_pool_lock(&rec).await
@@ -511,6 +598,7 @@ fn drive_adapter(
                     model,
                     false,
                     &harness,
+                    hold_epoch,
                 )
                 .await?;
                 match prepared {
@@ -2176,7 +2264,7 @@ mod tests {
         let r = rec(dir.path());
         run_with_driver(&r, Some("0019".into()), WorkflowDriver::Adapter).unwrap();
         let session = crate::harness::GrokSession::start_mock(
-            crate::harness::grok_cwd(&r),
+            crate::harness::grok_cwd(&r).expect("cwd"),
             mock_handshake_ok("sess-live-nongrok"),
             std::time::Duration::from_secs(2),
         )
@@ -2188,9 +2276,20 @@ mod tests {
             let s = pool.get_mut(&r.id).unwrap();
             s.mock_written().unwrap().len()
         };
+        // Re-assert the binding after the mock start. A parallel inject proof
+        // can leave this process on the default grok planner, and CI has no
+        // `grok` on PATH.
+        home.write_bindings(|b| {
+            b.get_mut(ROLE_PLANNER).unwrap().harness = "opencode".into();
+            b.get_mut(ROLE_PLANNER).unwrap().command = "opencode".into();
+        });
         let view = tick(&r).unwrap().expect("permission");
         assert_eq!(view.failure_class, Some(FailureClass::Permission));
-        assert!(view.last_event.contains("no long-lived adapter"));
+        assert!(
+            view.last_event.contains("no long-lived adapter"),
+            "last_event={}",
+            view.last_event
+        );
         let written_after = {
             let mut pool = crate::harness::global_pool().lock().await;
             let s = pool.get_mut(&r.id).unwrap();
@@ -2262,7 +2361,7 @@ mod tests {
         write_plan_skill(dir.path());
         run_with_driver(&r, Some("0038".into()), WorkflowDriver::Adapter).unwrap();
         let session = crate::harness::GrokSession::start_mock(
-            crate::harness::grok_cwd(&r),
+            crate::harness::grok_cwd(&r).expect("cwd"),
             mock_handshake_ok("sess-live-grok-mismatch"),
             std::time::Duration::from_secs(2),
         )
@@ -3479,5 +3578,565 @@ mod tests {
             load_run_state(&record).unwrap().pending_roles.is_empty(),
             "retry clears pending_roles"
         );
+    }
+
+    #[test]
+    fn shared_tree_wait_runs_first() {
+        let dir = tempdir().unwrap();
+        let record = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: true,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            review_comment_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+        std::fs::create_dir_all(record.state_dir.as_ref().unwrap()).unwrap();
+        let mut holder = crate::state::RunState::idle(&record.id);
+        holder.run_epoch = 2;
+        holder.status = RunStatus::Running;
+        holder.phase = PHASE_PLAN.into();
+        holder.driver = WorkflowDriver::Stub;
+        let mut other = holder.clone();
+        other.run_epoch = 5;
+        other.track_id = Some("B".into());
+        crate::state::write_run_book(
+            &record,
+            &crate::state::RunEnvelope::new(0, vec![holder, other]),
+        )
+        .unwrap();
+        let review = {
+            let _holder = crate::state::RunScope::enter(2).unwrap();
+            write_review_markdown(&record, "agy", Some("Verdict: pass\n\nreal report\n")).unwrap()
+        };
+        let review_bytes = std::fs::read(&review).unwrap();
+        assert!(
+            review.ends_with(
+                std::path::Path::new("reviews")
+                    .join("2")
+                    .join("agy-review.md")
+            ),
+            "{}",
+            review.display()
+        );
+        let _scope = crate::state::RunScope::enter(5).unwrap();
+        let view = tick(&record).unwrap().expect("sibling waits");
+        assert!(
+            view.last_event
+                .contains("wait: shared tree held by epoch 2"),
+            "{}",
+            view.last_event
+        );
+        assert_eq!(std::fs::read(&review).unwrap(), review_bytes);
+        let saved = {
+            let _b = crate::state::RunScope::enter(5).unwrap();
+            crate::state::load_run_state(&record).unwrap()
+        };
+        assert_eq!(saved.phase, PHASE_PLAN);
+    }
+
+    #[test]
+    fn shared_tree_both_finish() {
+        // Default primary is codex. Pin a private home so a parallel test cannot
+        // point COORDINATOR_HOME at a config whose first tier is a different slug.
+        let _home = IsolatedHome::enter();
+        let ws = tempdir().unwrap();
+        let repo = init_exec_repo();
+        let ignore = repo.path().join(".gitignore");
+        let mut text = std::fs::read_to_string(&ignore).unwrap();
+        text.push_str("epoch-write.txt\n");
+        std::fs::write(&ignore, text).unwrap();
+        git_ok(repo.path(), &["add", ".gitignore"]);
+        git_ok(repo.path(), &["commit", "-m", "ignore stub epoch write"]);
+        let record = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: ws.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: Some(repo.path().to_path_buf()),
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: Some(ws.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: true,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            review_comment_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+        std::fs::create_dir_all(record.state_dir.as_ref().unwrap()).unwrap();
+        write_registry(
+            ws.path(),
+            &format!(
+                "{}{}",
+                linked_row("0081", READY_CELL),
+                linked_row("0082", READY_CELL)
+            ),
+        );
+        for id in ["0081", "0082"] {
+            let track = ws.path().join("conductor").join(format!("{id}-T"));
+            std::fs::create_dir_all(&track).unwrap();
+            std::fs::write(track.join("spec.md"), b"fixture spec\n").unwrap();
+            std::fs::write(track.join("plan.md"), b"fixture plan\n").unwrap();
+        }
+        let entry = |epoch: u64, track: &str, phase: &str| {
+            let mut state = crate::state::RunState::idle(&record.id);
+            state.run_epoch = epoch;
+            state.status = RunStatus::Running;
+            state.phase = phase.into();
+            state.driver = WorkflowDriver::Stub;
+            state.workflow = Some(WORKFLOW_ID.into());
+            state.track_id = Some(track.into());
+            state
+        };
+        let phase_of = |record: &ProjectRecord, epoch: u64| {
+            let _scope = crate::state::RunScope::enter(epoch).unwrap();
+            let state = crate::state::load_run_state(record).unwrap();
+            (state.phase, state.status, state.last_event)
+        };
+        let tick_epoch = |record: &ProjectRecord, epoch: u64| {
+            let _scope = crate::state::RunScope::enter(epoch).unwrap();
+            crate::watch::poll_once(record).unwrap()
+        };
+        crate::state::write_run_book(
+            &record,
+            &crate::state::RunEnvelope::new(
+                0,
+                vec![
+                    entry(2, "0081", PHASE_PLAN_REVIEW),
+                    entry(5, "0082", PHASE_PLAN_REVIEW),
+                ],
+            ),
+        )
+        .unwrap();
+        {
+            let _scope = crate::state::RunScope::enter(2).unwrap();
+            crate::worktree::prepare_epoch_in(&record, 2, true).unwrap();
+        }
+        {
+            let _scope = crate::state::RunScope::enter(5).unwrap();
+            crate::worktree::prepare_epoch_in(&record, 5, true).unwrap();
+        }
+        let _drove = tick_epoch(&record, 2);
+        assert_eq!(
+            phase_of(&record, 5).0,
+            PHASE_PLAN_REVIEW,
+            "B injected during the holder's poll"
+        );
+        let waiting = tick_epoch(&record, 5);
+        assert!(
+            waiting
+                .as_ref()
+                .unwrap()
+                .last_event
+                .contains("wait: shared tree held by epoch 2"),
+            "plan-review: {waiting:?}"
+        );
+        assert_eq!(phase_of(&record, 5).0, PHASE_PLAN_REVIEW);
+        let (holder_phase, _, holder_event) = phase_of(&record, 2);
+        assert_eq!(
+            holder_phase,
+            crate::workflow::graph::PHASE_FOLD,
+            "plan-review holder did not finish: {holder_event}"
+        );
+        assert!(
+            record
+                .state_dir
+                .as_ref()
+                .unwrap()
+                .join("reviews")
+                .join("2")
+                .join("agy-review.md")
+                .is_file(),
+            "plan-review holder did not write a report"
+        );
+        assert_eq!(
+            phase_of(&record, 5).0,
+            PHASE_PLAN_REVIEW,
+            "B injected plan-review on A's tick"
+        );
+        let waiting = tick_epoch(&record, 5);
+        assert!(
+            waiting
+                .as_ref()
+                .unwrap()
+                .last_event
+                .contains("wait: shared tree held by epoch 2"),
+            "fold: B ran while A still holds, {waiting:?}"
+        );
+        let _drove = tick_epoch(&record, 2);
+        let (holder_phase, _, holder_event) = phase_of(&record, 2);
+        assert_eq!(
+            holder_phase,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            "fold holder did not finish: {holder_event}"
+        );
+        assert_eq!(phase_of(&record, 5).0, PHASE_PLAN_REVIEW);
+        let _drove = tick_epoch(&record, 5);
+        assert_eq!(
+            phase_of(&record, 5).0,
+            crate::workflow::graph::PHASE_FOLD,
+            "B did not finish plan-review after A left the set: {}",
+            phase_of(&record, 5).2
+        );
+        assert_eq!(
+            phase_of(&record, 2).0,
+            crate::workflow::graph::PHASE_IMPLEMENT
+        );
+        let _drove = tick_epoch(&record, 5);
+        assert_eq!(
+            phase_of(&record, 5).0,
+            crate::workflow::graph::PHASE_IMPLEMENT,
+            "B did not finish fold: {}",
+            phase_of(&record, 5).2
+        );
+        assert_eq!(
+            phase_of(&record, 2).0,
+            crate::workflow::graph::PHASE_IMPLEMENT
+        );
+
+        let backend = crate::review::backend::ScriptedBackend::new().push_ok(
+            crate::review::backend::ReviewResult {
+                exit: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                last_message: "## Verdict: PASS\n\n## Findings\n\nnone\n".into(),
+            },
+        );
+        let _hook = crate::review::install_test_backend(std::sync::Arc::new(backend));
+        let mut saw_advance = [false, false];
+        let mut saw_report = [false, false];
+        for _ in 0..24 {
+            let a = phase_of(&record, 2);
+            let b = phase_of(&record, 5);
+            if a.1 == RunStatus::Idle && b.1 == RunStatus::Idle {
+                break;
+            }
+            let a_live = matches!(a.1, RunStatus::Running | RunStatus::Paused);
+            let b_live = matches!(b.1, RunStatus::Running | RunStatus::Paused);
+            let epoch = if a_live {
+                2
+            } else if b_live {
+                5
+            } else {
+                panic!("neither entry can tick: {a:?} {b:?}");
+            };
+            let phase = if epoch == 2 { a.0.clone() } else { b.0.clone() };
+            if phase == crate::workflow::graph::PHASE_CROSS_MODEL {
+                let track = if epoch == 2 { "0081" } else { "0082" };
+                {
+                    let _scope = crate::state::RunScope::enter(epoch).unwrap();
+                    let mut state = crate::state::load_run_state(&record).unwrap();
+                    state.driver = WorkflowDriver::Adapter;
+                    state.delivery_target =
+                        Some(crate::workflow::execution_repo::seeded_delivery_target(
+                            &record,
+                            track,
+                            epoch,
+                            crate::workflow::graph::PHASE_CROSS_MODEL,
+                            repo.path(),
+                        ));
+                    crate::state::save_run_state(&record, &state).unwrap();
+                }
+                let _view = tick_epoch(&record, epoch);
+                let report = record
+                    .state_dir
+                    .as_ref()
+                    .unwrap()
+                    .join("reviews")
+                    .join(epoch.to_string())
+                    .join("cross-model-codex.md");
+                let body = std::fs::read_to_string(&report).unwrap_or_default();
+                assert!(
+                    body.contains("Verdict: PASS"),
+                    "epoch {epoch} cross-model report via review::drive: {body} after {:?}",
+                    phase_of(&record, epoch)
+                );
+                saw_report[if epoch == 2 { 0 } else { 1 }] = true;
+                {
+                    let _scope = crate::state::RunScope::enter(epoch).unwrap();
+                    let mut state = crate::state::load_run_state(&record).unwrap();
+                    state.driver = WorkflowDriver::Stub;
+                    crate::state::save_run_state(&record, &state).unwrap();
+                }
+            } else {
+                let _view = tick_epoch(&record, epoch);
+            }
+            let after = phase_of(&record, epoch);
+            assert!(
+                after.1 != RunStatus::Stopped,
+                "epoch {epoch} stopped in {phase}: {}",
+                after.2
+            );
+            if after.0 == crate::workflow::graph::PHASE_ADVANCE || after.1 == RunStatus::Idle {
+                let slot = if epoch == 2 { 0 } else { 1 };
+                if after.0 == crate::workflow::graph::PHASE_ADVANCE
+                    || phase == crate::workflow::graph::PHASE_ADVANCE
+                {
+                    saw_advance[slot] = true;
+                }
+            }
+        }
+        assert_eq!(
+            phase_of(&record, 2).1,
+            RunStatus::Idle,
+            "A did not finish the book: {:?}",
+            phase_of(&record, 2)
+        );
+        assert_eq!(
+            phase_of(&record, 5).1,
+            RunStatus::Idle,
+            "B did not finish the book: {:?}",
+            phase_of(&record, 5)
+        );
+        assert!(saw_advance[0] && saw_advance[1], "{saw_advance:?}");
+        assert!(saw_report[0] && saw_report[1], "{saw_report:?}");
+    }
+
+    #[test]
+    fn inject_thread_prompts_its_own_epoch() {
+        let home = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        struct ClearCapture {
+            prev_home: Option<std::ffi::OsString>,
+            prev_bin: Option<std::ffi::OsString>,
+        }
+        impl Drop for ClearCapture {
+            fn drop(&mut self) {
+                let _guard = test_env_lock();
+                crate::harness::pool::INJECT_RESOLVE_CAPTURE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                *crate::harness::pool::INJECT_HOME
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                unsafe {
+                    match self.prev_home.take() {
+                        Some(value) => {
+                            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, value);
+                        }
+                        None => std::env::remove_var(crate::config::ENV_COORDINATOR_HOME),
+                    }
+                    match self.prev_bin.take() {
+                        Some(value) => std::env::set_var(crate::harness::grok::ENV_GROK_BIN, value),
+                        None => std::env::remove_var(crate::harness::grok::ENV_GROK_BIN),
+                    }
+                }
+            }
+        }
+        let _capture = ClearCapture {
+            prev_home: std::env::var_os(crate::config::ENV_COORDINATOR_HOME),
+            prev_bin: std::env::var_os(crate::harness::grok::ENV_GROK_BIN),
+        };
+        let _guard = test_env_lock();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        let bin = dir.path().join("grok.exe");
+        std::fs::write(&bin, b"bin").unwrap();
+        unsafe {
+            std::env::set_var(crate::harness::grok::ENV_GROK_BIN, &bin);
+        }
+        let mut record = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: true,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            review_comment_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+        // `project add` stores the canonical path. `find_by_path` then compares
+        // that stored path to the canonical selector. An 8.3 temp path (GitHub
+        // Actions `RUNNER~1`) does not match its long form.
+        record.path = crate::registry::canonicalize_path(&record.path).unwrap();
+        let mut reg = Registry::default();
+        reg.projects.push(record.clone());
+        reg.save(&registry_path().unwrap()).unwrap();
+        std::fs::create_dir_all(record.state_dir.as_ref().unwrap()).unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("plan")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"plan\n").unwrap();
+        let epoch_dir = |epoch: u64| {
+            let path = crate::worktree::epoch_dir(&record, epoch).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        let cwd_a = epoch_dir(3);
+        let cwd_b = epoch_dir(5);
+        let serve = |cwd: &std::path::Path, session: &str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let ops_t = ops.clone();
+            let cwd = cwd.to_path_buf();
+            let session = session.to_string();
+            let bin = bin.clone();
+            std::thread::spawn(move || {
+                for _ in 0..6 {
+                    let Ok((stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = std::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                    let op = serde_json::from_str::<serde_json::Value>(line.trim())
+                        .ok()
+                        .and_then(|v| v.get("op").and_then(|op| op.as_str()).map(str::to_string))
+                        .unwrap_or_default();
+                    ops_t.lock().unwrap().push(op.clone());
+                    let body = if op == "ping" {
+                        serde_json::json!({
+                            "ok": true,
+                            "harness": {
+                                "alive": true,
+                                "session_id": session,
+                                "cwd": cwd,
+                                "adapter": "grok",
+                                "supports_compact": true,
+                                "bin": bin,
+                            }
+                        })
+                    } else {
+                        serde_json::json!({"ok": true})
+                    };
+                    let _ = std::io::Write::write_all(
+                        &mut writer,
+                        format!("{}\n", serde_json::to_string(&body).unwrap()).as_bytes(),
+                    );
+                    if op == "prompt" {
+                        break;
+                    }
+                }
+            });
+            (addr, ops)
+        };
+        let (addr_a, ops_a) = serve(&cwd_a, "sess-a");
+        let (addr_b, ops_b) = serve(&cwd_b, "sess-b");
+        let persist = |epoch: u64, addr: &str, cwd: &std::path::Path, session: &str| {
+            let path = record
+                .state_dir
+                .as_ref()
+                .unwrap()
+                .join("sessions")
+                .join(epoch.to_string())
+                .join("harness-grok.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                serde_json::json!({
+                    "version": 1,
+                    "project_id": record.id,
+                    "adapter": "grok",
+                    "supports_compact": true,
+                    "alive": true,
+                    "control_addr": addr,
+                    "cwd": cwd,
+                    "session_id": session,
+                    "bin": bin,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        persist(3, &addr_a, &cwd_a, "sess-a");
+        persist(5, &addr_b, &cwd_b, "sess-b");
+        let mut holder = crate::state::RunState::idle(&record.id);
+        holder.run_epoch = 3;
+        holder.status = RunStatus::Running;
+        holder.phase = PHASE_PLAN.into();
+        holder.driver = WorkflowDriver::Adapter;
+        holder.workflow = Some(WORKFLOW_ID.into());
+        let mut injected = holder.clone();
+        injected.run_epoch = 5;
+        injected.track_id = Some("B".into());
+        let mut envelope = crate::state::RunEnvelope::new(0, vec![holder, injected]);
+        envelope.shared_tree_holder = Some(5);
+        crate::state::write_run_book(&record, &envelope).unwrap();
+        record.worktree_isolation = true;
+        *crate::harness::pool::INJECT_HOME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(home.path().to_path_buf());
+        crate::harness::pool::INJECT_RESOLVE_CAPTURE
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        {
+            let _scope = crate::state::RunScope::enter(5).unwrap();
+            tick(&record).unwrap();
+        }
+        drop(_guard);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !ops_b.lock().unwrap().iter().any(|op| op == "prompt")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let failure = std::fs::read_to_string(dir.path().join("state").join("FAILURE.md"))
+            .unwrap_or_default();
+        assert!(
+            ops_b.lock().unwrap().iter().any(|op| op == "prompt"),
+            "B's inject did not prompt B: {:?} {failure}",
+            ops_b.lock().unwrap()
+        );
+        assert!(
+            !ops_a.lock().unwrap().iter().any(|op| op == "prompt"),
+            "B's inject prompted A: {:?}",
+            ops_a.lock().unwrap()
+        );
+        let driven = {
+            let _scope = crate::state::RunScope::enter(5).unwrap();
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .last_driven_phase
+        };
+        assert_eq!(driven.as_deref(), Some(PHASE_PLAN));
+        let other = {
+            let _scope = crate::state::RunScope::enter(3).unwrap();
+            crate::state::load_run_state(&record)
+                .unwrap()
+                .last_driven_phase
+        };
+        assert!(other.is_none(), "A was driven: {other:?}");
+        unsafe {
+            std::env::remove_var(crate::config::ENV_COORDINATOR_HOME);
+            std::env::remove_var(crate::harness::grok::ENV_GROK_BIN);
+        }
     }
 }

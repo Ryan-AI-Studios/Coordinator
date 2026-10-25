@@ -125,18 +125,18 @@ pub fn should_refuse_reuse(record: &ProjectRecord) -> bool {
 }
 
 /// Fire-and-forget abort. Never returns `Err` to `poll_once`.
-pub fn abort_stuck_prompt(record: &ProjectRecord, reason: AbortReason) {
+pub fn abort_stuck_prompt(record: &ProjectRecord, reason: AbortReason, run_epoch: u64) {
     let rec = record.clone();
     let _ = std::thread::Builder::new()
         .name(format!("abort-stuck-{}", rec.id))
         .spawn(move || {
-            abort_stuck_prompt_sync(&rec, reason);
+            abort_stuck_prompt_sync(&rec, reason, run_epoch);
         });
 }
 
 /// Block until cancel-wait + recycle finish. Used on ACP prompt-timeout
 /// so persist is dead before `apply_turn` / the next `start`.
-pub fn abort_stuck_prompt_sync(record: &ProjectRecord, reason: AbortReason) {
+pub fn abort_stuck_prompt_sync(record: &ProjectRecord, reason: AbortReason, run_epoch: u64) {
     let rec = record.clone();
     let join = std::thread::Builder::new()
         .name("abort-sync".into())
@@ -147,7 +147,7 @@ pub fn abort_stuck_prompt_sync(record: &ProjectRecord, reason: AbortReason) {
                 .map_err(|e| {
                     CoordinatorError::Message(format!("failed to start abort runtime: {e}"))
                 })
-                .and_then(|rt| rt.block_on(abort_stuck_prompt_async(&rec, reason)))
+                .and_then(|rt| rt.block_on(abort_stuck_prompt_async(&rec, reason, run_epoch)))
         });
     match join {
         Ok(handle) => match handle.join() {
@@ -176,12 +176,25 @@ fn tracing_or_eprint(record: &ProjectRecord, err: &CoordinatorError) {
     eprintln!("coordinator abort/recycle: {err}");
 }
 
-async fn abort_stuck_prompt_async(record: &ProjectRecord, reason: AbortReason) -> Result<()> {
+async fn abort_stuck_prompt_async(
+    record: &ProjectRecord,
+    reason: AbortReason,
+    run_epoch: u64,
+) -> Result<()> {
+    let scoped = matches!(
+        crate::state::load_run_book(record),
+        Ok(crate::state::RunBook::Many(_))
+    );
+    let _scope = if scoped {
+        crate::state::RunScope::enter(run_epoch).ok()
+    } else {
+        None
+    };
     note_aborted_session(record);
     if let Some(handle) = cancel_handle_for(&record.id) {
         let _ = handle.cancel().await;
     } else {
-        let _ = crate::harness::pool::holder_cancel(record).await;
+        let _ = crate::harness::pool::holder_cancel(record, Some(run_epoch)).await;
     }
 
     // PromptTimeout already returned from inject_prompt — do not wait on ourselves.
@@ -246,7 +259,8 @@ pub fn maybe_stamp_and_abort_stall(record: &ProjectRecord) -> Option<StatusView>
         if crate::workflow::watchdog::sidecar_tool_in_flight(record) {
             return revert_recycle_stamp(record);
         }
-        abort_stuck_prompt(record, AbortReason::Stall);
+        let epoch = stamped.as_ref().map(|view| view.run_epoch).unwrap_or(0);
+        abort_stuck_prompt(record, AbortReason::Stall, epoch);
     }
     stamped
 }
