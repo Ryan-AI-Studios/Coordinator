@@ -467,7 +467,7 @@ fn begin_fresh_run(
 ) -> Result<StatusView> {
     let closed_epoch = state.run_epoch;
     let next_epoch = crate::state::allocate_next_epoch(record, state)?;
-    crate::checkpoint::reap_abandoned(record, next_epoch)?;
+    crate::checkpoint::reap_abandoned(record, state, next_epoch)?;
     crate::worktree::prepare_epoch(record, next_epoch)?;
     let leftover =
         state.failure_class.is_some() || crate::notify::artifact::existing_path(record).is_some();

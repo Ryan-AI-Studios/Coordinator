@@ -660,7 +660,7 @@ fn finish_advance(record: &ProjectRecord, state: &mut RunState) -> Option<reuse:
     if state.failure_class == Some(FailureClass::Blocked) {
         return None;
     }
-    let _ = crate::checkpoint::reap_completed(record);
+    let _ = crate::checkpoint::reap_completed(record, state);
     if let Some(id) = state
         .track_id
         .as_deref()
@@ -768,7 +768,7 @@ fn apply_backlog_clear(record: &ProjectRecord, state: &mut RunState) {
     if state.failure_class == Some(FailureClass::Blocked) {
         return;
     }
-    let _ = crate::checkpoint::reap_completed(record);
+    let _ = crate::checkpoint::reap_completed(record, state);
     state.status = RunStatus::Idle;
     state.next_track = None;
     state.last_event = LAST_EVENT_BACKLOG_CLEAR.into();
