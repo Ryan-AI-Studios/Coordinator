@@ -3948,6 +3948,10 @@ mod tests {
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         };
+        // `project add` stores the canonical path. `find_by_path` then compares
+        // that stored path to the canonical selector. An 8.3 temp path (GitHub
+        // Actions `RUNNER~1`) does not match its long form.
+        record.path = crate::registry::canonicalize_path(&record.path).unwrap();
         let mut reg = Registry::default();
         reg.projects.push(record.clone());
         reg.save(&registry_path().unwrap()).unwrap();
