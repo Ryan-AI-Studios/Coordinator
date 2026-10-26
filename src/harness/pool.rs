@@ -3980,6 +3980,7 @@ async fn handle_prepared_prompt(
             return Ok(prepared_skip_response(shared, &reason));
         }
         session.install_turn_root(&target.prompt_path);
+        session.store_turn_phase(&target.phase, Some(target.track_id.as_str()));
         if let Ok(mut snap) = shared.snapshot.lock() {
             *snap = session_status(&session);
         }
@@ -4201,6 +4202,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                         let mut session = shared.session.lock().await;
                         // Legacy/manual prompts never inherit a prepared turn's ACP roots.
                         session.clear_turn_roots();
+                        session.store_turn_phase(&injected_phase, state.track_id.as_deref());
                         if let Ok(mut snap) = shared.snapshot.lock() {
                             *snap = session_status(&session);
                         }
@@ -4221,6 +4223,7 @@ async fn handle_hold_conn(stream: TcpStream, shared: std::sync::Arc<HolderShared
                         let turn = session
                             .inject_prompt(&text, prompt_timeout_for(record))
                             .await;
+                        session.clear_turn_roots();
                         (turn, block_identity)
                     };
                     let normal = matches!(&turn, Ok(pr) if !crate::harness::abort::stop_reason_is_cancelled(pr.stop_reason.as_deref()));
@@ -4528,8 +4531,10 @@ async fn prompt_impl(
         }
         if let Some(target) = &target {
             session.install_turn_root(&target.prompt_path);
+            session.store_turn_phase(&target.phase, Some(target.track_id.as_str()));
         } else {
             session.clear_turn_roots();
+            session.store_turn_phase(&injected_phase, state.track_id.as_deref());
         }
         crate::workflow::watchdog::note_progress(
             &rec,

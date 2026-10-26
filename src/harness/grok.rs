@@ -225,6 +225,12 @@ pub struct GrokSession {
     /// Per-turn ACP target roots (prepared implement/address-findings turns only).
     /// Cleared on every turn exit, cancel/recycle and before manual prompts.
     turn_roots: Vec<PathBuf>,
+    /// Phase captured for this turn. Each filesystem RPC recomputes roots from it.
+    /// Cleared with [`Self::clear_turn_roots`].
+    turn_phase: Option<String>,
+    /// Track id captured with the phase. Read roots resolve one track directory
+    /// from it and do not load run state.
+    turn_track_id: Option<String>,
     /// Test-only teardown counter: proves the owned session was torn down.
     #[cfg(test)]
     shutdown_calls: Arc<std::sync::atomic::AtomicU32>,
@@ -417,6 +423,8 @@ impl GrokSession {
             last_signal: None,
             last_tool_title: None,
             turn_roots: Vec::new(),
+            turn_phase: None,
+            turn_track_id: None,
             #[cfg(test)]
             shutdown_calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
@@ -494,6 +502,8 @@ impl GrokSession {
             last_signal: None,
             last_tool_title: None,
             turn_roots: Vec::new(),
+            turn_phase: None,
+            turn_track_id: None,
             #[cfg(test)]
             shutdown_calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
@@ -503,15 +513,27 @@ impl GrokSession {
     }
 
     /// Authorize one prepared target root for the next turn only.
+    ///
+    /// This does not capture the phase. Callers that install a root also store
+    /// `ResolvedExecution.phase`. Plan, fold, and advance never call this.
     pub fn install_turn_root(&mut self, root: &Path) {
         if !self.turn_roots.iter().any(|p| p == root) {
             self.turn_roots.push(root.to_path_buf());
         }
     }
 
-    /// Remove every per-turn root (success, error, cancel, recycle, manual prompt).
+    /// Store the phase for this turn. Filesystem RPCs recompute roots from it.
+    pub fn store_turn_phase(&mut self, phase: &str, track_id: Option<&str>) {
+        self.turn_phase = Some(phase.to_string());
+        self.turn_track_id = track_id.map(str::to_string);
+    }
+
+    /// Remove every per-turn root and the stored phase (success, error, cancel,
+    /// recycle, manual prompt, and when `inject_prompt` returns).
     pub fn clear_turn_roots(&mut self) {
         self.turn_roots.clear();
+        self.turn_phase = None;
+        self.turn_track_id = None;
     }
 
     pub fn turn_roots(&self) -> &[PathBuf] {
@@ -723,7 +745,10 @@ impl GrokSession {
                 ));
             }
         };
-        self.inject_prompt(&cmd, timeout).await
+        self.turn_phase = Some(crate::workflow::graph::PHASE_COMPACT.to_string());
+        let result = self.inject_prompt(&cmd, timeout).await;
+        self.clear_turn_roots();
+        result
     }
 
     /// Kill the ACP child (explicit teardown). Mock transport is a no-op drop.
@@ -931,11 +956,12 @@ impl GrokSession {
             return Ok(true);
         };
         self.note_session_progress();
-        let roots = self.fs_allowed_roots();
         let deny = |path: &Path| self.blocks_shared_checkout(path);
         let reply = if read {
+            let roots = self.fs_read_roots();
             fs_read_reply(req_id, v.get("params"), &roots, &deny)
         } else {
+            let roots = self.fs_write_roots();
             fs_write_reply(req_id, v.get("params"), &roots, &deny)
         };
         self.write_line(&reply).await?;
@@ -961,7 +987,7 @@ impl GrokSession {
         {
             let p = Path::new(raw);
             if p.is_absolute()
-                && (self.blocks_shared_checkout(p) || !fs_path_allowed(p, &self.fs_allowed_roots()))
+                && (self.blocks_shared_checkout(p) || !fs_path_allowed(p, &self.fs_write_roots()))
             {
                 self.write_line(&rpc_error_value(
                     &req_id,
@@ -1010,17 +1036,19 @@ impl GrokSession {
         );
     }
 
-    /// Session cwd plus layout workspace / execution (planning tree is outside grok_cwd).
+    /// Write roots for the stored phase.
     ///
-    /// When worktree isolation is on and the session cwd is a different path, the
-    /// shared execution repo is omitted. [`Self::blocks_shared_checkout`] also
-    /// rejects paths under that repo when an ancestor root (nested `workspace_root`)
-    /// would otherwise authorize them. The session cwd stays allowed, including a
-    /// worktree that lives under the execution-repo prefix.
-    fn fs_allowed_roots(&self) -> Vec<PathBuf> {
+    /// Planning phases keep the session cwd, turn roots, `workspace_root`, and the
+    /// execution repo unless isolation is on and that repo is a different path.
+    /// Implementation phases, a missing phase, and an unknown phase keep the cwd
+    /// and turn roots only. `workspace_root` is writable then only when it is the cwd.
+    /// [`Self::blocks_shared_checkout`] still rejects the shared checkout.
+    fn fs_write_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.cwd.clone()];
         roots.extend(self.turn_roots.iter().cloned());
-        if let Some(rec) = &self.progress_record {
+        if self.uses_planning_writes()
+            && let Some(rec) = &self.progress_record
+        {
             let paths = crate::layout::resolve(rec);
             roots.push(paths.workspace_root);
             if let Some(exec) = paths.execution_repo {
@@ -1032,6 +1060,60 @@ impl GrokSession {
             }
         }
         roots
+    }
+
+    /// Read roots. Implementation phases add the current track directory and the
+    /// skill directory. Those paths are not write roots. The conductor directory
+    /// is not a read root.
+    fn fs_read_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.fs_write_roots();
+        if self.uses_planning_writes() {
+            return roots;
+        }
+        let Some(rec) = &self.progress_record else {
+            return roots;
+        };
+        let track_dir = self
+            .turn_track_id
+            .as_deref()
+            .and_then(|id| crate::workflow::graph::resolve_track_dir(rec, id));
+        if let Some(dir) = &track_dir {
+            roots.push(dir.clone());
+        }
+        let phase = self.turn_phase.as_deref().unwrap_or("");
+        for skill in crate::workflow::reuse::implementation_skill_markdowns(rec, phase, &self.cwd) {
+            let Some(dir) = skill.parent() else {
+                continue;
+            };
+            if path_is_under(&self.cwd, dir) {
+                continue;
+            }
+            if track_dir
+                .as_ref()
+                .is_some_and(|track| path_is_under(track, dir))
+            {
+                continue;
+            }
+            let conductor = crate::layout::resolve(rec).conductor_dir;
+            if path_is_under(&conductor, dir) {
+                continue;
+            }
+            if roots
+                .iter()
+                .any(|root| crate::worktree::paths_same(root, dir))
+            {
+                continue;
+            }
+            roots.push(dir.to_path_buf());
+        }
+        roots
+    }
+
+    fn uses_planning_writes(&self) -> bool {
+        self.turn_phase.as_deref().is_some_and(|phase| {
+            crate::workflow::graph::phase_write_class(phase)
+                == Some(crate::workflow::graph::PhaseWriteClass::Planning)
+        })
     }
 
     /// Isolation on, session cwd is not the shared checkout, and `path` is that
@@ -2704,6 +2786,7 @@ mod tests {
             skill_aliases: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now(),
         });
+        session.store_turn_phase(crate::workflow::graph::PHASE_PLAN, Some("0099"));
         session.inject_prompt("read", timeout()).await.unwrap();
         let written = session.mock_written().unwrap();
         let reply = written
@@ -2765,6 +2848,7 @@ mod tests {
                 .await
                 .unwrap();
             session.set_progress_record(rec);
+            session.store_turn_phase(crate::workflow::graph::PHASE_PLAN, None);
             session.inject_prompt("read", timeout()).await.unwrap();
             let written = session.mock_written().unwrap();
             written
@@ -2800,6 +2884,7 @@ mod tests {
             .await
             .unwrap();
         session.set_progress_record(bound(true));
+        session.store_turn_phase(crate::workflow::graph::PHASE_PLAN, None);
         session.inject_prompt("write", timeout()).await.unwrap();
         assert_eq!(std::fs::read_to_string(&shared).unwrap(), "shared\n");
 
@@ -3370,13 +3455,13 @@ mod live_tests {
         let mut session = rooted_session(&primary, rec).await;
         session.install_turn_root(&sibling);
 
-        let allowed = session.fs_allowed_roots();
+        let allowed = session.fs_write_roots();
         assert!(
             fs_path_allowed(&sibling.join("file.txt"), &allowed),
             "selected sibling fs root missing: {allowed:?}"
         );
         assert!(
-            fs_path_allowed(&sibling.join("file.txt"), &session.fs_allowed_roots())
+            fs_path_allowed(&sibling.join("file.txt"), &session.fs_write_roots())
                 && !session.blocks_shared_checkout(&sibling),
             "selected sibling terminal cwd must be authorized"
         );
@@ -3448,7 +3533,7 @@ mod live_tests {
         session.install_turn_root(&selected);
         assert!(!fs_path_allowed(
             &other.join("file.txt"),
-            &session.fs_allowed_roots()
+            &session.fs_write_roots()
         ));
     }
 
@@ -3491,7 +3576,7 @@ mod live_tests {
         assert!(session.turn_roots().is_empty());
         assert!(!fs_path_allowed(
             &sibling.join("file.txt"),
-            &session.fs_allowed_roots()
+            &session.fs_write_roots()
         ));
     }
 
@@ -3530,5 +3615,488 @@ mod live_tests {
             collect_update(&msg, &mut ignored);
             assert!(ignored.is_empty(), "{msg}");
         }
+    }
+    fn paths_hit(roots: &[std::path::PathBuf], path: &std::path::Path) -> bool {
+        roots
+            .iter()
+            .any(|root| crate::worktree::paths_same(root, path))
+    }
+
+    fn fs_reply(session: &GrokSession, id: u64) -> Value {
+        session
+            .mock_written()
+            .unwrap()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|value| value.get("id") == Some(&json!(id)))
+            .unwrap_or_else(|| panic!("no reply {id}"))
+    }
+
+    fn outside_project(reply: &Value) -> bool {
+        reply["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("outside the project")
+    }
+
+    fn epoch_layout(ws: &std::path::Path) -> (ProjectRecord, std::path::PathBuf) {
+        let exec = ws.join("product");
+        std::fs::create_dir_all(&exec).unwrap();
+        let epoch = ws.join(".coordinator").join("worktrees").join("1");
+        std::fs::create_dir_all(&epoch).unwrap();
+        let mut rec = project_record(ws, crate::layout::LayoutProfile::Nested);
+        rec.execution_repo = Some(exec);
+        rec.worktree_isolation = true;
+        (rec, epoch)
+    }
+
+    fn seed_ambiguous_book(rec: &ProjectRecord) {
+        let mut first = crate::state::RunState::idle(&rec.id);
+        first.run_epoch = 1;
+        first.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+        first.track_id = Some("0132-A".into());
+        first.status = crate::state::RunStatus::Running;
+        let mut second = crate::state::RunState::idle(&rec.id);
+        second.run_epoch = 2;
+        second.phase = crate::workflow::graph::PHASE_IMPLEMENT.into();
+        second.track_id = Some("0133-B".into());
+        second.status = crate::state::RunStatus::Running;
+        crate::state::write_run_book(rec, &crate::state::RunEnvelope::new(2, vec![first, second]))
+            .unwrap();
+    }
+
+    async fn bound_session(cwd: &std::path::Path, rec: ProjectRecord, sid: &str) -> GrokSession {
+        let mut session = GrokSession::start_mock(
+            cwd.to_path_buf(),
+            mock_handshake_ok(sid),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        session.set_progress_record(rec);
+        session
+    }
+
+    #[tokio::test]
+    async fn implement_write_omits_workspace_when_cwd_differs() {
+        let ws = tempdir().unwrap();
+        let (rec, epoch) = epoch_layout(ws.path());
+        let conductor = ws.path().join("conductor");
+        let track = conductor.join("0132-A");
+        std::fs::create_dir_all(&track).unwrap();
+        let spec = track.join("spec.md");
+        std::fs::write(&spec, "own\n").unwrap();
+        let epoch_note = epoch.join("note.txt");
+        let mut lines = mock_handshake_ok("sess-w");
+        lines.push(fs_write_text_file(
+            41,
+            "sess-w",
+            spec.to_str().unwrap(),
+            "dirty\n",
+        ));
+        lines.push(fs_write_text_file(
+            42,
+            "sess-w",
+            epoch_note.to_str().unwrap(),
+            "in-tree\n",
+        ));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session =
+            GrokSession::start_mock(epoch.clone(), lines, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+        session.set_progress_record(rec);
+        session.store_turn_phase(crate::workflow::graph::PHASE_IMPLEMENT, Some("0132-A"));
+        let write_roots = session.fs_write_roots();
+        assert!(
+            !paths_hit(&write_roots, ws.path()),
+            "workspace_root is a write root: {write_roots:?}"
+        );
+        assert!(
+            !paths_hit(&write_roots, &conductor),
+            "conductor is a write root: {write_roots:?}"
+        );
+        session
+            .inject_prompt("write", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(outside_project(&fs_reply(&session, 41)));
+        assert_eq!(std::fs::read_to_string(&spec).unwrap(), "own\n");
+        assert_eq!(std::fs::read_to_string(&epoch_note).unwrap(), "in-tree\n");
+        assert!(fs_reply(&session, 42).get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn implement_read_is_one_track_not_the_conductor() {
+        let ws = tempdir().unwrap();
+        let (rec, epoch) = epoch_layout(ws.path());
+        let conductor = ws.path().join("conductor");
+        let own = conductor.join("0132-A");
+        let other = conductor.join("0133-B");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let own_spec = own.join("spec.md");
+        let other_spec = other.join("spec.md");
+        let deferred = conductor.join("deferred.md");
+        std::fs::write(&own_spec, "own spec\n").unwrap();
+        std::fs::write(&other_spec, "other spec\n").unwrap();
+        std::fs::write(&deferred, "deferred\n").unwrap();
+        let mut lines = mock_handshake_ok("sess-r");
+        lines.push(fs_read_text_file(41, "sess-r", own_spec.to_str().unwrap()));
+        lines.push(fs_read_text_file(
+            42,
+            "sess-r",
+            other_spec.to_str().unwrap(),
+        ));
+        lines.push(fs_read_text_file(43, "sess-r", deferred.to_str().unwrap()));
+        lines.push(fs_write_text_file(
+            44,
+            "sess-r",
+            other_spec.to_str().unwrap(),
+            "pwn\n",
+        ));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(epoch, lines, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        session.set_progress_record(rec);
+        session.store_turn_phase(crate::workflow::graph::PHASE_IMPLEMENT, Some("0132-A"));
+        let write_roots = session.fs_write_roots();
+        let read_roots = session.fs_read_roots();
+        assert!(!paths_hit(&write_roots, ws.path()));
+        assert!(!paths_hit(&write_roots, &conductor));
+        assert!(!paths_hit(&read_roots, &conductor));
+        assert!(paths_hit(&read_roots, &own));
+        assert!(!paths_hit(&write_roots, &own));
+        session
+            .inject_prompt("read", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(fs_reply(&session, 41)["result"]["content"], "own spec\n");
+        assert!(outside_project(&fs_reply(&session, 42)));
+        assert!(
+            !fs_reply(&session, 42)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("other spec")
+        );
+        assert!(outside_project(&fs_reply(&session, 43)));
+        assert!(outside_project(&fs_reply(&session, 44)));
+        assert_eq!(
+            std::fs::read_to_string(&other_spec).unwrap(),
+            "other spec\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_and_fold_write_their_track_on_a_two_entry_book() {
+        let ws = tempdir().unwrap();
+        let (rec, epoch_plan) = epoch_layout(ws.path());
+        let epoch_fold = ws.path().join(".coordinator").join("worktrees").join("2");
+        std::fs::create_dir_all(&epoch_fold).unwrap();
+        let track_plan = ws.path().join("conductor").join("0132-A");
+        let track_fold = ws.path().join("conductor").join("0133-B");
+        std::fs::create_dir_all(&track_plan).unwrap();
+        std::fs::create_dir_all(&track_fold).unwrap();
+        seed_ambiguous_book(&rec);
+        let plan_note = track_plan.join("from-plan.md");
+        let fold_note = track_fold.join("from-fold.md");
+
+        let mut plan_lines = mock_handshake_ok("sess-plan");
+        plan_lines.push(fs_write_text_file(
+            41,
+            "sess-plan",
+            plan_note.to_str().unwrap(),
+            "planned\n",
+        ));
+        plan_lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut plan =
+            GrokSession::start_mock(epoch_plan, plan_lines, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+        plan.set_progress_record(rec.clone());
+        plan.store_turn_phase(crate::workflow::graph::PHASE_PLAN, Some("0132-A"));
+        assert!(plan.turn_roots().is_empty());
+        plan.inject_prompt("plan", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            fs_reply(&plan, 41).get("error").is_none(),
+            "{:?}",
+            fs_reply(&plan, 41)
+        );
+        assert_eq!(std::fs::read_to_string(&plan_note).unwrap(), "planned\n");
+
+        let mut fold_lines = mock_handshake_ok("sess-fold");
+        fold_lines.push(fs_write_text_file(
+            42,
+            "sess-fold",
+            fold_note.to_str().unwrap(),
+            "folded\n",
+        ));
+        fold_lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut fold =
+            GrokSession::start_mock(epoch_fold, fold_lines, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+        fold.set_progress_record(rec);
+        fold.store_turn_phase(crate::workflow::graph::PHASE_FOLD, Some("0133-B"));
+        assert!(fold.turn_roots().is_empty());
+        fold.inject_prompt("fold", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            fs_reply(&fold, 42).get("error").is_none(),
+            "{:?}",
+            fs_reply(&fold, 42)
+        );
+        assert_eq!(std::fs::read_to_string(&fold_note).unwrap(), "folded\n");
+    }
+
+    #[tokio::test]
+    async fn stored_phase_recomputes_roots_on_one_session() {
+        let ws = tempdir().unwrap();
+        let (rec, epoch) = epoch_layout(ws.path());
+        seed_ambiguous_book(&rec);
+        let note = ws.path().join("planning-note.md");
+        let mut session = bound_session(&epoch, rec, "sess-flip").await;
+        session.store_turn_phase(crate::workflow::graph::PHASE_PLAN, Some("0132-A"));
+        let plan_roots = session.fs_write_roots();
+        assert!(paths_hit(&plan_roots, ws.path()));
+        session.mock_push_responses([
+            fs_write_text_file(41, "sess-flip", note.to_str().unwrap(), "plan\n"),
+            rpc_result(4, json!({ "stopReason": "end_turn" })),
+        ]);
+        session
+            .inject_prompt("plan", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "plan\n");
+
+        session.clear_turn_roots();
+        session.store_turn_phase(crate::workflow::graph::PHASE_IMPLEMENT, Some("0132-A"));
+        let implement_roots = session.fs_write_roots();
+        assert!(
+            paths_hit(&plan_roots, ws.path()),
+            "the first root vector was reused"
+        );
+        assert!(!paths_hit(&implement_roots, ws.path()));
+        session.mock_push_responses([
+            fs_write_text_file(42, "sess-flip", note.to_str().unwrap(), "implement\n"),
+            rpc_result(5, json!({ "stopReason": "end_turn" })),
+        ]);
+        session
+            .inject_prompt("implement", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(outside_project(&fs_reply(&session, 42)));
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "plan\n");
+
+        session.store_turn_phase(crate::workflow::graph::PHASE_PLAN, Some("0132-A"));
+        let restored = session.fs_write_roots();
+        assert!(paths_hit(&restored, ws.path()));
+        session.mock_push_responses([
+            fs_write_text_file(43, "sess-flip", note.to_str().unwrap(), "plan-again\n"),
+            rpc_result(6, json!({ "stopReason": "end_turn" })),
+        ]);
+        session
+            .inject_prompt("plan-again", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "plan-again\n");
+    }
+
+    #[tokio::test]
+    async fn implement_terminal_cwd_uses_write_roots() {
+        let ws = tempdir().unwrap();
+        let (rec, epoch) = epoch_layout(ws.path());
+        let track = ws.path().join("conductor").join("0132-A");
+        std::fs::create_dir_all(&track).unwrap();
+        let inside = epoch.join("inside");
+        std::fs::create_dir_all(&inside).unwrap();
+        let mut lines = mock_handshake_ok("sess-term");
+        for (id, cwd) in [
+            (41u64, track.as_path()),
+            (42, ws.path()),
+            (43, inside.as_path()),
+        ] {
+            lines.push(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "terminal/create",
+                    "params": {
+                        "sessionId": "sess-term",
+                        "command": "cmd.exe",
+                        "args": ["/C", "echo hi"],
+                        "cwd": cwd.to_str().unwrap()
+                    }
+                })
+                .to_string(),
+            );
+        }
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(epoch, lines, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        session.set_progress_record(rec);
+        session.store_turn_phase(crate::workflow::graph::PHASE_IMPLEMENT, Some("0132-A"));
+        session
+            .inject_prompt("term", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(outside_project(&fs_reply(&session, 41)), "track dir");
+        assert!(outside_project(&fs_reply(&session, 42)), "workspace");
+        let allowed = fs_reply(&session, 43);
+        assert!(allowed.get("error").is_none(), "{allowed}");
+        assert!(allowed["result"]["terminalId"].is_string(), "{allowed}");
+    }
+
+    #[tokio::test]
+    async fn equal_cwd_implementation_still_writes_the_conductor() {
+        let ws = tempdir().unwrap();
+        std::fs::create_dir_all(ws.path()).unwrap();
+        let mut rec = project_record(ws.path(), crate::layout::LayoutProfile::Nested);
+        rec.execution_repo = Some(ws.path().join("product"));
+        std::fs::create_dir_all(rec.execution_repo.as_ref().unwrap()).unwrap();
+        rec.worktree_isolation = true;
+        let note = ws.path().join("conductor").join("0132-A").join("note.md");
+        let mut lines = mock_handshake_ok("sess-eq");
+        lines.push(fs_write_text_file(
+            41,
+            "sess-eq",
+            note.to_str().unwrap(),
+            "same-cwd\n",
+        ));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(
+            ws.path().to_path_buf(),
+            lines,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        session.set_progress_record(rec);
+        session.store_turn_phase(crate::workflow::graph::PHASE_IMPLEMENT, Some("0132-A"));
+        session
+            .inject_prompt("write", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            fs_reply(&session, 41).get("error").is_none(),
+            "{:?}",
+            fs_reply(&session, 41)
+        );
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "same-cwd\n");
+    }
+
+    #[tokio::test]
+    async fn skill_directory_is_readable_and_not_writable() {
+        let ws = tempdir().unwrap();
+        let (mut rec, epoch) = epoch_layout(ws.path());
+        rec.worktree_isolation = false;
+        let skill = rec
+            .execution_repo
+            .as_ref()
+            .unwrap()
+            .join(".agents")
+            .join("skills")
+            .join("implement");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "skill\n").unwrap();
+        std::fs::write(skill.join("NOTES.md"), "notes\n").unwrap();
+        let outside = rec
+            .execution_repo
+            .as_ref()
+            .unwrap()
+            .join(".agents")
+            .join("skills")
+            .join("other");
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "nope\n").unwrap();
+        let notes = skill.join("NOTES.md");
+        let mut lines = mock_handshake_ok("sess-skill");
+        lines.push(fs_read_text_file(41, "sess-skill", notes.to_str().unwrap()));
+        lines.push(fs_read_text_file(
+            42,
+            "sess-skill",
+            secret.to_str().unwrap(),
+        ));
+        lines.push(fs_write_text_file(
+            43,
+            "sess-skill",
+            notes.to_str().unwrap(),
+            "dirty\n",
+        ));
+        lines.push(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "terminal/create",
+                "params": {
+                    "sessionId": "sess-skill",
+                    "command": "cmd.exe",
+                    "args": ["/C", "echo hi"],
+                    "cwd": skill.to_str().unwrap()
+                }
+            })
+            .to_string(),
+        );
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(epoch, lines, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        session.set_progress_record(rec);
+        session.store_turn_phase(crate::workflow::graph::PHASE_IMPLEMENT, Some("0132-A"));
+        assert!(!paths_hit(&session.fs_write_roots(), &skill));
+        assert!(paths_hit(&session.fs_read_roots(), &skill));
+        session
+            .inject_prompt("skill", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(fs_reply(&session, 41)["result"]["content"], "notes\n");
+        assert!(outside_project(&fs_reply(&session, 42)));
+        assert!(outside_project(&fs_reply(&session, 43)));
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "notes\n");
+        assert!(outside_project(&fs_reply(&session, 44)));
+    }
+
+    #[tokio::test]
+    async fn compact_does_not_keep_plan_write_roots() {
+        let ws = tempdir().unwrap();
+        let (rec, epoch) = epoch_layout(ws.path());
+        let note = ws.path().join("during-compact.md");
+        let mut lines = mock_handshake_ok("sess-compact");
+        lines.push(fs_write_text_file(
+            41,
+            "sess-compact",
+            note.to_str().unwrap(),
+            "nope\n",
+        ));
+        lines.push(rpc_result(4, json!({ "stopReason": "end_turn" })));
+        let mut session = GrokSession::start_mock(epoch, lines, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        session.set_progress_record(rec);
+        session.store_turn_phase(crate::workflow::graph::PHASE_PLAN, Some("0132-A"));
+        session
+            .compact(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(outside_project(&fs_reply(&session, 41)));
+        assert!(!note.exists());
+        assert!(session.turn_phase.is_none());
+    }
+
+    #[tokio::test]
+    async fn address_review_uses_the_implementation_write_set() {
+        let ws = tempdir().unwrap();
+        let (rec, epoch) = epoch_layout(ws.path());
+        let mut session = bound_session(&epoch, rec, "sess-ar").await;
+        session.store_turn_phase(crate::workflow::graph::PHASE_ADDRESS_REVIEW, Some("0132-A"));
+        assert!(!paths_hit(&session.fs_write_roots(), ws.path()));
+        session.store_turn_phase("not-a-phase", None);
+        assert!(!paths_hit(&session.fs_write_roots(), ws.path()));
     }
 }
