@@ -103,7 +103,8 @@ use std::sync::Arc;
 
 #[cfg(test)]
 thread_local! {
-    static TEST_PROBE: RefCell<Option<Arc<dyn MergedTrackProbe>>> = const { RefCell::new(None) };
+    static TEST_PROBE: RefCell<Option<Arc<dyn MergedTrackProbe + Send + Sync>>> =
+        const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -117,14 +118,16 @@ impl Drop for TestMergedProbeGuard {
 }
 
 #[cfg(test)]
-pub fn install_test_merged_probe(probe: Arc<dyn MergedTrackProbe>) -> TestMergedProbeGuard {
+pub fn install_test_merged_probe(
+    probe: Arc<dyn MergedTrackProbe + Send + Sync>,
+) -> TestMergedProbeGuard {
     TEST_PROBE.with(|c| *c.borrow_mut() = Some(probe));
     TestMergedProbeGuard
 }
 
 /// `#[cfg(test)]` unset → `None` (never a live `GhMergedTrackProbe`).
 #[cfg(test)]
-pub fn installed_merged_probe() -> Option<Arc<dyn MergedTrackProbe>> {
+pub fn installed_merged_probe() -> Option<Arc<dyn MergedTrackProbe + Send + Sync>> {
     TEST_PROBE.with(|c| c.borrow().clone())
 }
 

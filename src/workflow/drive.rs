@@ -3650,6 +3650,70 @@ mod tests {
     }
 
     #[test]
+    fn second_plan_run_waits_inside_its_run_scope() {
+        let dir = tempdir().unwrap();
+        let record = ProjectRecord {
+            id: Uuid::new_v4().to_string(),
+            path: dir.path().to_path_buf(),
+            display_name: None,
+            layout_profile: crate::layout::LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: Some(dir.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: true,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            review_comment_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+        std::fs::create_dir_all(record.state_dir.as_ref().unwrap()).unwrap();
+        let conductor = dir.path().join("conductor").join("conductor.md");
+        std::fs::create_dir_all(conductor.parent().unwrap()).unwrap();
+        std::fs::write(
+            &conductor,
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0020-Fixture | `.` | **Ready \u{2014} not started** | fixture |\n",
+        )
+        .unwrap();
+        let conductor_before = std::fs::read(&conductor).unwrap();
+        let mut holder = crate::state::RunState::idle(&record.id);
+        holder.run_epoch = 3;
+        holder.status = RunStatus::Running;
+        holder.phase = PHASE_PLAN.into();
+        holder.driver = WorkflowDriver::Stub;
+        holder.track_id = Some("0020".into());
+        let mut second = holder.clone();
+        second.run_epoch = 8;
+        second.track_id = Some("0021".into());
+        crate::state::write_run_book(
+            &record,
+            &crate::state::RunEnvelope::new(0, vec![holder, second]),
+        )
+        .unwrap();
+        let view = {
+            let _scope = crate::state::RunScope::enter(8).unwrap();
+            tick(&record).unwrap().expect("sibling waits")
+        };
+        assert_eq!(view.last_event, "wait: shared tree held by epoch 3");
+        assert_eq!(
+            crate::state::load_run_book(&record)
+                .unwrap()
+                .shared_tree_holder(),
+            Some(3)
+        );
+        assert_eq!(std::fs::read(&conductor).unwrap(), conductor_before);
+    }
+
+    #[test]
     fn shared_tree_both_finish() {
         // Default primary is codex. Pin a private home so a parallel test cannot
         // point COORDINATOR_HOME at a config whose first tier is a different slug.

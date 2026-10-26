@@ -243,6 +243,16 @@ fn admit_second_run(
     }) {
         return Err(CoordinatorError::Message("track already running".into()));
     }
+    let live = entries
+        .iter()
+        .filter(|entry| matches!(entry.status, RunStatus::Running | RunStatus::Paused))
+        .count();
+    if live >= 2 {
+        return Err(CoordinatorError::InvalidTransition {
+            action: "run",
+            from: "two runs active".into(),
+        });
+    }
     let original = entries
         .iter()
         .find(|entry| matches!(entry.status, RunStatus::Running | RunStatus::Paused))
