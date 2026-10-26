@@ -7853,7 +7853,8 @@ mod tests {
         };
         seed_address_review(&r, &head);
         let _ = succeed_address_review(&r);
-        let shown = crate::notify::artifact::read(&r).unwrap().unwrap();
+        let epoch = crate::state::load_run_state(&r).unwrap().run_epoch;
+        let shown = crate::notify::artifact::read(&r, epoch).unwrap().unwrap();
         assert!(
             shown.body.contains("failure_class: review_comments"),
             "{}",
@@ -7885,7 +7886,14 @@ mod tests {
             run_epoch: 1,
         };
         crate::notify::artifact::write_event(&event).unwrap();
-        let body = std::fs::read_to_string(path).unwrap();
+        let body = std::fs::read_to_string(
+            path.parent()
+                .unwrap()
+                .join("failures")
+                .join("1")
+                .join("FAILURE.md"),
+        )
+        .unwrap();
         assert!(body.contains("failure_class: review_comments"), "{body}");
         assert!(
             body.contains("Resolve or address the open review comments"),

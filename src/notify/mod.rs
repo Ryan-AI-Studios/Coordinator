@@ -205,15 +205,16 @@ static RECORDED_STALL_DELIVERIES: std::sync::Mutex<Vec<StallDelivery>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Single notify entry. Never fails the caller (toast/adapter errors isolated).
-pub fn on_hard_failure(record: &ProjectRecord, event: &NotifyEvent) {
+pub fn on_hard_failure(record: &ProjectRecord, event: &NotifyEvent) -> NotifyEvent {
     let event = {
         let mut e = event.clone();
-        if let Ok(p) = artifact::path(record) {
+        if let Ok(p) = artifact::run_path(record, e.run_epoch) {
             e.artifact_path = p;
         }
         e
     };
     let _ = Composite::default_stack().notify(&event);
+    event
 }
 
 fn env_flag_off(name: &str) -> bool {
@@ -335,6 +336,31 @@ fn cap_fleet_text(text: String) -> String {
     out
 }
 
+fn fleet_failure_token(view: &StatusView) -> String {
+    let raw = if !view.runs.is_empty() {
+        let mut runs = view.runs.clone();
+        runs.sort_by_key(|run| run.run_epoch);
+        let classes: Vec<&str> = runs
+            .iter()
+            .filter_map(|run| run.failure_class.map(|class| class.as_str()))
+            .collect();
+        if classes.is_empty() {
+            return String::new();
+        }
+        format!("(failure: {})", classes.join(", "))
+    } else if let Some(class) = view.failure_class {
+        format!("(failure: {})", class.as_str())
+    } else {
+        return String::new();
+    };
+    let capped = one_line(&raw, FLEET_LAST_EVENT_MAX_CHARS);
+    if capped.is_empty() {
+        String::new()
+    } else {
+        format!(" {capped}")
+    }
+}
+
 /// 0105: one full snapshot line per project, registry order preserved. The total
 /// digest is capped; later project lines may be dropped by the cap, while the
 /// caller's `projects` slice is never truncated.
@@ -377,10 +403,7 @@ fn fleet_summary_text(projects: &[StatusView]) -> String {
         } else {
             view.phase.trim()
         };
-        let failure = view
-            .failure_class
-            .map(|c| format!(" (failure: {})", c.as_str()))
-            .unwrap_or_default();
+        let failure = fleet_failure_token(view);
         let event = one_line(view.last_event.trim(), FLEET_LAST_EVENT_MAX_CHARS);
         let event = if event.is_empty() {
             "-".to_string()
@@ -595,7 +618,9 @@ mod tests {
             );
             let view = crate::outcome::apply(&r, o).unwrap();
             assert_eq!(view.failure_class, Some(class));
-            let shown = artifact::read(&r).unwrap().expect("FAILURE.md");
+            let shown = artifact::read(&r, view.run_epoch)
+                .unwrap()
+                .expect("FAILURE.md");
             assert!(shown.body.contains(&format!("project_id: {}", r.id)));
             assert!(shown.body.contains("track_id: 0009"));
             assert!(shown.body.contains("phase: stub:failed"));
@@ -624,7 +649,8 @@ mod tests {
         run_stub(&r, None).unwrap();
         let o = PhaseOutcome::success(STUB_PHASE_ACTIVE, OutcomeSource::Test, None, None, None);
         crate::outcome::apply(&r, o).unwrap();
-        assert!(artifact::read(&r).unwrap().is_none());
+        let epoch = crate::state::load_run_state(&r).unwrap().run_epoch;
+        assert!(artifact::read(&r, epoch).unwrap().is_none());
         assert!(toast::take_recorded_toasts().is_empty());
     }
 
@@ -702,7 +728,8 @@ mod tests {
             None,
         );
         crate::outcome::apply(&r, o).unwrap();
-        let shown = artifact::read(&r).unwrap().expect("artifact");
+        let epoch = crate::state::load_run_state(&r).unwrap().run_epoch;
+        let shown = artifact::read(&r, epoch).unwrap().expect("artifact");
         assert!(shown.body.contains(r"C:\dev\secret"));
         assert!(toast::take_recorded_toasts().is_empty());
         unsafe {
@@ -732,7 +759,9 @@ mod tests {
             .unwrap()
             .expect("timeout");
         assert_eq!(view.failure_class, Some(FailureClass::Timeout));
-        let shown = artifact::read(&r).unwrap().expect("FAILURE.md");
+        let shown = artifact::read(&r, view.run_epoch)
+            .unwrap()
+            .expect("FAILURE.md");
         assert!(shown.body.contains("failure_class: timeout"));
         assert!(shown.body.contains("Increase the phase budget"));
         assert!(!toast::take_recorded_toasts().is_empty());
@@ -1429,6 +1458,70 @@ mod tests {
             "- Alpha 0105: implement / Running - workflow: advance plan -> implement"
         );
         assert_eq!(lines[2], "- Beta -: idle / Idle - idle: no run");
+    }
+
+    #[test]
+    fn fleet_summary_lists_every_run_class_in_one_bounded_token() {
+        use crate::outcome::FailureClass;
+        use crate::state::{RunStatus, RunSummary};
+        let dir = tempdir().unwrap();
+        let mut view = fleet_view(
+            Some("Alpha"),
+            dir.path(),
+            RunStatus::Stopped,
+            "implement",
+            Some("0129"),
+            "failure: timeout",
+        );
+        view.failure_class = Some(FailureClass::CiFailed);
+        view.runs = vec![
+            RunSummary {
+                run_epoch: 5,
+                track_id: Some("0129".into()),
+                phase: "implement".into(),
+                status: RunStatus::Stopped,
+                failure_class: Some(FailureClass::Blocked),
+                failure_artifact: None,
+            },
+            RunSummary {
+                run_epoch: 4,
+                track_id: Some("0128".into()),
+                phase: "plan".into(),
+                status: RunStatus::Stopped,
+                failure_class: Some(FailureClass::Timeout),
+                failure_artifact: None,
+            },
+        ];
+        let text = fleet_summary_text(&[view]);
+        let line = text.lines().nth(1).unwrap();
+        assert_eq!(line.matches("(failure:").count(), 1, "{line}");
+        assert!(line.contains("(failure: timeout, blocked)"), "{line}");
+        assert!(!line.contains("ci_failed"), "{line}");
+
+        let mut long = fleet_view(
+            Some("Alpha"),
+            dir.path(),
+            RunStatus::Stopped,
+            "implement",
+            Some("0129"),
+            "event",
+        );
+        long.runs = (0..30)
+            .map(|epoch| RunSummary {
+                run_epoch: epoch,
+                track_id: Some("0129".into()),
+                phase: "implement".into(),
+                status: RunStatus::Stopped,
+                failure_class: Some(FailureClass::ReviewNeverSettles),
+                failure_artifact: None,
+            })
+            .collect();
+        let text = fleet_summary_text(&[long]);
+        let line = text.lines().nth(1).unwrap();
+        let start = line.find("(failure:").unwrap();
+        let token = &line[start..line[start..].find(" - ").unwrap() + start];
+        assert!(token.chars().count() <= 120, "{token}");
+        assert!(token.ends_with("..."), "{token}");
     }
 
     #[test]

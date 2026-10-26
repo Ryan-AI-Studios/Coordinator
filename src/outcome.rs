@@ -609,7 +609,7 @@ fn note_consecutive_failures(
 }
 
 fn refresh_failure_artifact(record: &ProjectRecord, mut view: StatusView) -> StatusView {
-    view.failure_artifact = crate::notify::artifact::existing_path(record);
+    view.failure_artifact = crate::notify::artifact::summary_path_if_present(record);
     view
 }
 

@@ -2628,7 +2628,7 @@ mod tests {
             1,
             "no continuation claimed"
         );
-        let artifact = crate::notify::artifact::read(&r)
+        let artifact = crate::notify::artifact::read(&r, state.run_epoch)
             .unwrap()
             .expect("Permission artifact");
         assert!(

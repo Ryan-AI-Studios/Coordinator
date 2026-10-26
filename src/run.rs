@@ -560,7 +560,7 @@ fn begin_fresh_run(
             archive_slugs: fresh.archive_slugs,
         },
     );
-    crate::notify::clear_artifact(record);
+    crate::notify::clear_artifact(record, closed_epoch);
     crate::workflow::watchdog::clear_progress(record);
     if leftover && !already_settled {
         crate::progress_log::append(record, "start", crate::notify::START_CLEAR_DETAIL);
@@ -586,6 +586,7 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
         }
         match state.status {
             RunStatus::Idle | RunStatus::Stopped => {
+                let closed_epoch = state.run_epoch;
                 let leftover = state.failure_class.is_some()
                     || crate::notify::artifact::existing_path(record).is_some();
                 let already_settled = state.last_event == crate::notify::SETTLED_DETAIL;
@@ -618,7 +619,7 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
                 state.last_event = "run: started stub".into();
                 state.updated_at = chrono::Utc::now();
                 clear_active_outcome_file(record);
-                crate::notify::clear_artifact(record);
+                crate::notify::clear_artifact(record, closed_epoch);
                 crate::workflow::watchdog::clear_progress(record);
                 if leftover && !already_settled {
                     crate::progress_log::append(record, "start", crate::notify::START_CLEAR_DETAIL);
@@ -1075,7 +1076,13 @@ fn compose_book_status(record: &ProjectRecord, envelope: &crate::state::RunEnvel
     view.runs = envelope
         .runs
         .iter()
-        .map(crate::state::RunSummary::from_state)
+        .map(|entry| {
+            let mut summary = crate::state::RunSummary::from_state(entry);
+            summary.failure_artifact = crate::notify::artifact::run_path(record, entry.run_epoch)
+                .ok()
+                .filter(|path| path.is_file());
+            summary
+        })
         .collect();
     view
 }

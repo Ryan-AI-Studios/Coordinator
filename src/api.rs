@@ -884,26 +884,52 @@ pub fn cmd_outcome_show(project: Option<&str>, infer_cwd: bool) -> Result<Option
     load_current_outcome(&rec)
 }
 
-/// Show `{state_dir}/FAILURE.md` if present (CLI / GET /v1/failure).
+/// Show one run's failure file (CLI / GET /v1/failure).
 pub fn cmd_failure_show(
     project: Option<&str>,
     infer_cwd: bool,
+    epoch: Option<u64>,
+    track: Option<&str>,
 ) -> Result<Option<crate::notify::FailureShow>> {
     let rec = resolve_selected(project, infer_cwd)?;
-    let mut shown = crate::notify::artifact::read(&rec)?;
-    if let Some(ref mut s) = shown
+    let Some(hit) = select_failure(&rec, epoch, track, "failure show")? else {
+        if epoch.is_none() && track.is_none() {
+            return crate::notify::artifact::read_legacy(&rec);
+        }
+        return Ok(None);
+    };
+    let mut shown = crate::notify::artifact::read(&rec, hit.epoch)?;
+    if shown.is_none() {
+        shown = legacy_show_for_epoch(&rec, hit.epoch)?;
+    }
+    if let Some(ref mut shown) = shown
+        && hit.has_entry
+        && let Ok(_scope) = crate::state::RunScope::enter(hit.epoch)
         && let Ok(state) = crate::state::load_run_state(&rec)
     {
-        s.superseded =
-            crate::workflow::conductor_md::failure_superseded(&rec, &state, Some(&s.body));
+        shown.superseded =
+            crate::workflow::conductor_md::failure_superseded(&rec, &state, Some(&shown.body));
     }
     Ok(shown)
 }
 
-/// Operator ack: delete FAILURE.md and drop `failure_class` (Idle/Stopped only).
-pub fn cmd_failure_resolve(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+/// Operator ack: delete one run's file and drop that entry's `failure_class`.
+pub fn cmd_failure_resolve(
+    project: Option<&str>,
+    infer_cwd: bool,
+    epoch: Option<u64>,
+    track: Option<&str>,
+) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
+    let Some(hit) = select_failure(&rec, epoch, track, "failure resolve")? else {
+        return resolve_when_no_failure(&rec);
+    };
+    if !hit.has_entry {
+        crate::notify::artifact::clear(&rec, hit.epoch);
+        return crate::run::status(&rec);
+    }
     crate::state::with_run_state_lock(&rec, || {
+        let _scope = crate::state::RunScope::enter(hit.epoch)?;
         let mut state = crate::state::load_run_state(&rec)?;
         if matches!(
             state.status,
@@ -916,7 +942,7 @@ pub fn cmd_failure_resolve(project: Option<&str>, infer_cwd: bool) -> Result<Sta
         }
         // 0098: `cmd_failure_resolve` is the only Blocked release. Persist the cleared
         // class and last_event BEFORE the artifact is removed, so a failed save leaves
-        // the on-disk hold and FAILURE.md unchanged. A retry then succeeds.
+        // the on-disk hold and the per-run file unchanged. A retry then succeeds.
         if state.failure_class == Some(crate::outcome::FailureClass::Blocked) {
             state.failure_class = None;
             state.last_event = crate::notify::LAST_EVENT_FAILURE_RESOLVED.into();
@@ -940,36 +966,173 @@ pub fn cmd_failure_resolve(project: Option<&str>, infer_cwd: bool) -> Result<Sta
     })
 }
 
+fn resolve_when_no_failure(record: &crate::registry::ProjectRecord) -> Result<StatusView> {
+    match crate::state::load_run_book(record)? {
+        crate::state::RunBook::Many(_) => crate::run::status(record),
+        crate::state::RunBook::One(_) => crate::state::with_run_state_lock(record, || {
+            let mut state = crate::state::load_run_state(record)?;
+            if matches!(
+                state.status,
+                crate::state::RunStatus::Running | crate::state::RunStatus::Paused
+            ) {
+                return Err(CoordinatorError::InvalidTransition {
+                    action: "failure resolve",
+                    from: state.status.to_string(),
+                });
+            }
+            state.last_event = crate::notify::LAST_EVENT_FAILURE_RESOLVED.into();
+            crate::progress_log::append(
+                record,
+                "resolve",
+                crate::notify::LAST_EVENT_FAILURE_RESOLVED,
+            );
+            crate::state::save_run_state(record, &state)?;
+            Ok(StatusView::from_record(record, &state))
+        }),
+    }
+}
+
+fn select_failure(
+    record: &crate::registry::ProjectRecord,
+    epoch: Option<u64>,
+    track: Option<&str>,
+    action: &'static str,
+) -> Result<Option<crate::notify::artifact::FailureRecord>> {
+    let hits = crate::notify::artifact::failure_records(record)?;
+    let summary =
+        crate::notify::artifact::path(record).unwrap_or_else(|_| PathBuf::from("FAILURE.md"));
+    match (epoch, track) {
+        (None, None) => {
+            if hits.len() > 1 {
+                return Err(ambiguous_failure(action, &hits, &summary));
+            }
+            Ok(hits.into_iter().next())
+        }
+        (Some(epoch), None) => match hits.into_iter().find(|hit| hit.epoch == epoch) {
+            Some(hit) => Ok(Some(hit)),
+            None => Err(crate::state::unknown_run_epoch_error(epoch)),
+        },
+        (None, Some(track)) => {
+            let same: Vec<_> = hits
+                .into_iter()
+                .filter(|hit| hit.track_id.as_deref() == Some(track))
+                .collect();
+            if same.len() > 1 {
+                return Err(ambiguous_failure(action, &same, &summary));
+            }
+            if same.is_empty() {
+                return Err(CoordinatorError::Message(format!(
+                    "no failure for track {track}"
+                )));
+            }
+            Ok(same.into_iter().next())
+        }
+        (Some(epoch), Some(track)) => {
+            let Some(hit) = hits.into_iter().find(|hit| hit.epoch == epoch) else {
+                return Err(crate::state::unknown_run_epoch_error(epoch));
+            };
+            if hit.track_id.as_deref() != Some(track) {
+                let found = hit.track_id.as_deref().unwrap_or("-");
+                return Err(CoordinatorError::AmbiguousControlTarget {
+                    action,
+                    matches: format!(
+                        "epoch {epoch} track {found} disagrees with track {track}; summary at {}",
+                        summary.display()
+                    ),
+                });
+            }
+            Ok(Some(hit))
+        }
+    }
+}
+
+fn ambiguous_failure(
+    action: &'static str,
+    hits: &[crate::notify::artifact::FailureRecord],
+    summary: &Path,
+) -> CoordinatorError {
+    let list = hits
+        .iter()
+        .map(|hit| {
+            let track = hit.track_id.as_deref().unwrap_or("-");
+            format!("epoch {} track {track}", hit.epoch)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    CoordinatorError::AmbiguousControlTarget {
+        action,
+        matches: format!("{list}; summary at {}", summary.display()),
+    }
+}
+
 /// Idle/Stopped + conductor row Completed → settle stored failure (0045).
 pub(crate) fn settle_if_conductor_completed(
     record: &crate::registry::ProjectRecord,
 ) -> Result<bool> {
     crate::state::with_run_state_lock(record, || {
-        let mut state = crate::state::load_run_state(record)?;
-        if !matches!(
-            state.status,
-            crate::state::RunStatus::Idle | crate::state::RunStatus::Stopped
-        ) {
-            return Ok(false);
-        }
-        // 0098: a Blocked hold is released only by `failure resolve`, never by a
-        // conductor-row edit, including the held track's Completed row.
-        if state.failure_class == Some(crate::outcome::FailureClass::Blocked) {
-            return Ok(false);
-        }
-        let body = crate::notify::artifact::read(record)?.map(|s| s.body);
-        let reason =
-            crate::workflow::conductor_md::failure_superseded(record, &state, body.as_deref());
-        if reason.as_deref() != Some(crate::notify::SUPERSEDED_COMPLETED) {
-            return Ok(false);
-        }
-        let changed =
-            crate::notify::settle_failure(record, &mut state, crate::notify::SETTLED_DETAIL, true);
-        if changed {
-            crate::state::save_run_state(record, &state)?;
+        let epochs: Vec<u64> = match crate::state::load_run_book(record)? {
+            crate::state::RunBook::One(state) => vec![state.run_epoch],
+            crate::state::RunBook::Many(envelope) => envelope
+                .runs
+                .into_iter()
+                .map(|entry| entry.run_epoch)
+                .collect(),
+        };
+        let mut changed = false;
+        for epoch in epochs {
+            let _scope = crate::state::RunScope::enter(epoch)?;
+            let mut state = crate::state::load_run_state(record)?;
+            if !matches!(
+                state.status,
+                crate::state::RunStatus::Idle | crate::state::RunStatus::Stopped
+            ) {
+                continue;
+            }
+            // 0098: a Blocked hold is released only by `failure resolve`, never by a
+            // conductor-row edit, including the held track's Completed row.
+            if state.failure_class == Some(crate::outcome::FailureClass::Blocked) {
+                continue;
+            }
+            let body = settle_body(record, state.run_epoch)?;
+            let reason =
+                crate::workflow::conductor_md::failure_superseded(record, &state, body.as_deref());
+            if reason.as_deref() != Some(crate::notify::SUPERSEDED_COMPLETED) {
+                continue;
+            }
+            if crate::notify::settle_failure(
+                record,
+                &mut state,
+                crate::notify::SETTLED_DETAIL,
+                true,
+            ) {
+                crate::state::save_run_state(record, &state)?;
+                changed = true;
+            }
         }
         Ok(changed)
     })
+}
+
+fn settle_body(record: &crate::registry::ProjectRecord, epoch: u64) -> Result<Option<String>> {
+    if let Some(shown) = crate::notify::artifact::read(record, epoch)? {
+        return Ok(Some(shown.body));
+    }
+    legacy_show_for_epoch(record, epoch).map(|shown| shown.map(|shown| shown.body))
+}
+
+fn legacy_show_for_epoch(
+    record: &crate::registry::ProjectRecord,
+    epoch: u64,
+) -> Result<Option<crate::notify::FailureShow>> {
+    let Some(shown) = crate::notify::artifact::read_legacy(record)? else {
+        return Ok(None);
+    };
+    let meta = crate::notify::artifact::parse_metadata(&shown.body);
+    if meta.run_epoch == Some(epoch) {
+        Ok(Some(shown))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Block until outcome applied or wait budget expires.
@@ -2701,7 +2864,7 @@ mod tests {
         state.failure_class = Some(crate::outcome::FailureClass::HarnessCrash);
         crate::state::save_run_state(&rec, &state).unwrap();
         write_failure(&rec, "0040", 2);
-        let shown = cmd_failure_show(Some(&rec.id), false)
+        let shown = cmd_failure_show(Some(&rec.id), false, None, None)
             .unwrap()
             .expect("artifact");
         assert!(shown.body.contains("track_id: 0040"));
@@ -2714,7 +2877,11 @@ mod tests {
     fn cmd_failure_show_none_when_absent() {
         let _guard = test_env_lock();
         let (_home, _proj, rec) = add_isolated_project();
-        assert!(cmd_failure_show(Some(&rec.id), false).unwrap().is_none());
+        assert!(
+            cmd_failure_show(Some(&rec.id), false, None, None)
+                .unwrap()
+                .is_none()
+        );
         clear_home();
     }
 
@@ -2730,7 +2897,7 @@ mod tests {
         state.last_applied_outcome_hash = Some("keep-me".into());
         crate::state::save_run_state(&rec, &state).unwrap();
         write_failure(&rec, "0040", 2);
-        let view = cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        let view = cmd_failure_resolve(Some(&rec.id), false, None, None).unwrap();
         assert!(artifact::existing_path(&rec).is_none());
         assert!(view.failure_class.is_none());
         assert_eq!(view.last_event, crate::notify::LAST_EVENT_FAILURE_RESOLVED);
@@ -2750,7 +2917,7 @@ mod tests {
     fn cmd_failure_resolve_absent_is_ok() {
         let _guard = test_env_lock();
         let (_home, _proj, rec) = add_isolated_project();
-        let view = cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        let view = cmd_failure_resolve(Some(&rec.id), false, None, None).unwrap();
         assert!(view.failure_class.is_none());
         assert_eq!(view.last_event, crate::notify::LAST_EVENT_FAILURE_RESOLVED);
         clear_home();
@@ -2768,7 +2935,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let err = cmd_failure_resolve(Some(&rec.id), false).unwrap_err();
+        let err = cmd_failure_resolve(Some(&rec.id), false, None, None).unwrap_err();
         match err {
             CoordinatorError::InvalidTransition { action, from } => {
                 assert_eq!(action, "failure resolve");
@@ -2776,6 +2943,341 @@ mod tests {
             }
             other => panic!("expected InvalidTransition, got {other}"),
         }
+        clear_home();
+    }
+
+    fn book_entry(
+        id: &str,
+        epoch: u64,
+        track: &str,
+        class: Option<crate::outcome::FailureClass>,
+        status: RunStatus,
+    ) -> RunState {
+        let mut state = RunState::idle(id);
+        state.run_epoch = epoch;
+        state.track_id = Some(track.into());
+        state.failure_class = class;
+        state.status = status;
+        state.phase = "implement".into();
+        state
+    }
+
+    fn reload_book(rec: &ProjectRecord) -> Vec<RunState> {
+        match crate::state::load_run_book(rec).unwrap() {
+            crate::state::RunBook::Many(envelope) => envelope.runs,
+            crate::state::RunBook::One(state) => vec![*state],
+        }
+    }
+
+    #[test]
+    fn failure_commands_select_one_run_and_leave_the_sibling() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let class = crate::outcome::FailureClass::Timeout;
+        let blocked = crate::outcome::FailureClass::Blocked;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(
+                0,
+                vec![
+                    book_entry(&rec.id, 4, "0128", Some(class), RunStatus::Stopped),
+                    book_entry(&rec.id, 5, "0129", Some(blocked), RunStatus::Running),
+                ],
+            ),
+        )
+        .unwrap();
+        write_failure(&rec, "0128", 4);
+        write_failure(&rec, "0129", 5);
+        let summary = artifact::path(&rec).unwrap();
+        let bare = cmd_failure_show(Some(&rec.id), false, None, None).unwrap_err();
+        match &bare {
+            CoordinatorError::AmbiguousControlTarget { action, matches } => {
+                assert_eq!(*action, "failure show");
+                assert!(matches.contains("epoch 4 track 0128"), "{matches}");
+                assert!(matches.contains("epoch 5 track 0129"), "{matches}");
+                assert!(matches.contains("summary at"), "{matches}");
+                assert!(
+                    matches.contains(&summary.display().to_string()),
+                    "{matches}"
+                );
+            }
+            other => panic!("expected AmbiguousControlTarget, got {other}"),
+        }
+        assert_eq!(bare.exit_code(), 2);
+        assert_eq!(bare.http_status(), 409);
+        let resolve = cmd_failure_resolve(Some(&rec.id), false, None, None).unwrap_err();
+        assert!(matches!(
+            resolve,
+            CoordinatorError::AmbiguousControlTarget {
+                action: "failure resolve",
+                ..
+            }
+        ));
+        assert!(artifact::run_path(&rec, 4).unwrap().is_file());
+        assert!(artifact::run_path(&rec, 5).unwrap().is_file());
+
+        let shown = cmd_failure_show(Some(&rec.id), false, Some(4), None)
+            .unwrap()
+            .expect("epoch 4 body");
+        assert!(shown.body.contains("run_epoch: 4"), "{}", shown.body);
+        assert!(!shown.body.contains("run_epoch: 5"), "{}", shown.body);
+
+        let disagree =
+            cmd_failure_resolve(Some(&rec.id), false, Some(4), Some("0129")).unwrap_err();
+        match disagree {
+            CoordinatorError::AmbiguousControlTarget { action, matches } => {
+                assert_eq!(action, "failure resolve");
+                assert!(matches.contains("disagrees with track 0129"), "{matches}");
+            }
+            other => panic!("expected disagreement, got {other}"),
+        }
+        assert!(artifact::run_path(&rec, 4).unwrap().is_file());
+        assert_eq!(
+            reload_book(&rec)
+                .iter()
+                .find(|entry| entry.run_epoch == 4)
+                .unwrap()
+                .failure_class,
+            Some(class)
+        );
+
+        let unknown = cmd_failure_show(Some(&rec.id), false, Some(9), None).unwrap_err();
+        assert!(
+            unknown.to_string().contains("unknown run epoch 9"),
+            "{unknown}"
+        );
+
+        cmd_failure_resolve(Some(&rec.id), false, Some(4), None).unwrap();
+        let book = reload_book(&rec);
+        let epoch4 = book.iter().find(|entry| entry.run_epoch == 4).unwrap();
+        let epoch5 = book.iter().find(|entry| entry.run_epoch == 5).unwrap();
+        assert!(epoch4.failure_class.is_none());
+        assert_eq!(epoch4.status, RunStatus::Stopped);
+        assert!(!artifact::run_path(&rec, 4).unwrap().is_file());
+        assert_eq!(epoch5.failure_class, Some(blocked));
+        assert_eq!(epoch5.status, RunStatus::Running);
+        assert!(artifact::run_path(&rec, 5).unwrap().is_file());
+        let summary_body = std::fs::read_to_string(&summary).unwrap();
+        assert!(!summary_body.contains("epoch 4:"), "{summary_body}");
+        assert!(summary_body.contains("epoch 5:"), "{summary_body}");
+        clear_home();
+    }
+
+    #[test]
+    fn shared_track_refuses_bare_track_and_epoch_clears_one_file() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let class = crate::outcome::FailureClass::HarnessCrash;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(
+                0,
+                vec![
+                    book_entry(&rec.id, 4, "0128", Some(class), RunStatus::Stopped),
+                    book_entry(&rec.id, 5, "0128", Some(class), RunStatus::Stopped),
+                ],
+            ),
+        )
+        .unwrap();
+        write_failure(&rec, "0128", 4);
+        write_failure(&rec, "0128", 5);
+        let err = cmd_failure_resolve(Some(&rec.id), false, None, Some("0128")).unwrap_err();
+        match err {
+            CoordinatorError::AmbiguousControlTarget { action, matches } => {
+                assert_eq!(action, "failure resolve");
+                assert!(matches.contains("epoch 4 track 0128"), "{matches}");
+                assert!(matches.contains("epoch 5 track 0128"), "{matches}");
+            }
+            other => panic!("expected AmbiguousControlTarget, got {other}"),
+        }
+        assert!(artifact::run_path(&rec, 4).unwrap().is_file());
+        cmd_failure_resolve(Some(&rec.id), false, Some(4), None).unwrap();
+        assert!(!artifact::run_path(&rec, 4).unwrap().is_file());
+        assert!(artifact::run_path(&rec, 5).unwrap().is_file());
+        let book = reload_book(&rec);
+        assert!(
+            book.iter()
+                .find(|entry| entry.run_epoch == 4)
+                .unwrap()
+                .failure_class
+                .is_none()
+        );
+        assert_eq!(
+            book.iter()
+                .find(|entry| entry.run_epoch == 5)
+                .unwrap()
+                .failure_class,
+            Some(class)
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn file_without_entry_and_class_without_file_resolve_one_side() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let blocked = crate::outcome::FailureClass::Blocked;
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(
+                0,
+                vec![
+                    book_entry(&rec.id, 4, "0128", Some(blocked), RunStatus::Stopped),
+                    book_entry(&rec.id, 5, "0129", Some(blocked), RunStatus::Stopped),
+                ],
+            ),
+        )
+        .unwrap();
+        write_failure(&rec, "orphan", 9);
+        assert!(
+            cmd_failure_show(Some(&rec.id), false, Some(4), None)
+                .unwrap()
+                .is_none()
+        );
+        cmd_failure_resolve(Some(&rec.id), false, Some(4), None).unwrap();
+        let book = reload_book(&rec);
+        assert!(
+            book.iter()
+                .find(|entry| entry.run_epoch == 4)
+                .unwrap()
+                .failure_class
+                .is_none()
+        );
+        assert_eq!(
+            book.iter()
+                .find(|entry| entry.run_epoch == 5)
+                .unwrap()
+                .failure_class,
+            Some(blocked)
+        );
+        assert!(artifact::run_path(&rec, 9).unwrap().is_file());
+        let orphan = cmd_failure_show(Some(&rec.id), false, Some(9), None)
+            .unwrap()
+            .expect("orphan file");
+        assert!(orphan.body.contains("run_epoch: 9"), "{}", orphan.body);
+        cmd_failure_resolve(Some(&rec.id), false, Some(9), None).unwrap();
+        assert!(!artifact::run_path(&rec, 9).unwrap().is_file());
+        assert_eq!(
+            reload_book(&rec)
+                .iter()
+                .find(|entry| entry.run_epoch == 5)
+                .unwrap()
+                .failure_class,
+            Some(blocked)
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn book_status_paths_come_from_compose_not_from_state() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let class = crate::outcome::FailureClass::Timeout;
+        let older = book_entry(&rec.id, 4, "0128", Some(class), RunStatus::Stopped);
+        let newer = book_entry(&rec.id, 5, "0129", None, RunStatus::Idle);
+        assert!(
+            crate::state::RunSummary::from_state(&older)
+                .failure_artifact
+                .is_none()
+        );
+        crate::state::write_run_book(&rec, &crate::state::RunEnvelope::new(0, vec![older, newer]))
+            .unwrap();
+        write_failure(&rec, "0128", 4);
+        let view = crate::run::status(&rec).unwrap();
+        assert_eq!(view.failure_artifact, Some(artifact::path(&rec).unwrap()));
+        let run4 = view.runs.iter().find(|run| run.run_epoch == 4).unwrap();
+        let run5 = view.runs.iter().find(|run| run.run_epoch == 5).unwrap();
+        assert_eq!(run4.failure_class, Some(class));
+        assert_eq!(
+            run4.failure_artifact,
+            Some(artifact::run_path(&rec, 4).unwrap())
+        );
+        assert!(run5.failure_class.is_none());
+        assert!(run5.failure_artifact.is_none());
+        cmd_failure_resolve(Some(&rec.id), false, Some(4), None).unwrap();
+        let cleared = crate::run::status(&rec).unwrap();
+        assert!(cleared.failure_artifact.is_none());
+        assert!(
+            cmd_failure_show(Some(&rec.id), false, None, None)
+                .unwrap()
+                .is_none()
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn legacy_body_shows_and_resolve_does_not_migrate_it() {
+        let _guard = test_env_lock();
+        let (_home, _proj, rec) = add_isolated_project();
+        let mut state = crate::state::load_run_state(&rec).unwrap();
+        state.status = RunStatus::Stopped;
+        state.track_id = Some("0128".into());
+        state.run_epoch = 4;
+        state.failure_class = Some(crate::outcome::FailureClass::Timeout);
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let legacy = b"- track_id: 0128\n- run_epoch: 4\n- failure_class: timeout\n";
+        let summary = artifact::path(&rec).unwrap();
+        std::fs::write(&summary, legacy).unwrap();
+        let shown = cmd_failure_show(Some(&rec.id), false, None, None)
+            .unwrap()
+            .expect("legacy body");
+        assert_eq!(shown.body.as_bytes(), legacy);
+        cmd_failure_resolve(Some(&rec.id), false, None, None).unwrap();
+        assert!(!summary.exists());
+        assert!(!artifact::run_path(&rec, 4).unwrap().exists());
+        assert!(
+            crate::state::load_run_state(&rec)
+                .unwrap()
+                .failure_class
+                .is_none()
+        );
+        clear_home();
+    }
+
+    #[test]
+    fn settle_clears_an_older_completed_book_entry() {
+        let _guard = test_env_lock();
+        let (_home, proj, rec) = add_isolated_project();
+        write_conductor_rows(
+            proj.path(),
+            "| [0128-Done](0128-Done/spec.md) | `.` | **Completed** | shipped |\n\
+             | [0129-Next](0129-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        );
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(
+                0,
+                vec![
+                    book_entry(
+                        &rec.id,
+                        4,
+                        "0128",
+                        Some(crate::outcome::FailureClass::Timeout),
+                        RunStatus::Stopped,
+                    ),
+                    book_entry(&rec.id, 5, "0129", None, RunStatus::Idle),
+                ],
+            ),
+        )
+        .unwrap();
+        write_failure(&rec, "0128", 4);
+        assert!(artifact::existing_path(&rec).is_none());
+        assert!(settle_if_conductor_completed(&rec).unwrap());
+        let book = reload_book(&rec);
+        let epoch4 = book.iter().find(|entry| entry.run_epoch == 4).unwrap();
+        let epoch5 = book.iter().find(|entry| entry.run_epoch == 5).unwrap();
+        assert!(epoch4.failure_class.is_none());
+        assert_eq!(epoch4.status, RunStatus::Stopped);
+        assert!(!artifact::run_path(&rec, 4).unwrap().is_file());
+        assert!(epoch5.failure_class.is_none());
+        assert_eq!(epoch5.status, RunStatus::Idle);
+        assert!(
+            crate::state::load_run_state(&rec)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous run")
+        );
+        assert!(!crate::notify::artifact::any_failure_record(&rec));
         clear_home();
     }
 
@@ -2799,7 +3301,7 @@ mod tests {
         state.failure_class = Some(crate::outcome::FailureClass::HarnessCrash);
         crate::state::save_run_state(&rec, &state).unwrap();
         write_failure(&rec, "0038", 2);
-        let shown = cmd_failure_show(Some(&rec.id), false)
+        let shown = cmd_failure_show(Some(&rec.id), false, None, None)
             .unwrap()
             .expect("artifact");
         assert_eq!(
@@ -2855,7 +3357,11 @@ mod tests {
         assert_eq!(state.run_epoch, 3);
         let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap();
         assert!(log.contains(crate::notify::SETTLED_DETAIL));
-        assert!(cmd_failure_show(Some(&rec.id), false).unwrap().is_none());
+        assert!(
+            cmd_failure_show(Some(&rec.id), false, None, None)
+                .unwrap()
+                .is_none()
+        );
         // 0063: a Completed retain is not resumable. Settle stays Stopped;
         // the next omit picks the Ready sibling instead of keeping 0045.
         let (track, picked) = resolve_run_track(&rec, None).unwrap();
@@ -3249,7 +3755,7 @@ mod tests {
         write_blocked_row(proj.path(), "0098", "**Completed**");
         assert!(!settle_if_conductor_completed(&rec).unwrap());
         assert!(artifact::existing_path(&rec).is_some());
-        let shown = cmd_failure_show(Some(&rec.id), false)
+        let shown = cmd_failure_show(Some(&rec.id), false, None, None)
             .unwrap()
             .expect("artifact stays live");
         assert!(
@@ -3272,7 +3778,7 @@ mod tests {
             "the hold is untouched by the refusal"
         );
 
-        let view = cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        let view = cmd_failure_resolve(Some(&rec.id), false, None, None).unwrap();
         assert!(view.failure_class.is_none());
         assert!(artifact::existing_path(&rec).is_none());
         // Recovery is --replay or a new id, never `failure resolve` + plain retry.
@@ -3731,7 +4237,7 @@ mod tests {
         perms.set_readonly(true);
         std::fs::set_permissions(&state_path, perms).unwrap();
 
-        let err = cmd_failure_resolve(Some(&rec.id), false).unwrap_err();
+        let err = cmd_failure_resolve(Some(&rec.id), false, None, None).unwrap_err();
         assert!(
             err.to_string().contains("I/O") || err.to_string().contains("access"),
             "{err}"
@@ -3750,7 +4256,7 @@ mod tests {
         let mut perms = std::fs::metadata(&state_path).unwrap().permissions();
         perms.set_readonly(false);
         std::fs::set_permissions(&state_path, perms).unwrap();
-        let view = cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        let view = cmd_failure_resolve(Some(&rec.id), false, None, None).unwrap();
         assert!(view.failure_class.is_none());
         assert!(artifact::existing_path(&rec).is_none());
         clear_home();

@@ -59,7 +59,8 @@ pub enum CoordinatorError {
     )]
     AmbiguousRunTrack { track: String, rows: String },
 
-    /// 0128: pause, resume, or stop matched more than one run, or the selectors disagree.
+    /// 0128: pause, resume, stop, failure show, or failure resolve matched more than one
+    /// run, or the selectors disagree.
     /// Not [`Self::AmbiguousRunTrack`] and not `state::ambiguous_run_error`.
     #[error("ambiguous {action} target: {matches}")]
     AmbiguousControlTarget {

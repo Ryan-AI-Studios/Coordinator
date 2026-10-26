@@ -551,7 +551,7 @@ pub fn try_auto_start(record: &ProjectRecord) -> AutoStartAttempt {
     };
     // Durable dedupe must precede gate (e): `should_pick_next_ready` is true for an
     // empty track_id even when a failure class is present.
-    if state.failure_class.is_some() || crate::notify::artifact::existing_path(record).is_some() {
+    if state.failure_class.is_some() || crate::notify::artifact::any_failure_record(record) {
         return AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure);
     }
     let mut pick = crate::workflow::ReadyPickState::from(&state);
@@ -732,14 +732,10 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
                         }
                         continue;
                     }
-                    let state = book
-                        .into_entries()
-                        .into_iter()
-                        .max_by_key(|entry| entry.run_epoch)
-                        .unwrap_or_else(|| crate::state::RunState::idle(&rec.id));
-                    if state.failure_class.is_some()
-                        || crate::notify::artifact::existing_path(rec).is_some()
-                    {
+                    let entries = book.into_entries();
+                    let durable = entries.iter().any(|entry| entry.failure_class.is_some())
+                        || crate::notify::artifact::any_failure_record(rec);
+                    if durable {
                         let rec = rec.clone();
                         let _ = crate::api::settle_if_conductor_completed(&rec);
                     }
@@ -2166,7 +2162,7 @@ mod tests {
         assert_eq!(project.failure_class, Some(FailureClass::HarnessCrash));
         assert_eq!(project.last_event, recorded_event);
 
-        let resolved = crate::api::cmd_failure_resolve(Some(&rec.id), false).unwrap();
+        let resolved = crate::api::cmd_failure_resolve(Some(&rec.id), false, None, None).unwrap();
         assert!(resolved.failure_class.is_none());
         assert!(on_disk(&rec).failure_class.is_none());
     }
