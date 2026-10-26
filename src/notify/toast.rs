@@ -38,7 +38,10 @@ pub fn toast_title(event: &NotifyEvent) -> String {
 
 pub fn toast_body(event: &NotifyEvent) -> String {
     let track = event.track_id.as_deref().unwrap_or("null");
-    let mut body = format!("{} · {} · {}", event.project_id, track, event.phase);
+    let mut body = format!(
+        "{} · {} · epoch {} · {}",
+        event.project_id, track, event.run_epoch, event.phase
+    );
     if let Some(ref msg) = event.message {
         let t = truncate(msg, TOAST_BODY_CAP);
         body.push(' ');
@@ -157,5 +160,20 @@ mod tests {
         assert!(b.contains("0009"));
         assert!(b.contains("implement"));
         assert!(b.contains("budget"));
+        assert!(b.contains("epoch 1"));
+    }
+
+    #[test]
+    fn long_uuid_message_still_names_the_epoch() {
+        let mut event = event();
+        event.project_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into();
+        event.run_epoch = 7;
+        event.message = Some("x".repeat(TOAST_BODY_CAP + 40));
+        let body = toast_body(&event);
+        assert!(
+            body.contains("epoch 7"),
+            "epoch must survive a long message: {body}"
+        );
+        assert!(body.find("epoch 7").unwrap() < body.find(&"x".repeat(8)).unwrap());
     }
 }

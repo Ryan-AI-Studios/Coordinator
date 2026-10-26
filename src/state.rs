@@ -707,7 +707,7 @@ pub struct StatusView {
     /// Additive workflow object (`id`, `driver`, `pending_roles`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowView>,
-    /// Path to `{state_dir}/FAILURE.md` when present; `null` when absent.
+    /// Path to the project failure summary when that file exists; `null` when absent.
     #[serde(default)]
     pub failure_artifact: Option<PathBuf>,
     /// Read-time SUPERSEDED reason (0040). Omitted when the failure is live.
@@ -764,6 +764,12 @@ pub struct RunSummary {
     pub track_id: Option<String>,
     pub phase: String,
     pub status: RunStatus,
+    /// Copied from the entry. This struct does not invent an artifact path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<FailureClass>,
+    /// Set by `compose_book_status` when that epoch's file exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_artifact: Option<PathBuf>,
 }
 
 impl RunSummary {
@@ -773,6 +779,8 @@ impl RunSummary {
             track_id: state.track_id.clone(),
             phase: state.phase.clone(),
             status: state.status,
+            failure_class: state.failure_class,
+            failure_artifact: None,
         }
     }
 }
@@ -911,7 +919,7 @@ impl StatusView {
                 ci_fix_attempts: state.ci_fix_attempts,
                 review_fix_attempts: state.review_fix_attempts,
             }),
-            failure_artifact: crate::notify::artifact::existing_path(record),
+            failure_artifact: crate::notify::artifact::summary_path_if_present(record),
             failure_superseded: failure_superseded_for(record, state),
             ci: ci_status_view(record, state),
             review: review_status_view(state),
@@ -948,13 +956,13 @@ fn holder_lifecycle(
 }
 
 fn failure_superseded_for(record: &ProjectRecord, state: &RunState) -> Option<String> {
-    if state.failure_class.is_none() && crate::notify::artifact::existing_path(record).is_none() {
-        return None;
-    }
-    let body = crate::notify::artifact::read(record)
+    let body = crate::notify::artifact::read(record, state.run_epoch)
         .ok()
         .flatten()
-        .map(|s| s.body);
+        .map(|shown| shown.body);
+    if state.failure_class.is_none() && body.is_none() {
+        return None;
+    }
     crate::workflow::conductor_md::failure_superseded(record, state, body.as_deref())
 }
 
@@ -2464,11 +2472,13 @@ mod tests {
             ),
         )
         .unwrap();
-        let path = crate::notify::artifact::path(&rec).unwrap();
-        std::fs::write(&path, "- track_id: B\n- run_epoch: 4\n").unwrap();
+        let sibling = crate::notify::artifact::run_path(&rec, 4).unwrap();
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        let bytes = b"- track_id: B\n- run_epoch: 4\n- failure_class: timeout\n";
+        std::fs::write(&sibling, bytes).unwrap();
         let _scope = RunScope::enter(3).unwrap();
-        crate::notify::clear_artifact(&rec);
-        assert!(path.is_file());
+        crate::notify::clear_artifact(&rec, 3);
+        assert_eq!(std::fs::read(&sibling).unwrap(), bytes);
         assert!(crate::notify::artifact::existing_path(&rec).is_none());
         let log = std::fs::read_to_string(crate::progress_log::path(&rec)).unwrap_or_default();
         assert!(

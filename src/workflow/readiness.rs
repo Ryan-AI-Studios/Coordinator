@@ -387,7 +387,7 @@ pub fn report_with_features(
         snapshot_evidence(record, &conductor_dir, &view_rows, parsed_view.is_some());
 
     // ---- run state once, pick once ----------------------------------------
-    let state_result = load_run_state(record);
+    let state_result = ready_state(record);
     let pick_result = state_result
         .as_ref()
         .ok()
@@ -636,6 +636,30 @@ fn snapshot_evidence(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The state the ticker would judge. A book uses the live entry when one is
+/// running or paused, otherwise the highest epoch. Singular runs stay on
+/// [`load_run_state`].
+fn ready_state(record: &ProjectRecord) -> Result<RunState> {
+    match crate::state::load_run_book(record)? {
+        crate::state::RunBook::One(_) => load_run_state(record),
+        crate::state::RunBook::Many(envelope) => {
+            if let Some(live) = envelope
+                .runs
+                .iter()
+                .find(|entry| matches!(entry.status, RunStatus::Running | RunStatus::Paused))
+            {
+                return Ok(live.clone());
+            }
+            Ok(envelope
+                .runs
+                .into_iter()
+                .max_by_key(|entry| entry.run_epoch)
+                .unwrap_or_else(|| RunState::idle(&record.id)))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn decide(
     record: &ProjectRecord,
     feature_enabled: bool,
@@ -667,7 +691,7 @@ fn decide(
         return ReadyDecision::skip(SkipReason::AlreadyActive, None);
     }
     // (e) durable failure must precede `should_pick_next_ready`.
-    if state.failure_class.is_some() || crate::notify::artifact::existing_path(record).is_some() {
+    if state.failure_class.is_some() || crate::notify::artifact::any_failure_record(record) {
         return ReadyDecision::skip(SkipReason::DurableFailure, None);
     }
     // (f) pick state.
@@ -1468,7 +1492,51 @@ mod tests {
         track_dir(ws.path(), "0020-Fixture");
         let artifact = crate::notify::artifact::path(&rec).unwrap();
         std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-        std::fs::write(&artifact, b"failure\n").unwrap();
+        std::fs::write(&artifact, b"- track_id: 0020\n- run_epoch: 1\n").unwrap();
+        assert_eq!(
+            report(&rec, true).decision.reason,
+            Some(SkipReason::DurableFailure)
+        );
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure)
+        );
+    }
+
+    #[test]
+    fn book_older_failure_file_is_durable_on_both_gates() {
+        let _guard = test_env_lock();
+        let _env = env_guard();
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::config::ENV_COORDINATOR_HOME, home.path());
+        }
+        let ws = tempdir().unwrap();
+        let rec = base_record(ws.path());
+        write_gate(home.path(), true);
+        write_md(ws.path(), &ready_md("0020"));
+        track_dir(ws.path(), "0020-Fixture");
+        let mut older = RunState::idle(&rec.id);
+        older.run_epoch = 4;
+        older.status = RunStatus::Idle;
+        older.track_id = Some("0128".into());
+        let mut newer = RunState::idle(&rec.id);
+        newer.run_epoch = 5;
+        newer.status = RunStatus::Idle;
+        newer.track_id = Some("0129".into());
+        crate::state::write_run_book(&rec, &crate::state::RunEnvelope::new(0, vec![older, newer]))
+            .unwrap();
+        let file = crate::notify::artifact::run_path(&rec, 4).unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            b"- track_id: 0128\n- run_epoch: 4\n- failure_class: timeout\n",
+        )
+        .unwrap();
+        assert!(
+            crate::notify::artifact::existing_path(&rec).is_none(),
+            "an unscoped book does not point at one run's file"
+        );
         assert_eq!(
             report(&rec, true).decision.reason,
             Some(SkipReason::DurableFailure)

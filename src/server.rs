@@ -75,6 +75,14 @@ struct StatusQuery {
     project: Option<String>,
 }
 
+/// `GET /v1/failure` query. No body.
+#[derive(Debug, Deserialize)]
+struct FailureQuery {
+    project: Option<String>,
+    epoch: Option<u64>,
+    track: Option<String>,
+}
+
 async fn get_status(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
     if q.project.is_some() {
         let view = api::status(q.project.as_deref(), false)?;
@@ -165,8 +173,8 @@ async fn post_grok_shutdown(
     Ok(Json(view))
 }
 
-async fn get_failure(Query(q): Query<StatusQuery>) -> Result<impl IntoResponse, ApiError> {
-    match api::cmd_failure_show(q.project.as_deref(), false)? {
+async fn get_failure(Query(q): Query<FailureQuery>) -> Result<impl IntoResponse, ApiError> {
+    match api::cmd_failure_show(q.project.as_deref(), false, q.epoch, q.track.as_deref())? {
         Some(v) => Ok(Json(v).into_response()),
         None => Ok((
             StatusCode::NOT_FOUND,
@@ -739,6 +747,90 @@ mod tests {
                 .contains("failure_class: timeout")
         );
 
+        unsafe {
+            std::env::remove_var(ENV_COORDINATOR_HOME);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn get_failure_two_epochs_is_409_and_query_selects_one() {
+        let _guard = test_env_lock();
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ENV_COORDINATOR_HOME, home.path());
+        }
+        let body = serde_json::to_vec(&json!({ "path": proj.path().to_string_lossy() })).unwrap();
+        let created = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let rec = api::load_registry()
+            .unwrap()
+            .projects
+            .into_iter()
+            .next()
+            .unwrap();
+        for (track, epoch) in [("0128", 4u64), ("0129", 5u64)] {
+            let event = crate::notify::NotifyEvent {
+                project_id: rec.id.clone(),
+                track_id: Some(track.into()),
+                phase: "plan".into(),
+                failure_class: crate::outcome::FailureClass::Timeout,
+                message: Some("budget".into()),
+                last_event: "test".into(),
+                artifact_path: crate::notify::artifact::path(&rec).unwrap(),
+                written_at: chrono::Utc::now(),
+                run_epoch: epoch,
+            };
+            crate::notify::artifact::write(&rec, &event).unwrap();
+        }
+        let refused = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/v1/failure")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"epoch":4,"track":"0128"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let bytes = refused.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let error = value["error"].as_str().unwrap();
+        assert!(error.contains("epoch 4 track 0128"), "{error}");
+        assert!(error.contains("epoch 5 track 0129"), "{error}");
+        assert!(error.contains("summary at"), "{error}");
+        assert!(value.get("body").is_none(), "{value}");
+        assert!(value.get("failure_class").is_none(), "{value}");
+
+        let shown = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/failure?epoch=4")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shown.status(), StatusCode::OK);
+        let bytes = shown.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            value["body"].as_str().unwrap().contains("run_epoch: 4"),
+            "{value}"
+        );
         unsafe {
             std::env::remove_var(ENV_COORDINATOR_HOME);
         }

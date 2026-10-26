@@ -756,7 +756,7 @@ fn start_or_park(
                     archive_slugs,
                 },
             );
-            crate::notify::clear_artifact(record);
+            crate::notify::clear_artifact(record, closed);
             watchdog::clear_progress(record);
             None
         }
@@ -778,7 +778,7 @@ fn apply_backlog_clear(record: &ProjectRecord, state: &mut RunState) {
     // `failure resolve` + SUPERSEDED display — this branch is
     // fixture-reachable after a failure apply (Stopped rejects apply,
     // so a new `run` already cleared the file).
-    if let Ok(Some(shown)) = crate::notify::artifact::read(record)
+    if let Ok(Some(shown)) = crate::notify::artifact::read(record, state.run_epoch)
         && let Some(ref track) = state.track_id
     {
         let meta = crate::notify::artifact::parse_metadata(&shown.body);
@@ -1053,7 +1053,7 @@ pub fn commit_probed_successor(
             archive_slugs: Vec::new(),
         },
     );
-    crate::notify::clear_artifact(record);
+    crate::notify::clear_artifact(record, closed);
     watchdog::clear_progress(record);
     state.updated_at = chrono::Utc::now();
     save_run_state(record, &state)?;

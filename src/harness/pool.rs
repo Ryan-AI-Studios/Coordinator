@@ -13222,7 +13222,10 @@ mod tests {
         let absent = no_change_turn(&rec, Some(&prepared), false).await;
         let absent_segment = leg_segment(&journal_before, &rec);
         let absent_state = crate::state::load_run_state(&rec).unwrap();
-        let absent_failure = crate::notify::artifact::read(&rec).unwrap().unwrap().body;
+        let absent_failure = crate::notify::artifact::read(&rec, absent_state.run_epoch)
+            .unwrap()
+            .unwrap()
+            .body;
         assert!(evidence_details(&absent_segment).is_empty());
         assert_eq!(absent.failure_class, Some(FailureClass::HarnessCrash));
         assert!(absent.applied);
@@ -13242,7 +13245,10 @@ mod tests {
         let current = no_change_turn(&rec, Some(&prepared), false).await;
         let current_segment = leg_segment(&journal_before, &rec);
         let current_state = crate::state::load_run_state(&rec).unwrap();
-        let current_failure = crate::notify::artifact::read(&rec).unwrap().unwrap().body;
+        let current_failure = crate::notify::artifact::read(&rec, current_state.run_epoch)
+            .unwrap()
+            .unwrap()
+            .body;
         let details = evidence_details(&current_segment);
         assert_eq!(details.len(), 1);
         assert!(details[0].starts_with(&format!(

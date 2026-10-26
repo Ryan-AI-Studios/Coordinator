@@ -336,7 +336,7 @@ fn acp_harness_cell(adapter: &str) -> String {
 }
 
 pub fn failure_panel(view: &StatusView) -> Option<FailurePanel> {
-    if let Ok(Some(shown)) = api::cmd_failure_show(Some(&view.project_id), false) {
+    if let Ok(Some(shown)) = api::cmd_failure_show(Some(&view.project_id), false, None, None) {
         return Some(FailurePanel {
             path: shown.path,
             body: shown.body,
@@ -648,7 +648,7 @@ pub fn run_selected(project_id: &str, track: Option<String>) -> Result<StatusVie
 }
 
 pub fn show_failure(project_id: &str) -> Result<Option<crate::notify::FailureShow>> {
-    api::cmd_failure_show(Some(project_id), false)
+    api::cmd_failure_show(Some(project_id), false, None, None)
 }
 
 /// Auto-start row. This is not the contextual state-policy alert.
@@ -1298,7 +1298,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let rec = fixture_record(dir.path());
         write_row(dir.path(), "**Ready — not started**");
-        write_failure(&rec, "0038", 2);
+        write_failure(&rec, "0038", 9);
+        let file = artifact::run_path(&rec, 9).unwrap();
+        std::fs::write(
+            &file,
+            "- track_id: 0038\n- run_epoch: 2\n- failure_class: harness_crash\n",
+        )
+        .unwrap();
         let mut state = crate::state::RunState::idle(&rec.id);
         state.status = RunStatus::Stopped;
         state.track_id = Some("0038".into());
@@ -1376,6 +1382,8 @@ mod tests {
             track_id: Some(track.into()),
             phase: "plan".into(),
             status,
+            failure_class: None,
+            failure_artifact: None,
         }
     }
 

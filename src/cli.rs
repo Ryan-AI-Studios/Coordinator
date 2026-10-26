@@ -683,15 +683,27 @@ pub enum OutcomeCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum FailureCommands {
-    /// Print `{state_dir}/FAILURE.md` if present
+    /// Print one run's failure file if present
     Show {
         #[arg(long)]
         project: Option<String>,
+        /// One run epoch. With --track, both must name that failure.
+        #[arg(long)]
+        epoch: Option<u64>,
+        /// Exact track id. Not a prefix match.
+        #[arg(long)]
+        track: Option<String>,
     },
-    /// Acknowledge and remove a leftover Failure Artifact (Idle/Stopped only)
+    /// Acknowledge and remove one run's Failure Artifact (Idle/Stopped only)
     Resolve {
         #[arg(long)]
         project: Option<String>,
+        /// One run epoch. With --track, both must name that failure.
+        #[arg(long)]
+        epoch: Option<u64>,
+        /// Exact track id. Not a prefix match.
+        #[arg(long)]
+        track: Option<String>,
     },
 }
 
@@ -1042,16 +1054,23 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             }
         },
         Commands::Failure { action } => match action {
-            FailureCommands::Show { project } => {
-                match api::cmd_failure_show(project.as_deref(), true)? {
-                    Some(v) => print!("{}", v.body),
-                    None => {
-                        return Err(CoordinatorError::Message("no failure artifact".into()));
-                    }
+            FailureCommands::Show {
+                project,
+                epoch,
+                track,
+            } => match api::cmd_failure_show(project.as_deref(), true, epoch, track.as_deref())? {
+                Some(v) => print!("{}", v.body),
+                None => {
+                    return Err(CoordinatorError::Message("no failure artifact".into()));
                 }
-            }
-            FailureCommands::Resolve { project } => {
-                let view = api::cmd_failure_resolve(project.as_deref(), true)?;
+            },
+            FailureCommands::Resolve {
+                project,
+                epoch,
+                track,
+            } => {
+                let view =
+                    api::cmd_failure_resolve(project.as_deref(), true, epoch, track.as_deref())?;
                 println!("{}", serde_json::to_string_pretty(&view)?);
             }
         },
@@ -2454,8 +2473,17 @@ mod tests {
         let parsed = Cli::try_parse_from(["coordinator", "failure", "resolve"]).unwrap();
         match parsed.command {
             Commands::Failure {
-                action: FailureCommands::Resolve { project },
-            } => assert!(project.is_none()),
+                action:
+                    FailureCommands::Resolve {
+                        project,
+                        epoch,
+                        track,
+                    },
+            } => {
+                assert!(project.is_none());
+                assert!(epoch.is_none());
+                assert!(track.is_none());
+            }
             other => panic!("expected failure resolve, got {other:?}"),
         }
         assert!(
