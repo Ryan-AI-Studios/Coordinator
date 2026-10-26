@@ -2107,6 +2107,15 @@ pub(crate) fn shutdown_epoch(record: &ProjectRecord, epoch: u64) -> Result<bool>
     }
 }
 
+/// No live holder for `epoch`. Does not send Shutdown. A read error is not "gone".
+pub(crate) fn session_is_gone(record: &ProjectRecord, epoch: u64) -> bool {
+    match load_persist_at(record, Some(epoch)) {
+        Ok(None) => true,
+        Ok(Some(handle)) => !(handle.alive || handle.prompt_in_flight),
+        Err(_) => false,
+    }
+}
+
 fn holder_rpc_bounded(addr: &str, req: &HoldRequest) -> Result<HoldResponse> {
     holder_rpc_sync(addr, req, crate::harness::reap::RPC_TIMEOUT)
         .map_err(|err| CoordinatorError::Message(format!("holder rpc: {}", err.detail)))
@@ -13866,7 +13875,7 @@ mod holder_command_tests {
             ),
         )
         .unwrap();
-        let view = crate::run::stop(&rec).unwrap();
+        let view = crate::run::stop_target(&rec, crate::run::RunControl::All).unwrap();
         assert!(
             matches!(
                 crate::state::load_run_book(&rec).unwrap(),
@@ -14052,7 +14061,7 @@ mod holder_command_tests {
             .expect("epoch 7 address");
         assert!(holder_answers_ping(&addr_a), "epoch 3 did not answer Ping");
         assert!(holder_answers_ping(&addr_b), "epoch 7 did not answer Ping");
-        crate::run::stop(&rec).unwrap();
+        crate::run::stop_target(&rec, crate::run::RunControl::All).unwrap();
         let text = std::fs::read_to_string(rec.state_dir.as_ref().unwrap().join("run-state.json"))
             .unwrap();
         assert!(text.contains("project_id"), "{text}");
@@ -14190,6 +14199,199 @@ mod holder_command_tests {
                 crate::state::RunBook::Many(_)
             ),
             "a live idle holder was collapsed"
+        );
+    }
+
+    fn record_rpc(lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut reader, &mut line).is_ok() && !line.is_empty() {
+                    lines.lock().unwrap().push(line);
+                    let _ = std::io::Write::write_all(&mut writer, b"{\"ok\":true}\n");
+                }
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn targeted_stop_leaves_the_sibling_holder_answering_ping() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        std::fs::create_dir_all(rec.state_dir.as_ref().unwrap()).unwrap();
+        let lines_a = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines_b = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr_a = record_rpc(lines_a.clone());
+        let addr_b = record_rpc(lines_b.clone());
+        let mut first = crate::state::RunState::idle(&rec.id);
+        first.run_epoch = 3;
+        first.status = crate::state::RunStatus::Running;
+        first.track_id = Some("A".into());
+        first.phase = "plan".into();
+        let mut second = crate::state::RunState::idle(&rec.id);
+        second.run_epoch = 7;
+        second.status = crate::state::RunStatus::Running;
+        second.track_id = Some("B".into());
+        second.phase = "implement".into();
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![first.clone(), second.clone()]),
+        )
+        .unwrap();
+        write_session(&rec, 3, &addr_a, None);
+        write_session(&rec, 7, &addr_b, None);
+        crate::run::stop_target(&rec, crate::run::RunControl::Epoch(3)).unwrap();
+        let book = crate::state::load_run_book(&rec).unwrap();
+        let crate::state::RunBook::Many(envelope) = book else {
+            panic!("targeted stop collapsed the book");
+        };
+        let kept = envelope
+            .runs
+            .iter()
+            .find(|entry| entry.run_epoch == 7)
+            .expect("sibling");
+        assert_eq!(kept, &second);
+        assert_eq!(kept.status, crate::state::RunStatus::Running);
+        let sibling_lines = lines_b.lock().unwrap().clone();
+        assert!(
+            sibling_lines.iter().all(|line| !line.contains("shutdown")),
+            "sibling received Shutdown: {sibling_lines:?}"
+        );
+        assert!(
+            holder_answers_ping(&addr_b),
+            "sibling holder no longer answers Ping"
+        );
+        let persist = rec
+            .state_dir
+            .as_ref()
+            .unwrap()
+            .join("sessions")
+            .join("7")
+            .join("harness-grok.json");
+        assert!(persist.is_file(), "sibling session persist is gone");
+        let stopped_lines = lines_a.lock().unwrap().clone();
+        assert!(
+            stopped_lines.iter().any(|line| line.contains("shutdown")),
+            "the stopped epoch was not shut down: {stopped_lines:?}"
+        );
+    }
+
+    #[test]
+    fn stopped_epoch_stop_does_not_shutdown_the_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        std::fs::create_dir_all(rec.state_dir.as_ref().unwrap()).unwrap();
+        let lines_a = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines_b = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr_a = record_rpc(lines_a.clone());
+        let addr_b = record_rpc(lines_b.clone());
+        let mut stopped = crate::state::RunState::idle(&rec.id);
+        stopped.run_epoch = 3;
+        stopped.status = crate::state::RunStatus::Stopped;
+        stopped.track_id = Some("A".into());
+        stopped.last_event = crate::state::STOP_LAST_EVENT.into();
+        let mut sibling = crate::state::RunState::idle(&rec.id);
+        sibling.run_epoch = 7;
+        sibling.status = crate::state::RunStatus::Running;
+        sibling.track_id = Some("B".into());
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![stopped, sibling.clone()]),
+        )
+        .unwrap();
+        write_session(&rec, 3, &addr_a, None);
+        write_session(&rec, 7, &addr_b, None);
+        crate::run::stop_target(&rec, crate::run::RunControl::Epoch(3)).unwrap();
+        assert!(
+            lines_a.lock().unwrap().is_empty(),
+            "stopped epoch was shut down"
+        );
+        assert!(lines_b.lock().unwrap().is_empty(), "sibling was shut down");
+        assert!(holder_answers_ping(&addr_b));
+        let crate::state::RunBook::Many(envelope) = crate::state::load_run_book(&rec).unwrap()
+        else {
+            panic!("idempotent stop collapsed the book");
+        };
+        let kept = envelope
+            .runs
+            .iter()
+            .find(|entry| entry.run_epoch == 7)
+            .unwrap();
+        assert_eq!(kept, &sibling);
+    }
+
+    fn singular_running(
+        rec: &crate::registry::ProjectRecord,
+        epoch: u64,
+    ) -> crate::state::RunState {
+        let mut state = crate::state::RunState::idle(&rec.id);
+        state.run_epoch = epoch;
+        state.status = crate::state::RunStatus::Running;
+        state.phase = "plan".into();
+        state.track_id = Some("A".into());
+        crate::state::save_run_state(rec, &state).unwrap();
+        state
+    }
+
+    fn write_singular_session(rec: &crate::registry::ProjectRecord, addr: &str) {
+        let path = rec.state_dir.as_ref().unwrap().join("harness-grok.json");
+        let body = serde_json::json!({
+            "version": 1,
+            "project_id": rec.id,
+            "adapter": "grok",
+            "supports_compact": true,
+            "alive": true,
+            "control_addr": addr,
+        });
+        std::fs::write(path, serde_json::to_string(&body).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn singular_stop_shuts_down_its_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record(dir.path());
+        std::fs::create_dir_all(rec.state_dir.as_ref().unwrap()).unwrap();
+        for target in [
+            crate::run::RunControl::Bare,
+            crate::run::RunControl::Epoch(4),
+        ] {
+            let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let addr = record_rpc(lines.clone());
+            singular_running(&rec, 4);
+            write_singular_session(&rec, &addr);
+            let label = format!("{target:?}");
+            crate::run::stop_target(&rec, target).unwrap();
+            let stopped = lines.lock().unwrap().clone();
+            assert!(
+                stopped.iter().any(|line| line.contains("shutdown")),
+                "singular {label} did not shut the holder down: {stopped:?}"
+            );
+            let crate::state::RunBook::One(state) = crate::state::load_run_book(&rec).unwrap()
+            else {
+                panic!("singular stop became a book");
+            };
+            assert_eq!(state.status, crate::state::RunStatus::Stopped);
+        }
+
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = record_rpc(lines.clone());
+        let mut state = singular_running(&rec, 4);
+        state.status = crate::state::RunStatus::Stopped;
+        state.last_event = crate::state::STOP_LAST_EVENT.into();
+        crate::state::save_run_state(&rec, &state).unwrap();
+        write_singular_session(&rec, &addr);
+        crate::run::stop(&rec).unwrap();
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "already-Stopped singular stop shut the holder down"
         );
     }
 }

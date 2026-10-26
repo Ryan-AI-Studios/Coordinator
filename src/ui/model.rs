@@ -417,37 +417,201 @@ pub fn load_fleet(selected: Option<&str>) -> Result<FleetSnapshot> {
     Ok(build_fleet(views, selected.as_deref()))
 }
 
-/// Pause every Running project. `InvalidTransition` is skip, not a hard UI error.
+/// A project the fleet Pause control should include.
+///
+/// A book counts when any entry is `Running`, including when the lowest epoch
+/// (the top-level status) is not. A one-run card has an empty `runs` list.
+pub fn project_has_running(view: &StatusView) -> bool {
+    if view.runs.is_empty() {
+        view.status == RunStatus::Running
+    } else {
+        view.runs.iter().any(|run| run.status == RunStatus::Running)
+    }
+}
+
+fn paused_entries(view: &StatusView) -> usize {
+    if view.runs.is_empty() {
+        usize::from(view.status == RunStatus::Paused)
+    } else {
+        view.runs
+            .iter()
+            .filter(|run| run.status == RunStatus::Paused)
+            .count()
+    }
+}
+
+fn stoppable_entries(view: &StatusView) -> usize {
+    if view.runs.is_empty() {
+        usize::from(matches!(
+            view.status,
+            RunStatus::Running | RunStatus::Paused
+        ))
+    } else {
+        view.runs
+            .iter()
+            .filter(|run| matches!(run.status, RunStatus::Running | RunStatus::Paused))
+            .count()
+    }
+}
+
+/// Ops-bar resume or stop. The label is the control the operator sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpsControl {
+    pub label: &'static str,
+    pub target: crate::run::RunControl,
+}
+
+/// `None` when the selected project has no paused entry.
+pub fn ops_resume(view: &StatusView) -> Option<OpsControl> {
+    match paused_entries(view) {
+        0 => None,
+        1 => Some(OpsControl {
+            label: "Resume",
+            target: crate::run::RunControl::Bare,
+        }),
+        _ => Some(OpsControl {
+            label: "Resume project",
+            target: crate::run::RunControl::All,
+        }),
+    }
+}
+
+/// Two or more Running/Paused entries are project-wide. Fewer stay no-selector.
+pub fn ops_stop(view: &StatusView) -> OpsControl {
+    if stoppable_entries(view) >= 2 {
+        OpsControl {
+            label: "Stop project",
+            target: crate::run::RunControl::All,
+        }
+    } else {
+        OpsControl {
+            label: "Stop selected",
+            target: crate::run::RunControl::Bare,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardVerb {
+    Pause,
+    Resume,
+    Stop,
+}
+
+/// One button on a multi-run card. Epoch buttons carry `run_epoch`, never a track id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardControl {
+    pub label: String,
+    pub verb: CardVerb,
+    pub target: crate::run::RunControl,
+}
+
+/// Epoch strip plus project-wide buttons. `None` keeps [`card_primary_action`].
+///
+/// 0130 has not drawn per-run rows, so this strip is the list. It does not
+/// include phase, wait, or failure text.
+pub fn card_control_buttons(view: &StatusView) -> Option<Vec<CardControl>> {
+    if view.runs.len() <= 1 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for run in &view.runs {
+        match run.status {
+            RunStatus::Running => {
+                out.push(epoch_control(CardVerb::Pause, run.run_epoch));
+                out.push(epoch_control(CardVerb::Stop, run.run_epoch));
+            }
+            RunStatus::Paused => {
+                out.push(epoch_control(CardVerb::Resume, run.run_epoch));
+                out.push(epoch_control(CardVerb::Stop, run.run_epoch));
+            }
+            _ => {}
+        }
+    }
+    if view.runs.iter().any(|run| run.status == RunStatus::Running) {
+        out.push(project_control(CardVerb::Pause));
+    }
+    if view.runs.iter().any(|run| run.status == RunStatus::Paused) {
+        out.push(project_control(CardVerb::Resume));
+    }
+    if view
+        .runs
+        .iter()
+        .any(|run| matches!(run.status, RunStatus::Running | RunStatus::Paused))
+    {
+        out.push(project_control(CardVerb::Stop));
+    }
+    Some(out)
+}
+
+fn verb_word(verb: CardVerb) -> &'static str {
+    match verb {
+        CardVerb::Pause => "Pause",
+        CardVerb::Resume => "Resume",
+        CardVerb::Stop => "Stop",
+    }
+}
+
+fn epoch_control(verb: CardVerb, epoch: u64) -> CardControl {
+    CardControl {
+        label: format!("{} {epoch}", verb_word(verb)),
+        verb,
+        target: crate::run::RunControl::Epoch(epoch),
+    }
+}
+
+fn project_control(verb: CardVerb) -> CardControl {
+    CardControl {
+        label: format!("{} project", verb_word(verb)),
+        verb,
+        target: crate::run::RunControl::All,
+    }
+}
+
+/// Pause every project that has a Running entry. Passes `all: true`.
+/// `InvalidTransition` is a skip. The ambiguous-target error is not a skip
+/// and does not drop the rest of the fleet.
 pub fn pause_all() -> Result<Vec<StatusView>> {
-    pause_listed(api::status_all()?, |id| api::cmd_pause(Some(id), false))
+    pause_listed(api::status_all()?, |view| {
+        api::cmd_pause(Some(&view.project_id), false, crate::run::RunControl::All)
+    })
 }
 
 /// Testable pause-all core (no process-wide registry).
 pub fn pause_listed(
     views: impl IntoIterator<Item = StatusView>,
-    mut pause: impl FnMut(&str) -> Result<StatusView>,
+    mut pause: impl FnMut(&StatusView) -> Result<StatusView>,
 ) -> Result<Vec<StatusView>> {
     let mut out = Vec::new();
+    let mut ambiguous = None;
     for view in views {
-        if view.status != RunStatus::Running {
+        if !project_has_running(&view) {
             continue;
         }
-        match pause(&view.project_id) {
+        match pause(&view) {
             Ok(next) => out.push(next),
             Err(CoordinatorError::InvalidTransition { .. }) => {}
-            Err(e) => return Err(e),
+            Err(error @ CoordinatorError::AmbiguousControlTarget { .. }) => {
+                if ambiguous.is_none() {
+                    ambiguous = Some(error);
+                }
+            }
+            Err(error) => return Err(error),
         }
+    }
+    if let Some(error) = ambiguous {
+        return Err(error);
     }
     Ok(out)
 }
 
 /// Stop selected. Does not call harness shutdown and does not write `FAILURE.md`.
-pub fn stop_selected(project_id: &str) -> Result<StatusView> {
-    api::cmd_stop(Some(project_id), false)
+pub fn stop_selected(project_id: &str, target: crate::run::RunControl) -> Result<StatusView> {
+    api::cmd_stop(Some(project_id), false, target)
 }
 
-pub fn resume_selected(project_id: &str) -> Result<StatusView> {
-    api::cmd_resume(Some(project_id), false)
+pub fn resume_selected(project_id: &str, target: crate::run::RunControl) -> Result<StatusView> {
+    api::cmd_resume(Some(project_id), false, target)
 }
 
 /// Explicit absolute path only. Never `project scan --add`.
@@ -1189,9 +1353,9 @@ mod tests {
         let mut paused = running.clone();
         paused.status = RunStatus::Paused;
         let mut calls = Vec::new();
-        let out = pause_listed(vec![running, other, idle], |id| {
-            calls.push(id.to_string());
-            if id == "p2" {
+        let out = pause_listed(vec![running, other, idle], |view| {
+            calls.push(view.project_id.clone());
+            if view.project_id == "p2" {
                 Err(CoordinatorError::InvalidTransition {
                     action: "pause",
                     from: "Running".into(),
@@ -1204,6 +1368,181 @@ mod tests {
         assert_eq!(calls, vec!["p1", "p2"]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].status, RunStatus::Paused);
+    }
+
+    fn summary(epoch: u64, track: &str, status: RunStatus) -> crate::state::RunSummary {
+        crate::state::RunSummary {
+            run_epoch: epoch,
+            track_id: Some(track.into()),
+            phase: "plan".into(),
+            status,
+        }
+    }
+
+    #[test]
+    fn multi_run_card_draws_epoch_and_project_controls() {
+        let one_run = view(RunStatus::Running, "plan", None, None);
+        let mut view = view(RunStatus::Idle, "plan", None, None);
+        view.runs = vec![
+            summary(1, "A", RunStatus::Idle),
+            summary(4, "B", RunStatus::Running),
+            summary(9, "C", RunStatus::Paused),
+        ];
+        let buttons = card_control_buttons(&view).expect("epoch strip");
+        let labels: Vec<&str> = buttons.iter().map(|button| button.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Pause 4",
+                "Stop 4",
+                "Resume 9",
+                "Stop 9",
+                "Pause project",
+                "Resume project",
+                "Stop project",
+            ]
+        );
+        assert!(
+            labels
+                .iter()
+                .all(|label| { *label != "Pause" && *label != "Resume" && *label != "Stop" })
+        );
+        assert!(labels.iter().all(|label| {
+            !label.contains("phase") && !label.contains("wait") && !label.contains("failure")
+        }));
+        assert!(matches!(
+            buttons[0].target,
+            crate::run::RunControl::Epoch(4)
+        ));
+        assert!(matches!(buttons[4].target, crate::run::RunControl::All));
+        assert!(card_control_buttons(&one_run).is_none());
+    }
+
+    #[test]
+    fn ops_bar_names_project_controls_for_two_matches() {
+        let mut idle_low = view(RunStatus::Idle, STUB_PHASE_IDLE, None, None);
+        idle_low.runs = vec![
+            summary(1, "A", RunStatus::Idle),
+            summary(2, "B", RunStatus::Running),
+        ];
+        assert!(project_has_running(&idle_low));
+        let mut two_paused = view(RunStatus::Paused, "plan", None, None);
+        two_paused.runs = vec![
+            summary(3, "A", RunStatus::Paused),
+            summary(4, "B", RunStatus::Paused),
+        ];
+        let resume = ops_resume(&two_paused).unwrap();
+        assert_eq!(resume.label, "Resume project");
+        assert_eq!(resume.target, crate::run::RunControl::All);
+        let stop = ops_stop(&two_paused);
+        assert_eq!(stop.label, "Stop project");
+        assert_eq!(stop.target, crate::run::RunControl::All);
+        let mut one = view(RunStatus::Paused, "plan", None, None);
+        one.runs = vec![
+            summary(3, "A", RunStatus::Paused),
+            summary(4, "B", RunStatus::Idle),
+        ];
+        let resume = ops_resume(&one).unwrap();
+        assert_eq!(resume.label, "Resume");
+        assert_eq!(resume.target, crate::run::RunControl::Bare);
+        assert_eq!(ops_stop(&one).target, crate::run::RunControl::Bare);
+    }
+
+    #[test]
+    fn pause_listed_pauses_idle_lowest_then_the_next_project() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let rec_a = crate::registry::ProjectRecord {
+            id: "idle-low".into(),
+            path: dir_a.path().to_path_buf(),
+            display_name: None,
+            layout_profile: LayoutProfile::Nested,
+            conductor_dir: None,
+            execution_repo: None,
+            execution_repos: std::collections::BTreeMap::new(),
+            state_dir: Some(dir_a.path().join("state")),
+            auto_merge: true,
+            phase_timeouts_secs: std::collections::BTreeMap::new(),
+            notify_progress: false,
+            worktree_isolation: false,
+            ready_aliases: Vec::new(),
+            auto_start: Default::default(),
+            state_policies: Vec::new(),
+            self_continuation: false,
+            ci_fix_routing: false,
+            review_comment_routing: false,
+            skill_aliases: std::collections::BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+        let mut rec_b = rec_a.clone();
+        rec_b.id = "second".into();
+        rec_b.path = dir_b.path().to_path_buf();
+        rec_b.state_dir = Some(dir_b.path().join("state"));
+        let mut idle = crate::state::RunState::idle(&rec_a.id);
+        idle.run_epoch = 1;
+        idle.status = RunStatus::Idle;
+        let mut running = crate::state::RunState::idle(&rec_a.id);
+        running.run_epoch = 2;
+        running.status = RunStatus::Running;
+        running.track_id = Some("B".into());
+        crate::state::ensure_state_dir(&rec_a).unwrap();
+        crate::state::write_run_book(
+            &rec_a,
+            &crate::state::RunEnvelope::new(0, vec![idle, running]),
+        )
+        .unwrap();
+        crate::run::run_with_driver(
+            &rec_b,
+            Some("0130".into()),
+            crate::workflow::WorkflowDriver::Stub,
+        )
+        .unwrap();
+        let mut first = view(RunStatus::Idle, STUB_PHASE_IDLE, None, None);
+        first.project_id = rec_a.id.clone();
+        first.runs = vec![
+            summary(1, "A", RunStatus::Idle),
+            summary(2, "B", RunStatus::Running),
+        ];
+        let mut second = view(RunStatus::Running, "plan", None, None);
+        second.project_id = rec_b.id.clone();
+        pause_listed(vec![first, second], |view| {
+            let rec = if view.project_id == rec_a.id {
+                &rec_a
+            } else {
+                &rec_b
+            };
+            crate::run::pause_target(rec, crate::run::RunControl::All)
+        })
+        .unwrap();
+        let crate::state::RunBook::Many(book) = crate::state::load_run_book(&rec_a).unwrap() else {
+            panic!("first project collapsed");
+        };
+        assert_eq!(book.runs[1].status, RunStatus::Paused);
+        assert_eq!(
+            crate::state::load_run_state(&rec_b).unwrap().status,
+            RunStatus::Paused
+        );
+    }
+
+    #[test]
+    fn pause_listed_reports_ambiguous_after_the_rest_of_the_fleet() {
+        let first = view(RunStatus::Running, "plan", None, None);
+        let mut second = first.clone();
+        second.project_id = "p2".into();
+        let mut calls = Vec::new();
+        let err = pause_listed(vec![first, second], |view| {
+            calls.push(view.project_id.clone());
+            Err(CoordinatorError::AmbiguousControlTarget {
+                action: "pause",
+                matches: "epoch 1 track A, epoch 2 track B".into(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(calls, vec!["p1", "p2"]);
+        assert!(matches!(
+            err,
+            CoordinatorError::AmbiguousControlTarget { .. }
+        ));
     }
 
     #[test]

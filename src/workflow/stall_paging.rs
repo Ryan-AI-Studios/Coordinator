@@ -53,9 +53,25 @@ pub fn tick(record: &ProjectRecord) {
 /// POST can be killed mid-flight. Bounded by `POST_TIMEOUT` (5 s); a failure is
 /// logged and not retried.
 pub fn tick_blocking(record: &ProjectRecord) {
+    #[cfg(test)]
+    TICK_BLOCKING_SCOPES.with(|slot| {
+        slot.borrow_mut().push(crate::state::active_run_epoch());
+    });
     if let Some(event) = reconcile(record) {
         crate::notify::on_stall_blocking(&event);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TICK_BLOCKING_SCOPES: std::cell::RefCell<Vec<Option<u64>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Epochs observed by [`tick_blocking`], in call order. `None` means no run scope.
+#[cfg(test)]
+pub fn take_tick_blocking_scopes_for_tests() -> Vec<Option<u64>> {
+    TICK_BLOCKING_SCOPES.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
 fn reconcile_locked(record: &ProjectRecord) -> Result<Option<StallEvent>> {

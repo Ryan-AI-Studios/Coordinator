@@ -58,6 +58,14 @@ pub enum CoordinatorError {
          id — fix the duplicate rows in the registry"
     )]
     AmbiguousRunTrack { track: String, rows: String },
+
+    /// 0128: pause, resume, or stop matched more than one run, or the selectors disagree.
+    /// Not [`Self::AmbiguousRunTrack`] and not `state::ambiguous_run_error`.
+    #[error("ambiguous {action} target: {matches}")]
+    AmbiguousControlTarget {
+        action: &'static str,
+        matches: String,
+    },
 }
 
 impl CoordinatorError {
@@ -71,7 +79,8 @@ impl CoordinatorError {
             Self::InvalidTransition { .. }
             | Self::BlockedHold { .. }
             | Self::TerminalRunTrack { .. }
-            | Self::AmbiguousRunTrack { .. } => 2,
+            | Self::AmbiguousRunTrack { .. }
+            | Self::AmbiguousControlTarget { .. } => 2,
             Self::ProjectNotFound(_) => 3,
             Self::NonLoopbackBind(_) => 4,
             Self::Message(_) | Self::Io(_) | Self::Json(_) | Self::Preflight { .. } => 1,
@@ -86,7 +95,8 @@ impl CoordinatorError {
             | Self::Preflight { .. }
             | Self::BlockedHold { .. }
             | Self::TerminalRunTrack { .. }
-            | Self::AmbiguousRunTrack { .. } => 409,
+            | Self::AmbiguousRunTrack { .. }
+            | Self::AmbiguousControlTarget { .. } => 409,
             Self::ProjectNotFound(_) => 404,
             Self::NonLoopbackBind(_) => 400,
             Self::Message(_) => 400,

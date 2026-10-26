@@ -12,7 +12,7 @@ use serde_json::json;
 
 use crate::api::{
     self, HarnessPromptBody, OutcomeWriteBody, ProjectAddRequest, ProjectRefBody,
-    ProjectScanRequest, ProjectSetRequest, RestoreBody,
+    ProjectScanRequest, ProjectSetRequest, RestoreBody, RunControlBody,
 };
 use crate::config::{DEFAULT_SERVE_PORT, loopback_addr, require_loopback};
 use crate::error::CoordinatorError;
@@ -106,18 +106,21 @@ async fn post_run(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse,
     Ok(Json(view))
 }
 
-async fn post_pause(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_pause(body.project.as_deref(), false)?;
+async fn post_pause(Json(body): Json<RunControlBody>) -> Result<impl IntoResponse, ApiError> {
+    let target = api::run_control_from_parts(body.track, body.epoch, body.all)?;
+    let view = api::cmd_pause(body.project.as_deref(), false, target)?;
     Ok(Json(view))
 }
 
-async fn post_resume(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_resume(body.project.as_deref(), false)?;
+async fn post_resume(Json(body): Json<RunControlBody>) -> Result<impl IntoResponse, ApiError> {
+    let target = api::run_control_from_parts(body.track, body.epoch, body.all)?;
+    let view = api::cmd_resume(body.project.as_deref(), false, target)?;
     Ok(Json(view))
 }
 
-async fn post_stop(Json(body): Json<ProjectRefBody>) -> Result<impl IntoResponse, ApiError> {
-    let view = api::cmd_stop(body.project.as_deref(), false)?;
+async fn post_stop(Json(body): Json<RunControlBody>) -> Result<impl IntoResponse, ApiError> {
+    let target = api::run_control_from_parts(body.track, body.epoch, body.all)?;
+    let view = api::cmd_stop(body.project.as_deref(), false, target)?;
     Ok(Json(view))
 }
 
@@ -1913,5 +1916,121 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["status"], "Running", "{body}");
         assert_eq!(body["track_id"], "0120", "{body}");
+    }
+
+    async fn post_control(path: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::to_vec(&body).unwrap();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    fn seed_control_book(
+        rec: &crate::registry::ProjectRecord,
+        left: crate::state::RunStatus,
+        right: crate::state::RunStatus,
+    ) {
+        let mut first = crate::state::RunState::idle(&rec.id);
+        first.run_epoch = 3;
+        first.status = left;
+        first.track_id = Some("A".into());
+        first.phase = "plan".into();
+        let mut second = crate::state::RunState::idle(&rec.id);
+        second.run_epoch = 4;
+        second.status = right;
+        second.track_id = Some("B".into());
+        second.phase = "implement".into();
+        crate::state::write_run_book(rec, &crate::state::RunEnvelope::new(0, vec![first, second]))
+            .unwrap();
+    }
+
+    fn control_book(rec: &crate::registry::ProjectRecord) -> Vec<crate::state::RunState> {
+        match crate::state::load_run_book(rec).unwrap() {
+            crate::state::RunBook::Many(envelope) => envelope.runs,
+            crate::state::RunBook::One(state) => vec![*state],
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn control_routes_accept_epoch_and_all_and_refuse_a_bare_body() {
+        let _guard = test_env_lock();
+        let fx = run_fixture();
+        let (status, body) = post_control(
+            "/v1/run",
+            json!({ "driver": "stub", "track": "0128", "epoch": 99, "all": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "Running", "{body}");
+        assert_eq!(body["track_id"], "0128");
+
+        for path in ["/v1/pause", "/v1/resume", "/v1/stop"] {
+            let (left, right) = match path {
+                "/v1/pause" | "/v1/stop" => (
+                    crate::state::RunStatus::Running,
+                    crate::state::RunStatus::Running,
+                ),
+                _ => (
+                    crate::state::RunStatus::Paused,
+                    crate::state::RunStatus::Paused,
+                ),
+            };
+            seed_control_book(&fx.rec, left, right);
+            let before = control_book(&fx.rec);
+            let (status, body) = post_control(path, json!({})).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{path} bare {body}");
+            assert!(
+                body["error"].as_str().unwrap_or("").contains("ambiguous"),
+                "{path} {body}"
+            );
+            assert!(
+                !body["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("ambiguous run")
+            );
+            assert_eq!(control_book(&fx.rec), before, "{path} bare wrote");
+
+            seed_control_book(&fx.rec, left, right);
+            let before = control_book(&fx.rec);
+            let (status, body) = post_control(path, json!({ "epoch": 3 })).await;
+            assert_eq!(status, StatusCode::OK, "{path} epoch {body}");
+            let after = control_book(&fx.rec);
+            assert_eq!(after[1], before[1], "{path} epoch changed the sibling");
+            let expect = match path {
+                "/v1/pause" => crate::state::RunStatus::Paused,
+                "/v1/resume" => crate::state::RunStatus::Running,
+                _ => crate::state::RunStatus::Stopped,
+            };
+            assert_eq!(after[0].run_epoch, 3);
+            assert_eq!(after[0].status, expect, "{path} epoch");
+
+            seed_control_book(&fx.rec, left, right);
+            let (status, body) = post_control(path, json!({ "all": true })).await;
+            assert_eq!(status, StatusCode::OK, "{path} all {body}");
+            let after = control_book(&fx.rec);
+            let expect = match path {
+                "/v1/pause" => crate::state::RunStatus::Paused,
+                "/v1/resume" => crate::state::RunStatus::Running,
+                _ => crate::state::RunStatus::Stopped,
+            };
+            assert!(
+                after.iter().all(|entry| entry.status == expect),
+                "{path} all {after:?}"
+            );
+        }
     }
 }

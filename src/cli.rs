@@ -109,16 +109,43 @@ pub enum Commands {
     Pause {
         #[arg(long)]
         project: Option<String>,
+        /// One track id. With --epoch, both must name that run.
+        #[arg(long)]
+        track: Option<String>,
+        /// One run epoch.
+        #[arg(long)]
+        epoch: Option<u64>,
+        /// Every matching run. Conflicts with --track and --epoch.
+        #[arg(long, conflicts_with_all = ["track", "epoch"])]
+        all: bool,
     },
     /// Resume a paused workflow
     Resume {
         #[arg(long)]
         project: Option<String>,
+        /// One track id. With --epoch, both must name that run.
+        #[arg(long)]
+        track: Option<String>,
+        /// One run epoch.
+        #[arg(long)]
+        epoch: Option<u64>,
+        /// Every matching run. Conflicts with --track and --epoch.
+        #[arg(long, conflicts_with_all = ["track", "epoch"])]
+        all: bool,
     },
     /// Stop a run (no merge; sessions left for attach; not a failure)
     Stop {
         #[arg(long)]
         project: Option<String>,
+        /// One track id. With --epoch, both must name that run.
+        #[arg(long)]
+        track: Option<String>,
+        /// One run epoch.
+        #[arg(long)]
+        epoch: Option<u64>,
+        /// Every matching run. Conflicts with --track and --epoch.
+        #[arg(long, conflicts_with_all = ["track", "epoch"])]
+        all: bool,
     },
     /// Return the execution tree to this epoch's checkpoint ref
     Restore {
@@ -949,16 +976,34 @@ fn dispatch(cli: Cli) -> Result<(), CoordinatorError> {
             )?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
-        Commands::Pause { project } => {
-            let view = api::cmd_pause(project.as_deref(), true)?;
+        Commands::Pause {
+            project,
+            track,
+            epoch,
+            all,
+        } => {
+            let target = api::run_control_from_parts(track, epoch, all)?;
+            let view = api::cmd_pause(project.as_deref(), true, target)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
-        Commands::Resume { project } => {
-            let view = api::cmd_resume(project.as_deref(), true)?;
+        Commands::Resume {
+            project,
+            track,
+            epoch,
+            all,
+        } => {
+            let target = api::run_control_from_parts(track, epoch, all)?;
+            let view = api::cmd_resume(project.as_deref(), true, target)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
-        Commands::Stop { project } => {
-            let view = api::cmd_stop(project.as_deref(), true)?;
+        Commands::Stop {
+            project,
+            track,
+            epoch,
+            all,
+        } => {
+            let target = api::run_control_from_parts(track, epoch, all)?;
+            let view = api::cmd_stop(project.as_deref(), true, target)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Commands::Restore { project, discard } => {
@@ -1800,6 +1845,39 @@ mod tests {
     fn run_detach_conflicts_with_serve_port() {
         let err = Cli::try_parse_from(["coordinator", "run", "--detach", "--serve-port", "7500"]);
         assert!(err.is_err(), "detach + serve-port must conflict");
+    }
+
+    #[test]
+    fn control_all_conflicts_with_track_and_epoch() {
+        for verb in ["pause", "resume", "stop"] {
+            assert!(
+                Cli::try_parse_from(["coordinator", verb, "--all", "--epoch", "3"]).is_err(),
+                "{verb} --all --epoch must conflict"
+            );
+            assert!(
+                Cli::try_parse_from(["coordinator", verb, "--all", "--track", "0128"]).is_err(),
+                "{verb} --all --track must conflict"
+            );
+            let parsed =
+                Cli::try_parse_from(["coordinator", verb, "--track", "0128", "--epoch", "3"])
+                    .unwrap_or_else(|err| panic!("{verb} track+epoch: {err}"));
+            match &parsed.command {
+                Commands::Pause {
+                    track, epoch, all, ..
+                }
+                | Commands::Resume {
+                    track, epoch, all, ..
+                }
+                | Commands::Stop {
+                    track, epoch, all, ..
+                } => {
+                    assert_eq!(track.as_deref(), Some("0128"));
+                    assert_eq!(*epoch, Some(3));
+                    assert!(!*all);
+                }
+                other => panic!("expected a control command, got {other:?}"),
+            }
+        }
     }
 
     #[test]

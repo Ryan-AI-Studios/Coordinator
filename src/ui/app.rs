@@ -8,10 +8,11 @@ use dioxus::prelude::*;
 
 use crate::error::CoordinatorError;
 use crate::ui::model::{
-    AUTO_START_ROW_LABEL, CI_FIX_ROW_LABEL, CardPrimaryAction, CardState, ChipKind, FleetSnapshot,
-    ProjectCard, REVIEW_FIX_ROW_LABEL, SELF_CHECK_ROW_LABEL, STATE_GATE_ROW_LABEL, add_project,
-    card_primary_action, ci_fix_row, load_fleet, pause_all, resume_selected, review_fix_row,
-    run_selected, selected_is_paused, self_check_row, state_gate_row, stop_selected, ticker_label,
+    AUTO_START_ROW_LABEL, CI_FIX_ROW_LABEL, CardControl, CardPrimaryAction, CardState, CardVerb,
+    ChipKind, FleetSnapshot, OpsControl, ProjectCard, REVIEW_FIX_ROW_LABEL, SELF_CHECK_ROW_LABEL,
+    STATE_GATE_ROW_LABEL, add_project, card_control_buttons, card_primary_action, ci_fix_row,
+    load_fleet, ops_resume, ops_stop, pause_all, resume_selected, review_fix_row, run_selected,
+    self_check_row, state_gate_row, stop_selected, ticker_label,
 };
 use crate::ui::{WEBVIEW2_MISSING_HINT, model::card_title};
 use crate::watch::ServeAttach;
@@ -452,7 +453,22 @@ fn LocalOpsConsole() -> Element {
     });
 
     let snap = fleet();
-    let paused = selected_is_paused(&snap);
+    let selected_view = snap
+        .cards
+        .iter()
+        .find(|card| Some(&card.view.project_id) == snap.selected.as_ref())
+        .map(|card| card.view.clone());
+    let resume_ctl = selected_view.as_ref().and_then(ops_resume);
+    let stop_ctl = selected_view.as_ref().map(ops_stop).unwrap_or(OpsControl {
+        label: "Stop selected",
+        target: crate::run::RunControl::Bare,
+    });
+    let resume_label = resume_ctl.as_ref().map(|control| control.label);
+    let resume_target = resume_ctl
+        .map(|control| control.target)
+        .unwrap_or(crate::run::RunControl::Bare);
+    let stop_label = stop_ctl.label;
+    let stop_target = stop_ctl.target;
     let err = banner().or(snap.last_error.clone()).unwrap_or_default();
 
     rsx! {
@@ -483,14 +499,18 @@ fn LocalOpsConsole() -> Element {
                         },
                         "Pause all"
                     }
-                    if paused {
+                    if let Some(label) = resume_label {
                         button {
                             class: "primary",
                             title: "Resume: continue pipeline after held phase",
                             onclick: move |_| {
                                 let id = fleet.peek().selected.clone();
                                 if let Some(id) = id {
-                                    match resume_selected(&id) {
+                                    match crate::api::cmd_resume(
+                                        Some(&id),
+                                        false,
+                                        resume_target.clone(),
+                                    ) {
                                         Ok(_) => {
                                             banner.set(None);
                                             refresh(&mut fleet);
@@ -499,7 +519,7 @@ fn LocalOpsConsole() -> Element {
                                     }
                                 }
                             },
-                            "Resume"
+                            "{label}"
                         }
                     }
                     button {
@@ -508,7 +528,7 @@ fn LocalOpsConsole() -> Element {
                         onclick: move |_| {
                             let id = fleet.peek().selected.clone();
                             if let Some(id) = id {
-                                match stop_selected(&id) {
+                                match crate::api::cmd_stop(Some(&id), false, stop_target.clone()) {
                                     Ok(_) => {
                                         banner.set(None);
                                         refresh(&mut fleet);
@@ -519,7 +539,7 @@ fn LocalOpsConsole() -> Element {
                                 banner.set(Some("select a project first".into()));
                             }
                         },
-                        "Stop selected"
+                        "{stop_label}"
                     }
                 }
             }
@@ -703,6 +723,49 @@ fn status_pill(state: CardState) -> (&'static str, &'static str) {
     }
 }
 
+fn run_control_button(
+    control: CardControl,
+    project_id: String,
+    mut fleet: Signal<FleetSnapshot>,
+    mut banner: Signal<Option<String>>,
+) -> Element {
+    let class = if control.verb == CardVerb::Stop {
+        "danger"
+    } else {
+        "primary"
+    };
+    let label = control.label.clone();
+    let title = control.label.clone();
+    let verb = control.verb;
+    let target = control.target;
+    rsx! {
+        button {
+            class: "{class}",
+            title: "{title}",
+            onclick: move |evt| {
+                evt.stop_propagation();
+                let result = match verb {
+                    CardVerb::Pause => {
+                        crate::api::cmd_pause(Some(&project_id), false, target.clone())
+                    }
+                    CardVerb::Resume => {
+                        crate::api::cmd_resume(Some(&project_id), false, target.clone())
+                    }
+                    CardVerb::Stop => crate::api::cmd_stop(Some(&project_id), false, target.clone()),
+                };
+                match result {
+                    Ok(_) => {
+                        banner.set(None);
+                        refresh(&mut fleet);
+                    }
+                    Err(e) => banner.set(Some(e.to_string())),
+                }
+            },
+            "{label}"
+        }
+    }
+}
+
 fn project_card(
     card: &ProjectCard,
     selected_id: Option<&str>,
@@ -731,6 +794,8 @@ fn project_card(
     let parked = card.view.parked_next.clone();
     let layout = card.view.layout_profile.as_str().to_string();
     let (pill_class, pill_label) = status_pill(card.card_state);
+    let controls = card_control_buttons(&card.view);
+    let multi_run = controls.is_some();
     let primary = card_primary_action(&card.view);
     let run_label = if primary == CardPrimaryAction::StartNextReady {
         "Start next Ready"
@@ -774,13 +839,17 @@ fn project_card(
                     p { class: "project-path", "{path}" }
                 }
                 div { class: "project-actions",
-                    if primary == CardPrimaryAction::Resume {
+                    if let Some(controls) = controls {
+                        for control in controls {
+                            {run_control_button(control, id.clone(), fleet, banner)}
+                        }
+                    } else if primary == CardPrimaryAction::Resume {
                         button {
                             class: "primary",
                             title: "Resume: continue pipeline after held phase",
                             onclick: move |evt| {
                                 evt.stop_propagation();
-                                match resume_selected(&id_resume) {
+                                match resume_selected(&id_resume, crate::run::RunControl::Bare) {
                                     Ok(_) => {
                                         banner.set(None);
                                         refresh(&mut fleet);
@@ -814,7 +883,7 @@ fn project_card(
                             title: "Pause: finish current phase, hold next until Resume",
                             onclick: move |evt| {
                                 evt.stop_propagation();
-                                match crate::api::cmd_pause(Some(&id_pause), false) {
+                                match crate::api::cmd_pause(Some(&id_pause), false, crate::run::RunControl::Bare) {
                                     Ok(_) => {
                                         banner.set(None);
                                         refresh(&mut fleet);
@@ -825,20 +894,22 @@ fn project_card(
                             "Pause"
                         }
                     }
-                    button {
-                        class: "danger",
-                        title: "Stop: abort current phase · no merge · sessions left for attach",
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            match stop_selected(&id_stop) {
-                                Ok(_) => {
-                                    banner.set(None);
-                                    refresh(&mut fleet);
+                    if !multi_run {
+                        button {
+                            class: "danger",
+                            title: "Stop: abort current phase · no merge · sessions left for attach",
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                match stop_selected(&id_stop, crate::run::RunControl::Bare) {
+                                    Ok(_) => {
+                                        banner.set(None);
+                                        refresh(&mut fleet);
+                                    }
+                                    Err(e) => banner.set(Some(e.to_string())),
                                 }
-                                Err(e) => banner.set(Some(e.to_string())),
-                            }
-                        },
-                        "Stop"
+                            },
+                            "Stop"
+                        }
                     }
                 }
             }
