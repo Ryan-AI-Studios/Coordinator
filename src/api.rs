@@ -108,6 +108,20 @@ pub struct ProjectRefBody {
     pub skip_preflight: bool,
 }
 
+/// POST /v1/pause, /v1/resume, and /v1/stop. Not added onto [`ProjectRefBody`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunControlBody {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub track: Option<String>,
+    #[serde(default)]
+    pub epoch: Option<u64>,
+    /// Omitted is false. False is not project-wide.
+    #[serde(default)]
+    pub all: bool,
+}
+
 /// Effective phase wall clock for `project show`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PhaseTimeoutView {
@@ -745,19 +759,51 @@ pub fn cmd_doctor(project: Option<&str>) -> Result<crate::harness::preflight::Do
     crate::harness::preflight::probe_machine()
 }
 
-pub fn cmd_pause(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+pub fn cmd_pause(
+    project: Option<&str>,
+    infer_cwd: bool,
+    target: run::RunControl,
+) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
-    run::pause(&rec)
+    run::pause_target(&rec, target)
 }
 
-pub fn cmd_resume(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+pub fn cmd_resume(
+    project: Option<&str>,
+    infer_cwd: bool,
+    target: run::RunControl,
+) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
-    run::resume(&rec)
+    run::resume_target(&rec, target)
 }
 
-pub fn cmd_stop(project: Option<&str>, infer_cwd: bool) -> Result<StatusView> {
+pub fn cmd_stop(
+    project: Option<&str>,
+    infer_cwd: bool,
+    target: run::RunControl,
+) -> Result<StatusView> {
     let rec = resolve_selected(project, infer_cwd)?;
-    run::stop(&rec)
+    run::stop_target(&rec, target)
+}
+
+pub fn run_control_from_parts(
+    track: Option<String>,
+    epoch: Option<u64>,
+    all: bool,
+) -> Result<run::RunControl> {
+    if all && (track.is_some() || epoch.is_some()) {
+        return Err(crate::error::CoordinatorError::AmbiguousControlTarget {
+            action: "control",
+            matches: "all disagrees with track and epoch".into(),
+        });
+    }
+    Ok(match (all, track, epoch) {
+        (true, _, _) => run::RunControl::All,
+        (false, Some(track), Some(epoch)) => run::RunControl::EpochAndTrack { track, epoch },
+        (false, Some(track), None) => run::RunControl::Track(track),
+        (false, None, Some(epoch)) => run::RunControl::Epoch(epoch),
+        (false, None, None) => run::RunControl::Bare,
+    })
 }
 
 /// CLI and `POST /v1/restore`. Project omit matches `stop` (`infer_cwd` is false for HTTP).
@@ -2507,7 +2553,7 @@ mod tests {
             false,
         )
         .unwrap();
-        cmd_stop(Some(&rec.id), false).unwrap();
+        cmd_stop(Some(&rec.id), false, run::RunControl::Bare).unwrap();
         let view = cmd_run(Some(&rec.id), None, Some("stub"), false, false).unwrap();
         assert_eq!(view.track_id.as_deref(), Some("0020"));
         assert!(

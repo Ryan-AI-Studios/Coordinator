@@ -634,46 +634,215 @@ pub fn run_stub(record: &ProjectRecord, track_id: Option<String>) -> Result<Stat
     })
 }
 
-/// Apply `pause`: every Running entry → Paused. Sends no Shutdown.
+/// Which run a pause, resume, or stop command names.
+///
+/// [`Self::Bare`] is the no-selector path. It is not [`Self::All`]. There is no
+/// `Default`: a caller that means every match passes [`Self::All`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunControl {
+    Bare,
+    Epoch(u64),
+    Track(String),
+    EpochAndTrack { epoch: u64, track: String },
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlVerb {
+    Pause,
+    Resume,
+    Stop,
+}
+
+impl ControlVerb {
+    fn action(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Stop => "stop",
+        }
+    }
+
+    fn matches(self, status: RunStatus) -> bool {
+        match self {
+            Self::Pause => status == RunStatus::Running,
+            Self::Resume => status == RunStatus::Paused,
+            Self::Stop => matches!(status, RunStatus::Running | RunStatus::Paused),
+        }
+    }
+}
+
+enum ControlPick {
+    Apply(Vec<usize>),
+    /// Stop of an entry that is already `Stopped`.
+    IdempotentStop(usize),
+    NoMatch,
+}
+
+fn describe_entries(entries: &[RunState], indices: &[usize]) -> String {
+    indices
+        .iter()
+        .map(|index| {
+            let entry = &entries[*index];
+            format!(
+                "epoch {} track {}",
+                entry.run_epoch,
+                entry.track_id.as_deref().unwrap_or("-")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn ambiguous_control(
+    verb: ControlVerb,
+    entries: &[RunState],
+    indices: &[usize],
+) -> CoordinatorError {
+    CoordinatorError::AmbiguousControlTarget {
+        action: verb.action(),
+        matches: describe_entries(entries, indices),
+    }
+}
+
+fn disagree_control(verb: ControlVerb, detail: String) -> CoordinatorError {
+    CoordinatorError::AmbiguousControlTarget {
+        action: verb.action(),
+        matches: detail,
+    }
+}
+
+fn pick_named(entries: &[RunState], verb: ControlVerb, index: usize) -> Result<ControlPick> {
+    let entry = &entries[index];
+    if verb == ControlVerb::Stop && entry.status == RunStatus::Stopped {
+        return Ok(ControlPick::IdempotentStop(index));
+    }
+    if !verb.matches(entry.status) {
+        return Err(CoordinatorError::InvalidTransition {
+            action: verb.action(),
+            from: entry.status.to_string(),
+        });
+    }
+    Ok(ControlPick::Apply(vec![index]))
+}
+
+fn pick_control(
+    entries: &[RunState],
+    verb: ControlVerb,
+    target: &RunControl,
+) -> Result<ControlPick> {
+    match target {
+        RunControl::Bare | RunControl::All => {
+            let hits: Vec<usize> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| verb.matches(entry.status))
+                .map(|(index, _)| index)
+                .collect();
+            if matches!(target, RunControl::Bare) && hits.len() > 1 {
+                return Err(ambiguous_control(verb, entries, &hits));
+            }
+            if hits.is_empty() {
+                Ok(ControlPick::NoMatch)
+            } else {
+                Ok(ControlPick::Apply(hits))
+            }
+        }
+        RunControl::Epoch(epoch) => {
+            match entries.iter().position(|entry| entry.run_epoch == *epoch) {
+                Some(index) => pick_named(entries, verb, index),
+                None => Err(crate::state::unknown_run_epoch_error(*epoch)),
+            }
+        }
+        RunControl::Track(track) => {
+            let same: Vec<usize> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.track_id.as_deref() == Some(track.as_str()))
+                .map(|(index, _)| index)
+                .collect();
+            if same.len() > 1 {
+                return Err(ambiguous_control(verb, entries, &same));
+            }
+            let Some(index) = same.first().copied() else {
+                return Err(CoordinatorError::InvalidTransition {
+                    action: verb.action(),
+                    from: format!("no such track {track}"),
+                });
+            };
+            pick_named(entries, verb, index)
+        }
+        RunControl::EpochAndTrack { epoch, track } => {
+            let Some(index) = entries.iter().position(|entry| entry.run_epoch == *epoch) else {
+                return Err(disagree_control(
+                    verb,
+                    format!("epoch {epoch} disagrees with track {track}"),
+                ));
+            };
+            let found = entries[index].track_id.as_deref().unwrap_or("-");
+            if found != track {
+                return Err(disagree_control(
+                    verb,
+                    format!("epoch {epoch} track {found} disagrees with track {track}"),
+                ));
+            }
+            pick_named(entries, verb, index)
+        }
+    }
+}
+
+fn pause_entry(entry: &mut RunState, now: chrono::DateTime<chrono::Utc>) {
+    entry.status = RunStatus::Paused;
+    entry.pause_started_at = Some(now);
+    entry.last_event = "pause: hold".into();
+    entry.updated_at = now;
+}
+
+/// Apply `pause` with no selector. One matching run, or a refusal. Not [`RunControl::All`].
 pub fn pause(record: &ProjectRecord) -> Result<StatusView> {
+    pause_target(record, RunControl::Bare)
+}
+
+/// Apply `pause` to `target`. Sends no Shutdown.
+pub fn pause_target(record: &ProjectRecord, target: RunControl) -> Result<StatusView> {
     with_run_state_lock(record, || {
         ensure_state_dir(record)?;
         match crate::state::load_run_book(record)? {
             crate::state::RunBook::Many(mut envelope) => {
-                let mut any = false;
-                let now = chrono::Utc::now();
-                for entry in &mut envelope.runs {
-                    if entry.status == RunStatus::Running {
-                        entry.status = RunStatus::Paused;
-                        entry.pause_started_at = Some(now);
-                        entry.last_event = "pause: hold".into();
-                        entry.updated_at = now;
-                        any = true;
-                    }
-                }
-                if !any {
-                    return Err(CoordinatorError::InvalidTransition {
+                match pick_control(&envelope.runs, ControlVerb::Pause, &target)? {
+                    ControlPick::NoMatch => Err(CoordinatorError::InvalidTransition {
                         action: "pause",
                         from: "not running".into(),
-                    });
+                    }),
+                    ControlPick::IdempotentStop(_) => Err(CoordinatorError::InvalidTransition {
+                        action: "pause",
+                        from: RunStatus::Stopped.to_string(),
+                    }),
+                    ControlPick::Apply(indices) => {
+                        let now = chrono::Utc::now();
+                        for index in indices {
+                            pause_entry(&mut envelope.runs[index], now);
+                        }
+                        crate::state::write_run_book(record, &envelope)?;
+                        Ok(compose_book_status(record, &envelope))
+                    }
                 }
-                crate::state::write_run_book(record, &envelope)?;
-                Ok(compose_book_status(record, &envelope))
             }
-            crate::state::RunBook::One(mut state) => match state.status {
-                RunStatus::Running => {
-                    state.status = RunStatus::Paused;
-                    state.pause_started_at = Some(chrono::Utc::now());
-                    state.last_event = "pause: hold".into();
-                    state.updated_at = chrono::Utc::now();
-                    save_run_state(record, &state)?;
-                    Ok(StatusView::from_record(record, &state))
+            crate::state::RunBook::One(mut state) => {
+                match pick_control(std::slice::from_ref(&state), ControlVerb::Pause, &target)? {
+                    ControlPick::Apply(_) => {
+                        pause_entry(&mut state, chrono::Utc::now());
+                        save_run_state(record, &state)?;
+                        Ok(StatusView::from_record(record, &state))
+                    }
+                    ControlPick::NoMatch | ControlPick::IdempotentStop(_) => {
+                        Err(CoordinatorError::InvalidTransition {
+                            action: "pause",
+                            from: state.status.to_string(),
+                        })
+                    }
                 }
-                other => Err(CoordinatorError::InvalidTransition {
-                    action: "pause",
-                    from: other.to_string(),
-                }),
-            },
+            }
         }
     })
 }
@@ -683,47 +852,82 @@ enum ResumePrep {
     Probe(crate::workflow::reuse::ReuseProbe),
 }
 
-/// Apply `resume`: Paused → Running (accumulate paused duration for timeout freeze).
+/// Apply `resume` with no selector. One paused run, or a refusal. Not [`RunControl::All`].
 ///
 /// If the phase already completed/failed while held, release to Idle instead of
 /// re-entering `Running` without a phase clock (would hang forever under autonomy).
 /// An advance successor that still needs `gh pr view` is probed after the lock drops.
+/// `commit_probed_successor` runs inside `RunScope` for `probe.snap_epoch`: the scope
+/// held by `resume_locked` drops when that function returns.
 pub fn resume(record: &ProjectRecord) -> Result<StatusView> {
-    let prep = with_run_state_lock(record, || resume_locked(record))?;
-    match prep {
-        ResumePrep::Done(view) => Ok(*view),
-        ResumePrep::Probe(probe) => {
-            let answer =
-                crate::workflow::reuse::probe_resume(record, probe.number, probe.repo.as_deref());
-            with_run_state_lock(record, || {
-                crate::workflow::commit_probed_successor(record, &probe, &answer)
-            })
-        }
-    }
+    resume_target(record, RunControl::Bare)
 }
 
-fn resume_locked(record: &ProjectRecord) -> Result<ResumePrep> {
-    ensure_state_dir(record)?;
-    if let crate::state::RunBook::Many(envelope) = crate::state::load_run_book(record)? {
-        let paused: Vec<_> = envelope
-            .runs
-            .iter()
-            .filter(|entry| entry.status == RunStatus::Paused)
-            .map(|entry| entry.run_epoch)
-            .collect();
-        if paused.len() > 1 {
-            return Err(CoordinatorError::Message("two paused".into()));
-        }
-        if paused.is_empty() {
-            return Err(CoordinatorError::InvalidTransition {
-                action: "resume",
-                from: "not paused".into(),
-            });
-        }
-        let _scope = crate::state::RunScope::enter(paused[0])?;
-        return resume_scoped(record);
+/// Apply `resume` to `target`.
+pub fn resume_target(record: &ProjectRecord, target: RunControl) -> Result<StatusView> {
+    let parts = with_run_state_lock(record, || resume_locked(record, &target))?;
+    let mut last = None;
+    for part in parts {
+        last = Some(match part {
+            ResumePrep::Done(view) => *view,
+            ResumePrep::Probe(probe) => {
+                let answer = crate::workflow::reuse::probe_resume(
+                    record,
+                    probe.number,
+                    probe.repo.as_deref(),
+                );
+                let _scope = crate::state::RunScope::enter(probe.snap_epoch)?;
+                with_run_state_lock(record, || {
+                    crate::workflow::commit_probed_successor(record, &probe, &answer)
+                })?
+            }
+        });
     }
-    resume_scoped(record)
+    last.ok_or_else(|| CoordinatorError::InvalidTransition {
+        action: "resume",
+        from: "not paused".into(),
+    })
+}
+
+fn resume_locked(record: &ProjectRecord, target: &RunControl) -> Result<Vec<ResumePrep>> {
+    ensure_state_dir(record)?;
+    match crate::state::load_run_book(record)? {
+        crate::state::RunBook::Many(envelope) => {
+            match pick_control(&envelope.runs, ControlVerb::Resume, target)? {
+                ControlPick::NoMatch => Err(CoordinatorError::InvalidTransition {
+                    action: "resume",
+                    from: "not paused".into(),
+                }),
+                ControlPick::IdempotentStop(_) => Err(CoordinatorError::InvalidTransition {
+                    action: "resume",
+                    from: RunStatus::Stopped.to_string(),
+                }),
+                ControlPick::Apply(indices) => {
+                    let epochs: Vec<u64> = indices
+                        .iter()
+                        .map(|index| envelope.runs[*index].run_epoch)
+                        .collect();
+                    let mut parts = Vec::with_capacity(epochs.len());
+                    for epoch in epochs {
+                        let _scope = crate::state::RunScope::enter(epoch)?;
+                        parts.push(resume_scoped(record)?);
+                    }
+                    Ok(parts)
+                }
+            }
+        }
+        crate::state::RunBook::One(state) => {
+            match pick_control(std::slice::from_ref(&state), ControlVerb::Resume, target)? {
+                ControlPick::Apply(_) => Ok(vec![resume_scoped(record)?]),
+                ControlPick::NoMatch | ControlPick::IdempotentStop(_) => {
+                    Err(CoordinatorError::InvalidTransition {
+                        action: "resume",
+                        from: state.status.to_string(),
+                    })
+                }
+            }
+        }
+    }
 }
 
 fn resume_scoped(record: &ProjectRecord) -> Result<ResumePrep> {
@@ -783,79 +987,72 @@ fn resume_scoped(record: &ProjectRecord) -> Result<ResumePrep> {
     }
 }
 
-/// Apply `stop`: Running/Paused → Stopped; already Stopped = successful no-op.
+struct StopPrep {
+    view: StatusView,
+    /// Epochs this call transitioned to `Stopped`. Stall close is scoped to these.
+    transitioned: Vec<u64>,
+    /// Epochs that receive `shutdown_epoch`. Empty is not "every session is gone".
+    shutdown: Vec<u64>,
+    /// Collapse only after every entry is `Stopped` and every session is gone.
+    try_collapse: bool,
+}
+
+/// Apply `stop` with no selector. One matching run, or a refusal. Not [`RunControl::All`].
 ///
-/// 0104: an operator stop now also closes an open stall page (one `run_ended`
-/// clear). The close runs **after** the run-state lock is released and only on
-/// the `Ok` path; its POST is **synchronous** (bounded by `POST_TIMEOUT`, 5 s) so a
-/// one-shot CLI stop cannot lose it at process exit. A failure is logged and not
-/// retried (at-most-once). Ordinary stops with an idle marker take the lock-free
-/// early return, so no extra lock or delay is taken.
+/// 0104: an operator stop also closes an open stall page (one `run_ended` clear).
+/// The close runs **after** the run-state lock is released and only on the `Ok`
+/// path, inside `RunScope` for each epoch this call transitioned. Its POST is
+/// **synchronous** (bounded by `POST_TIMEOUT`, 5 s). A failure is logged and not
+/// retried. A refusal returns before any close.
 pub fn stop(record: &ProjectRecord) -> Result<StatusView> {
-    let book_stop = with_run_state_lock(record, || stop_book_locked(record))?;
-    if let Some(epochs) = book_stop {
-        let mut all_gone = true;
-        let mut targets = epochs;
-        if let Ok(crate::state::RunBook::Many(envelope)) = crate::state::load_run_book(record) {
-            for entry in envelope.runs {
-                if !targets.contains(&entry.run_epoch) {
-                    targets.push(entry.run_epoch);
-                }
-            }
-        }
-        for epoch in &targets {
-            if !crate::harness::pool::shutdown_epoch(record, *epoch).unwrap_or(false) {
-                all_gone = false;
-            }
-        }
-        let result = if all_gone {
-            with_run_state_lock(record, || collapse_stopped_book(record))?
-        } else {
-            status(record)?
-        };
-        crate::workflow::stall_paging::tick_blocking(record);
-        return Ok(result);
+    stop_target(record, RunControl::Bare)
+}
+
+/// Apply `stop` to `target`.
+pub fn stop_target(record: &ProjectRecord, target: RunControl) -> Result<StatusView> {
+    let prep = with_run_state_lock(record, || stop_locked(record, &target))?;
+    if prep.shutdown.is_empty() && prep.transitioned.is_empty() {
+        return Ok(prep.view);
     }
-    let result = with_run_state_lock(record, || {
-        ensure_state_dir(record)?;
-        let mut state = load_run_state(record)?;
-        match state.status {
-            RunStatus::Running | RunStatus::Paused => {
-                state.status = RunStatus::Stopped;
-                state.phase = STUB_PHASE_STOPPED.into();
-                state.last_event = STOP_LAST_EVENT.into();
-                state.phase_started_at = None;
-                state.pause_started_at = None;
-                state.updated_at = chrono::Utc::now();
-                save_run_state(record, &state)?;
-                let track = state.track_id.as_deref().unwrap_or("-");
-                crate::progress_log::append(
-                    record,
-                    "stop",
-                    &format!("track={track} phase={}  {}", state.phase, state.last_event),
-                );
-                Ok(StatusView::from_record(record, &state))
-            }
-            RunStatus::Stopped => {
-                // Idempotent re-stop: successful no-op (ADR / DoD-2).
-                if state.last_event != STOP_LAST_EVENT {
-                    state.last_event = STOP_LAST_EVENT.into();
-                    state.updated_at = chrono::Utc::now();
-                    save_run_state(record, &state)?;
-                }
-                Ok(StatusView::from_record(record, &state))
-            }
-            other => Err(CoordinatorError::InvalidTransition {
-                action: "stop",
-                from: other.to_string(),
-            }),
+    let mut shutdown_ok = Vec::with_capacity(prep.shutdown.len());
+    for epoch in &prep.shutdown {
+        let ok = crate::harness::pool::shutdown_epoch(record, *epoch).unwrap_or(false);
+        shutdown_ok.push((*epoch, ok));
+    }
+    // Close each transitioned page while the book still has that entry.
+    for epoch in &prep.transitioned {
+        let _scope = crate::state::RunScope::enter(*epoch)?;
+        crate::workflow::stall_paging::tick_blocking(record);
+    }
+    if prep.try_collapse && stop_sessions_clear(record, &shutdown_ok)? {
+        return with_run_state_lock(record, || collapse_stopped_book(record));
+    }
+    if prep.try_collapse {
+        return status(record);
+    }
+    Ok(prep.view)
+}
+
+fn stop_sessions_clear(record: &ProjectRecord, shutdown_ok: &[(u64, bool)]) -> Result<bool> {
+    let crate::state::RunBook::Many(envelope) = crate::state::load_run_book(record)? else {
+        return Ok(false);
+    };
+    if !envelope
+        .runs
+        .iter()
+        .all(|entry| entry.status == RunStatus::Stopped)
+    {
+        return Ok(false);
+    }
+    Ok(envelope.runs.iter().all(|entry| {
+        match shutdown_ok
+            .iter()
+            .find(|(epoch, _)| *epoch == entry.run_epoch)
+        {
+            Some((_, ok)) => *ok,
+            None => crate::harness::pool::session_is_gone(record, entry.run_epoch),
         }
-    })?;
-    // The run-state directory lock is non-reentrant; `reconcile` takes the same
-    // lock, so the close must run here, after the closure returned, never inside
-    // it. Deliberately blocking (round-2 m1): the one-shot CLI exits next.
-    crate::workflow::stall_paging::tick_blocking(record);
-    Ok(result)
+    }))
 }
 
 /// Read status without mutation. A book fills `runs` and the lowest epoch's top-level fields.
@@ -883,32 +1080,132 @@ fn compose_book_status(record: &ProjectRecord, envelope: &crate::state::RunEnvel
     view
 }
 
-fn stop_book_locked(record: &ProjectRecord) -> Result<Option<Vec<u64>>> {
-    let crate::state::RunBook::Many(mut envelope) = crate::state::load_run_book(record)? else {
-        return Ok(None);
-    };
-    let epochs: Vec<u64> = envelope
-        .runs
-        .iter()
-        .filter(|entry| matches!(entry.status, RunStatus::Running | RunStatus::Paused))
-        .map(|entry| entry.run_epoch)
-        .collect();
-    if epochs.is_empty() {
-        return Ok(Some(Vec::new()));
+fn mark_stopped(record: &ProjectRecord, entry: &mut RunState, now: chrono::DateTime<chrono::Utc>) {
+    entry.status = RunStatus::Stopped;
+    entry.phase = STUB_PHASE_STOPPED.into();
+    entry.last_event = STOP_LAST_EVENT.into();
+    entry.phase_started_at = None;
+    entry.pause_started_at = None;
+    entry.updated_at = now;
+    let track = entry.track_id.as_deref().unwrap_or("-");
+    crate::progress_log::append(
+        record,
+        "stop",
+        &format!("track={track} phase={}  {}", entry.phase, entry.last_event),
+    );
+}
+
+fn note_idempotent_stop(entry: &mut RunState) -> bool {
+    if entry.last_event != STOP_LAST_EVENT {
+        entry.last_event = STOP_LAST_EVENT.into();
+        entry.updated_at = chrono::Utc::now();
+        true
+    } else {
+        false
     }
-    let now = chrono::Utc::now();
-    for entry in &mut envelope.runs {
-        if matches!(entry.status, RunStatus::Running | RunStatus::Paused) {
-            entry.status = RunStatus::Stopped;
-            entry.phase = STUB_PHASE_STOPPED.into();
-            entry.last_event = STOP_LAST_EVENT.into();
-            entry.phase_started_at = None;
-            entry.pause_started_at = None;
-            entry.updated_at = now;
+}
+
+fn stop_locked(record: &ProjectRecord, target: &RunControl) -> Result<StopPrep> {
+    ensure_state_dir(record)?;
+    match crate::state::load_run_book(record)? {
+        crate::state::RunBook::Many(mut envelope) => stop_book(record, target, &mut envelope),
+        crate::state::RunBook::One(mut state) => stop_one(record, target, &mut state),
+    }
+}
+
+fn stop_one(record: &ProjectRecord, target: &RunControl, state: &mut RunState) -> Result<StopPrep> {
+    match pick_control(std::slice::from_ref(state), ControlVerb::Stop, target)? {
+        ControlPick::Apply(_) => {
+            let epoch = state.run_epoch;
+            mark_stopped(record, state, chrono::Utc::now());
+            save_run_state(record, state)?;
+            Ok(StopPrep {
+                view: StatusView::from_record(record, state),
+                transitioned: vec![epoch],
+                shutdown: vec![epoch],
+                try_collapse: false,
+            })
+        }
+        ControlPick::IdempotentStop(_) | ControlPick::NoMatch
+            if state.status == RunStatus::Stopped =>
+        {
+            if note_idempotent_stop(state) {
+                save_run_state(record, state)?;
+            }
+            Ok(StopPrep {
+                view: StatusView::from_record(record, state),
+                transitioned: Vec::new(),
+                shutdown: Vec::new(),
+                try_collapse: false,
+            })
+        }
+        ControlPick::NoMatch | ControlPick::IdempotentStop(_) => {
+            Err(CoordinatorError::InvalidTransition {
+                action: "stop",
+                from: state.status.to_string(),
+            })
         }
     }
-    crate::state::write_run_book(record, &envelope)?;
-    Ok(Some(epochs))
+}
+
+fn stop_book(
+    record: &ProjectRecord,
+    target: &RunControl,
+    envelope: &mut crate::state::RunEnvelope,
+) -> Result<StopPrep> {
+    match pick_control(&envelope.runs, ControlVerb::Stop, target)? {
+        ControlPick::NoMatch if matches!(target, RunControl::All) && book_all_stopped(envelope) => {
+            Ok(StopPrep {
+                view: compose_book_status(record, envelope),
+                transitioned: Vec::new(),
+                shutdown: envelope.runs.iter().map(|entry| entry.run_epoch).collect(),
+                try_collapse: true,
+            })
+        }
+        ControlPick::NoMatch => Ok(StopPrep {
+            view: compose_book_status(record, envelope),
+            transitioned: Vec::new(),
+            shutdown: Vec::new(),
+            try_collapse: false,
+        }),
+        ControlPick::IdempotentStop(index) => {
+            if note_idempotent_stop(&mut envelope.runs[index]) {
+                crate::state::write_run_book(record, envelope)?;
+            }
+            Ok(StopPrep {
+                view: compose_book_status(record, envelope),
+                transitioned: Vec::new(),
+                shutdown: Vec::new(),
+                try_collapse: false,
+            })
+        }
+        ControlPick::Apply(indices) => {
+            let epochs: Vec<u64> = indices
+                .iter()
+                .map(|index| envelope.runs[*index].run_epoch)
+                .collect();
+            let now = chrono::Utc::now();
+            for index in indices {
+                mark_stopped(record, &mut envelope.runs[index], now);
+            }
+            crate::state::write_run_book(record, envelope)?;
+            let try_collapse = book_all_stopped(envelope);
+            Ok(StopPrep {
+                view: compose_book_status(record, envelope),
+                transitioned: epochs.clone(),
+                shutdown: epochs,
+                try_collapse,
+            })
+        }
+    }
+}
+
+fn book_all_stopped(envelope: &crate::state::RunEnvelope) -> bool {
+    !envelope.runs.is_empty()
+        && envelope
+            .runs
+            .iter()
+            .all(|entry| entry.status == RunStatus::Stopped)
 }
 
 fn collapse_stopped_book(record: &ProjectRecord) -> Result<StatusView> {
@@ -1624,5 +1921,312 @@ mod tests {
         assert!(envelope.runs.iter().any(|entry| {
             entry.track_id.as_deref() == Some("B") && entry.status == RunStatus::Running
         }));
+    }
+
+    fn pair(id: &str, epoch: u64, status: RunStatus, track: &str) -> RunState {
+        let mut state = RunState::idle(id);
+        state.run_epoch = epoch;
+        state.status = status;
+        state.track_id = Some(track.into());
+        state.phase = "plan".into();
+        state.last_event = format!("seed {epoch}");
+        state
+    }
+
+    fn write_pair(r: &ProjectRecord, left: RunState, right: RunState) {
+        ensure_state_dir(r).unwrap();
+        crate::state::write_run_book(r, &crate::state::RunEnvelope::new(0, vec![left, right]))
+            .unwrap();
+    }
+
+    fn book_runs(r: &ProjectRecord) -> Vec<RunState> {
+        match crate::state::load_run_book(r).unwrap() {
+            crate::state::RunBook::Many(envelope) => envelope.runs,
+            crate::state::RunBook::One(state) => panic!("expected a book, got {state:?}"),
+        }
+    }
+
+    fn assert_control_refusal(err: &CoordinatorError) {
+        assert!(
+            matches!(err, CoordinatorError::AmbiguousControlTarget { .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.http_status(), 409);
+        assert!(!matches!(err, CoordinatorError::Message(_)));
+        assert!(!matches!(err, CoordinatorError::AmbiguousRunTrack { .. }));
+        assert_ne!(
+            err.to_string(),
+            crate::state::ambiguous_run_error().to_string()
+        );
+        assert!(!err.to_string().contains("two paused"), "{err}");
+    }
+
+    #[test]
+    fn bare_controls_refuse_two_matches_without_a_write_or_stall_close() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let left = pair(&r.id, 3, RunStatus::Running, "A");
+        let right = pair(&r.id, 4, RunStatus::Running, "B");
+        write_pair(&r, left.clone(), right.clone());
+        let _ = crate::workflow::stall_paging::take_tick_blocking_scopes_for_tests();
+        let err = pause_target(&r, RunControl::Bare).unwrap_err();
+        assert_control_refusal(&err);
+        assert!(err.to_string().contains("epoch 3 track A"), "{err}");
+        assert!(err.to_string().contains("epoch 4 track B"), "{err}");
+        assert_eq!(book_runs(&r), vec![left.clone(), right.clone()]);
+        let err = stop_target(&r, RunControl::Bare).unwrap_err();
+        assert_control_refusal(&err);
+        assert!(crate::workflow::stall_paging::take_tick_blocking_scopes_for_tests().is_empty());
+        assert_eq!(book_runs(&r), vec![left, right]);
+
+        let paused_l = pair(&r.id, 3, RunStatus::Paused, "A");
+        let paused_r = pair(&r.id, 4, RunStatus::Paused, "B");
+        write_pair(&r, paused_l.clone(), paused_r.clone());
+        let err = resume_target(&r, RunControl::Bare).unwrap_err();
+        assert_control_refusal(&err);
+        assert_eq!(book_runs(&r), vec![paused_l, paused_r]);
+    }
+
+    #[test]
+    fn epoch_changes_one_entry_and_scopes_the_stall_close() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let left = pair(&r.id, 3, RunStatus::Running, "A");
+        let right = pair(&r.id, 4, RunStatus::Running, "B");
+        write_pair(&r, left.clone(), right.clone());
+        let _ = crate::workflow::stall_paging::take_tick_blocking_scopes_for_tests();
+        pause_target(&r, RunControl::Epoch(3)).unwrap();
+        let runs = book_runs(&r);
+        assert_eq!(runs[0].status, RunStatus::Paused);
+        assert_eq!(runs[0].last_event, "pause: hold");
+        assert!(runs[0].pause_started_at.is_some());
+        assert_eq!(runs[1], right);
+
+        let paused = book_runs(&r);
+        resume_target(&r, RunControl::Epoch(3)).unwrap();
+        let runs = book_runs(&r);
+        assert_eq!(runs[0].status, RunStatus::Running);
+        assert_eq!(runs[1], paused[1]);
+
+        write_pair(&r, left.clone(), right.clone());
+        stop_target(&r, RunControl::Epoch(3)).unwrap();
+        let runs = book_runs(&r);
+        assert_eq!(runs[0].status, RunStatus::Stopped);
+        assert_eq!(runs[0].last_event, STOP_LAST_EVENT);
+        assert_eq!(runs[1], right);
+        assert!(matches!(
+            crate::state::load_run_book(&r).unwrap(),
+            crate::state::RunBook::Many(_)
+        ));
+        assert_eq!(
+            crate::workflow::stall_paging::take_tick_blocking_scopes_for_tests(),
+            vec![Some(3)]
+        );
+    }
+
+    #[test]
+    fn all_changes_every_match_and_leaves_a_non_match() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let running = pair(&r.id, 3, RunStatus::Running, "A");
+        let idle = pair(&r.id, 4, RunStatus::Idle, "B");
+        write_pair(&r, running, idle.clone());
+        pause_target(&r, RunControl::All).unwrap();
+        let runs = book_runs(&r);
+        assert_eq!(runs[0].status, RunStatus::Paused);
+        assert_eq!(runs[1], idle);
+
+        let paused = pair(&r.id, 5, RunStatus::Paused, "C");
+        let idle = pair(&r.id, 6, RunStatus::Idle, "D");
+        write_pair(&r, paused, idle.clone());
+        resume_target(&r, RunControl::All).unwrap();
+        let runs = book_runs(&r);
+        assert_eq!(runs[0].status, RunStatus::Running);
+        assert_eq!(runs[1], idle);
+
+        let running = pair(&r.id, 7, RunStatus::Running, "E");
+        let idle = pair(&r.id, 8, RunStatus::Idle, "F");
+        write_pair(&r, running, idle.clone());
+        stop_target(&r, RunControl::All).unwrap();
+        let runs = book_runs(&r);
+        assert_eq!(runs[0].status, RunStatus::Stopped);
+        assert_eq!(runs[1], idle);
+        assert!(matches!(
+            crate::state::load_run_book(&r).unwrap(),
+            crate::state::RunBook::Many(_)
+        ));
+    }
+
+    #[test]
+    fn running_sibling_without_a_session_stays_in_the_book() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let left = pair(&r.id, 3, RunStatus::Running, "A");
+        let right = pair(&r.id, 9, RunStatus::Running, "B");
+        write_pair(&r, left, right.clone());
+        stop_target(&r, RunControl::Epoch(3)).unwrap();
+        let crate::state::RunBook::Many(envelope) = crate::state::load_run_book(&r).unwrap() else {
+            panic!("book collapsed");
+        };
+        let kept = envelope
+            .runs
+            .iter()
+            .find(|entry| entry.run_epoch == 9)
+            .unwrap();
+        assert_eq!(kept, &right);
+        assert_eq!(kept.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn singular_bare_and_matching_epoch_still_work_and_a_miss_is_unknown() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        run_with_driver(&r, Some("0128".into()), WorkflowDriver::Stub).unwrap();
+        let before = load_run_state(&r).unwrap();
+        let epoch = before.run_epoch;
+        pause(&r).unwrap();
+        assert_eq!(load_run_state(&r).unwrap().status, RunStatus::Paused);
+        resume_target(&r, RunControl::Epoch(epoch)).unwrap();
+        assert_eq!(load_run_state(&r).unwrap().status, RunStatus::Running);
+        stop(&r).unwrap();
+        assert_eq!(load_run_state(&r).unwrap().status, RunStatus::Stopped);
+        let err = stop_target(&r, RunControl::Epoch(epoch + 5)).unwrap_err();
+        assert!(
+            matches!(err, CoordinatorError::Message(ref text) if text.contains("unknown run epoch")),
+            "{err}"
+        );
+        assert_eq!(load_run_state(&r).unwrap().status, RunStatus::Stopped);
+        stop(&r).unwrap();
+        assert_eq!(load_run_state(&r).unwrap().status, RunStatus::Stopped);
+    }
+
+    #[test]
+    fn bare_stop_with_no_match_does_not_collapse_an_all_stopped_book() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let left = pair(&r.id, 3, RunStatus::Stopped, "A");
+        let right = pair(&r.id, 4, RunStatus::Stopped, "B");
+        write_pair(&r, left.clone(), right.clone());
+        stop(&r).unwrap();
+        assert_eq!(book_runs(&r), vec![left, right]);
+        stop_target(&r, RunControl::All).unwrap();
+        assert!(
+            matches!(
+                crate::state::load_run_book(&r).unwrap(),
+                crate::state::RunBook::One(state) if state.status == RunStatus::Stopped
+            ),
+            "all-stopped --all did not collapse"
+        );
+    }
+
+    #[test]
+    fn track_selectors_refuse_duplicates_and_disagreement() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let left = pair(&r.id, 3, RunStatus::Running, "A");
+        let right = pair(&r.id, 4, RunStatus::Running, "A");
+        write_pair(&r, left.clone(), right.clone());
+        let err = pause_target(&r, RunControl::Track("A".into())).unwrap_err();
+        assert_control_refusal(&err);
+        assert_eq!(book_runs(&r), vec![left.clone(), right.clone()]);
+        let err = stop_target(
+            &r,
+            RunControl::EpochAndTrack {
+                epoch: 3,
+                track: "B".into(),
+            },
+        )
+        .unwrap_err();
+        assert_control_refusal(&err);
+        assert!(err.to_string().contains("disagrees"), "{err}");
+        assert_eq!(book_runs(&r), vec![left, right]);
+    }
+
+    #[test]
+    fn resume_of_one_paused_entry_leaves_the_other_paused() {
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let left = pair(&r.id, 3, RunStatus::Paused, "A");
+        let right = pair(&r.id, 4, RunStatus::Paused, "B");
+        write_pair(&r, left, right.clone());
+        resume_target(&r, RunControl::Epoch(3)).unwrap();
+        let runs = book_runs(&r);
+        assert_eq!(runs[0].status, RunStatus::Running);
+        assert_eq!(runs[1], right);
+    }
+
+    #[test]
+    fn advance_probe_resume_stays_in_scope_and_leaves_the_sibling() {
+        let dir = tempdir().unwrap();
+        let mut r = rec(dir.path());
+        r.auto_start = crate::registry::AutoStartPolicy::Full;
+        let cond = dir.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0001-Example")).unwrap();
+        std::fs::create_dir_all(cond.join("0002-Next")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | [0001-Example](0001-Example/spec.md) | `.` | **Completed** | done |\n\
+             | [0002-Next](0002-Next/spec.md) | `.` | **Ready — not started** | next |\n",
+        )
+        .unwrap();
+        let next = cond.join("0002-Next");
+        std::fs::write(next.join("spec.md"), b"spec\n").unwrap();
+        std::fs::write(next.join("plan.md"), b"plan\n").unwrap();
+        let skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("review-track")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, b"skill\n").unwrap();
+        let mut seeded = RunState::idle(&r.id);
+        seeded.track_id = Some("0002".into());
+        seeded.run_epoch = 1;
+        seeded.status = RunStatus::Running;
+        ensure_state_dir(&r).unwrap();
+        save_run_state(&r, &seeded).unwrap();
+        crate::workflow::drive::write_review_markdown(&r, "agy", Some("agy review\n")).unwrap();
+        crate::workflow::drive::write_review_markdown(&r, "opencode", Some("oc review\n")).unwrap();
+        crate::workflow::reuse::write_join_receipt(&r, &seeded);
+        crate::workflow::reuse::note_pr(&r, "0002", 80, "abc123", "track/0002-next", None);
+        assert!(
+            matches!(
+                crate::workflow::reuse::decide_resume(&r, Some("0002")),
+                crate::workflow::reuse::ResumeChoice::Probe { .. }
+            ),
+            "fixture did not reach the probe arm"
+        );
+        let mut paused = pair(&r.id, 3, RunStatus::Paused, "0001");
+        paused.phase = crate::workflow::graph::PHASE_ADVANCE.into();
+        paused.last_driven_phase = Some(crate::workflow::graph::PHASE_ADVANCE.into());
+        let sibling = pair(&r.id, 8, RunStatus::Running, "SIB");
+        write_pair(&r, paused, sibling.clone());
+        let _probe = crate::workflow::reuse::install_test_probe(std::sync::Arc::new(|_| {
+            Ok(Some(crate::workflow::reuse::ResumePr {
+                state: "OPEN".into(),
+                head_oid: "abc123".into(),
+                head_ref: "track/0002-next".into(),
+            }))
+        }));
+        let view = resume(&r).unwrap();
+        assert!(
+            !view.last_event.contains("ambiguous run"),
+            "{}",
+            view.last_event
+        );
+        let runs = book_runs(&r);
+        let kept = runs.iter().find(|entry| entry.run_epoch == 8).unwrap();
+        assert_eq!(kept, &sibling);
+        let resumed = runs.iter().find(|entry| entry.run_epoch != 8).unwrap();
+        assert_eq!(resumed.phase, crate::workflow::graph::PHASE_CI_WAIT);
+        assert!(
+            resumed.last_event.contains("resume ci-wait"),
+            "{}",
+            resumed.last_event
+        );
     }
 }
