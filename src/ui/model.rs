@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::api;
 use crate::error::{CoordinatorError, Result};
 use crate::layout::LayoutProfile;
+use crate::outcome::FailureClass;
 use crate::registry::{ProjectAddOptions, ProjectRecord};
 use crate::state::{RunStatus, STOP_LAST_EVENT, StatusView, TickerView};
 use crate::workflow::graph::{
@@ -78,11 +79,112 @@ pub struct FailurePanel {
     pub superseded: Option<String>,
 }
 
+pub const FAILURE_PANEL_TITLE: &str = "Failure Artifact";
+pub const FAILURE_PANEL_TITLE_SUPERSEDED: &str = "Failure Artifact [SUPERSEDED]";
+pub const FAILURE_PANEL_TITLE_SUMMARY: &str = "Failure Artifact (project summary)";
+pub const FAILURE_PANEL_TITLE_SUMMARY_SUPERSEDED: &str =
+    "Failure Artifact (project summary) [SUPERSEDED]";
+
+/// Epoch files (`failures/{epoch}/FAILURE.md`) use the epoch pair. The summary
+/// file (`{state_dir}/FAILURE.md`), including legacy and the ambiguous-select
+/// fallback, uses the summary pair. An absent panel has no title.
+pub fn failure_panel_title(panel: &FailurePanel) -> &'static str {
+    let summary = failure_path_is_project_summary(&panel.path);
+    match (summary, panel.superseded.is_some()) {
+        (false, false) => FAILURE_PANEL_TITLE,
+        (false, true) => FAILURE_PANEL_TITLE_SUPERSEDED,
+        (true, false) => FAILURE_PANEL_TITLE_SUMMARY,
+        (true, true) => FAILURE_PANEL_TITLE_SUMMARY_SUPERSEDED,
+    }
+}
+
+fn failure_path_is_project_summary(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    if !file_name.eq_ignore_ascii_case("FAILURE.md") {
+        return true;
+    }
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    let Some(epoch) = parent.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    if epoch.is_empty() || !epoch.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    parent
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        != Some("failures")
+}
+
+/// One run on a multi-run card. Empty when the card stays on the single-status path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLine {
+    pub track_id: Option<String>,
+    pub run_epoch: u64,
+    pub phase: String,
+    pub status: RunStatus,
+    pub wait: String,
+    pub failure_class: Option<FailureClass>,
+    pub failure_artifact: Option<PathBuf>,
+    pub failure_superseded: Option<String>,
+}
+
+pub fn run_line_text(line: &RunLine) -> String {
+    let track = line.track_id.as_deref().unwrap_or("—");
+    let mut text = format!(
+        "{track} · epoch {} · {} · {}",
+        line.run_epoch, line.phase, line.status
+    );
+    if !line.wait.is_empty() {
+        text.push_str(" · ");
+        text.push_str(&line.wait);
+    }
+    if let Some(class) = line.failure_class {
+        text.push_str(" · ");
+        text.push_str(class.as_str());
+    }
+    if let Some(path) = &line.failure_artifact {
+        text.push_str(" · ");
+        text.push_str(&path.display().to_string());
+    }
+    if let Some(reason) = &line.failure_superseded {
+        text.push_str(" · ");
+        text.push_str(reason);
+    }
+    text
+}
+
+fn run_line_from_summary(run: &crate::state::RunSummary) -> RunLine {
+    let wait = if run.last_event.starts_with("wait:") {
+        run.last_event.clone()
+    } else {
+        String::new()
+    };
+    RunLine {
+        track_id: run.track_id.clone(),
+        run_epoch: run.run_epoch,
+        phase: run.phase.clone(),
+        status: run.status,
+        wait,
+        failure_class: run.failure_class,
+        failure_artifact: run.failure_artifact.clone(),
+        failure_superseded: run.failure_superseded.clone(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCard {
     pub view: StatusView,
     pub card_state: CardState,
     pub sessions: Vec<SessionRow>,
+    pub run_lines: Vec<RunLine>,
+    /// True for an empty `runs` vec and for a one-entry book.
+    pub single_status: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -99,7 +201,13 @@ pub struct FleetSnapshot {
 }
 
 /// Map live status → mock card `data-state` (spec §2 table).
+///
+/// `runs.len() <= 1` keeps the status match. Two or more runs take one bucket:
+/// any pause, else a live failure, else any running run, else idle.
 pub fn card_state(view: &StatusView) -> CardState {
+    if view.runs.len() > 1 {
+        return multi_run_card_state(view);
+    }
     match view.status {
         RunStatus::Running if view.phase == PHASE_PLAN_REVIEW => CardState::ParallelPlanReview,
         RunStatus::Running if view.phase == PHASE_CI_WAIT => CardState::TokenIdleCi,
@@ -112,6 +220,18 @@ pub fn card_state(view: &StatusView) -> CardState {
             CardState::HardFailure
         }
         RunStatus::Idle | RunStatus::Stopped => CardState::Idle,
+    }
+}
+
+fn multi_run_card_state(view: &StatusView) -> CardState {
+    if view.runs.iter().any(|run| run.status == RunStatus::Paused) {
+        CardState::Paused
+    } else if view.runs.iter().any(|run| run.is_live_failure()) {
+        CardState::HardFailure
+    } else if view.runs.iter().any(|run| run.status == RunStatus::Running) {
+        CardState::Running
+    } else {
+        CardState::Idle
     }
 }
 
@@ -370,12 +490,20 @@ pub fn build_fleet(views: Vec<StatusView>, selected: Option<&str>) -> FleetSnaps
     let cards = views
         .into_iter()
         .map(|view| {
+            let single_status = view.runs.len() <= 1;
+            let run_lines = if single_status {
+                Vec::new()
+            } else {
+                view.runs.iter().map(run_line_from_summary).collect()
+            };
             let card_state = card_state(&view);
             let sessions = session_rows(&view);
             ProjectCard {
                 view,
                 card_state,
                 sessions,
+                run_lines,
+                single_status,
             }
         })
         .collect();
@@ -508,8 +636,8 @@ pub struct CardControl {
 
 /// Epoch strip plus project-wide buttons. `None` keeps [`card_primary_action`].
 ///
-/// 0130 has not drawn per-run rows, so this strip is the list. It does not
-/// include phase, wait, or failure text.
+/// 0130 draws the per-run rows separately. This strip stays the controls and
+/// does not include phase, wait, or failure text.
 pub fn card_control_buttons(view: &StatusView) -> Option<Vec<CardControl>> {
     if view.runs.len() <= 1 {
         return None;
@@ -921,6 +1049,10 @@ mod tests {
         assert_eq!(counts.active, 1);
         assert_eq!(counts.attention, 2);
         assert_eq!(counts.idle, 1);
+        assert_eq!(
+            counts.projects,
+            counts.active + counts.attention + counts.idle
+        );
     }
 
     #[test]
@@ -1384,7 +1516,441 @@ mod tests {
             status,
             failure_class: None,
             failure_artifact: None,
+            last_event: String::new(),
+            failure_superseded: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn book_run(
+        epoch: u64,
+        track: &str,
+        phase: &str,
+        status: RunStatus,
+        last_event: &str,
+        failure_class: Option<FailureClass>,
+        failure_artifact: Option<PathBuf>,
+        failure_superseded: Option<&str>,
+    ) -> crate::state::RunSummary {
+        crate::state::RunSummary {
+            run_epoch: epoch,
+            track_id: Some(track.into()),
+            phase: phase.into(),
+            status,
+            failure_class,
+            failure_artifact,
+            last_event: last_event.into(),
+            failure_superseded: failure_superseded.map(str::to_string),
+        }
+    }
+
+    fn one_project(
+        status: RunStatus,
+        phase: &str,
+        runs: Vec<crate::state::RunSummary>,
+    ) -> StatusView {
+        let mut project = view(status, phase, None, None);
+        project.runs = runs;
+        project
+    }
+
+    #[test]
+    fn idle_plus_running_lists_both_runs_as_one_active_card() {
+        let mut project = view(RunStatus::Idle, STUB_PHASE_IDLE, None, None);
+        project.track_id = Some("0128".into());
+        project.runs = vec![
+            book_run(
+                1,
+                "0128",
+                STUB_PHASE_IDLE,
+                RunStatus::Idle,
+                "",
+                None,
+                None,
+                None,
+            ),
+            book_run(
+                2,
+                "0130",
+                "implement",
+                RunStatus::Running,
+                "",
+                None,
+                None,
+                None,
+            ),
+        ];
+        let snap = build_fleet(vec![project], None);
+        let card = &snap.cards[0];
+        assert!(!card.single_status);
+        assert_eq!(card.card_state, CardState::Running);
+        assert_eq!(card.card_state.as_data_state(), "running");
+        assert_eq!(card.run_lines.len(), 2);
+        assert_eq!(card.run_lines[0].track_id.as_deref(), Some("0128"));
+        assert_eq!(card.run_lines[0].run_epoch, 1);
+        assert_eq!(card.run_lines[0].phase, STUB_PHASE_IDLE);
+        assert_eq!(card.run_lines[0].status, RunStatus::Idle);
+        assert_eq!(card.run_lines[1].track_id.as_deref(), Some("0130"));
+        assert_eq!(card.run_lines[1].run_epoch, 2);
+        assert_eq!(card.run_lines[1].phase, "implement");
+        assert_eq!(card.run_lines[1].status, RunStatus::Running);
+        assert_eq!(
+            run_line_text(&card.run_lines[0]),
+            "0128 · epoch 1 · stub:idle · Idle"
+        );
+        assert_eq!(
+            run_line_text(&card.run_lines[1]),
+            "0130 · epoch 2 · implement · Running"
+        );
+        assert_eq!(
+            snap.counts,
+            HeaderCounts {
+                projects: 1,
+                active: 1,
+                attention: 0,
+                idle: 0,
+            }
+        );
+        assert_eq!(snap.phase_chips.len(), 1);
+        assert_eq!(snap.phase_chips[0].label, STUB_PHASE_IDLE);
+        assert_eq!(snap.phase_chips[0].kind, ChipKind::Current);
+    }
+
+    #[test]
+    fn multi_run_header_is_one_bucket() {
+        let idle_running = one_project(
+            RunStatus::Idle,
+            STUB_PHASE_IDLE,
+            vec![
+                book_run(
+                    1,
+                    "0128",
+                    STUB_PHASE_IDLE,
+                    RunStatus::Idle,
+                    "",
+                    None,
+                    None,
+                    None,
+                ),
+                book_run(
+                    2,
+                    "0130",
+                    "implement",
+                    RunStatus::Running,
+                    "",
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+        );
+        let running_paused = one_project(
+            RunStatus::Running,
+            "implement",
+            vec![
+                book_run(
+                    1,
+                    "0130",
+                    "implement",
+                    RunStatus::Running,
+                    "",
+                    None,
+                    None,
+                    None,
+                ),
+                book_run(2, "0128", "plan", RunStatus::Paused, "", None, None, None),
+            ],
+        );
+        let live = PathBuf::from(r"C:\state\failures\2\FAILURE.md");
+        let running_live = one_project(
+            RunStatus::Running,
+            "implement",
+            vec![
+                book_run(
+                    1,
+                    "0130",
+                    "implement",
+                    RunStatus::Running,
+                    "",
+                    None,
+                    None,
+                    None,
+                ),
+                book_run(
+                    2,
+                    "0128",
+                    "stub:failed",
+                    RunStatus::Stopped,
+                    "",
+                    Some(FailureClass::Timeout),
+                    Some(live),
+                    None,
+                ),
+            ],
+        );
+        let superseded = PathBuf::from(r"C:\state\failures\1\FAILURE.md");
+        let running_old = one_project(
+            RunStatus::Idle,
+            STUB_PHASE_IDLE,
+            vec![
+                book_run(
+                    1,
+                    "0128",
+                    STUB_PHASE_IDLE,
+                    RunStatus::Idle,
+                    "",
+                    Some(FailureClass::Timeout),
+                    Some(superseded),
+                    Some("completed"),
+                ),
+                book_run(
+                    2,
+                    "0130",
+                    "implement",
+                    RunStatus::Running,
+                    "",
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+        );
+        let sibling_flag = one_project(
+            RunStatus::Running,
+            "implement",
+            vec![
+                book_run(
+                    1,
+                    "0130",
+                    "implement",
+                    RunStatus::Running,
+                    "",
+                    None,
+                    None,
+                    None,
+                ),
+                book_run(
+                    2,
+                    "0128",
+                    STUB_PHASE_IDLE,
+                    RunStatus::Idle,
+                    "",
+                    Some(FailureClass::HarnessCrash),
+                    Some(PathBuf::from(r"C:\state\failures\9\FAILURE.md")),
+                    Some("completed"),
+                ),
+            ],
+        );
+
+        let cases = [
+            (&idle_running, CardState::Running, 1, 0, 0),
+            (&running_paused, CardState::Paused, 0, 1, 0),
+            (&running_live, CardState::HardFailure, 0, 1, 0),
+            (&running_old, CardState::Running, 1, 0, 0),
+            (&sibling_flag, CardState::Running, 1, 0, 0),
+        ];
+        for (project, state, active, attention, idle) in cases {
+            let counts = header_counts(std::slice::from_ref(project));
+            assert_eq!(counts.projects, 1);
+            assert_eq!(counts.active, active);
+            assert_eq!(counts.attention, attention);
+            assert_eq!(counts.idle, idle);
+            assert_eq!(
+                counts.projects,
+                counts.active + counts.attention + counts.idle
+            );
+            let snap = build_fleet(vec![project.clone()], None);
+            assert_eq!(snap.cards[0].card_state, state);
+        }
+        let old_snap = build_fleet(vec![running_old], None);
+        let old_lines = &old_snap.cards[0].run_lines;
+        assert_eq!(
+            old_lines[0].failure_superseded.as_deref(),
+            Some("completed")
+        );
+        assert_eq!(old_lines[1].failure_superseded, None);
+        assert_eq!(
+            run_line_text(&old_lines[0]),
+            r"0128 · epoch 1 · stub:idle · Idle · timeout · C:\state\failures\1\FAILURE.md · completed"
+        );
+    }
+
+    #[test]
+    fn run_line_wait_and_failure_class_stay_on_that_run() {
+        let project = one_project(
+            RunStatus::Idle,
+            STUB_PHASE_IDLE,
+            vec![
+                book_run(
+                    1,
+                    "0128",
+                    STUB_PHASE_IDLE,
+                    RunStatus::Idle,
+                    "wait: shared tree held by epoch 2",
+                    Some(FailureClass::Timeout),
+                    None,
+                    None,
+                ),
+                book_run(
+                    2,
+                    "0130",
+                    "implement",
+                    RunStatus::Running,
+                    "pause: hold",
+                    Some(FailureClass::HarnessCrash),
+                    None,
+                    None,
+                ),
+            ],
+        );
+        let snap = build_fleet(vec![project], None);
+        let lines = &snap.cards[0].run_lines;
+        assert_eq!(lines[0].wait, "wait: shared tree held by epoch 2");
+        assert_eq!(lines[1].wait, "");
+        assert_eq!(lines[0].failure_class, Some(FailureClass::Timeout));
+        assert_eq!(lines[1].failure_class, Some(FailureClass::HarnessCrash));
+        assert_eq!(
+            run_line_text(&lines[0]),
+            "0128 · epoch 1 · stub:idle · Idle · wait: shared tree held by epoch 2 · timeout"
+        );
+        assert_eq!(
+            run_line_text(&lines[1]),
+            "0130 · epoch 2 · implement · Running · harness_crash"
+        );
+    }
+
+    #[test]
+    fn run_line_shows_only_its_own_failure_path() {
+        let path_a = PathBuf::from(r"C:\state\failures\1\FAILURE.md");
+        let path_b = PathBuf::from(r"C:\state\failures\2\FAILURE.md");
+        let summary = PathBuf::from(r"C:\state\FAILURE.md");
+        let mut project = one_project(
+            RunStatus::Idle,
+            STUB_PHASE_IDLE,
+            vec![
+                book_run(
+                    1,
+                    "0128",
+                    "stub:failed",
+                    RunStatus::Idle,
+                    "",
+                    Some(FailureClass::Timeout),
+                    Some(path_a.clone()),
+                    None,
+                ),
+                book_run(
+                    2,
+                    "0130",
+                    "implement",
+                    RunStatus::Running,
+                    "",
+                    Some(FailureClass::HarnessCrash),
+                    Some(path_b.clone()),
+                    None,
+                ),
+                book_run(3, "0129", "plan", RunStatus::Idle, "", None, None, None),
+            ],
+        );
+        project.failure_artifact = Some(summary.clone());
+        let snap = build_fleet(vec![project], None);
+        let lines = &snap.cards[0].run_lines;
+        assert_eq!(lines[0].failure_artifact.as_ref(), Some(&path_a));
+        assert_eq!(lines[1].failure_artifact.as_ref(), Some(&path_b));
+        assert_eq!(lines[2].failure_artifact, None);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.failure_artifact.as_ref() != Some(&summary))
+        );
+        assert_eq!(
+            run_line_text(&lines[0]),
+            r"0128 · epoch 1 · stub:failed · Idle · timeout · C:\state\failures\1\FAILURE.md"
+        );
+        assert_eq!(
+            run_line_text(&lines[1]),
+            r"0130 · epoch 2 · implement · Running · harness_crash · C:\state\failures\2\FAILURE.md"
+        );
+        assert_eq!(run_line_text(&lines[2]), "0129 · epoch 3 · plan · Idle");
+    }
+
+    #[test]
+    fn failure_panel_title_follows_the_body_path() {
+        let epoch = FailurePanel {
+            path: PathBuf::from(r"C:\state\failures\2\FAILURE.md"),
+            body: "epoch".into(),
+            superseded: None,
+        };
+        let epoch_old = FailurePanel {
+            path: PathBuf::from(r"C:\state\failures\2\FAILURE.md"),
+            body: "epoch".into(),
+            superseded: Some("completed".into()),
+        };
+        let summary = FailurePanel {
+            path: PathBuf::from(r"C:\state\FAILURE.md"),
+            body: "summary".into(),
+            superseded: None,
+        };
+        let summary_old = FailurePanel {
+            path: PathBuf::from(r"C:\state\FAILURE.md"),
+            body: "summary".into(),
+            superseded: Some("completed".into()),
+        };
+        assert_eq!(failure_panel_title(&epoch), FAILURE_PANEL_TITLE);
+        assert_eq!(failure_panel_title(&epoch), "Failure Artifact");
+        assert_eq!(
+            failure_panel_title(&epoch_old),
+            FAILURE_PANEL_TITLE_SUPERSEDED
+        );
+        assert_eq!(
+            failure_panel_title(&epoch_old),
+            "Failure Artifact [SUPERSEDED]"
+        );
+        assert_eq!(failure_panel_title(&summary), FAILURE_PANEL_TITLE_SUMMARY);
+        assert_eq!(
+            failure_panel_title(&summary),
+            "Failure Artifact (project summary)"
+        );
+        assert_eq!(
+            failure_panel_title(&summary_old),
+            FAILURE_PANEL_TITLE_SUMMARY_SUPERSEDED
+        );
+        assert_eq!(
+            failure_panel_title(&summary_old),
+            "Failure Artifact (project summary) [SUPERSEDED]"
+        );
+    }
+
+    #[test]
+    fn empty_and_single_run_keep_the_single_card() {
+        let empty = view(RunStatus::Idle, STUB_PHASE_IDLE, None, None);
+        let empty_snap = build_fleet(vec![empty], None);
+        let empty_card = &empty_snap.cards[0];
+        assert!(empty_card.single_status);
+        assert!(empty_card.run_lines.is_empty());
+        assert_eq!(empty_card.card_state, CardState::Idle);
+        assert!(card_control_buttons(&empty_card.view).is_none());
+
+        let one = one_project(
+            RunStatus::Running,
+            "implement",
+            vec![book_run(
+                1,
+                "0130",
+                "implement",
+                RunStatus::Running,
+                "",
+                None,
+                None,
+                None,
+            )],
+        );
+        let one_snap = build_fleet(vec![one], None);
+        let one_card = &one_snap.cards[0];
+        assert!(one_card.single_status);
+        assert!(one_card.run_lines.is_empty());
+        assert_eq!(one_card.card_state, CardState::Running);
+        assert_eq!(one_card.card_state.as_data_state(), "running");
+        assert!(card_control_buttons(&one_card.view).is_none());
     }
 
     #[test]
