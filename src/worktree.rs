@@ -70,8 +70,11 @@ pub fn product_git_cwd(record: &ProjectRecord) -> Option<PathBuf> {
     crate::layout::resolve(record).execution_repo
 }
 
-/// Absolute `{state_dir}/cargo-target` when isolation is on and `cwd` is inside
-/// `{state_dir}/worktrees`. Otherwise `None` (no `CARGO_TARGET_DIR` injection).
+/// Absolute `{state_dir}/cargo-targets/{epoch}` when isolation is on and `cwd`
+/// is under `{state_dir}/worktrees/{epoch}`. The epoch is the first path
+/// component under `worktrees/` when that component parses as a `u64`, including
+/// a nested cwd such as `worktrees/4/src`. Otherwise `None` (no injection).
+/// Does not call `worktree_epoch` and does not fall back to `cargo-target`.
 pub fn cargo_target_dir_for(record: &ProjectRecord, cwd: &Path) -> Option<PathBuf> {
     if !isolation_enabled(record).unwrap_or(false) {
         return None;
@@ -80,8 +83,24 @@ pub fn cargo_target_dir_for(record: &ProjectRecord, cwd: &Path) -> Option<PathBu
     if !path_is_inside(cwd, &root) {
         return None;
     }
-    let dir = resolve_state_dir(record).ok()?.join("cargo-target");
+    let epoch = epoch_under_worktrees(cwd, &root)?;
+    let dir = resolve_state_dir(record)
+        .ok()?
+        .join("cargo-targets")
+        .join(epoch.to_string());
     Some(absolutize(dir))
+}
+
+/// First component under `root` when it parses as `u64`. A nested cwd still
+/// yields that epoch. The worktrees root itself and a non-numeric component
+/// yield `None`.
+fn epoch_under_worktrees(cwd: &Path, root: &Path) -> Option<u64> {
+    let cwd_key = slash_key(cwd);
+    let root_folded = slash_key(root);
+    let root_key = root_folded.trim_end_matches('/');
+    let rest = cwd_key.strip_prefix(root_key)?.strip_prefix('/')?;
+    let first = rest.split('/').next().filter(|part| !part.is_empty())?;
+    first.parse().ok()
 }
 
 /// Prepare the detached worktree for `next_epoch` before run state becomes Running.
@@ -193,24 +212,54 @@ pub fn reap_aged(record: &ProjectRecord) -> Result<()> {
     if !isolation_enabled(record)? {
         return Ok(());
     }
-    let exec = match execution_repo(record) {
-        Ok(path) => path,
-        Err(_) => return Ok(()),
+    if let Ok(exec) = execution_repo(record) {
+        let root = worktrees_root(record)?;
+        let max_age = Duration::from_secs(reap_secs());
+        for child in numeric_children(&root) {
+            let epoch = child
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<u64>().ok());
+            let _scope = epoch.and_then(|epoch| crate::state::RunScope::enter(epoch).ok());
+            if is_live(record, &child) || !older_than(&child, max_age) {
+                continue;
+            }
+            let _ = remove_worktree(record, &exec, &child);
+        }
+    }
+    reap_cargo_targets(record);
+    Ok(())
+}
+
+/// Drop `{state_dir}/cargo-targets/{epoch}` when `is_live` is false for that
+/// epoch's worktree path. Liveness is the only signal: not `older_than` and
+/// not `reap_secs`. A failed `RunScope::enter` still calls `is_live`. An
+/// `epoch_dir` error, a book that fails to load, or a failed delete leaves
+/// that directory. The parent `cargo-targets` and the legacy `cargo-target`
+/// directory are never removed. This does not call `remove_worktree`.
+fn reap_cargo_targets(record: &ProjectRecord) {
+    let Ok(state_dir) = resolve_state_dir(record) else {
+        return;
     };
-    let root = worktrees_root(record)?;
-    let max_age = Duration::from_secs(reap_secs());
+    let root = state_dir.join("cargo-targets");
     for child in numeric_children(&root) {
-        let epoch = child
+        let Some(epoch) = child
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| name.parse::<u64>().ok());
-        let _scope = epoch.and_then(|epoch| crate::state::RunScope::enter(epoch).ok());
-        if is_live(record, &child) || !older_than(&child, max_age) {
+            .and_then(|name| name.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let _scope = crate::state::RunScope::enter(epoch).ok();
+        let keep = match epoch_dir(record, epoch) {
+            Ok(path) => is_live(record, &path),
+            Err(_) => true,
+        };
+        if keep {
             continue;
         }
-        let _ = remove_worktree(record, &exec, &child);
+        let _ = std::fs::remove_dir_all(&child);
     }
-    Ok(())
 }
 
 /// Slash- and case-insensitive path compare (git porcelain vs Windows paths).
@@ -1147,7 +1196,166 @@ mod tests {
         assert!(cargo_target_dir_for(&off, &epoch).is_none());
         let target = cargo_target_dir_for(&rec, &epoch).unwrap();
         assert!(target.is_absolute());
-        assert_eq!(target, state.path().join("cargo-target"));
+        assert_eq!(target, state.path().join("cargo-targets").join("3"));
+    }
+
+    #[test]
+    fn cargo_target_dir_is_per_epoch_absolute_and_not_under_worktrees() {
+        let ws = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let exec = ws.path().join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        let rec = record(
+            ws.path().to_path_buf(),
+            Some(exec.clone()),
+            Some(state.path().to_path_buf()),
+            true,
+        );
+        let root = worktrees_root(&rec).unwrap();
+        let four = root.join("4");
+        let five = root.join("5");
+        let nested = four.join("src");
+        let epoch4 = cargo_target_dir_for(&rec, &four).unwrap();
+        let epoch5 = cargo_target_dir_for(&rec, &five).unwrap();
+        assert_ne!(epoch4, epoch5);
+        assert_eq!(epoch4, state.path().join("cargo-targets").join("4"));
+        assert_eq!(epoch5, state.path().join("cargo-targets").join("5"));
+        assert!(epoch4.is_absolute());
+        assert!(epoch5.is_absolute());
+        assert_eq!(cargo_target_dir_for(&rec, &nested).unwrap(), epoch4);
+        assert!(!path_is_inside(&epoch4, &root));
+        assert!(!path_is_inside(&epoch5, &root));
+        let legacy = state.path().join("cargo-target");
+        assert_ne!(epoch4, legacy);
+        assert_ne!(epoch5, legacy);
+        assert!(cargo_target_dir_for(&rec, &root).is_none());
+        assert!(cargo_target_dir_for(&rec, &root.join("not-an-epoch")).is_none());
+        let outside = tempfile::tempdir().unwrap();
+        assert!(cargo_target_dir_for(&rec, outside.path()).is_none());
+        let off = record(
+            ws.path().to_path_buf(),
+            Some(exec),
+            Some(state.path().to_path_buf()),
+            false,
+        );
+        assert!(cargo_target_dir_for(&off, &four).is_none());
+    }
+
+    #[test]
+    fn reap_aged_drops_idle_cargo_dir_and_keeps_running_marker() {
+        let ws = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let exec = ws.path().join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        let rec = record(
+            ws.path().to_path_buf(),
+            Some(exec),
+            Some(state.path().to_path_buf()),
+            true,
+        );
+        let mut running = crate::state::RunState::idle(&rec.id);
+        running.status = RunStatus::Running;
+        running.run_epoch = 2;
+        save_run_state(&rec, &running).unwrap();
+
+        let cargo_root = state.path().join("cargo-targets");
+        let idle = cargo_root.join("1");
+        let live = cargo_root.join("2");
+        std::fs::create_dir_all(&idle).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        let marker = live.join("marker.txt");
+        std::fs::write(&marker, b"running").unwrap();
+        let legacy = state.path().join("cargo-target");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("keep.txt"), b"legacy").unwrap();
+        assert!(
+            !epoch_dir(&rec, 1).unwrap().exists(),
+            "worktrees/1 is absent before cleanup"
+        );
+        assert!(
+            !epoch_dir(&rec, 2).unwrap().exists(),
+            "worktrees/2 is not required"
+        );
+
+        reap_aged(&rec).unwrap();
+
+        assert!(!idle.exists(), "idle epoch cargo directory is gone");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "running");
+        assert!(live.is_dir(), "running epoch cargo directory remains");
+        assert!(cargo_root.is_dir(), "parent cargo-targets remains");
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("keep.txt")).unwrap(),
+            "legacy"
+        );
+    }
+
+    #[test]
+    fn reap_aged_keeps_cargo_dirs_when_run_book_is_corrupt() {
+        let ws = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let exec = ws.path().join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        let rec = record(
+            ws.path().to_path_buf(),
+            Some(exec),
+            Some(state.path().to_path_buf()),
+            true,
+        );
+        let book = run_state_path(&rec).unwrap();
+        std::fs::write(&book, b"{not-json").unwrap();
+        assert!(
+            crate::state::load_run_book(&rec).is_err(),
+            "corrupt state file must not load as an Idle book"
+        );
+        let cargo_root = state.path().join("cargo-targets");
+        let epoch1 = cargo_root.join("1");
+        let epoch2 = cargo_root.join("2");
+        std::fs::create_dir_all(&epoch1).unwrap();
+        std::fs::create_dir_all(&epoch2).unwrap();
+        std::fs::write(epoch1.join("marker.txt"), b"one").unwrap();
+        std::fs::write(epoch2.join("marker.txt"), b"two").unwrap();
+
+        reap_aged(&rec).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(epoch1.join("marker.txt")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(epoch2.join("marker.txt")).unwrap(),
+            "two"
+        );
+        assert!(cargo_root.is_dir());
+    }
+
+    #[test]
+    fn reap_aged_keeps_paused_cargo_marker_without_worktree() {
+        let ws = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let exec = ws.path().join("exec");
+        std::fs::create_dir_all(&exec).unwrap();
+        let rec = record(
+            ws.path().to_path_buf(),
+            Some(exec),
+            Some(state.path().to_path_buf()),
+            true,
+        );
+        let mut paused = crate::state::RunState::idle(&rec.id);
+        paused.status = RunStatus::Paused;
+        paused.run_epoch = 6;
+        save_run_state(&rec, &paused).unwrap();
+        let cargo = state.path().join("cargo-targets").join("6");
+        std::fs::create_dir_all(&cargo).unwrap();
+        let marker = cargo.join("marker.txt");
+        std::fs::write(&marker, b"paused").unwrap();
+        assert!(
+            !epoch_dir(&rec, 6).unwrap().exists(),
+            "worktrees/6 is not created"
+        );
+
+        reap_aged(&rec).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "paused");
     }
 
     #[test]

@@ -1589,10 +1589,21 @@ mod tests {
         on.worktree_isolation = true;
         on.state_dir = Some(state.path().to_path_buf());
         seed_journal_run(&on);
-        let expected = state.path().join("cargo-target");
+        let expected = state.path().join("cargo-targets").join("4");
+        let epoch5 = state.path().join("worktrees").join("5");
+        std::fs::create_dir_all(&epoch5).unwrap();
+        let expected5 = state.path().join("cargo-targets").join("5");
+        // Observe the parent only. This test does not call `std::env::set_var`.
+        let parent_before = std::env::var_os("CARGO_TARGET_DIR");
 
         let seen = child_cargo_target(&on, &epoch, "relative-target").await;
         assert_eq!(seen, expected.display().to_string());
+
+        let seen5 = child_cargo_target(&on, &epoch5, "relative-target").await;
+        assert_eq!(seen5, expected5.display().to_string());
+        assert_ne!(expected, expected5);
+        assert_ne!(expected, state.path().join("cargo-target"));
+        assert_eq!(std::env::var_os("CARGO_TARGET_DIR"), parent_before);
 
         let mut off = on.clone();
         off.worktree_isolation = false;
@@ -1601,6 +1612,7 @@ mod tests {
 
         let elsewhere = child_cargo_target(&on, outside.path(), "relative-target").await;
         assert_eq!(elsewhere, "relative-target");
+        assert_eq!(std::env::var_os("CARGO_TARGET_DIR"), parent_before);
     }
 
     async fn child_cargo_target(
