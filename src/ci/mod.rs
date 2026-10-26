@@ -1075,6 +1075,7 @@ fn accept_resolved_target(
 #[cfg(test)]
 fn ci_merged_probe() -> Option<Arc<dyn MergedTrackProbe>> {
     crate::workflow::shipped::installed_merged_probe()
+        .map(|probe| probe as Arc<dyn MergedTrackProbe>)
 }
 
 #[cfg(not(test))]

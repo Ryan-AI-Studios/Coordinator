@@ -596,9 +596,20 @@ pub(crate) fn cmd_run_request(
     let _ = settle_if_conductor_completed(&rec);
     // 0098: the durable Blocked hold refuses every fresh run (any driver / track)
     // before driver resolution, `gh` omit-pick and machine preflight.
-    let state = crate::state::load_run_state(&rec)?;
-    if let Some(err) = crate::run::blocked_hold(&rec, &state) {
-        return Err(err);
+    // A book checks every entry from `load_run_book`. Unscoped `load_run_state`
+    // is `ambiguous run` on a book, so that load stays on the singular file.
+    let book = crate::state::load_run_book(&rec)?;
+    if book.is_book() {
+        for entry in book.entries() {
+            if let Some(err) = crate::run::blocked_hold(&rec, entry) {
+                return Err(err);
+            }
+        }
+    } else {
+        let state = crate::state::load_run_state(&rec)?;
+        if let Some(err) = crate::run::blocked_hold(&rec, &state) {
+            return Err(err);
+        }
     }
     let driver = crate::workflow::resolve_driver(driver)?;
     let (track, picked) = resolve_run_track_for_driver(&rec, track, driver)?;
@@ -739,7 +750,13 @@ fn adapter_omit_pick(
     explicit: Option<String>,
 ) -> Result<(Option<String>, bool)> {
     let hooked = crate::workflow::shipped::installed_merged_probe();
-    resolve_run_track_with_probe(record, explicit, hooked.as_deref())
+    resolve_run_track_with_probe(
+        record,
+        explicit,
+        hooked
+            .as_deref()
+            .map(|probe| probe as &dyn crate::workflow::MergedTrackProbe),
+    )
 }
 
 #[cfg(not(test))]

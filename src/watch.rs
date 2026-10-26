@@ -520,12 +520,55 @@ pub enum AutoStartAttempt {
     },
 }
 
-/// One auto-start attempt for one project (0103).
+/// Map a Ready-pick error the way the zero-live guard always has.
+fn map_ready_pick_error(record: &ProjectRecord, err: &CoordinatorError) -> AutoStartAttempt {
+    if crate::registry_store::is_view_drift_error(err) {
+        return AutoStartAttempt::Skipped(AutoStartSkip::RegistryDrift);
+    }
+    if crate::workflow::conductor_md::ready_pick_miss_is_benign(err) {
+        return AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow);
+    }
+    // Transient read glitch (Windows share, delete in flight): skip the tick,
+    // write nothing. A persistent Io skips like poll_once and never latches
+    // harness_crash.
+    if matches!(err, CoordinatorError::Io(_)) {
+        return AutoStartAttempt::Skipped(AutoStartSkip::TransientRead);
+    }
+    record_auto_start_failure(record, err)
+}
+
+/// Second-start pre-pick. Same probe as the adapter omit path: the test hook
+/// under `cfg(test)`, otherwise `GhMergedTrackProbe`. An explicit id inside
+/// `cmd_run` still returns before that probe, so this call is the probe.
+fn pick_second_ready(record: &ProjectRecord, skip: &[String], sticky: &[String]) -> Result<String> {
+    #[cfg(test)]
+    {
+        let hooked = crate::workflow::shipped::installed_merged_probe();
+        crate::workflow::pick_next_ready_excluding_sticky(
+            record,
+            skip,
+            hooked
+                .as_deref()
+                .map(|probe| probe as &dyn crate::workflow::MergedTrackProbe),
+            sticky,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let probe = crate::ci::GhMergedTrackProbe::default();
+        crate::workflow::pick_next_ready_excluding_sticky(record, skip, Some(&probe), sticky)
+    }
+}
+
+/// One auto-start attempt for one project (0103, second start 0131).
 ///
 /// Stateless: the feature gate, policy, run state and Ready rows are re-read on
-/// every call. `auto_start: full` only; `hitl`/`never` report and wait. The start
-/// uses the canonical [`crate::api::cmd_run`] omit-pick path — there is no second
-/// launch path. Never retries internally.
+/// every call. `auto_start: full` only; `hitl`/`never` report and wait. The
+/// zero-live start keeps the canonical [`crate::api::cmd_run`] omit-pick path.
+/// A second start, when exactly one entry is `Running` and isolation is on,
+/// pre-picks with the omit-path merged-PR probe and then calls `cmd_run` with
+/// that track id. `should_pick_next_ready` is not applied to the live entry.
+/// Never retries internally.
 pub fn try_auto_start(record: &ProjectRecord) -> AutoStartAttempt {
     // Gate (a): live re-read every attempt (0102 semantics; never cache).
     if !crate::features::is_enabled(crate::features::Duty::AutoStart) {
@@ -536,31 +579,75 @@ pub fn try_auto_start(record: &ProjectRecord) -> AutoStartAttempt {
         AutoStartPolicy::Full => {}
         other => return AutoStartAttempt::Skipped(AutoStartSkip::Policy(other)),
     }
-    // Gate (c): fresh run state.
-    let state = match crate::state::load_run_book(record) {
-        Ok(book) => {
-            if crate::state::any_entry_live(record).unwrap_or(false) {
-                return AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive);
-            }
-            book.into_entries()
-                .into_iter()
-                .max_by_key(|entry| entry.run_epoch)
-                .unwrap_or_else(|| crate::state::RunState::idle(&record.id))
-        }
+    let book = match crate::state::load_run_book(record) {
+        Ok(book) => book,
         Err(_) => return AutoStartAttempt::Skipped(AutoStartSkip::NotEligible),
     };
-    // Durable dedupe must precede gate (e): `should_pick_next_ready` is true for an
-    // empty track_id even when a failure class is present.
-    if state.failure_class.is_some() || crate::notify::artifact::any_failure_record(record) {
+    let running = book
+        .entries()
+        .iter()
+        .filter(|entry| entry.status == RunStatus::Running)
+        .count();
+    let paused = book
+        .entries()
+        .iter()
+        .filter(|entry| entry.status == RunStatus::Paused)
+        .count();
+    // Exactly one Running entry, and isolation confirmed on. Paused-only, two
+    // live entries, isolation off, and an invalid worktree flag all stay
+    // AlreadyActive — before the pick and before `cmd_run`.
+    let second = running == 1
+        && paused == 0
+        && matches!(crate::worktree::isolation_enabled(record), Ok(true));
+    if running + paused > 0 && !second {
+        return AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive);
+    }
+    // Entry union, not the max-epoch row alone. A Running sibling is not a failure.
+    if book
+        .entries()
+        .iter()
+        .any(|entry| entry.failure_class.is_some())
+        || crate::notify::artifact::any_failure_record(record)
+    {
         return AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure);
     }
+    if second {
+        let skip: Vec<String> = book
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.status, RunStatus::Running | RunStatus::Paused))
+            .filter_map(|entry| entry.track_id.clone())
+            .collect();
+        let sticky = book
+            .entries()
+            .iter()
+            .max_by_key(|entry| entry.run_epoch)
+            .map(|entry| entry.sticky_ready_ids.clone())
+            .unwrap_or_default();
+        let id = match pick_second_ready(record, &skip, &sticky) {
+            Ok(id) => id,
+            Err(e) => return map_ready_pick_error(record, &e),
+        };
+        return match crate::api::cmd_run(Some(&record.id), Some(id), None, false, false) {
+            Ok(view) => AutoStartAttempt::Started(view),
+            Err(e) => auto_start_after_error(record, &e),
+        };
+    }
+    // Zero-live path. Durable dedupe already ran. `should_pick_next_ready` stays
+    // on this path only — applying it to a live Running entry would reject every
+    // second start.
+    let state = book
+        .entries()
+        .into_iter()
+        .max_by_key(|entry| entry.run_epoch)
+        .cloned()
+        .unwrap_or_else(|| crate::state::RunState::idle(&record.id));
     let mut pick = crate::workflow::ReadyPickState::from(&state);
     pick.auto_start = record.auto_start;
     if !crate::workflow::should_pick_next_ready(&pick) {
         return AutoStartAttempt::Skipped(AutoStartSkip::NotEligible);
     }
-    // Gate (f): probeless "is there anything to start" guard. The canonical pick
-    // inside `cmd_run` still decides (merged-PR probe, sticky overlay, skip list).
+    // Probeless existence guard. Omit-pick inside `cmd_run` still decides.
     match crate::workflow::pick_next_ready_excluding_sticky(
         record,
         &[],
@@ -568,24 +655,11 @@ pub fn try_auto_start(record: &ProjectRecord) -> AutoStartAttempt {
         &state.sticky_ready_ids,
     ) {
         Ok(_id) => {}
-        Err(e) => {
-            if crate::registry_store::is_view_drift_error(&e) {
-                return AutoStartAttempt::Skipped(AutoStartSkip::RegistryDrift);
-            }
-            if crate::workflow::conductor_md::ready_pick_miss_is_benign(&e) {
-                return AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow);
-            }
-            // Transient read glitch (Windows share, delete in flight): skip the tick,
-            // write nothing. A persistent Io skips like poll_once and never latches
-            // harness_crash.
-            if matches!(e, CoordinatorError::Io(_)) {
-                return AutoStartAttempt::Skipped(AutoStartSkip::TransientRead);
-            }
-            return record_auto_start_failure(record, &e);
-        }
+        Err(e) => return map_ready_pick_error(record, &e),
     }
-    // Gate (g): the canonical launch. Omit the id on purpose: pinning would bypass
-    // the merged-PR probe, the sticky overlay and the skip list.
+    // Omit the id on purpose: pinning would bypass the merged-PR probe, the
+    // sticky overlay and the skip list. The second-start branch above is the
+    // one that pins, and only after its own probe.
     match crate::api::cmd_run(Some(&record.id), None, None, false, false) {
         Ok(view) => AutoStartAttempt::Started(view),
         Err(e) => auto_start_after_error(record, &e),
@@ -595,16 +669,29 @@ pub fn try_auto_start(record: &ProjectRecord) -> AutoStartAttempt {
 /// `spawn_blocking` wrapper, mirroring [`poll_once_async`].
 pub async fn try_auto_start_async(record: &ProjectRecord) -> Result<AutoStartAttempt> {
     let rec = record.clone();
-    tokio::task::spawn_blocking(move || try_auto_start(&rec))
-        .await
-        .map_err(|e| CoordinatorError::Message(format!("auto-start task join: {e}")))
+    // The merged-PR test hook is thread-local. Carry it onto the blocking
+    // thread so a tick sees the same probe the omit path would.
+    #[cfg(test)]
+    let probe = crate::workflow::shipped::installed_merged_probe();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _probe = probe.as_ref().map(|probe| {
+            crate::workflow::shipped::install_test_merged_probe(std::sync::Arc::clone(probe))
+        });
+        try_auto_start(&rec)
+    })
+    .await
+    .map_err(|e| CoordinatorError::Message(format!("auto-start task join: {e}")))
 }
 
-/// Map a `cmd_run` error without writing for the benign cases (0103).
+/// Map a `cmd_run` error without writing for the benign cases (0103, 0131).
 ///
-/// Only setup/parse failures and `Preflight` become durable; a lost race, a
-/// policy flip, a transient `Io` read, a 0098 hold and a vanished project never
-/// write.
+/// Setup and parse failures become durable. A zero-live `Preflight` still
+/// latches `Permission`. A second-start `Preflight` (any entry live) is
+/// `NotEligible` and writes nothing. `InvalidTransition` (including the
+/// two-run cap), `track already running`, and `TerminalRunTrack` also write
+/// nothing. A lost race, a policy flip, a transient `Io` read, a 0098 hold and
+/// a vanished project never write.
 pub(crate) fn auto_start_after_error(
     record: &ProjectRecord,
     err: &CoordinatorError,
@@ -614,6 +701,13 @@ pub(crate) fn auto_start_after_error(
         E::BlockedHold { .. } => AutoStartAttempt::Skipped(AutoStartSkip::Held),
         E::ProjectNotFound(_) => AutoStartAttempt::Skipped(AutoStartSkip::ProjectGone),
         E::InvalidTransition { .. } => AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive),
+        E::Message(m) if m == "track already running" => {
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        }
+        E::TerminalRunTrack { .. } => AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow),
+        E::Preflight { .. } if crate::state::any_entry_live(record).unwrap_or(false) => {
+            AutoStartAttempt::Skipped(AutoStartSkip::NotEligible)
+        }
         E::Message(m) if m.starts_with("auto_start=never") => {
             AutoStartAttempt::Skipped(AutoStartSkip::Policy(AutoStartPolicy::Never))
         }
@@ -695,8 +789,68 @@ pub(crate) fn record_auto_start_failure(
     }
 }
 
+/// One project's poll, and at most one auto-start attempt.
+///
+/// No live entry: today's path, including the durable-failure settle, then the
+/// placeholder backstop and `try_auto_start_async`. Exactly one `Running` entry
+/// and isolation `Ok(true)`: poll that epoch, then the same backstop and
+/// auto-start. The backstop still refuses the live book; that refusal does not
+/// block the auto-start call. A `Paused`-only project, two or more live
+/// entries, isolation off, and `isolation_enabled` `Err` poll and return.
+pub(crate) async fn serve_project_tick(rec: &ProjectRecord) {
+    let book = match crate::state::load_run_book(rec) {
+        Ok(book) => book,
+        Err(e) => {
+            eprintln!(
+                "coordinator: serve: project {} run-state unreadable: {e}",
+                rec.id
+            );
+            return;
+        }
+    };
+    let live: Vec<u64> = book
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry.status, RunStatus::Running | RunStatus::Paused))
+        .map(|entry| entry.run_epoch)
+        .collect();
+    let running = book
+        .entries()
+        .iter()
+        .filter(|entry| entry.status == RunStatus::Running)
+        .count();
+    let second = running == 1
+        && live.len() == 1
+        && matches!(crate::worktree::isolation_enabled(rec), Ok(true));
+    if !live.is_empty() {
+        for epoch in live {
+            let _ = poll_once_scoped(rec, Some(epoch)).await;
+        }
+        if !second {
+            return;
+        }
+    } else {
+        let durable = book
+            .entries()
+            .iter()
+            .any(|entry| entry.failure_class.is_some())
+            || crate::notify::artifact::any_failure_record(rec);
+        if durable {
+            let rec = rec.clone();
+            let _ = crate::api::settle_if_conductor_completed(&rec);
+        }
+    }
+    // 0106: restore registry truth for a parked/idle project before the 0103 picker runs.
+    // The backstop refuses Running/Paused under the run-state lock, so it cannot race the
+    // fold's own promotion. On the one-Running path that refusal is `BackstopSkip::Active`
+    // and does not block the auto-start below.
+    let _ = crate::workflow::placeholder_backstop::tick_async(rec).await;
+    // 0103: one attempt per project per tick; the helper is the only start point.
+    let _ = try_auto_start_async(rec).await;
+}
+
 /// Background poll all registered projects that are Running or Paused, and one
-/// auto-start attempt per non-active project (0103).
+/// auto-start attempt per eligible project (0103, second start 0131).
 pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut last_fleet: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut last_reap: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -708,44 +862,8 @@ pub async fn serve_poll_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
         match crate::api::load_registry() {
             Ok(reg) => {
                 for rec in reg.list() {
-                    let book = match crate::state::load_run_book(rec) {
-                        Ok(book) => book,
-                        Err(e) => {
-                            eprintln!(
-                                "coordinator: serve: project {} run-state unreadable: {e}",
-                                rec.id
-                            );
-                            continue;
-                        }
-                    };
-                    let live: Vec<u64> = book
-                        .entries()
-                        .iter()
-                        .filter(|entry| {
-                            matches!(entry.status, RunStatus::Running | RunStatus::Paused)
-                        })
-                        .map(|entry| entry.run_epoch)
-                        .collect();
-                    if !live.is_empty() {
-                        for epoch in live {
-                            let _ = poll_once_scoped(rec, Some(epoch)).await;
-                        }
-                        continue;
-                    }
-                    let entries = book.into_entries();
-                    let durable = entries.iter().any(|entry| entry.failure_class.is_some())
-                        || crate::notify::artifact::any_failure_record(rec);
-                    if durable {
-                        let rec = rec.clone();
-                        let _ = crate::api::settle_if_conductor_completed(&rec);
-                    }
-                    // 0106: restore registry truth for a parked/idle project before the 0103 picker runs.
-                    // The backstop refuses Running/Paused under the run-state lock, so it cannot race the
-                    // fold's own promotion. The spawn_blocking wrapper keeps the async loop off the lock.
-                    let _ = crate::workflow::placeholder_backstop::tick_async(rec).await;
-                    // 0103: one attempt per project per tick; the helper is the only
-                    // start point. Awaited so two projects never start concurrently.
-                    let _ = try_auto_start_async(rec).await;
+                    // Awaited so two projects never start concurrently.
+                    serve_project_tick(rec).await;
                 }
                 for rec in reg.list() {
                     let _ = crate::worktree::reap_aged(rec);
@@ -2755,5 +2873,537 @@ mod tests {
             "A was not cancelled: {:?}",
             ops_a.lock().unwrap()
         );
+    }
+
+    fn init_seed_repo() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_command::command()
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("README.md"), b"seed\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-m", "seed"]);
+        dir
+    }
+
+    fn ready_rows(ws: &std::path::Path, rows: &[(&str, &str)]) {
+        for (name, _) in rows {
+            write_track_dir(ws, name);
+        }
+        let body = rows
+            .iter()
+            .map(|(name, summary)| {
+                format!("| {name} | `.` | **Ready \u{2014} not started** | {summary} |")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_conductor_row(ws, &body);
+    }
+
+    fn seed_entry(id: &str, epoch: u64, track: &str, status: RunStatus) -> crate::state::RunState {
+        let mut state = crate::state::RunState::idle(id);
+        state.run_epoch = epoch;
+        state.status = status;
+        state.phase = crate::workflow::graph::PHASE_PLAN.into();
+        state.track_id = Some(track.into());
+        state.driver = crate::workflow::WorkflowDriver::FileWait;
+        state.last_event = format!("seed {epoch}");
+        state
+    }
+
+    fn save_singular(rec: &ProjectRecord, state: &crate::state::RunState) {
+        crate::state::ensure_state_dir(rec).unwrap();
+        save_run_state(rec, state).unwrap();
+    }
+
+    fn book_entries(rec: &ProjectRecord) -> Vec<crate::state::RunState> {
+        crate::state::load_run_book(rec).unwrap().into_entries()
+    }
+
+    fn state_bytes(rec: &ProjectRecord) -> Vec<u8> {
+        std::fs::read(crate::state::run_state_path(rec).unwrap()).unwrap_or_default()
+    }
+
+    fn assert_same_entry(found: &crate::state::RunState, before: &crate::state::RunState) {
+        assert_eq!(found.run_epoch, before.run_epoch);
+        assert_eq!(found.track_id, before.track_id);
+        assert_eq!(found.phase, before.phase);
+        assert_eq!(found.status, before.status);
+    }
+
+    fn sample_preflight() -> CoordinatorError {
+        use crate::harness::preflight::{DoctorReport, DoctorRow, RowStatus};
+        CoordinatorError::Preflight {
+            report: Box::new(DoctorReport {
+                ok: false,
+                rows: vec![DoctorRow {
+                    role: "planner".into(),
+                    harness: "grok".into(),
+                    command: "grok".into(),
+                    path: None,
+                    status: RowStatus::Missing,
+                    required: true,
+                    login: Some("grok login".into()),
+                    detail: None,
+                }],
+            }),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn serve_project_tick_starts_second_ready_while_one_is_running() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+        let repo = init_seed_repo();
+        let (_home, ws, rec) = auto_start_project(
+            AutoStartPolicy::Full,
+            false,
+            true,
+            Some(repo.path().to_path_buf()),
+        );
+        ready_rows(
+            ws.path(),
+            &[("0020-Fixture", "first"), ("0021-Fixture", "second")],
+        );
+
+        let first = try_auto_start(&rec);
+        let AutoStartAttempt::Started(_) = first else {
+            panic!("expected the first start, got {first:?}");
+        };
+        let before = book_entries(&rec);
+        assert_eq!(before.len(), 1, "first start stays singular");
+        let first_entry = before[0].clone();
+        assert_eq!(first_entry.track_id.as_deref(), Some("0020"));
+        assert_eq!(first_entry.status, RunStatus::Running);
+        assert_eq!(first_entry.phase, crate::workflow::graph::PHASE_PLAN);
+
+        serve_project_tick(&rec).await;
+
+        let after = book_entries(&rec);
+        assert_eq!(after.len(), 2, "second start did not admit: {after:?}");
+        let kept = after
+            .iter()
+            .find(|entry| entry.run_epoch == first_entry.run_epoch)
+            .expect("first entry missing");
+        assert_same_entry(kept, &first_entry);
+        let started = after
+            .iter()
+            .find(|entry| entry.run_epoch != first_entry.run_epoch)
+            .unwrap();
+        assert_eq!(started.status, RunStatus::Running);
+        assert_eq!(started.phase, crate::workflow::graph::PHASE_PLAN);
+        assert_eq!(started.track_id.as_deref(), Some("0021"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn second_start_skips_a_merged_ready_row() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+        let repo = init_seed_repo();
+        let (_home, ws, rec) = auto_start_project(
+            AutoStartPolicy::Full,
+            false,
+            true,
+            Some(repo.path().to_path_buf()),
+        );
+        ready_rows(
+            ws.path(),
+            &[
+                ("0020-Fixture", "live"),
+                ("0021-Fixture", "merged"),
+                ("0022-Fixture", "next"),
+            ],
+        );
+        let first = try_auto_start(&rec);
+        let AutoStartAttempt::Started(view) = first else {
+            panic!("expected the live row, got {first:?}");
+        };
+        assert_eq!(view.track_id.as_deref(), Some("0020"));
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0021", 91);
+        let _probe =
+            crate::workflow::shipped::install_test_merged_probe(std::sync::Arc::new(probe));
+
+        serve_project_tick(&rec).await;
+
+        let after = book_entries(&rec);
+        assert!(
+            after
+                .iter()
+                .all(|entry| entry.track_id.as_deref() != Some("0021")),
+            "merged row was started: {after:?}"
+        );
+        assert!(
+            after.iter().any(|entry| {
+                entry.track_id.as_deref() == Some("0022")
+                    && entry.status == RunStatus::Running
+                    && entry.phase == crate::workflow::graph::PHASE_PLAN
+            }),
+            "next unmerged row was not started: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn second_start_skips_when_the_only_other_ready_row_is_merged() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+        let repo = init_seed_repo();
+        let (_home, ws, rec) = auto_start_project(
+            AutoStartPolicy::Full,
+            false,
+            true,
+            Some(repo.path().to_path_buf()),
+        );
+        ready_rows(ws.path(), &[("0021-Fixture", "merged")]);
+        save_singular(&rec, &seed_entry(&rec.id, 4, "0020", RunStatus::Running));
+        let probe = crate::workflow::shipped::ScriptedMergedProbe::found("0021", 91);
+        let _probe =
+            crate::workflow::shipped::install_test_merged_probe(std::sync::Arc::new(probe));
+        let before = state_bytes(&rec);
+
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow)
+        );
+        serve_project_tick(&rec).await;
+
+        assert_eq!(book_entries(&rec).len(), 1);
+        assert_eq!(state_bytes(&rec), before);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn second_start_gates_do_not_write_a_new_entry() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+
+        // Duty off.
+        let (home, ws, rec) = auto_start_project(AutoStartPolicy::Full, false, true, None);
+        ready_rows(ws.path(), &[("0021-Fixture", "next")]);
+        save_singular(&rec, &seed_entry(&rec.id, 2, "0020", RunStatus::Running));
+        write_features_config(home.path(), serde_json::json!({ "auto_start": false }));
+        let before = state_bytes(&rec);
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::FeatureOff)
+        );
+        assert_eq!(state_bytes(&rec), before);
+
+        // Policy hitl and never, on the same one-Running shape.
+        for policy in [AutoStartPolicy::Hitl, AutoStartPolicy::Never] {
+            let (_home, ws, rec) = auto_start_project(policy, false, true, None);
+            ready_rows(ws.path(), &[("0021-Fixture", "next")]);
+            save_singular(&rec, &seed_entry(&rec.id, 2, "0020", RunStatus::Running));
+            let before = state_bytes(&rec);
+            assert_eq!(
+                try_auto_start(&rec),
+                AutoStartAttempt::Skipped(AutoStartSkip::Policy(policy))
+            );
+            assert_eq!(state_bytes(&rec), before);
+            assert_eq!(book_entries(&rec).len(), 1);
+        }
+
+        // Paused-only stays AlreadyActive and the tick does not start.
+        let (_home, ws, rec) = auto_start_project(AutoStartPolicy::Full, false, true, None);
+        ready_rows(ws.path(), &[("0021-Fixture", "next")]);
+        save_singular(&rec, &seed_entry(&rec.id, 2, "0020", RunStatus::Paused));
+        let before = state_bytes(&rec);
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        serve_project_tick(&rec).await;
+        assert_eq!(state_bytes(&rec), before);
+        assert_eq!(book_entries(&rec)[0].status, RunStatus::Paused);
+
+        // Isolation off, including when nothing is Ready: AlreadyActive, not NoReadyRow.
+        let (_home, _ws, rec) = auto_start_project(AutoStartPolicy::Full, false, false, None);
+        save_singular(&rec, &seed_entry(&rec.id, 2, "0020", RunStatus::Running));
+        let before = state_bytes(&rec);
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        serve_project_tick(&rec).await;
+        assert_eq!(state_bytes(&rec), before);
+
+        // Nostart is the existing picker, not the proof of the new branch.
+        let (_home, ws, rec) = auto_start_project(AutoStartPolicy::Full, false, true, None);
+        write_track_dir(ws.path(), "0021-Fixture");
+        write_conductor_row(
+            ws.path(),
+            "| 0021-Fixture | `.` | **Ready \u{2014} not started** <!-- nostart --> | fixture |",
+        );
+        save_singular(&rec, &seed_entry(&rec.id, 2, "0020", RunStatus::Running));
+        let before = state_bytes(&rec);
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow)
+        );
+        assert_eq!(state_bytes(&rec), before);
+
+        // A Blocked hold on any entry writes nothing. The class is a failure, so the
+        // ticker skips as durable. The explicit run still sees the hold.
+        let (_home, _ws, rec) = auto_start_project(AutoStartPolicy::Full, false, true, None);
+        let mut running = seed_entry(&rec.id, 2, "0020", RunStatus::Running);
+        running.failure_class = None;
+        let mut held = seed_entry(&rec.id, 3, "0021", RunStatus::Stopped);
+        held.failure_class = Some(FailureClass::Blocked);
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![running, held]),
+        )
+        .unwrap();
+        let before = state_bytes(&rec);
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure)
+        );
+        let err = crate::api::cmd_run_request(
+            Some(&rec.id),
+            Some("0022".into()),
+            Some("file_wait"),
+            false,
+            false,
+            crate::api::RunRequest::control_plane(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CoordinatorError::BlockedHold { .. }),
+            "{err:?}"
+        );
+        assert_eq!(state_bytes(&rec), before);
+        let stopped = book_entries(&rec)
+            .into_iter()
+            .find(|entry| entry.run_epoch == 3)
+            .unwrap();
+        assert_eq!(stopped.failure_class, Some(FailureClass::Blocked));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn two_live_runs_refuse_a_third_and_a_clean_stopped_sibling_admits() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+
+        let (_home, ws, rec) = auto_start_project(AutoStartPolicy::Full, false, true, None);
+        ready_rows(ws.path(), &[("0022-Fixture", "third")]);
+        let left = seed_entry(&rec.id, 2, "0020", RunStatus::Running);
+        let right = seed_entry(&rec.id, 4, "0021", RunStatus::Paused);
+        crate::state::write_run_book(&rec, &crate::state::RunEnvelope::new(0, vec![left, right]))
+            .unwrap();
+        serve_project_tick(&rec).await;
+        assert_eq!(book_entries(&rec).len(), 2);
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        let before = state_bytes(&rec);
+        let err = crate::api::cmd_run_request(
+            Some(&rec.id),
+            Some("0022".into()),
+            Some("file_wait"),
+            false,
+            false,
+            crate::api::RunRequest::control_plane(),
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("ambiguous run"), "{err}");
+        match &err {
+            CoordinatorError::InvalidTransition { action, from } => {
+                assert_eq!(*action, "run");
+                assert_eq!(from, "two runs active");
+            }
+            other => panic!("expected the cap, got {other:?}"),
+        }
+        assert_eq!(state_bytes(&rec), before);
+        assert_eq!(book_entries(&rec).len(), 2);
+
+        let repo = init_seed_repo();
+        let (_home, _ws, rec) = auto_start_project(
+            AutoStartPolicy::Full,
+            false,
+            true,
+            Some(repo.path().to_path_buf()),
+        );
+        let running = seed_entry(&rec.id, 2, "0020", RunStatus::Running);
+        let stopped = seed_entry(&rec.id, 5, "0021", RunStatus::Stopped);
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![running.clone(), stopped.clone()]),
+        )
+        .unwrap();
+        let view = crate::api::cmd_run_request(
+            Some(&rec.id),
+            Some("0022".into()),
+            Some("file_wait"),
+            false,
+            false,
+            crate::api::RunRequest::control_plane(),
+        )
+        .unwrap();
+        assert_eq!(view.track_id.as_deref(), Some("0022"));
+        assert_eq!(view.status, RunStatus::Running);
+        let after = book_entries(&rec);
+        assert_eq!(after.len(), 3);
+        let kept = after.iter().find(|entry| entry.run_epoch == 2).unwrap();
+        assert_same_entry(kept, &running);
+        let sibling = after.iter().find(|entry| entry.run_epoch == 5).unwrap();
+        assert_eq!(sibling.status, RunStatus::Stopped);
+        assert!(sibling.failure_class.is_none());
+        assert!(
+            !crate::notify::artifact::path(&rec).unwrap().exists(),
+            "admit wrote a project failure summary"
+        );
+    }
+
+    #[test]
+    fn auto_start_error_map_does_not_latch_a_second_start() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+        let (_home, _ws, live) = auto_start_project(AutoStartPolicy::Full, false, true, None);
+        save_singular(&live, &seed_entry(&live.id, 2, "0020", RunStatus::Running));
+
+        let cap = CoordinatorError::InvalidTransition {
+            action: "run",
+            from: "two runs active".into(),
+        };
+        assert_eq!(
+            auto_start_after_error(&live, &cap),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        assert_eq!(
+            auto_start_after_error(
+                &live,
+                &CoordinatorError::Message("track already running".into())
+            ),
+            AutoStartAttempt::Skipped(AutoStartSkip::AlreadyActive)
+        );
+        assert_eq!(
+            auto_start_after_error(
+                &live,
+                &CoordinatorError::TerminalRunTrack {
+                    track: "0021".into(),
+                    status: "Completed".into(),
+                }
+            ),
+            AutoStartAttempt::Skipped(AutoStartSkip::NoReadyRow)
+        );
+        assert_eq!(
+            auto_start_after_error(&live, &sample_preflight()),
+            AutoStartAttempt::Skipped(AutoStartSkip::NotEligible)
+        );
+        let after = book_entries(&live);
+        assert_eq!(after.len(), 1);
+        assert!(after[0].failure_class.is_none());
+        assert!(!after[0].last_event.starts_with("auto-start:"));
+
+        // Zero-live preflight still latches Permission.
+        let (_home, _ws, idle) = auto_start_project(AutoStartPolicy::Full, true, false, None);
+        let out = auto_start_after_error(&idle, &sample_preflight());
+        assert!(
+            matches!(
+                out,
+                AutoStartAttempt::Failed {
+                    failure_class: FailureClass::Permission,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(on_disk(&idle).failure_class, Some(FailureClass::Permission));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn durable_failure_union_skips_and_deletes_nothing() {
+        let _guard = test_env_lock();
+        let _env = auto_start_env_guard();
+        crate::features::reset_feature_warnings_for_tests();
+        set_auto_start_env("file_wait");
+
+        let (_home, ws, rec) = auto_start_project(AutoStartPolicy::Full, false, true, None);
+        ready_rows(ws.path(), &[("0021-Fixture", "next")]);
+        save_singular(&rec, &seed_entry(&rec.id, 2, "0020", RunStatus::Running));
+        let fail = crate::notify::artifact::run_path(&rec, 9).unwrap();
+        std::fs::create_dir_all(fail.parent().unwrap()).unwrap();
+        std::fs::write(&fail, b"- track_id: 0099\n- run_epoch: 9\n").unwrap();
+        assert!(crate::notify::artifact::any_failure_record(&rec));
+        assert!(book_entries(&rec)[0].failure_class.is_none());
+        let before = state_bytes(&rec);
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure)
+        );
+        serve_project_tick(&rec).await;
+        assert_eq!(state_bytes(&rec), before);
+        assert_eq!(
+            std::fs::read(&fail).unwrap(),
+            b"- track_id: 0099\n- run_epoch: 9\n"
+        );
+        assert_eq!(book_entries(&rec).len(), 1);
+
+        let (_home, ws, rec) = auto_start_project(AutoStartPolicy::Full, false, true, None);
+        ready_rows(ws.path(), &[("0022-Fixture", "next")]);
+        let running = seed_entry(&rec.id, 2, "0020", RunStatus::Running);
+        let mut stopped = seed_entry(&rec.id, 6, "0021", RunStatus::Stopped);
+        stopped.failure_class = Some(FailureClass::HarnessCrash);
+        crate::state::write_run_book(
+            &rec,
+            &crate::state::RunEnvelope::new(0, vec![running, stopped]),
+        )
+        .unwrap();
+        assert!(
+            !crate::notify::artifact::any_failure_record(&rec),
+            "a class without a file must stay file-false"
+        );
+        assert!(!crate::notify::artifact::path(&rec).unwrap().exists());
+        let before = state_bytes(&rec);
+        assert_eq!(
+            try_auto_start(&rec),
+            AutoStartAttempt::Skipped(AutoStartSkip::DurableFailure)
+        );
+        assert_eq!(state_bytes(&rec), before, "the attempt wrote the book");
+        serve_project_tick(&rec).await;
+        let stopped = book_entries(&rec)
+            .into_iter()
+            .find(|entry| entry.run_epoch == 6)
+            .unwrap();
+        assert_eq!(stopped.failure_class, Some(FailureClass::HarnessCrash));
+        let running = book_entries(&rec)
+            .into_iter()
+            .find(|entry| entry.run_epoch == 2)
+            .unwrap();
+        assert_eq!(running.track_id.as_deref(), Some("0020"));
+        assert_eq!(running.status, RunStatus::Running);
+        assert!(running.failure_class.is_none());
+        assert!(!crate::notify::artifact::path(&rec).unwrap().exists());
+        assert_eq!(book_entries(&rec).len(), 2);
     }
 }
