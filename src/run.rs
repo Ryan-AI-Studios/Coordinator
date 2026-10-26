@@ -1081,6 +1081,7 @@ fn compose_book_status(record: &ProjectRecord, envelope: &crate::state::RunEnvel
             summary.failure_artifact = crate::notify::artifact::run_path(record, entry.run_epoch)
                 .ok()
                 .filter(|path| path.is_file());
+            summary.failure_superseded = crate::state::failure_superseded_for(record, entry);
             summary
         })
         .collect();
@@ -2235,5 +2236,49 @@ mod tests {
             "{}",
             resumed.last_event
         );
+    }
+
+    #[test]
+    fn book_status_copies_last_event_and_per_run_superseded() {
+        let _guard = crate::config::test_env_lock();
+        let dir = tempdir().unwrap();
+        let r = rec(dir.path());
+        let cond = dir.path().join("conductor");
+        std::fs::create_dir_all(cond.join("0128-Done")).unwrap();
+        std::fs::create_dir_all(cond.join("0130-Open")).unwrap();
+        std::fs::write(
+            cond.join("conductor.md"),
+            "| Track | Execution path | Status | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | 0128-Done | `.` | **Completed** | done |\n\
+             | 0130-Open | `.` | **Ready - not started** | open |\n",
+        )
+        .unwrap();
+        let mut low = crate::state::RunState::idle(&r.id);
+        low.run_epoch = 1;
+        low.status = RunStatus::Idle;
+        low.phase = "stub:idle".into();
+        low.track_id = Some("0128".into());
+        low.failure_class = Some(crate::outcome::FailureClass::Timeout);
+        low.last_event = "wait: shared tree held by epoch 2".into();
+        let mut high = crate::state::RunState::idle(&r.id);
+        high.run_epoch = 2;
+        high.status = RunStatus::Running;
+        high.phase = "implement".into();
+        high.track_id = Some("0130".into());
+        high.last_event = "pause: hold".into();
+        crate::state::write_run_book(&r, &crate::state::RunEnvelope::new(0, vec![low, high]))
+            .unwrap();
+        let view = status(&r).unwrap();
+        assert_eq!(view.runs.len(), 2);
+        assert_eq!(view.runs[0].last_event, "wait: shared tree held by epoch 2");
+        assert_eq!(view.runs[1].last_event, "pause: hold");
+        assert_eq!(
+            view.runs[0].failure_superseded.as_deref(),
+            Some(crate::notify::SUPERSEDED_COMPLETED)
+        );
+        assert_eq!(view.runs[1].failure_superseded, None);
+        assert_eq!(view.runs[0].failure_artifact, None);
+        assert_eq!(view.runs[1].failure_artifact, None);
     }
 }

@@ -9,10 +9,11 @@ use dioxus::prelude::*;
 use crate::error::CoordinatorError;
 use crate::ui::model::{
     AUTO_START_ROW_LABEL, CI_FIX_ROW_LABEL, CardControl, CardPrimaryAction, CardState, CardVerb,
-    ChipKind, FleetSnapshot, OpsControl, ProjectCard, REVIEW_FIX_ROW_LABEL, SELF_CHECK_ROW_LABEL,
-    STATE_GATE_ROW_LABEL, add_project, card_control_buttons, card_primary_action, ci_fix_row,
-    load_fleet, ops_resume, ops_stop, pause_all, resume_selected, review_fix_row, run_selected,
-    self_check_row, state_gate_row, stop_selected, ticker_label,
+    ChipKind, FAILURE_PANEL_TITLE, FleetSnapshot, OpsControl, ProjectCard, REVIEW_FIX_ROW_LABEL,
+    SELF_CHECK_ROW_LABEL, STATE_GATE_ROW_LABEL, add_project, card_control_buttons,
+    card_primary_action, ci_fix_row, failure_panel_title, load_fleet, ops_resume, ops_stop,
+    pause_all, resume_selected, review_fix_row, run_line_text, run_selected, self_check_row,
+    state_gate_row, stop_selected, ticker_label,
 };
 use crate::ui::{WEBVIEW2_MISSING_HINT, model::card_title};
 use crate::watch::ServeAttach;
@@ -198,6 +199,9 @@ main#projects {
   padding: 0.45rem var(--space-2);
   background: var(--panel-2);
   border-radius: 7px;
+}
+.kv .row.run-line .value {
+  white-space: normal;
 }
 .label { color: var(--muted); font-size: 0.78rem; }
 .value {
@@ -712,6 +716,58 @@ fn card_classes(card: &ProjectCard, selected: bool) -> String {
     classes
 }
 
+fn project_status_rows(card: &ProjectCard) -> Element {
+    if card.single_status {
+        let track = card.view.track_id.clone().unwrap_or_else(|| "—".into());
+        let phase = card.view.phase.clone();
+        let (pill_class, pill_label) = status_pill(card.card_state);
+        rsx! {
+            div { class: "row",
+                span { class: "label", "Track" }
+                span { class: "value", "{track}" }
+                span { class: "{pill_class}", "{pill_label}" }
+            }
+            div { class: "row",
+                span { class: "label", "Phase" }
+                span { class: "value", "{phase}" }
+                span { class: "pill idle", "live" }
+            }
+        }
+    } else {
+        let rows: Vec<(String, String, &'static str, &'static str)> = card
+            .run_lines
+            .iter()
+            .map(|line| {
+                let (class, label) = run_status_pill(line.status);
+                (
+                    format!("Epoch {}", line.run_epoch),
+                    run_line_text(line),
+                    class,
+                    label,
+                )
+            })
+            .collect();
+        rsx! {
+            for (label, value, class, pill) in rows {
+                div { class: "row run-line",
+                    span { class: "label", "{label}" }
+                    span { class: "value", "{value}" }
+                    span { class: "{class}", "{pill}" }
+                }
+            }
+        }
+    }
+}
+
+fn run_status_pill(status: crate::state::RunStatus) -> (&'static str, &'static str) {
+    match status {
+        crate::state::RunStatus::Running => ("pill running", "running"),
+        crate::state::RunStatus::Paused => ("pill paused", "paused"),
+        crate::state::RunStatus::Idle => ("pill idle", "idle"),
+        crate::state::RunStatus::Stopped => ("pill idle", "stopped"),
+    }
+}
+
 fn status_pill(state: CardState) -> (&'static str, &'static str) {
     match state {
         CardState::ParallelPlanReview | CardState::TokenIdleCi | CardState::Running => {
@@ -783,8 +839,6 @@ fn project_card(
     let state = card.card_state.as_data_state();
     let title = card_title(&card.view);
     let path = card.view.path.display().to_string();
-    let track = card.view.track_id.clone().unwrap_or_else(|| "—".into());
-    let phase = card.view.phase.clone();
     let next = card.view.next_track.clone().unwrap_or_else(|| "—".into());
     let policy = card.view.auto_start.as_str().to_string();
     let state_gate = state_gate_row(&card.view);
@@ -793,7 +847,6 @@ fn project_card(
     let review_fix = review_fix_row(&card.view);
     let parked = card.view.parked_next.clone();
     let layout = card.view.layout_profile.as_str().to_string();
-    let (pill_class, pill_label) = status_pill(card.card_state);
     let controls = card_control_buttons(&card.view);
     let multi_run = controls.is_some();
     let primary = card_primary_action(&card.view);
@@ -814,11 +867,10 @@ fn project_card(
     } else {
         None
     };
-    let artifact_title = if failure.as_ref().is_some_and(|p| p.superseded.is_some()) {
-        "Failure Artifact [SUPERSEDED]"
-    } else {
-        "Failure Artifact"
-    };
+    let artifact_title = failure
+        .as_ref()
+        .map(failure_panel_title)
+        .unwrap_or(FAILURE_PANEL_TITLE);
 
     rsx! {
         article {
@@ -914,16 +966,7 @@ fn project_card(
                 }
             }
             div { class: "kv",
-                div { class: "row",
-                    span { class: "label", "Track" }
-                    span { class: "value", "{track}" }
-                    span { class: "{pill_class}", "{pill_label}" }
-                }
-                div { class: "row",
-                    span { class: "label", "Phase" }
-                    span { class: "value", "{phase}" }
-                    span { class: "pill idle", "live" }
-                }
+                {project_status_rows(card)}
                 div { class: "row",
                     span { class: "label", "Next" }
                     span { class: "value", "{next}" }
@@ -1143,6 +1186,8 @@ mod tests {
             view,
             card_state: CardState::Running,
             sessions: Vec::new(),
+            run_lines: Vec::new(),
+            single_status: true,
         };
         let (cls, text) = note_for(&card).expect("stall note");
         assert_eq!(cls, "note warn");
@@ -1189,6 +1234,8 @@ mod tests {
             view,
             card_state: CardState::Running,
             sessions: Vec::new(),
+            run_lines: Vec::new(),
+            single_status: true,
         };
         let (cls, text) = note_for(&card).expect("recycle note");
         assert_eq!(cls, "note warn");
@@ -1236,6 +1283,8 @@ mod tests {
             view: view.clone(),
             card_state: CardState::HardFailure,
             sessions: Vec::new(),
+            run_lines: Vec::new(),
+            single_status: true,
         };
         let (cls, text) = note_for(&card).expect("blocked note");
         assert_eq!(cls, "note err");

@@ -364,26 +364,55 @@ fn fleet_failure_token(view: &StatusView) -> String {
 /// 0105: one full snapshot line per project, registry order preserved. The total
 /// digest is capped; later project lines may be dropped by the cap, while the
 /// caller's `projects` slice is never truncated.
+/// One word per project. A book uses pause, then a live Stopped failure, then a
+/// live Idle failure, then running, then any Stopped, then idle. A singular
+/// status still counts `v.status`.
+fn fleet_project_status(view: &StatusView) -> RunStatus {
+    if view.runs.len() <= 1 {
+        return view.status;
+    }
+    if view.runs.iter().any(|run| run.status == RunStatus::Paused) {
+        return RunStatus::Paused;
+    }
+    if view
+        .runs
+        .iter()
+        .any(|run| run.is_live_failure() && run.status == RunStatus::Stopped)
+    {
+        return RunStatus::Stopped;
+    }
+    if view
+        .runs
+        .iter()
+        .any(|run| run.is_live_failure() && run.status == RunStatus::Idle)
+    {
+        return RunStatus::Idle;
+    }
+    if view.runs.iter().any(|run| run.status == RunStatus::Running) {
+        return RunStatus::Running;
+    }
+    if view.runs.iter().any(|run| run.status == RunStatus::Stopped) {
+        return RunStatus::Stopped;
+    }
+    RunStatus::Idle
+}
+
 fn fleet_summary_text(projects: &[StatusView]) -> String {
     if projects.is_empty() {
         return "fleet 0 projects".to_string();
     }
-    let running = projects
-        .iter()
-        .filter(|v| v.status == RunStatus::Running)
-        .count();
-    let paused = projects
-        .iter()
-        .filter(|v| v.status == RunStatus::Paused)
-        .count();
-    let idle = projects
-        .iter()
-        .filter(|v| v.status == RunStatus::Idle)
-        .count();
-    let stopped = projects
-        .iter()
-        .filter(|v| v.status == RunStatus::Stopped)
-        .count();
+    let mut running = 0;
+    let mut paused = 0;
+    let mut idle = 0;
+    let mut stopped = 0;
+    for view in projects {
+        match fleet_project_status(view) {
+            RunStatus::Running => running += 1,
+            RunStatus::Paused => paused += 1,
+            RunStatus::Idle => idle += 1,
+            RunStatus::Stopped => stopped += 1,
+        }
+    }
     let mut out = format!(
         "fleet {} projects: {} running, {} paused, {} idle, {} stopped",
         projects.len(),
@@ -1482,6 +1511,8 @@ mod tests {
                 status: RunStatus::Stopped,
                 failure_class: Some(FailureClass::Blocked),
                 failure_artifact: None,
+                last_event: String::new(),
+                failure_superseded: None,
             },
             RunSummary {
                 run_epoch: 4,
@@ -1490,6 +1521,8 @@ mod tests {
                 status: RunStatus::Stopped,
                 failure_class: Some(FailureClass::Timeout),
                 failure_artifact: None,
+                last_event: String::new(),
+                failure_superseded: None,
             },
         ];
         let text = fleet_summary_text(&[view]);
@@ -1514,6 +1547,8 @@ mod tests {
                 status: RunStatus::Stopped,
                 failure_class: Some(FailureClass::ReviewNeverSettles),
                 failure_artifact: None,
+                last_event: String::new(),
+                failure_superseded: None,
             })
             .collect();
         let text = fleet_summary_text(&[long]);
@@ -1522,6 +1557,175 @@ mod tests {
         let token = &line[start..line[start..].find(" - ").unwrap() + start];
         assert!(token.chars().count() <= 120, "{token}");
         assert!(token.ends_with("..."), "{token}");
+    }
+
+    #[test]
+    fn fleet_summary_counts_one_word_per_multi_run_project() {
+        use crate::outcome::FailureClass;
+        use crate::state::{RunStatus, RunSummary};
+
+        fn run(
+            epoch: u64,
+            track: &str,
+            phase: &str,
+            status: RunStatus,
+            class: Option<FailureClass>,
+            superseded: Option<&str>,
+        ) -> RunSummary {
+            RunSummary {
+                run_epoch: epoch,
+                track_id: Some(track.into()),
+                phase: phase.into(),
+                status,
+                failure_class: class,
+                failure_artifact: class
+                    .map(|_| std::path::PathBuf::from(r"C:\state\failures\1\FAILURE.md")),
+                last_event: String::new(),
+                failure_superseded: superseded.map(str::to_string),
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let mut idle_running = fleet_view(
+            Some("Alpha"),
+            dir.path(),
+            RunStatus::Idle,
+            "stub:idle",
+            Some("0128"),
+            "idle: no run",
+        );
+        idle_running.runs = vec![
+            run(1, "0128", "stub:idle", RunStatus::Idle, None, None),
+            run(2, "0130", "implement", RunStatus::Running, None, None),
+        ];
+        let idle_text = fleet_summary_text(&[idle_running.clone()]);
+        let idle_lines: Vec<&str> = idle_text.lines().collect();
+        assert_eq!(
+            idle_lines[0],
+            "fleet 1 projects: 1 running, 0 paused, 0 idle, 0 stopped"
+        );
+        assert_eq!(idle_lines.len(), 2);
+        assert_eq!(
+            idle_lines[1],
+            "- Alpha 0128: stub:idle / Idle - idle: no run"
+        );
+
+        let mut running_paused = fleet_view(
+            Some("Beta"),
+            dir.path(),
+            RunStatus::Running,
+            "implement",
+            Some("0130"),
+            "running",
+        );
+        running_paused.runs = vec![
+            run(1, "0130", "implement", RunStatus::Running, None, None),
+            run(2, "0128", "plan", RunStatus::Paused, None, None),
+        ];
+        assert_eq!(
+            fleet_summary_text(&[running_paused.clone()])
+                .lines()
+                .next()
+                .unwrap(),
+            "fleet 1 projects: 0 running, 1 paused, 0 idle, 0 stopped"
+        );
+
+        let mut running_stopped = fleet_view(
+            Some("Gamma"),
+            dir.path(),
+            RunStatus::Running,
+            "implement",
+            Some("0130"),
+            "running",
+        );
+        running_stopped.runs = vec![
+            run(1, "0130", "implement", RunStatus::Running, None, None),
+            run(
+                2,
+                "0128",
+                "stub:failed",
+                RunStatus::Stopped,
+                Some(FailureClass::Timeout),
+                None,
+            ),
+        ];
+        assert_eq!(
+            fleet_summary_text(&[running_stopped.clone()])
+                .lines()
+                .next()
+                .unwrap(),
+            "fleet 1 projects: 0 running, 0 paused, 0 idle, 1 stopped"
+        );
+
+        let mut running_old = fleet_view(
+            Some("Delta"),
+            dir.path(),
+            RunStatus::Idle,
+            "stub:idle",
+            Some("0128"),
+            "old",
+        );
+        running_old.runs = vec![
+            run(
+                1,
+                "0128",
+                "stub:idle",
+                RunStatus::Idle,
+                Some(FailureClass::Timeout),
+                Some("completed"),
+            ),
+            run(2, "0130", "implement", RunStatus::Running, None, None),
+        ];
+        assert_eq!(
+            fleet_summary_text(std::slice::from_ref(&running_old))
+                .lines()
+                .next()
+                .unwrap(),
+            "fleet 1 projects: 1 running, 0 paused, 0 idle, 0 stopped"
+        );
+
+        let mut running_idle_fail = fleet_view(
+            Some("Zeta"),
+            dir.path(),
+            RunStatus::Running,
+            "implement",
+            Some("0130"),
+            "running",
+        );
+        running_idle_fail.runs = vec![
+            run(1, "0130", "implement", RunStatus::Running, None, None),
+            run(
+                2,
+                "0128",
+                "stub:idle",
+                RunStatus::Idle,
+                Some(FailureClass::Timeout),
+                None,
+            ),
+        ];
+        assert_eq!(
+            fleet_summary_text(std::slice::from_ref(&running_idle_fail))
+                .lines()
+                .next()
+                .unwrap(),
+            "fleet 1 projects: 0 running, 0 paused, 1 idle, 0 stopped"
+        );
+
+        let plain_idle = fleet_view(
+            Some("Epsilon"),
+            dir.path(),
+            RunStatus::Idle,
+            "idle",
+            None,
+            "idle: no run",
+        );
+        assert_eq!(
+            fleet_summary_text(&[idle_running, running_paused, running_stopped, plain_idle])
+                .lines()
+                .next()
+                .unwrap(),
+            "fleet 4 projects: 1 running, 1 paused, 1 idle, 1 stopped"
+        );
     }
 
     #[test]

@@ -756,7 +756,7 @@ pub struct StatusView {
 }
 
 /// One live or remembered run inside a status book. The status surface that renders
-/// this list is 0126; the field is the contract `status()` already fills.
+/// this list is 0130; the field is the contract `status()` already fills.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunSummary {
     pub run_epoch: u64,
@@ -770,6 +770,12 @@ pub struct RunSummary {
     /// Set by `compose_book_status` when that epoch's file exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_artifact: Option<PathBuf>,
+    /// Copied from the entry. Omitted when empty so an old payload stays stable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_event: String,
+    /// Same read-time reason as `StatusView.failure_superseded`, for this entry only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_superseded: Option<String>,
 }
 
 impl RunSummary {
@@ -781,7 +787,17 @@ impl RunSummary {
             status: state.status,
             failure_class: state.failure_class,
             failure_artifact: None,
+            last_event: state.last_event.clone(),
+            failure_superseded: None,
         }
+    }
+
+    /// Live failure, matching `card_state`: Idle or Stopped, a class or artifact,
+    /// and no superseded reason. A sibling is not judged by another epoch's flag.
+    pub(crate) fn is_live_failure(&self) -> bool {
+        matches!(self.status, RunStatus::Idle | RunStatus::Stopped)
+            && (self.failure_class.is_some() || self.failure_artifact.is_some())
+            && self.failure_superseded.is_none()
     }
 }
 
@@ -955,7 +971,7 @@ fn holder_lifecycle(
     crate::harness::reap::decide(record, Utc::now(), state, state_present, gate_on).lifecycle
 }
 
-fn failure_superseded_for(record: &ProjectRecord, state: &RunState) -> Option<String> {
+pub(crate) fn failure_superseded_for(record: &ProjectRecord, state: &RunState) -> Option<String> {
     let body = crate::notify::artifact::read(record, state.run_epoch)
         .ok()
         .flatten()
@@ -2266,6 +2282,21 @@ mod tests {
             last.is_none() || last.is_some_and(|v| v.is_null()),
             "idle last_progress_at must be omitted or null"
         );
+    }
+
+    #[test]
+    fn run_summary_old_payload_omits_empty_last_event_and_superseded() {
+        let old = r#"{"run_epoch":2,"phase":"implement","status":"Running"}"#;
+        let summary: RunSummary = serde_json::from_str(old).unwrap();
+        assert_eq!(summary.last_event, "");
+        assert_eq!(summary.failure_superseded, None);
+        assert_eq!(summary.track_id, None);
+        assert_eq!(summary.failure_class, None);
+        assert_eq!(summary.failure_artifact, None);
+        let back = serde_json::to_value(&summary).unwrap();
+        let obj = back.as_object().unwrap();
+        assert!(!obj.contains_key("last_event"));
+        assert!(!obj.contains_key("failure_superseded"));
     }
 
     #[test]
