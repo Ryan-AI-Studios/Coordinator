@@ -66,6 +66,32 @@ pub fn all_phase_ids() -> &'static [&'static str] {
     ]
 }
 
+/// Which write roots a stored phase uses. Every [`all_phase_ids`] entry has one class.
+/// An unknown string is `None`; the session then uses the implementation set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseWriteClass {
+    /// Today's roots, including `workspace_root`.
+    Planning,
+    /// Session cwd and turn roots. `workspace_root` is not a write root.
+    Implementation,
+}
+
+pub fn phase_write_class(phase: &str) -> Option<PhaseWriteClass> {
+    match phase {
+        PHASE_PLAN | PHASE_FOLD | PHASE_ADVANCE | PHASE_PLAN_REVIEW => {
+            Some(PhaseWriteClass::Planning)
+        }
+        PHASE_IMPLEMENT
+        | PHASE_ADDRESS_FINDINGS
+        | PHASE_ADDRESS_CI
+        | PHASE_ADDRESS_REVIEW
+        | PHASE_COMPACT
+        | PHASE_CROSS_MODEL
+        | PHASE_CI_WAIT => Some(PhaseWriteClass::Implementation),
+        _ => None,
+    }
+}
+
 pub fn is_canonical(phase: &str) -> bool {
     all_phase_ids().contains(&phase)
 }
@@ -321,6 +347,32 @@ mod tests {
         assert_eq!(REVIEW_FIX_CAP, 2);
         assert!(all_phase_ids().contains(&PHASE_ADDRESS_REVIEW));
         assert_eq!(all_phase_ids().len(), canonical_phases().len() + 3);
+    }
+
+    #[test]
+    fn every_phase_id_has_one_write_class() {
+        for id in all_phase_ids() {
+            let class = phase_write_class(id).unwrap_or_else(|| panic!("{id} is unclassified"));
+            let expect = match *id {
+                PHASE_PLAN | PHASE_FOLD | PHASE_ADVANCE | PHASE_PLAN_REVIEW => {
+                    PhaseWriteClass::Planning
+                }
+                PHASE_IMPLEMENT
+                | PHASE_ADDRESS_FINDINGS
+                | PHASE_ADDRESS_CI
+                | PHASE_ADDRESS_REVIEW
+                | PHASE_COMPACT
+                | PHASE_CROSS_MODEL
+                | PHASE_CI_WAIT => PhaseWriteClass::Implementation,
+                other => panic!("write-class table is missing {other}"),
+            };
+            assert_eq!(class, expect, "{id}");
+        }
+        assert_eq!(
+            phase_write_class(PHASE_COMPACT),
+            Some(PhaseWriteClass::Implementation)
+        );
+        assert_eq!(phase_write_class("not-a-phase"), None);
     }
 
     fn record_at(path: &std::path::Path) -> crate::registry::ProjectRecord {

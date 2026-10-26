@@ -147,6 +147,42 @@ fn skill_markdown(root: &Path, dir_name: &str) -> PathBuf {
         .join("SKILL.md")
 }
 
+/// `SKILL.md` paths an implementation phase already names.
+///
+/// The session cwd stands in for the epoch directory. The layout execution root
+/// is the fallback [`execution_skill_path`] uses when no epoch directory is
+/// active. This does not read run state.
+pub(crate) fn implementation_skill_markdowns(
+    record: &ProjectRecord,
+    phase: &str,
+    cwd: &Path,
+) -> Vec<PathBuf> {
+    use super::graph::{PHASE_ADDRESS_FINDINGS, PHASE_IMPLEMENT};
+    let names: &[&str] = match phase {
+        PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS => &["implement", "onboarding"],
+        _ => &[],
+    };
+    names
+        .iter()
+        .map(|name| named_skill_markdown(record, cwd, name))
+        .collect()
+}
+
+fn named_skill_markdown(record: &ProjectRecord, cwd: &Path, canonical: &str) -> PathBuf {
+    let dir_name = skill_directory_name(record, canonical);
+    let in_cwd = skill_markdown(cwd, &dir_name);
+    if in_cwd.is_file() {
+        return in_cwd;
+    }
+    let paths = crate::layout::resolve(record);
+    let fallback = paths.execution_repo.clone().unwrap_or(paths.workspace_root);
+    let fallback_path = skill_markdown(&fallback, &dir_name);
+    if fallback_path.is_file() {
+        return fallback_path;
+    }
+    in_cwd
+}
+
 /// Alias directory segment, or the canonical name when the map has no entry.
 pub fn skill_directory_name(record: &ProjectRecord, canonical: &str) -> String {
     record

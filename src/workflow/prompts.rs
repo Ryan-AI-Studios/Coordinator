@@ -19,9 +19,9 @@ Do not run `coordinator outcome write` during this inject.";
 
 /// 0012 / 0016 layout lines plus the pinned planning-outside-product sentence.
 ///
-/// `implement` and `address-findings` name the epoch worktree as the execution
-/// repo when that directory exists. Other phases keep the shared execution repo
-/// and add an `Epoch worktree:` line.
+/// `implement`, `address-findings`, `address-ci`, and `address-review` name the
+/// epoch worktree as the execution repo when that directory exists. Other phases
+/// keep the shared execution repo and add an `Epoch worktree:` line.
 pub(crate) fn layout_block(record: &ProjectRecord, track_id: Option<&str>, phase: &str) -> String {
     layout_block_with_target(record, track_id, phase, None)
 }
@@ -68,7 +68,7 @@ pub(crate) fn layout_block_with_target(
     let use_epoch = epoch.is_some()
         && matches!(
             phase,
-            PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS | PHASE_ADDRESS_CI
+            PHASE_IMPLEMENT | PHASE_ADDRESS_FINDINGS | PHASE_ADDRESS_CI | PHASE_ADDRESS_REVIEW
         );
     let execution = if use_epoch {
         epoch.as_ref().map(|p| p.display().to_string())
@@ -205,6 +205,129 @@ fn list_gate_archives(
     }
     out.sort();
     out
+}
+
+/// Copy prepared-turn gate archives that sit outside the cwd and the track
+/// directory into `{cwd}/.coordinator/snapshots/`. A missing source is skipped.
+/// Nothing is written back to the conductor tree. The prompt names the copy.
+fn snapshot_gate_archives(
+    record: &ProjectRecord,
+    track_id: Option<&str>,
+    cwd: &Path,
+    archives: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let track_dir = track_id.and_then(|id| resolve_track_dir(record, id));
+    let mut shown = Vec::with_capacity(archives.len());
+    let mut ensured = false;
+    for src in archives {
+        let outside_cwd = !path_within(cwd, &src);
+        let outside_track = match &track_dir {
+            Some(dir) => !path_within(dir, &src),
+            None => true,
+        };
+        if !(outside_cwd && outside_track) {
+            shown.push(src);
+            continue;
+        }
+        if !src.is_file() {
+            continue;
+        }
+        let dest_dir = cwd.join(".coordinator").join("snapshots");
+        if std::fs::create_dir_all(&dest_dir).is_err() {
+            continue;
+        }
+        let dest = snapshot_dest(&dest_dir, &src);
+        if !ensured {
+            ensure_snapshot_untracked(cwd, &dest);
+            ensured = true;
+        }
+        if std::fs::copy(&src, &dest).is_ok() {
+            shown.push(dest);
+        }
+    }
+    shown
+}
+
+fn snapshot_dest(dir: &Path, source: &Path) -> PathBuf {
+    let name = source
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("archive.md"));
+    let candidate = dir.join(&name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    dir.join(format!("copy-{}", name.to_string_lossy()))
+}
+
+fn path_within(root: &Path, candidate: &Path) -> bool {
+    if crate::worktree::paths_same(root, candidate) {
+        return true;
+    }
+    let norm = |path: &Path| {
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    let root_n = dunce::canonicalize(root)
+        .map(|path| norm(dunce::simplified(&path)))
+        .unwrap_or_else(|_| norm(root));
+    let cand_n = dunce::canonicalize(candidate)
+        .map(|path| norm(dunce::simplified(&path)))
+        .unwrap_or_else(|_| norm(candidate));
+    cand_n.starts_with(&format!("{root_n}\\"))
+}
+
+fn ensure_snapshot_untracked(cwd: &Path, snapshot: &Path) {
+    if snapshot_path_ignored(cwd, snapshot) {
+        return;
+    }
+    let Some(common) = git_common_dir(cwd) else {
+        return;
+    };
+    let exclude = common.join("info").join("exclude");
+    if let Some(parent) = exclude.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut body = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if body.lines().any(|line| line.trim() == ".coordinator/") {
+        return;
+    }
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(".coordinator/\n");
+    let _ = std::fs::write(exclude, body);
+}
+
+fn snapshot_path_ignored(cwd: &Path, path: &Path) -> bool {
+    let output = crate::git_command::command()
+        .args(["check-ignore", "--quiet", "--"])
+        .arg(path)
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output();
+    matches!(output, Ok(out) if out.status.success())
+}
+
+fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
+    let output = crate::git_command::command()
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    dunce::canonicalize(PathBuf::from(text))
+        .ok()
+        .map(|path| PathBuf::from(dunce::simplified(&path)))
 }
 
 /// On-disk `plan.md` for the plan-phase branch. A read error is `Unreadable`
@@ -441,6 +564,12 @@ pub fn phase_prompt_with_target(
                 .map(|s| s.address_findings_attempts)
                 .unwrap_or(0);
             let archives = list_gate_archives(record, track_id, attempts);
+            let archives = match target {
+                Some(target) => {
+                    snapshot_gate_archives(record, track_id, &target.prompt_path, archives)
+                }
+                None => archives,
+            };
             let mut archive_lines = String::from(
                 "Honor archived gate reports under the track dir (and state reviews dir).\n",
             );
@@ -1858,6 +1987,164 @@ mod tests {
         assert_eq!(
             crate::workflow::block::classify(&text, crate::workflow::graph::PHASE_ADDRESS_REVIEW),
             None
+        );
+    }
+
+    #[test]
+    fn address_review_layout_names_the_epoch_directory() {
+        let _lock = crate::config::test_env_lock();
+        let prev_wt = std::env::var("COORDINATOR_WORKTREE").ok();
+        let prev_state = std::env::var(crate::config::ENV_COORDINATOR_STATE_DIR).ok();
+        unsafe {
+            std::env::remove_var("COORDINATOR_WORKTREE");
+            std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+        }
+        struct Restore(&'static str, Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.1 {
+                        Some(value) => std::env::set_var(self.0, value),
+                        None => std::env::remove_var(self.0),
+                    }
+                }
+            }
+        }
+        let _wt = Restore("COORDINATOR_WORKTREE", prev_wt);
+        let _state = Restore(crate::config::ENV_COORDINATOR_STATE_DIR, prev_state);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = temp_project(dir.path());
+        rec.worktree_isolation = true;
+        rec.state_dir = Some(dir.path().join("state"));
+        let product = dir.path().join("shared-product");
+        std::fs::create_dir_all(&product).unwrap();
+        rec.execution_repo = Some(product.clone());
+        let mut state = crate::state::RunState::idle(&rec.id);
+        state.run_epoch = 4;
+        state.phase = crate::workflow::graph::PHASE_ADDRESS_REVIEW.into();
+        crate::state::save_run_state(&rec, &state).unwrap();
+        let epoch = dir.path().join("state").join("worktrees").join("4");
+        std::fs::create_dir_all(&epoch).unwrap();
+        let text = layout_block(
+            &rec,
+            Some("0132"),
+            crate::workflow::graph::PHASE_ADDRESS_REVIEW,
+        );
+        let execution = text
+            .lines()
+            .find(|line| line.starts_with("Execution repo:"))
+            .unwrap_or("");
+        assert!(
+            execution.contains(&epoch.display().to_string()),
+            "{execution}\n{text}"
+        );
+        assert!(
+            !execution.contains(&product.display().to_string()),
+            "{execution}"
+        );
+    }
+
+    #[test]
+    fn prepared_turn_snapshots_gate_archives_outside_the_track() {
+        let _lock = crate::config::test_env_lock();
+        let prev_wt = std::env::var("COORDINATOR_WORKTREE").ok();
+        let prev_state = std::env::var(crate::config::ENV_COORDINATOR_STATE_DIR).ok();
+        unsafe {
+            std::env::remove_var("COORDINATOR_WORKTREE");
+            std::env::remove_var(crate::config::ENV_COORDINATOR_STATE_DIR);
+        }
+        struct RestoreEnv(&'static str, Option<String>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.1 {
+                        Some(value) => std::env::set_var(self.0, value),
+                        None => std::env::remove_var(self.0),
+                    }
+                }
+            }
+        }
+        let _wt = RestoreEnv("COORDINATOR_WORKTREE", prev_wt);
+        let _state = RestoreEnv(crate::config::ENV_COORDINATOR_STATE_DIR, prev_state);
+
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut rec = temp_project(&ws);
+        rec.state_dir = Some(ws.join("state"));
+        let track = ws.join("conductor").join("0132-Snap");
+        std::fs::create_dir_all(&track).unwrap();
+        rec.conductor_dir = Some(ws.join("conductor"));
+        let reviews = ws.join("state").join("reviews");
+        std::fs::create_dir_all(&reviews).unwrap();
+        let archive = reviews.join("cross-model-agy.gate1.md");
+        std::fs::write(&archive, "archive\n").unwrap();
+        std::fs::create_dir(reviews.join("cross-model-codex.gate1.md")).unwrap();
+        let track_archive = track.join("review.agy.gate1.md");
+        std::fs::write(&track_archive, "track archive\n").unwrap();
+        let mut state = crate::state::RunState::idle(&rec.id);
+        state.address_findings_attempts = 1;
+        state.phase = crate::workflow::graph::PHASE_ADDRESS_FINDINGS.into();
+        state.track_id = Some("0132-Snap".into());
+        crate::state::save_run_state(&rec, &state).unwrap();
+
+        let cwd = root.path().join("epoch");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let init = crate::git_command::command()
+            .arg("init")
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let before = std::fs::read(&archive).unwrap();
+        let track_before = std::fs::read(&track_archive).unwrap();
+        let target = crate::workflow::execution_repo::ResolvedExecution {
+            project_id: rec.id.clone(),
+            run_epoch: 1,
+            phase: crate::workflow::graph::PHASE_ADDRESS_FINDINGS.into(),
+            track_id: "0132-Snap".into(),
+            declared_path: cwd.clone(),
+            prompt_path: cwd.clone(),
+            sample_path: cwd.clone(),
+            source: crate::workflow::execution_repo::ResolutionSource::ProjectDefault,
+            planning_only: false,
+            late_metadata: Vec::new(),
+        };
+        let text = phase_prompt_with_target(
+            &rec,
+            crate::workflow::graph::PHASE_ADDRESS_FINDINGS,
+            Some("0132-Snap"),
+            Some(&target),
+        );
+        let copy = cwd
+            .join(".coordinator")
+            .join("snapshots")
+            .join("cross-model-agy.gate1.md");
+        assert!(copy.is_file(), "snapshot missing");
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "archive\n");
+        assert!(text.contains(&copy.display().to_string()), "{text}");
+        assert!(
+            text.contains(&track_archive.display().to_string()),
+            "{text}"
+        );
+        assert!(
+            !text.contains("cross-model-codex.gate1.md"),
+            "a missing source was named: {text}"
+        );
+        assert_eq!(std::fs::read(&archive).unwrap(), before);
+        assert_eq!(std::fs::read(&track_archive).unwrap(), track_before);
+        assert!(!cwd.join(".gitignore").exists());
+        let status = crate::git_command::command()
+            .args(["status", "--porcelain"])
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let porcelain = String::from_utf8(status.stdout).unwrap();
+        assert!(
+            porcelain.trim().is_empty(),
+            "snapshot is in git status: {porcelain}"
         );
     }
 }
