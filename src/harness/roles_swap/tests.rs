@@ -247,12 +247,20 @@ fn opencode_variant_probe_matches_the_base_and_fails_when_absent() {
         slot.command = opencode_s;
         slot.model = Some("fixture-provider/fixture-model#high".into());
     });
-    let probe = ScriptedProbe::ready().with_models(
-        "opencode",
-        0,
-        "fixture-provider/fixture-model\nanother/model\n",
-        false,
-    );
+    let probe = ScriptedProbe::ready()
+        .with_models(
+            "opencode",
+            0,
+            "fixture-provider/fixture-model\nanother/model\n",
+            false,
+        )
+        .with_auth(
+            "opencode",
+            0,
+            "fixture-provider   API key   stored\n",
+            "",
+            false,
+        );
     let _probe = install_test_probe(probe);
     let outcome = swap(
         "plan_reviewer_opencode",
@@ -290,6 +298,112 @@ fn opencode_variant_probe_matches_the_base_and_fails_when_absent() {
     );
     let err = receipt.unwrap_err().message();
     assert!(err.contains("not listed"), "err={err}");
+}
+
+#[test]
+fn opencode_adapter_swap_probes_both_roles_and_rejects_wrong_command() {
+    let home = SwapHome::enter();
+    let bin = home.dummy("opencode.exe");
+    let wrong = home.dummy("claude-agent-acp.exe");
+    let _probe = install_test_probe(
+        ScriptedProbe::ready()
+            .with_models("opencode", 0, "provider/model\n", false)
+            .with_auth("opencode", 0, "OpenCode Go   API key   stored\n", "", false),
+    );
+    for role in ["planner", "implementor"] {
+        let outcome = swap(
+            role,
+            PartialBinding {
+                harness: Some("opencode".into()),
+                command: Some(bin.to_string_lossy().into()),
+                model: Some("provider/model".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(outcome.applied);
+        let receipt = crate::harness::preflight::probe_target(role, &home.binding(role)).unwrap();
+        assert!(receipt.auth_detail.unwrap().contains("unverified"));
+        let err = swap(
+            role,
+            PartialBinding {
+                command: Some(wrong.to_string_lossy().into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not belong"));
+        let err = swap(
+            role,
+            PartialBinding {
+                model: Some("provider/missing".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not listed"));
+    }
+}
+
+#[test]
+fn opencode_swap_without_model_is_refused_before_any_probe() {
+    let home = SwapHome::enter();
+    let bin = home.dummy("opencode.exe");
+    let _probe = install_test_probe(
+        ScriptedProbe::ready()
+            .with_models("opencode", 0, "provider/model\n", false)
+            .with_auth("opencode", 0, "provider   API key   stored\n", "", false),
+    );
+    let err = swap(
+        "planner",
+        PartialBinding {
+            harness: Some("opencode".into()),
+            command: Some(bin.to_string_lossy().into()),
+            clear_model: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("explicit --model"), "err={}", err);
+    assert_ne!(home.binding("planner").harness, "opencode");
+}
+
+#[test]
+fn opencode_adapter_swap_refuses_missing_credential() {
+    let home = SwapHome::enter();
+    let bin = home.dummy("opencode.exe");
+    let _probe = install_test_probe(
+        ScriptedProbe::ready()
+            .with_models("opencode", 0, "provider/model\n", false)
+            .with_auth(
+                "opencode",
+                0,
+                "Connected providers:\nNo credentials found\n",
+                "",
+                false,
+            ),
+    );
+    let err = swap(
+        "planner",
+        PartialBinding {
+            harness: Some("opencode".into()),
+            command: Some(bin.to_string_lossy().into()),
+            model: Some("provider/model".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("opencode"), "err={message}");
+    assert!(
+        message.contains("credential") || message.contains("auth"),
+        "err={message}"
+    );
+    assert_ne!(
+        home.binding("planner").harness,
+        "opencode",
+        "a refused swap must not be applied"
+    );
 }
 
 #[test]
@@ -607,12 +721,20 @@ fn plan_review_pending_applies_before_its_binding_is_read() {
         slot.command = opencode_s;
         slot.model = Some("fixture-provider/fixture-model".into());
     });
-    let probe = ScriptedProbe::ready().with_models(
-        "opencode",
-        0,
-        "fixture-provider/fixture-model\nfixture-provider/fixture-model:2\n",
-        false,
-    );
+    let probe = ScriptedProbe::ready()
+        .with_models(
+            "opencode",
+            0,
+            "fixture-provider/fixture-model\nfixture-provider/fixture-model:2\n",
+            false,
+        )
+        .with_auth(
+            "opencode",
+            0,
+            "fixture-provider   API key   stored\n",
+            "",
+            false,
+        );
     let _probe = install_test_probe(probe);
     let project_dir = tempfile::tempdir().unwrap();
     let record = crate::api::project_add(
@@ -672,7 +794,7 @@ fn fixture_provider_is_data_and_run_argv_carries_the_selector_byte_exact() {
     let script = format!(
         "@echo off\r\n\
          if \"%1\"==\"--version\" (echo opencode v2.0.32& exit /b 0)\r\n\
-         if \"%1\"==\"auth\" (echo OpenCode\\tAPI key\\tstored& exit /b 0)\r\n\
+         if \"%1\"==\"auth\" (echo OpenCode API key stored& exit /b 0)\r\n\
          if \"%1\"==\"models\" (echo fixture-provider/fixture-model& exit /b 0)\r\n\
          if \"%1\"==\"run\" (echo %*>\"{}\"& echo {{}}& exit /b 0)\r\n\
          exit /b 0\r\n",

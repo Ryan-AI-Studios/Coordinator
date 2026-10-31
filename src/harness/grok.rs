@@ -397,6 +397,14 @@ impl GrokSession {
         let in_flight_id = Arc::new(AtomicU64::new(0));
         let session_id_shared = Arc::new(std::sync::Mutex::new(String::new()));
         let cancel_requested = Arc::new(AtomicBool::new(false));
+        if harness.eq_ignore_ascii_case("opencode")
+            && model.map(str::trim).filter(|m| !m.is_empty()).is_none()
+        {
+            let _ = child.kill().await;
+            return Err(CoordinatorError::Message(
+                "opencode harness requires an explicit model in the role binding".into(),
+            ));
+        }
         let mut session = Self {
             transport: AcpTransport::Process {
                 child: Box::new(child),
@@ -429,7 +437,13 @@ impl GrokSession {
             shutdown_calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         session.terminals.set_adapter(harness);
-        session.handshake(timeout, model).await?;
+        // kill_on_drop(false) keeps pooled children alive across ticks, so a failed
+        // handshake/model confirmation must tear the child down explicitly or the
+        // ACP process is orphaned.
+        if let Err(e) = session.handshake(timeout, model).await {
+            let _ = session.shutdown().await;
+            return Err(e);
+        }
         if let Err(e) = session.terminals.probe_host_shell().await {
             let _ = session.shutdown().await;
             return Err(CoordinatorError::Message(e));
@@ -452,6 +466,16 @@ impl GrokSession {
         responses: Vec<String>,
         timeout: Duration,
         harness: &str,
+    ) -> Result<Self> {
+        Self::start_mock_for_model(cwd, responses, timeout, harness, None).await
+    }
+
+    async fn start_mock_for_model(
+        cwd: PathBuf,
+        responses: Vec<String>,
+        timeout: Duration,
+        harness: &str,
+        model: Option<&str>,
     ) -> Result<Self> {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         let incoming_slot = Arc::new(std::sync::Mutex::new(Some(incoming_tx)));
@@ -486,7 +510,7 @@ impl GrokSession {
             pid: Some(4242),
             supports_compact: true,
             adapter: harness.to_string(),
-            model: None,
+            model: model.map(str::to_string),
             bin: PathBuf::from("mock"),
             compact_command: None,
             next_id: 1,
@@ -508,7 +532,7 @@ impl GrokSession {
             shutdown_calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         session.terminals.set_adapter(harness);
-        session.handshake(timeout, None).await?;
+        session.handshake(timeout, model).await?;
         Ok(session)
     }
 
@@ -635,7 +659,9 @@ impl GrokSession {
         // their own CLI credentials and advertise no `authMethods`, so
         // `pick_auth_method` would fail on them — skip it and go straight to
         // `session/new`.
-        if !is_adaptor_session_harness(&self.adapter) {
+        if !is_adaptor_session_harness(&self.adapter)
+            && !self.adapter.eq_ignore_ascii_case("opencode")
+        {
             let method_id = pick_auth_method(&init, &self.adapter)?;
             self.request(
                 "authenticate",
@@ -678,8 +704,15 @@ impl GrokSession {
     /// their dialects differ:
     /// - codex: `session/set_model { sessionId, modelId }`, effort inside the id;
     /// - claude: `session/set_config_option { sessionId, configId: "model", value }`.
+    /// - opencode: `session/set_config_option { sessionId, configId: "model", value }` (same as claude).
     ///
     /// A no-op for grok/cursor and for an absent or blank model.
+    ///
+    /// `opencode` cannot pin a model through argv, so a bound role without a
+    /// model would silently run the CLI default. That is enforced where it
+    /// matters — `spawn_piped` (real process) and `roles_swap::propose`
+    /// (binding validation) — rather than here, so unit tests can drive
+    /// `select_model` directly against a mock transport.
     async fn select_model(&mut self, model: Option<&str>, timeout: Duration) -> Result<()> {
         let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) else {
             return Ok(());
@@ -691,17 +724,35 @@ impl GrokSession {
                 timeout,
             )
             .await?;
-        } else if self.adapter.eq_ignore_ascii_case("claude") {
-            self.request(
-                "session/set_config_option",
-                json!({
-                    "sessionId": self.session_id,
-                    "configId": "model",
-                    "value": m
-                }),
-                timeout,
-            )
-            .await?;
+        } else if self.adapter.eq_ignore_ascii_case("claude")
+            || self.adapter.eq_ignore_ascii_case("opencode")
+        {
+            let result = self
+                .request(
+                    "session/set_config_option",
+                    json!({
+                        "sessionId": self.session_id,
+                        "configId": "model",
+                        "value": m
+                    }),
+                    timeout,
+                )
+                .await?;
+            if self.adapter.eq_ignore_ascii_case("opencode")
+                && !result
+                    .get("configOptions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|options| {
+                        options.iter().any(|option| {
+                            option.get("id").and_then(Value::as_str) == Some("model")
+                                && option.get("currentValue").and_then(Value::as_str) == Some(m)
+                        })
+                    })
+            {
+                return Err(CoordinatorError::Message(format!(
+                    "session/set_config_option did not confirm requested model {m}"
+                )));
+            }
         }
         Ok(())
     }
@@ -1433,11 +1484,12 @@ pub fn harness_error_in_text(text: &str) -> Option<String> {
     None
 }
 
-/// Case-insensitive `grok`, `cursor`, or a published ACP-adapter harness — the
+/// Case-insensitive `grok`, `cursor`, `opencode`, or a published ACP-adapter harness — the
 /// harnesses driven on this ACP client.
 pub fn is_acp_session_harness(h: &str) -> bool {
     h.eq_ignore_ascii_case("grok")
         || h.eq_ignore_ascii_case("cursor")
+        || h.eq_ignore_ascii_case("opencode")
         || is_adaptor_session_harness(h)
 }
 
@@ -1470,9 +1522,9 @@ pub fn grok_agent_argv(model: Option<&str>) -> Vec<String> {
 }
 
 /// ACP child argv for `harness`. Grok stays `agent [-m] stdio`; cursor is
-/// `--yolo --trust [--model] acp`; the npm adapters take no argv at all (their shim
-/// is the whole command, and the model is a JSON-RPC call — see
-/// [`is_adaptor_session_harness`]).
+/// `--yolo --trust [--model] acp`; opencode is `acp` (model via `session/set_config_option`);
+/// the npm adapters take no argv at all (their shim is the whole command, and the model is a
+/// JSON-RPC call — see [`is_adaptor_session_harness`]).
 pub fn acp_agent_argv(harness: &str, model: Option<&str>) -> Vec<String> {
     if harness.eq_ignore_ascii_case("cursor") {
         let mut args = vec!["--yolo".into(), "--trust".into()];
@@ -1485,6 +1537,9 @@ pub fn acp_agent_argv(harness: &str, model: Option<&str>) -> Vec<String> {
         }
         args.push("acp".into());
         args
+    } else if harness.eq_ignore_ascii_case("opencode") {
+        // opencode acp takes no model argv; model is set via session/set_config_option
+        vec!["acp".into()]
     } else if is_adaptor_session_harness(harness) {
         Vec::new()
     } else {
@@ -1974,11 +2029,35 @@ mod tests {
         assert!(is_acp_session_harness("CURSOR"));
         assert!(is_acp_session_harness("claude"));
         assert!(is_acp_session_harness("CODEX"));
-        assert!(!is_acp_session_harness("opencode"));
+        assert!(is_acp_session_harness("opencode"));
         assert!(!is_acp_session_harness("antigravity"));
         assert!(is_adaptor_session_harness("claude"));
         assert!(is_adaptor_session_harness("codex"));
         assert!(!is_adaptor_session_harness("grok"));
+        assert!(!is_adaptor_session_harness("opencode"));
+    }
+
+    #[test]
+    fn opencode_agent_argv_is_acp_no_model() {
+        assert_eq!(acp_agent_argv("opencode", None), ["acp"]);
+        assert_eq!(acp_agent_argv("opencode", Some("gpt-5")), ["acp"]);
+        assert_eq!(acp_agent_argv("opencode", Some("")), ["acp"]);
+        assert_eq!(acp_agent_argv("opencode", Some("   ")), ["acp"]);
+        assert!(
+            !acp_agent_argv("opencode", Some("model"))
+                .iter()
+                .any(|a| a == "agent")
+        );
+        assert!(
+            !acp_agent_argv("opencode", Some("model"))
+                .iter()
+                .any(|a| a == "stdio")
+        );
+        assert!(
+            !acp_agent_argv("opencode", Some("model"))
+                .iter()
+                .any(|a| a == "--model")
+        );
     }
 
     #[test]
@@ -2172,6 +2251,119 @@ mod tests {
             prompt["params"]["prompt"][0]["text"],
             "Reply with exactly: pong"
         );
+    }
+
+    #[tokio::test]
+    async fn opencode_wire_model_confirmation_and_failures() {
+        let dir = tempdir().unwrap();
+        let init = rpc_result(
+            1,
+            json!({"protocolVersion": 1, "authMethods": [{"id": "opencode-login"}]}),
+        );
+        for (response, succeeds) in [
+            (
+                rpc_result(
+                    3,
+                    json!({"configOptions": [{"id":"model", "currentValue":"provider/model"}]}),
+                ),
+                true,
+            ),
+            (
+                rpc_result(
+                    3,
+                    json!({"configOptions": [{"id":"model", "currentValue":"provider/other"}]}),
+                ),
+                false,
+            ),
+            (
+                rpc_result(3, json!({"configOptions": [{"id":"model"}]})),
+                false,
+            ),
+            (rpc_result(3, json!({"configOptions": []})), false),
+            (rpc_error(3, "model unavailable"), false),
+        ] {
+            let lines = vec![
+                init.clone(),
+                rpc_result(2, json!({"sessionId":"s"})),
+                response,
+            ];
+            let mut session =
+                GrokSession::start_mock_for(dir.path().to_path_buf(), lines, timeout(), "opencode")
+                    .await
+                    .unwrap();
+            let result = session
+                .select_model(Some(" provider/model "), timeout())
+                .await;
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            let requests: Vec<Value> = session
+                .mock_written()
+                .unwrap()
+                .iter()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(requests[0]["method"], "initialize");
+            assert_eq!(requests[1]["method"], "session/new");
+            assert_eq!(requests[2]["method"], "session/set_config_option");
+            assert_eq!(
+                requests[2]["params"],
+                json!({"sessionId":"s", "configId":"model", "value":"provider/model"})
+            );
+            assert!(
+                requests
+                    .iter()
+                    .all(|r| r["method"] != "authenticate" && r["method"] != "session/prompt")
+            );
+        }
+        let err = GrokSession::start_mock_for(
+            dir.path().to_path_buf(),
+            vec![init, rpc_error(2, "credentials rejected")],
+            timeout(),
+            "opencode",
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("credentials rejected"));
+    }
+
+    #[tokio::test]
+    async fn opencode_handshake_requires_model_confirmation() {
+        let dir = tempdir().unwrap();
+        for (value, succeeds) in [("provider/model", true), ("provider/other", false)] {
+            let lines = vec![
+                rpc_result(1, json!({"authMethods":[{"id":"opencode-login"}]})),
+                rpc_result(2, json!({"sessionId":"s"})),
+                rpc_result(
+                    3,
+                    json!({"configOptions":[{"id":"model", "currentValue":value}]}),
+                ),
+            ];
+            let result = GrokSession::start_mock_for_model(
+                dir.path().to_path_buf(),
+                lines,
+                timeout(),
+                "opencode",
+                Some("provider/model"),
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds);
+            if let Ok(session) = result {
+                let requests: Vec<Value> = session
+                    .mock_written()
+                    .unwrap()
+                    .iter()
+                    .map(|s| serde_json::from_str(s).unwrap())
+                    .collect();
+                assert_eq!(
+                    requests
+                        .iter()
+                        .map(|r| r["method"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["initialize", "session/new", "session/set_config_option"]
+                );
+            }
+        }
     }
 
     #[tokio::test]

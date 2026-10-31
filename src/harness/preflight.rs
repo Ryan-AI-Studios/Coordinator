@@ -191,7 +191,10 @@ impl ScriptedProbe {
                 },
                 default_auth: RawOut {
                     exit: 0,
-                    stdout: "{\"loggedIn\":true}\nxai credential\n".into(),
+                    // grok-shaped plus a real opencode listing row: opencode
+                    // classification requires a row ending in `stored`.
+                    stdout: "{\"loggedIn\":true}\nxai credential\nopencode-provider   API key   stored\n"
+                        .into(),
                     stderr: String::new(),
                     timed_out: false,
                 },
@@ -613,6 +616,11 @@ fn auth_step_for(
                 ENV_COORDINATOR_CODEX_BIN,
                 vec!["login".into(), "status".into()],
             ),
+            "opencode" => Ok(AuthStep {
+                path: runtime.to_path_buf(),
+                argv: vec!["auth".into(), "list".into()],
+                note: None,
+            }),
             other => Err(crate::error::CoordinatorError::Message(format!(
                 "no adapter auth probe for {other}"
             ))),
@@ -663,6 +671,55 @@ fn auth_step_for(
 struct AuthVerdict {
     ready: bool,
     detail: Option<String>,
+}
+
+/// What `opencode auth list` actually established.
+///
+/// `stored` rows mean a credential exists for *some* provider; they do not prove
+/// the pinned provider/model is authorized. Explicit negatives must stay
+/// fail-closed, and an unrecognised format must never be read as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeCredentialState {
+    Missing,
+    Configured,
+    Ambiguous,
+}
+
+fn opencode_credential_state(out: &RawOut) -> OpenCodeCredentialState {
+    if out.timed_out || out.exit != 0 {
+        return OpenCodeCredentialState::Missing;
+    }
+    let text = format!("{}\n{}", out.stdout, out.stderr);
+    if text.trim().is_empty() {
+        return OpenCodeCredentialState::Missing;
+    }
+    let lower = text.to_ascii_lowercase();
+    const NEGATIVE: &[&str] = &[
+        "no credentials",
+        "no stored credentials",
+        "not authenticated",
+        "not logged in",
+        "logged out",
+        "unauthorized",
+        "nothing stored",
+    ];
+    if NEGATIVE.iter().any(|marker| lower.contains(marker)) {
+        return OpenCodeCredentialState::Missing;
+    }
+    // A real listing row ends in the literal `stored`; a heading or sentence
+    // does not. Do not key on provider names or row counts.
+    let stored_row = text.lines().any(|line| {
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        columns.len() >= 2
+            && columns
+                .last()
+                .is_some_and(|c| c.eq_ignore_ascii_case("stored"))
+    });
+    if stored_row {
+        OpenCodeCredentialState::Configured
+    } else {
+        OpenCodeCredentialState::Ambiguous
+    }
 }
 
 fn classify_target_auth(harness: &str, out: &RawOut) -> AuthVerdict {
@@ -735,19 +792,25 @@ fn classify_target_auth(harness: &str, out: &RawOut) -> AuthVerdict {
                 }
             }
         }
-        "opencode" => {
-            if out.exit == 0 && out.stdout.lines().any(|l| !l.trim().is_empty()) {
-                AuthVerdict {
-                    ready: true,
-                    detail: Some("`opencode auth list` has a stored credential".into()),
-                }
-            } else {
-                AuthVerdict {
-                    ready: false,
-                    detail: Some("`opencode auth list` is empty".into()),
-                }
-            }
-        }
+        "opencode" => match opencode_credential_state(out) {
+            OpenCodeCredentialState::Configured => AuthVerdict {
+                ready: true,
+                detail: Some(
+                    "`opencode auth list` shows a stored credential; requested-provider authorization unverified"
+                        .into(),
+                ),
+            },
+            OpenCodeCredentialState::Missing => AuthVerdict {
+                ready: false,
+                detail: Some("`opencode auth list` shows no stored credential".into()),
+            },
+            OpenCodeCredentialState::Ambiguous => AuthVerdict {
+                ready: false,
+                detail: Some(
+                    "`opencode auth list` output unrecognised; authorization unverified".into(),
+                ),
+            },
+        },
         "codex" => {
             if out.exit == 0 {
                 AuthVerdict {
@@ -1200,17 +1263,28 @@ fn classify_auth_out(harness: &str, out: &RawOut) -> (RowStatus, Option<String>)
                 Some("grok models output ambiguous".into()),
             )
         }
-        "opencode" => {
-            if out.exit != 0 {
-                return (RowStatus::Auth, Some("logged out".into()));
-            }
-            let nonempty = out.stdout.lines().any(|l| !l.trim().is_empty());
-            if nonempty {
-                (RowStatus::Ready, None)
-            } else {
-                (RowStatus::Auth, Some("logged out".into()))
-            }
-        }
+        "opencode" => match opencode_credential_state(out) {
+            OpenCodeCredentialState::Configured => (
+                RowStatus::Unknown,
+                Some(
+                    "stored credential present; requested-provider authorization unverified".into(),
+                ),
+            ),
+            OpenCodeCredentialState::Missing => (
+                RowStatus::Auth,
+                Some("`opencode auth list` shows no stored credential".into()),
+            ),
+            OpenCodeCredentialState::Ambiguous => (
+                // Doctor's required-gate only blocks Missing|Auth, so an
+                // unrecognised listing must land on Auth: we cannot prove a
+                // credential exists, and a required role must not proceed.
+                RowStatus::Auth,
+                Some(
+                    "`opencode auth list` output unrecognised; no stored credential confirmed"
+                        .into(),
+                ),
+            ),
+        },
         "codex" | "gh" => {
             if out.exit == 0 {
                 (RowStatus::Ready, None)
@@ -1562,6 +1636,117 @@ mod tests {
             Some("x".into())
         );
         assert_eq!(merge_shell_detail("gh", None), None);
+    }
+
+    #[test]
+    fn opencode_auth_list_distinguishes_missing_configured_and_ambiguous() {
+        let raw = |exit: i32, stdout: &str| RawOut {
+            exit,
+            stdout: stdout.into(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+
+        // Known absence must fail closed for BOTH binding validation and doctor.
+        for stdout in [
+            "",
+            "No credentials found\n",
+            "Not authenticated\n",
+            "logged out\n",
+        ] {
+            let out = raw(0, stdout);
+            assert!(
+                !classify_target_auth("opencode", &out).ready,
+                "must not be binding-ready: {stdout:?}"
+            );
+            assert!(
+                matches!(classify_auth_out("opencode", &out).0, RowStatus::Auth),
+                "must be auth: {stdout:?}"
+            );
+        }
+
+        // A heading-only listing proves nothing and must not pass the required gate.
+        let heading_only = raw(0, "Connected providers:\n");
+        assert!(!classify_target_auth("opencode", &heading_only).ready);
+        assert!(matches!(
+            classify_auth_out("opencode", &heading_only).0,
+            RowStatus::Auth
+        ));
+
+        // A stored credential row is established fact, but provider authorization
+        // is not; binding readiness is qualified and doctor stays Unknown.
+        let configured = raw(
+            0,
+            "OpenCode   Go   API key   stored\nOllama Cloud   API key   stored\n",
+        );
+        let target = classify_target_auth("opencode", &configured);
+        assert!(target.ready);
+        let detail = target.detail.unwrap();
+        assert!(detail.contains("stored credential") && detail.contains("unverified"));
+        let (status, doctor_detail) = classify_auth_out("opencode", &configured);
+        assert!(matches!(status, RowStatus::Unknown));
+        let doctor_detail = doctor_detail.unwrap();
+        assert!(doctor_detail.contains("unverified"));
+        assert!(!doctor_detail.contains("ready"));
+
+        // Unrecognised free-form output is never success and fails the required gate.
+        let ambiguous = raw(0, "some future output shape\n");
+        assert!(!classify_target_auth("opencode", &ambiguous).ready);
+        assert!(matches!(
+            classify_auth_out("opencode", &ambiguous).0,
+            RowStatus::Auth
+        ));
+
+        // Command failure / timeout is missing.
+        assert!(!classify_target_auth("opencode", &raw(1, "stored")).ready);
+        assert!(matches!(
+            classify_auth_out("opencode", &raw(1, "stored")).0,
+            RowStatus::Auth
+        ));
+        let mut timed_out = raw(0, "stored");
+        timed_out.timed_out = true;
+        assert!(!classify_target_auth("opencode", &timed_out).ready);
+    }
+
+    #[test]
+    fn opencode_unproven_credential_fails_the_required_doctor_gate() {
+        // Doctor's gate ignores Unknown, so any listing that does not prove a
+        // stored credential must classify as Auth for a required role.
+        for stdout in [
+            "",
+            "Connected providers:\n",
+            "some future output shape\n",
+            "No credentials found\n",
+        ] {
+            let out = RawOut {
+                exit: 0,
+                stdout: stdout.into(),
+                stderr: String::new(),
+                timed_out: false,
+            };
+            let (status, detail) = classify_auth_out("opencode", &out);
+            assert!(
+                matches!(status, RowStatus::Auth),
+                "unproven credential must be Auth for {stdout:?}, got {status:?}"
+            );
+            let report = DoctorReport {
+                ok: true,
+                rows: vec![DoctorRow {
+                    role: "planner".into(),
+                    harness: "opencode".into(),
+                    command: "opencode".into(),
+                    path: Some(PathBuf::from("opencode")),
+                    status,
+                    required: true,
+                    login: Some("opencode auth login".into()),
+                    detail,
+                }],
+            };
+            assert!(
+                !report.ok_required(),
+                "required opencode row must fail the gate for {stdout:?}"
+            );
+        }
     }
 
     #[test]

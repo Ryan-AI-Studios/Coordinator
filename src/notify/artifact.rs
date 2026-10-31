@@ -522,7 +522,7 @@ fn rebuild_summary(state_dir: &std::path::Path, adopt: bool) -> Result<Vec<Scann
         return Ok(scan_per_run(state_dir));
     }
     let _first = scan_per_run(state_dir);
-    pause_summary_rebuild();
+    pause_summary_rebuild(state_dir);
     let entries = scan_per_run(state_dir);
     write_summary(state_dir, &entries)?;
     Ok(entries)
@@ -567,28 +567,34 @@ fn with_summary_lock<T>(state_dir: &std::path::Path, f: impl FnOnce() -> Result<
     }
 }
 
+/// Test-only pause hook, scoped to one state dir. A process-global unnamed slot
+/// fires inside whichever test happens to rebuild a summary next, which made
+/// these tests race under the default parallel runner.
 #[cfg(test)]
-static SUMMARY_PAUSE: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
-    std::sync::Mutex::new(None);
+type SummaryPauseHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+type ArmedSummaryPause = Option<(std::path::PathBuf, SummaryPauseHook)>;
 
 #[cfg(test)]
-pub(crate) fn arm_summary_pause(hook: impl FnOnce() + Send + 'static) {
-    *SUMMARY_PAUSE.lock().unwrap_or_else(|err| err.into_inner()) = Some(Box::new(hook));
+static SUMMARY_PAUSE: std::sync::Mutex<ArmedSummaryPause> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn arm_summary_pause(state_dir: &std::path::Path, hook: impl FnOnce() + Send + 'static) {
+    *SUMMARY_PAUSE.lock().unwrap_or_else(|err| err.into_inner()) =
+        Some((state_dir.to_path_buf(), Box::new(hook)));
 }
 
 #[cfg(test)]
-fn pause_summary_rebuild() {
-    let hook = SUMMARY_PAUSE
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .take();
-    if let Some(hook) = hook {
+fn pause_summary_rebuild(state_dir: &std::path::Path) {
+    let mut slot = SUMMARY_PAUSE.lock().unwrap_or_else(|err| err.into_inner());
+    let armed_for_this_dir = slot.as_ref().is_some_and(|(armed, _)| armed == state_dir);
+    if armed_for_this_dir && let Some((_, hook)) = slot.take() {
         hook();
     }
 }
 
 #[cfg(not(test))]
-fn pause_summary_rebuild() {}
+fn pause_summary_rebuild(_state_dir: &std::path::Path) {}
 
 fn render(event: &NotifyEvent) -> String {
     let track = event.track_id.as_deref().unwrap_or("null");
@@ -901,7 +907,7 @@ mod tests {
         let r = rec(dir.path());
         crate::state::ensure_state_dir(&r).unwrap();
         let sibling = run_path(&r, 5).unwrap();
-        arm_summary_pause(move || {
+        arm_summary_pause(&resolve_state_dir(&r).unwrap(), move || {
             std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
             std::fs::write(
                 &sibling,

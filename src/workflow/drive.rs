@@ -2228,8 +2228,8 @@ mod tests {
     fn non_grok_harness_is_permission_no_inject() {
         let home = IsolatedHome::enter();
         home.write_bindings(|b| {
-            b.get_mut(ROLE_PLANNER).unwrap().harness = "opencode".into();
-            b.get_mut(ROLE_PLANNER).unwrap().command = "opencode".into();
+            b.get_mut(ROLE_PLANNER).unwrap().harness = "antigravity".into();
+            b.get_mut(ROLE_PLANNER).unwrap().command = "agy".into();
         });
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
@@ -2239,7 +2239,7 @@ mod tests {
         assert_eq!(view.failure_class, Some(FailureClass::Permission));
         assert!(
             view.last_event.contains("no long-lived adapter")
-                && view.last_event.contains("opencode")
+                && view.last_event.contains("antigravity")
                 && view.last_event.contains(PHASE_PLAN)
                 && view.last_event.contains("planner"),
             "last_event={}",
@@ -2257,8 +2257,8 @@ mod tests {
     async fn non_grok_harness_does_not_prompt_live_grok() {
         let home = IsolatedHome::enter();
         home.write_bindings(|b| {
-            b.get_mut(ROLE_PLANNER).unwrap().harness = "opencode".into();
-            b.get_mut(ROLE_PLANNER).unwrap().command = "opencode".into();
+            b.get_mut(ROLE_PLANNER).unwrap().harness = "antigravity".into();
+            b.get_mut(ROLE_PLANNER).unwrap().command = "agy".into();
         });
         let dir = tempdir().unwrap();
         let r = rec(dir.path());
@@ -2280,8 +2280,8 @@ mod tests {
         // can leave this process on the default grok planner, and CI has no
         // `grok` on PATH.
         home.write_bindings(|b| {
-            b.get_mut(ROLE_PLANNER).unwrap().harness = "opencode".into();
-            b.get_mut(ROLE_PLANNER).unwrap().command = "opencode".into();
+            b.get_mut(ROLE_PLANNER).unwrap().harness = "antigravity".into();
+            b.get_mut(ROLE_PLANNER).unwrap().command = "agy".into();
         });
         let view = tick(&r).unwrap().expect("permission");
         assert_eq!(view.failure_class, Some(FailureClass::Permission));
@@ -2308,7 +2308,8 @@ mod tests {
         assert!(crate::harness::is_acp_session_harness("grok"));
         assert!(crate::harness::is_acp_session_harness("claude"));
         assert!(crate::harness::is_acp_session_harness("codex"));
-        assert!(!crate::harness::is_acp_session_harness("opencode"));
+        assert!(crate::harness::is_acp_session_harness("opencode"));
+        assert!(!crate::harness::is_acp_session_harness("antigravity"));
     }
 
     #[test]
