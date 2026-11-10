@@ -361,6 +361,15 @@ impl GrokSession {
         harness: &str,
         model: Option<&str>,
     ) -> Result<Self> {
+        // Refuse before any process exists: killing a `.cmd` shim would only kill
+        // cmd.exe and could orphan the real opencode child.
+        if harness.eq_ignore_ascii_case("opencode")
+            && model.map(str::trim).filter(|m| !m.is_empty()).is_none()
+        {
+            return Err(CoordinatorError::Message(
+                "opencode harness requires an explicit model in the role binding".into(),
+            ));
+        }
         let mut cmd = acp_spawn_command(&bin);
         for arg in args {
             cmd.arg(arg);
@@ -397,14 +406,6 @@ impl GrokSession {
         let in_flight_id = Arc::new(AtomicU64::new(0));
         let session_id_shared = Arc::new(std::sync::Mutex::new(String::new()));
         let cancel_requested = Arc::new(AtomicBool::new(false));
-        if harness.eq_ignore_ascii_case("opencode")
-            && model.map(str::trim).filter(|m| !m.is_empty()).is_none()
-        {
-            let _ = child.kill().await;
-            return Err(CoordinatorError::Message(
-                "opencode harness requires an explicit model in the role binding".into(),
-            ));
-        }
         let mut session = Self {
             transport: AcpTransport::Process {
                 child: Box::new(child),
@@ -3225,6 +3226,38 @@ mod tests {
         assert!(text.contains("acp"), "argv={text:?}");
         assert!(!text.contains("agent"), "argv={text:?}");
         assert!(!text.contains("stdio"), "argv={text:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn opencode_missing_model_is_refused_before_spawning_a_cmd_shim() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("spawned.txt");
+        let stub = dir.path().join("opencode-stub.cmd");
+        std::fs::write(
+            &stub,
+            "@echo off\r\n>\"%~dp0spawned.txt\" echo spawned\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        let err = GrokSession::start_with_harness(
+            dir.path().to_path_buf(),
+            Duration::from_millis(400),
+            stub,
+            None,
+            "opencode",
+        )
+        .await
+        .expect_err("opencode with no model must be refused");
+        assert!(
+            err.to_string()
+                .contains("opencode harness requires an explicit model"),
+            "err={err}"
+        );
+        assert!(
+            !marker.exists(),
+            "the .cmd shim must not be spawned: {}",
+            marker.display()
+        );
     }
 
     #[tokio::test]

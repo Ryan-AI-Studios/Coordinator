@@ -128,7 +128,7 @@ pub(crate) fn resolve_binding_binary(binding: &RoleBinding, role: &str) -> Resul
         // Must match preflight::env_pin_for_harness, or doctor would probe the
         // override while execution runs the binding command.
         match std::env::var(crate::config::ENV_COORDINATOR_OPENCODE_BIN) {
-            Ok(over) if !over.trim().is_empty() => over,
+            Ok(over) if !over.trim().is_empty() => over.trim().to_string(),
             _ => binding.command.clone(),
         }
     } else {

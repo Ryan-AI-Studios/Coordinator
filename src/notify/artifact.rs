@@ -586,9 +586,16 @@ pub(crate) fn arm_summary_pause(state_dir: &std::path::Path, hook: impl FnOnce()
 
 #[cfg(test)]
 fn pause_summary_rebuild(state_dir: &std::path::Path) {
-    let mut slot = SUMMARY_PAUSE.lock().unwrap_or_else(|err| err.into_inner());
-    let armed_for_this_dir = slot.as_ref().is_some_and(|(armed, _)| armed == state_dir);
-    if armed_for_this_dir && let Some((_, hook)) = slot.take() {
+    let hook = {
+        let mut slot = SUMMARY_PAUSE.lock().unwrap_or_else(|err| err.into_inner());
+        let armed_for_this_dir = slot.as_ref().is_some_and(|(armed, _)| armed == state_dir);
+        if armed_for_this_dir {
+            slot.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
         hook();
     }
 }

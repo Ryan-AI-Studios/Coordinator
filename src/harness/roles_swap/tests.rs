@@ -369,6 +369,36 @@ fn opencode_swap_without_model_is_refused_before_any_probe() {
 }
 
 #[test]
+fn opencode_model_less_swap_is_allowed_for_plan_review_and_cross_model() {
+    let home = SwapHome::enter();
+    let bin = home.dummy("opencode.exe");
+    let _probe = install_test_probe(ScriptedProbe::ready().with_auth(
+        "opencode",
+        0,
+        "provider   API key   stored\n",
+        "",
+        false,
+    ));
+    // `opencode run` carries `-m`, so plan-review and cross-model slots need no
+    // model pin in the binding. Only the ACP adapter class is refused.
+    for role in [ROLE_REVIEWER_OPENCODE, ROLE_CROSS_MODEL_TERTIARY] {
+        let outcome = swap(
+            role,
+            PartialBinding {
+                command: Some(bin.to_string_lossy().into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{role} model-less swap must succeed: {e}"));
+        assert!(outcome.applied && !outcome.deferred, "{outcome:?}");
+        assert!(
+            home.binding(role).model.is_none(),
+            "{role} must stay model-less"
+        );
+    }
+}
+
+#[test]
 fn opencode_adapter_swap_refuses_missing_credential() {
     let home = SwapHome::enter();
     let bin = home.dummy("opencode.exe");
@@ -555,6 +585,54 @@ fn deferred_swap_applies_at_the_phase_boundary_in_process() {
     let ledger = load_ledger().unwrap();
     assert!(!ledger.pending.contains_key("implementor"));
     assert!(!ledger.errors.contains_key("implementor"));
+}
+
+#[test]
+fn deferred_apply_returns_the_boundary_receipt_not_the_queued_one() {
+    let home = SwapHome::enter();
+    let (_shim, _companion) = codex_planner(&home, Some("model-a"));
+    let _probe = install_test_probe(ready_probe());
+    let current = home.binding(ROLE_PLANNER);
+    let proposed = RoleBinding {
+        model: Some("model-b".into()),
+        ..current.clone()
+    };
+    let mut queued =
+        crate::harness::preflight::probe_target(ROLE_PLANNER, &proposed).expect("queued probe ok");
+    queued.runtime_version = Some("queued-receipt".into());
+    let mut ledger = new_ledger();
+    ledger.pending.insert(
+        ROLE_PLANNER.into(),
+        PendingSwap {
+            role: ROLE_PLANNER.into(),
+            previous: current.clone(),
+            proposed,
+            receipt: queued,
+            requested_at: Utc::now(),
+        },
+    );
+    save_ledger(&ledger).unwrap();
+
+    let outcomes = apply_pending_for_roles(&[ROLE_PLANNER]);
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    let receipt = outcomes[0].receipt.as_ref().expect("outcome receipt");
+    assert_eq!(
+        receipt.runtime_version.as_deref(),
+        Some("1.0.0"),
+        "outcome must carry the boundary receipt"
+    );
+    assert_ne!(receipt.runtime_version.as_deref(), Some("queued-receipt"));
+    let ledger = load_ledger().unwrap();
+    assert_eq!(
+        ledger.last[ROLE_PLANNER]
+            .receipt
+            .as_ref()
+            .unwrap()
+            .runtime_version
+            .as_deref(),
+        Some("1.0.0"),
+        "ledger must record the boundary receipt"
+    );
 }
 
 #[test]

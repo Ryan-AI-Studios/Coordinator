@@ -191,10 +191,9 @@ impl ScriptedProbe {
                 },
                 default_auth: RawOut {
                     exit: 0,
-                    // grok-shaped plus a real opencode listing row: opencode
-                    // classification requires a row ending in `stored`.
-                    stdout: "{\"loggedIn\":true}\nxai credential\nopencode-provider   API key   stored\n"
-                        .into(),
+                    // grok-shaped default. Per-harness auth fixtures (notably
+                    // opencode's `stored` row) are supplied with `with_auth`.
+                    stdout: "{\"loggedIn\":true}\nxai credential\n".into(),
                     stderr: String::new(),
                     timed_out: false,
                 },
@@ -685,11 +684,46 @@ enum OpenCodeCredentialState {
     Ambiguous,
 }
 
+fn strip_ansi_sgr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            let mut lookahead = chars.clone();
+            lookahead.next(); // '['
+            let mut consumed = 0usize;
+            let mut sgr = false;
+            loop {
+                match lookahead.next() {
+                    Some(ch) if ch.is_ascii_digit() || ch == ';' => consumed += 1,
+                    Some('m') => {
+                        sgr = true;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            if sgr {
+                chars.next(); // '['
+                for _ in 0..consumed {
+                    chars.next();
+                }
+                chars.next(); // 'm'
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn opencode_credential_state(out: &RawOut) -> OpenCodeCredentialState {
     if out.timed_out || out.exit != 0 {
         return OpenCodeCredentialState::Missing;
     }
-    let text = format!("{}\n{}", out.stdout, out.stderr);
+    let stdout = strip_ansi_sgr(&out.stdout);
+    let stderr = strip_ansi_sgr(&out.stderr);
+    let text = format!("{stdout}\n{stderr}");
     if text.trim().is_empty() {
         return OpenCodeCredentialState::Missing;
     }
@@ -706,9 +740,11 @@ fn opencode_credential_state(out: &RawOut) -> OpenCodeCredentialState {
     if NEGATIVE.iter().any(|marker| lower.contains(marker)) {
         return OpenCodeCredentialState::Missing;
     }
-    // A real listing row ends in the literal `stored`; a heading or sentence
-    // does not. Do not key on provider names or row counts.
-    let stored_row = text.lines().any(|line| {
+    // Positive evidence must come from stdout: stderr may carry warnings that
+    // mention `stored` without listing a credential. A real listing row ends in
+    // the literal `stored`; a heading or sentence does not. Do not key on
+    // provider names or row counts. ANSI colour codes are already stripped.
+    let stored_row = stdout.lines().any(|line| {
         let columns: Vec<&str> = line.split_whitespace().collect();
         columns.len() >= 2
             && columns
@@ -1607,7 +1643,13 @@ mod tests {
         let iso = IsolatedDoctor::enter();
         iso.point_all_to_dummies();
         iso.grok_ready_via_key();
-        let probe = ScriptedProbe::ready();
+        let probe = ScriptedProbe::ready().with_auth(
+            "opencode",
+            0,
+            "opencode-provider   API key   stored\n",
+            "",
+            false,
+        );
         let _g = install_test_probe(probe.clone());
         let report = probe_machine().unwrap();
         assert!(report.ok, "report={report:?}");
@@ -1688,6 +1730,34 @@ mod tests {
         let doctor_detail = doctor_detail.unwrap();
         assert!(doctor_detail.contains("unverified"));
         assert!(!doctor_detail.contains("ready"));
+
+        // Positive evidence is stdout-only: a stderr line ending in `stored`
+        // proves nothing about the listing.
+        let stderr_only = RawOut {
+            exit: 0,
+            stdout: String::new(),
+            stderr: "Provider   API key   stored\n".into(),
+            timed_out: false,
+        };
+        assert!(
+            !classify_target_auth("opencode", &stderr_only).ready,
+            "stderr-only stored must not be binding-ready"
+        );
+        assert!(matches!(
+            classify_auth_out("opencode", &stderr_only).0,
+            RowStatus::Auth
+        ));
+
+        // ANSI SGR colour codes glued to the last column must not hide the row.
+        let configured_ansi = raw(0, "Provider  API key  stored\x1b[0m\n");
+        assert!(
+            classify_target_auth("opencode", &configured_ansi).ready,
+            "ANSI-coloured stored row must be configured"
+        );
+        assert!(matches!(
+            classify_auth_out("opencode", &configured_ansi).0,
+            RowStatus::Unknown
+        ));
 
         // Unrecognised free-form output is never success and fails the required gate.
         let ambiguous = raw(0, "some future output shape\n");
@@ -2050,7 +2120,15 @@ mod tests {
         let iso = IsolatedDoctor::enter();
         iso.point_all_to_dummies();
         iso.grok_ready_via_key();
-        let probe = ScriptedProbe::ready().with_version("codex", 124, true);
+        let probe = ScriptedProbe::ready()
+            .with_version("codex", 124, true)
+            .with_auth(
+                "opencode",
+                0,
+                "opencode-provider   API key   stored\n",
+                "",
+                false,
+            );
         let _g = install_test_probe(probe);
         let (_proj, rec) = iso.add_project();
         let result = api::cmd_run(
@@ -2131,7 +2209,13 @@ mod tests {
         iso.grok_ready_via_key();
         let _a = iso.add_project();
         let _b = iso.add_project();
-        let probe = ScriptedProbe::ready();
+        let probe = ScriptedProbe::ready().with_auth(
+            "opencode",
+            0,
+            "opencode-provider   API key   stored\n",
+            "",
+            false,
+        );
         let _g = install_test_probe(probe);
         let report = api::cmd_doctor(None).unwrap();
         assert!(report.ok);
