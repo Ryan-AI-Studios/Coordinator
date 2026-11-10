@@ -105,6 +105,7 @@ fn adapter_command(harness: &str) -> Option<&'static str> {
         "cursor" => Some("cursor-agent"),
         "claude" => Some("claude-agent-acp"),
         "codex" => Some("codex-acp"),
+        "opencode" => Some("opencode"),
         _ => None,
     }
 }
@@ -136,7 +137,7 @@ fn cross_model_command(harness: &str) -> Option<(&'static str, &'static str)> {
 
 fn allowed_harnesses(class: RoleClass) -> &'static str {
     match class {
-        RoleClass::Adapter => "grok, cursor, claude, codex",
+        RoleClass::Adapter => "grok, cursor, claude, codex, opencode",
         RoleClass::PlanReviewAgy => "antigravity, codex",
         RoleClass::PlanReviewOpenCode => "opencode, codex",
         RoleClass::CrossModel => "codex, claude, opencode",
@@ -1025,6 +1026,23 @@ pub fn propose(
         proposed.model = Some(model.to_string());
     }
 
+    // ACP adapter roles cannot carry a model through opencode's ACP argv, so a
+    // binding without one would silently run the CLI default. Plan-review and
+    // cross-model slots use `opencode run`, which does take `-m`, so this refusal
+    // is scoped to the adapter (planner/implementor) class only.
+    if class == RoleClass::Adapter
+        && proposed.harness.eq_ignore_ascii_case("opencode")
+        && proposed
+            .model
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    {
+        return Err(CoordinatorError::Message(format!(
+            "opencode role {role} requires an explicit --model; the ACP argv cannot pin one"
+        )));
+    }
+
     if proposed == *current {
         return Err(CoordinatorError::Message(format!(
             "binding unchanged for role {role}; no write"
@@ -1579,7 +1597,6 @@ fn apply_pending_roles(
                 continue;
             }
         };
-        let _ = receipt;
 
         match write_binding_verified(role, &pending.proposed, &current_cfg) {
             Ok(snapshot) => {
@@ -1593,7 +1610,9 @@ fn apply_pending_roles(
                         previous: pending.previous.clone(),
                         applied: pending.proposed.clone(),
                         snapshot: Some(snapshot.clone()),
-                        receipt: Some(pending.receipt.clone()),
+                        // Record the receipt produced at the swap boundary, not the
+                        // one captured when the request was queued.
+                        receipt: Some(receipt.clone()),
                         applied_at: Utc::now(),
                     },
                 );
@@ -1619,7 +1638,7 @@ fn apply_pending_roles(
                         "role-swap: applied {role} ({}) at the boundary",
                         describe_binding(Some(&pending.proposed))
                     ),
-                    receipt: Some(pending.receipt.clone()),
+                    receipt: Some(receipt),
                     snapshot: Some(snapshot),
                 });
             }

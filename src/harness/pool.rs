@@ -6279,6 +6279,63 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), hold).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opencode_holder_reuses_identity_and_recycles_model_or_command_change() {
+        for change in ["model", "command"] {
+            let dir = tempdir().unwrap();
+            let rec = record_in(&dir, &format!("opencode-{change}"));
+            crate::state::ensure_state_dir(&rec).unwrap();
+            let bin = PathBuf::from("opencode.exe");
+            let lines = vec![
+                crate::harness::grok::rpc_result(
+                    1,
+                    serde_json::json!({"authMethods":[{"id":"opencode-login"}]}),
+                ),
+                crate::harness::grok::rpc_result(2, serde_json::json!({"sessionId":"s"})),
+            ];
+            let mut session = GrokSession::start_mock_for(
+                crate::harness::grok_cwd(&rec).unwrap(),
+                lines,
+                Duration::from_secs(2),
+                "opencode",
+            )
+            .await
+            .unwrap();
+            session.model = Some("provider/model".into());
+            session.bin = bin.clone();
+            let rec_hold = rec.clone();
+            let hold = tokio::spawn(async move { hold_loop_with_session(rec_hold, session).await });
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while load_persist(&rec)
+                .unwrap()
+                .is_none_or(|h| h.control_addr.is_none())
+            {
+                assert!(std::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                reuse_or_reap_existing(&rec, "opencode", Some("provider/model"), Some(&bin))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let other_bin = PathBuf::from("other-opencode.exe");
+            let (model, target_bin) = if change == "model" {
+                ("provider/other", &bin)
+            } else {
+                ("provider/model", &other_bin)
+            };
+            assert!(
+                reuse_or_reap_existing(&rec, "opencode", Some(model), Some(target_bin))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(load_persist(&rec).unwrap().is_none());
+            let _ = tokio::time::timeout(Duration::from_secs(2), hold).await;
+        }
+    }
+
     #[tokio::test]
     async fn retry_after_failed_start_clears_stale_error() {
         let dir = tempdir().unwrap();
