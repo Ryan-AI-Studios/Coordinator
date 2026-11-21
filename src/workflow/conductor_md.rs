@@ -1679,15 +1679,17 @@ fn is_id_lookahead(rest: &str) -> bool {
         return true;
     }
     let stripped = rest.trim_start_matches(|c: char| c.is_whitespace());
-    if stripped.len() < rest.len()
+    trimmed_starts_with_alpha(rest, stripped)
+}
+
+/// Split out so clippy's `needless_bool` (Rust 1.100) does not read the tail as an
+/// `if ... { true } else { false }`. Behaviour is identical to the former inline guard.
+fn trimmed_starts_with_alpha(rest: &str, stripped: &str) -> bool {
+    stripped.len() < rest.len()
         && stripped
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic())
-    {
-        return true;
-    }
-    false
 }
 
 /// Track+Status rows `parse_conductor_md` can see. `None` if the file is
