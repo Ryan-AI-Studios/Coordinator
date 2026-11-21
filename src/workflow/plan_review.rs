@@ -165,11 +165,25 @@ impl PlanReviewBackend for CodexCli {
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .unwrap_or_default();
-        let stdout = if last_message.trim().is_empty() {
-            out.stdout.clone()
-        } else {
+        // The slot is writable at its track root now, so a review the model wrote itself is
+        // the authoritative text; `-o` is the fallback and stdout the last resort.
+        let written = req
+            .track_dir
+            .as_ref()
+            .and_then(|dir| {
+                std::fs::read_to_string(dir.join(format!("{}-review.md", req.slug))).ok()
+            })
+            .unwrap_or_default();
+        let stdout = if !written.trim().is_empty() {
+            written
+        } else if !last_message.trim().is_empty() {
             last_message
+        } else {
+            out.stdout.clone()
         };
+        // No heading is synthesised here. The dud gate exists to keep a refusal or a transcript
+        // from counting as a review, and a reviewer that did not follow the prompt must fail
+        // that gate visibly rather than be dressed up as a pass. The prompt carries the contract.
         Ok(PlanReviewResult {
             exit: out.exit,
             stdout,
@@ -195,10 +209,13 @@ pub fn codex_plan_review_argv(
     // `codex exec` refuses to run outside a trusted directory ("Not inside a trusted
     // directory and --skip-git-repo-check was not specified"), so the execution repo is
     // named with `-C` and is also the child's cwd. The cross-model driver does the same.
-    if let Some(dir) = exec_repo.or(Some(workspace_root)) {
-        args.push("-C".into());
-        args.push(dir.to_string_lossy().into_owned());
-    }
+    // Read-only is deliberate: `workspace-write` rooted at the track dir would also authorise
+    // rewriting the `spec.md`/`plan.md` this slot is reviewing, and deleting the other slot's
+    // review (independent codex review, PR #153). The review travels through `-o` instead, and
+    // the prompt for a codex slot tells the model not to attempt a write.
+    let root = exec_repo.unwrap_or(workspace_root);
+    args.push("-C".into());
+    args.push(root.to_string_lossy().into_owned());
     args.extend([
         "-s".into(),
         "read-only".into(),
@@ -330,15 +347,25 @@ fn paths_differ(a: &Path, b: &Path) -> bool {
 
 /// Review-track contract: write `agy-review.md` on the track; no Verdict/PASS.
 pub fn agy_prompt(record: &ProjectRecord, track_id: Option<&str>) -> String {
-    slot_prompt(record, track_id, REVIEW_SLUG_AGY)
+    slot_prompt(record, track_id, REVIEW_SLUG_AGY, PlanReviewDriver::Agy)
 }
 
 /// Review-track contract: write `opencode-review.md` on the track; no Verdict/PASS.
 pub fn opencode_prompt(record: &ProjectRecord, track_id: Option<&str>) -> String {
-    slot_prompt(record, track_id, REVIEW_SLUG_OPENCODE)
+    slot_prompt(
+        record,
+        track_id,
+        REVIEW_SLUG_OPENCODE,
+        PlanReviewDriver::OpenCode,
+    )
 }
 
-fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> String {
+fn slot_prompt(
+    record: &ProjectRecord,
+    track_id: Option<&str>,
+    slug: &str,
+    driver: PlanReviewDriver,
+) -> String {
     let track_dir = track_id
         .and_then(|id| resolve_track_dir(record, id))
         .map(|p| p.display().to_string())
@@ -346,6 +373,17 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
     let skill = super::reuse::review_track_skill_prompt(record);
     let file = format!("{slug}-review.md");
     let layout = crate::workflow::prompts::layout_block(record, track_id, "plan-review");
+    // A codex slot runs `codex exec -s read-only`: it cannot write, and asking it to is what
+    // turned a substantive review into a dud on 0601. The review is its final message, which
+    // the driver captures with `-o` and stamps with the heading the gate checks.
+    let write_block = if driver == PlanReviewDriver::Codex {
+        "Do NOT attempt to write any file in this session: the sandbox is read-only.\n\
+         Return the complete review as your final message, starting with the line\n\
+         `# Track review: <track id>`."
+            .to_string()
+    } else {
+        format!("Write your review to this exact path (overwrite):\n{track_dir}/{file}")
+    };
     let research = if slug == REVIEW_SLUG_OPENCODE {
         "Knowledge is stale. Verify APIs, hooks, and plan-vs-live-src against docs.rs, \
          official harness docs, and the execution repo — not crate-version pins.\n\
@@ -367,8 +405,7 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
          Read spec.md and plan.md in:\n\
          {track_dir}\n\
          \n\
-         Write your review to this exact path (overwrite):\n\
-         {track_dir}/{file}\n\
+         {write_block}\n\
          \n\
          {research}\n\
          \n\
@@ -376,6 +413,11 @@ fn slot_prompt(record: &ProjectRecord, track_id: Option<&str>, slug: &str) -> St
          - Review the plan for completeness, risks, and missing Definition of Done.\n\
          - Do not require a Verdict/PASS header. This is not the post-implement \
          cross-model review gate.\n\
+         - The file MUST begin with the line `# Track review: <track id>`. The \
+         coordinator rejects a review without that heading as a dud and does not \
+         count it toward the gate.\n\
+         - If you cannot write the file, put the complete review, starting with \
+         that heading, in your final message.\n\
          - You may inspect product source under the execution repo when it is available.\n\
          - Do not run `coordinator outcome write`.\n"
     )
@@ -895,7 +937,7 @@ fn maybe_spawn_slot(record: &ProjectRecord, state: &RunState, slug: &str) -> Res
     let track_dir = spawn_track_id
         .as_deref()
         .and_then(|id| resolve_track_dir(record, id));
-    let prompt = slot_prompt(record, spawn_track_id.as_deref(), slug);
+    let prompt = slot_prompt(record, spawn_track_id.as_deref(), slug, driver);
     let extra_env = match slug {
         REVIEW_SLUG_OPENCODE => vec![(
             "OPENCODE_PERMISSION".into(),
@@ -2867,8 +2909,18 @@ mod tests {
             &last,
         );
         assert_eq!(args[0], "exec");
+        // Read-only is the boundary: a writable track root would let this slot rewrite the
+        // spec/plan it reviews and delete the other slot's review (independent codex review).
         assert!(
             args.windows(2).any(|w| w[0] == "-s" && w[1] == "read-only"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-C" && w[1] == "C:\\exec"),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--skip-git-repo-check"),
             "{args:?}"
         );
         assert!(
@@ -2882,11 +2934,6 @@ mod tests {
             "{args:?}"
         );
         assert_eq!(args.last().unwrap(), "-", "{args:?}");
-        // `codex exec` refuses to start outside a trusted directory: the exec repo is named.
-        assert!(
-            args.windows(2).any(|w| w[0] == "-C" && w[1] == "C:\\exec"),
-            "{args:?}"
-        );
         // The prompt is stdin, never argv: cmd.exe `%*` truncates newlines.
         assert!(
             !args
@@ -3051,6 +3098,8 @@ mod tests {
         let ws = tempdir().unwrap();
         let exec = ws.path().join("exec");
         std::fs::create_dir_all(&exec).unwrap();
+        let track = ws.path().join("conductor").join("0001-Example");
+        std::fs::create_dir_all(&track).unwrap();
         let out = driver_argv(
             PlanReviewDriver::Codex,
             REVIEW_SLUG_OPENCODE,
@@ -3063,7 +3112,13 @@ mod tests {
         );
         assert_eq!(out.argv[0], "exec");
         assert!(out.last_message_path.is_some());
-        assert!(out.argv.windows(2).any(|w| w[0] == "-C"), "{:?}", out.argv);
+        assert!(
+            out.argv
+                .windows(2)
+                .any(|w| w[0] == "-C" && w[1] == exec.to_string_lossy()),
+            "{:?}",
+            out.argv
+        );
         assert!(
             out.argv
                 .windows(2)
@@ -3153,6 +3208,25 @@ mod tests {
         assert!(!oc.contains("## Verdict: PASS"));
         assert!(oc.contains("spec.md"));
         assert!(oc.to_ascii_lowercase().contains("outside the product git"));
+    }
+
+    #[test]
+    fn slot_prompt_requires_the_track_review_heading_and_a_message_fallback() {
+        // A codex slot runs `-s workspace-write` at the track root, but the heading is still
+        // the gate: without `# Track review:` the coordinator files the text as a dud and does
+        // not count the slot. The fallback matters because the final message is the only text
+        // a read-only or failed write can carry.
+        let dir = tempdir().unwrap();
+        setup_track(dir.path(), "0001");
+        let r = rec(dir.path());
+        for text in [
+            agy_prompt(&r, Some("0001")),
+            opencode_prompt(&r, Some("0001")),
+        ] {
+            assert!(text.contains("# Track review: <track id>"), "{text}");
+            assert!(text.contains("final message"), "{text}");
+            assert!(text.contains("dud"), "{text}");
+        }
     }
 
     fn contains_skill(text: &str, name: &str) -> bool {
