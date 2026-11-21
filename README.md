@@ -491,6 +491,14 @@ plan → plan-review (agy + opencode join) → fold → implement
   → compact → advance
 ```
 
+The plan loop is deliberately **one round**: a single `plan`, one two-reviewer `plan-review`, one
+`fold`, then `implement`. A fold may absorb review findings into `spec.md` / `plan.md`, but the
+rewritten pair is **not** re-reviewed — re-entering `plan-review` turned every fold into a new
+review round and could cycle without bound (measured on track 0601, epochs 393–394). The fold's
+artifact gate still refuses `implement` when `plan.md` is missing or a review verdict says
+`Needs re-plan`, and `fold_advance` still withholds on a non-Ready row: those fail closed without
+iterating.
+
 GateFail on `cross-model-review` with `address_findings_attempts < 2` does **not** Stop. Coordinator archives live `review.{slug}.md` → `review.{slug}.gate{n}.md` **and** `{state_dir}/reviews/cross-model-{slug}.md` → `cross-model-{slug}.gate{n}.md`, injects **`address-findings`** (implementor), then a **fresh** Codex→Claude→OpenCode gate (`review` cleared). After two address-findings entries this `run_epoch`, the next GateFail Stops with `difficulty` + Failure Artifact + toast (`last_event` contains `address-findings exhausted`). Other failure classes (permission / exhaustion / crash / timeout) and difficulty from any other phase still Stop. **Archive lifetime is in-run:** a fresh `run` `remove_dir_all`s `{state_dir}/reviews/` (existing `clear_plan_review_artifacts`). A matching track review is kept. An unmatched track review is copied to `prior/{epoch}-{slug}-review.md` and then removed. Track-dir `*.gate{n}.md` may remain on disk like leftover `review.codex.md` — they are not the next gate. Happy-path stub walk never visits `address-findings`.
 
 | Driver | CLI / env | Behavior |

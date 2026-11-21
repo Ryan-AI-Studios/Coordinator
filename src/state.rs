@@ -100,15 +100,17 @@ pub struct RunState {
     /// Old files load as 0. Zero is omitted so a pre-0073 file stays byte-stable.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub epoch_floor: u64,
-    /// 0097: consecutive `fold -> plan-review` re-entries this run (capped). A fold that
-    /// rewrites a reviewed artifact must be re-reviewed, but a fold that always rewrites
-    /// must not spin: the run stops with `review_never_settles` at the cap.
+    /// 0097 legacy: consecutive `fold -> plan-review` re-entries this run.
+    ///
+    /// **Retired 2026-11-21 (owner directive):** the workflow is one `plan`, one
+    /// two-reviewer `plan-review`, one `fold`, then `implement`. A fold may absorb
+    /// review findings, but the rewritten pair is NOT re-reviewed, so this counter and
+    /// [`Self::fold_last_pair`] are no longer incremented. The fields stay in the state
+    /// schema so existing run files still round-trip.
     #[serde(default)]
     pub fold_review_reentries: u32,
-    /// Option (b) part 2 (2026-10-20): the last spec/plan pair observed at a fold
-    /// re-entry. A re-entry counts against [`MAX_FOLD_REVIEW_REENTRIES`] only when it
-    /// reproduces this identical pair; a pair that changed since the previous re-entry
-    /// is a converging rewrite and resets the count instead of marching toward the cap.
+    /// Legacy companion to [`Self::fold_review_reentries`]; written only by the retired
+    /// re-entry path. Kept for state-file compatibility, never read by a decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fold_last_pair: Option<(String, String)>,
     /// When the current phase clock started (Running entry / fresh run).
